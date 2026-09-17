@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   test:
-    name: ${{ matrix.name }}
+    name: Modules
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -124,7 +124,7 @@ jobs:
     timeout-minutes: 15
     steps:
 
-      - name: Check Out
+      - name: Checkout
         uses: actions/checkout@v4
 
         with:

@@ -57,7 +57,7 @@ jobs:
         run: bash crabbot-scripts/metrics.sh
 
   modules:
-    name: ${{ matrix.name }}
+    name: Modules
     runs-on: ubuntu-latest
     container: node:22-bookworm
 
