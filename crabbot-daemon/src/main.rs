@@ -14,7 +14,10 @@ where
     match future.await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Error: {}.", sentence(error.to_string()));
+            tracing::error!(
+                error = %crabbot_runtime::redact_diagnostic(sentence(error.to_string())),
+                "Daemon failed."
+            );
             ExitCode::FAILURE
         }
     }

@@ -16,6 +16,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{Duration, timeout},
 };
+use tracing::warn;
 
 use super::{Cancellation, Stop, state::Store};
 
@@ -55,12 +56,13 @@ pub async fn serve(listener: TcpListener, state: Arc<State>) -> io::Result<()> {
             result = listener.accept() => {
                 let (stream, _) = result?;
                 let Ok(slot) = Arc::clone(&state.slots).try_acquire_owned() else {
+                    warn!("IPC client limit reached; connection rejected.");
                     continue;
                 };
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     if let Err(error) = handle(stream, state, slot).await {
-                        eprintln!("IPC client closed: {}", super::sentence(error.to_string()));
+                        warn!(error = %super::diagnostic(super::sentence(error.to_string())), "IPC client closed.");
                     }
                 });
             }
@@ -85,6 +87,7 @@ async fn handle(
         return Ok(());
     };
     if !request.valid() || request.token != state.token {
+        warn!(method = %super::diagnostic(&request.method), "Rejected unauthorized IPC request.");
         jsonl::write(&mut output, &IpcResponse::fail(request.id, 401, "Unauthorized."))
             .await
             .map_err(to_io)?;

@@ -9,14 +9,14 @@ use std::{
     process::{ExitCode, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use crabbot_core::{
     plugin::Process,
     types::{
@@ -31,6 +31,8 @@ use tokio::{
     net::TcpListener,
     sync::{Mutex as AsyncMutex, Notify, RwLock, watch},
 };
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::filter::LevelFilter;
 
 pub(crate) mod approval;
 pub(crate) mod ipc;
@@ -44,8 +46,7 @@ const BANNER: &str = r#"
 ██║      ██████╔╝ ███████║ ██████╔╝ ██████╔╝ ██║   ██║    ██║   
 ██║      ██╔══██╗ ██╔══██║ ██╔══██╗ ██╔══██╗ ██║   ██║    ██║   
 ╚██████╗ ██║  ██║ ██║  ██║ ██████╔╝ ██████╔╝ ╚██████╔╝    ██║   
- ╚═════╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝   ╚═════╝     ╚═╝   
-"#;
+ ╚═════╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝   ╚═════╝     ╚═╝   "#;
 const TOOL_STEPS: usize = 8;
 const TOOL_CALLS: usize = 16;
 const TURN_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -262,6 +263,14 @@ fn sentence(value: impl Into<String>) -> String {
     value
 }
 
+fn diagnostic(value: impl AsRef<str>) -> String {
+    redact_diagnostic(value)
+}
+
+pub fn redact_diagnostic(value: impl AsRef<str>) -> String {
+    redact(value.as_ref().as_bytes())
+}
+
 fn command_output(command: &mut std::process::Command) -> std::io::Result<std::process::Output> {
     command_output_limited(command, None, u64::MAX)
 }
@@ -369,126 +378,190 @@ fn read_output(input: impl Read) -> std::io::Result<Vec<u8>> {
     name = NAME,
     version = VERSION,
     about = "Your last next agent.",
-    before_help = BANNER
+    before_help = BANNER,
+    disable_help_flag = true,
+    disable_version_flag = true
 )]
 struct Cli {
+    #[arg(long, global = true, help = "Render command output as JSON where supported.")]
+    json: bool,
+    #[arg(long, global = true, help = "Show diagnostic error details.")]
+    debug: bool,
+    #[arg(long, global = true, help = "Show diagnostic progress and timing.")]
+    verbose: bool,
+    #[arg(
+        short = 'v',
+        visible_short_alias = 'V',
+        long = "version",
+        action = ArgAction::Version,
+        help = "Print version."
+    )]
+    version_flag: Option<bool>,
+    #[arg(
+        short = 'h',
+        visible_short_alias = 'H',
+        long = "help",
+        global = true,
+        action = ArgAction::Help,
+        required = false,
+        help = "Print help."
+    )]
+    help: Option<bool>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(about = "Initialize the Crabbot home directory and configuration.")]
     Init,
+    #[command(about = "Check configuration, plugins, credentials, and local state.")]
     Doctor,
+    #[command(about = "Show installation and daemon health.")]
     Status(Output),
+    #[command(about = "Print the Crabbot version.")]
     Version,
+    #[command(about = "Manage installed plugins.")]
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
     },
+    #[command(about = "Manage durable agent sessions.")]
     Session {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    #[command(about = "Manage pending channel deliveries.")]
     Delivery {
         #[command(subcommand)]
         command: DeliveryCommand,
     },
+    #[command(about = "Install, remove, and control the native service.")]
     Service {
         #[command(subcommand)]
         command: Option<ServiceCommand>,
     },
+    #[command(about = "Send one prompt through an intelligence plugin.")]
     Ask(Ask),
+    #[command(about = "Export the local configuration and plugin lock.")]
     Export(CrabfileExport),
+    #[command(about = "Import a configuration and plugin lock.")]
     Import(CrabfileImport),
-    #[command(external_subcommand)]
+    #[command(external_subcommand, hide = true)]
     External(Vec<String>),
 }
 
 #[derive(Debug, Args)]
 struct CrabfileExport {
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", help = "Write the Crabfile to PATH.")]
     path: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct CrabfileImport {
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", help = "Read the Crabfile from PATH.")]
     path: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, help = "Confirm the import without prompting.")]
     yes: bool,
-    #[arg(long)]
+    #[arg(long, help = "Replace existing local state.")]
     force: bool,
 }
 
 #[derive(Debug, Subcommand)]
 enum PluginCommand {
+    #[command(about = "List installed plugins.")]
     List(Output),
+    #[command(about = "Install and activate a plugin.")]
     Install(Source),
+    #[command(about = "Link a local plugin and activate it.")]
     Link(Source),
+    #[command(about = "Update locked plugins.")]
     Update(Output),
+    #[command(about = "Remove an installed plugin.")]
     Remove(Name),
 }
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
+    #[command(about = "Create a durable session.")]
     New(SessionNew),
+    #[command(about = "List durable sessions.")]
     List(Output),
+    #[command(about = "Show a session transcript and metadata.")]
     Show(Id),
+    #[command(about = "Fork a session into a new session.")]
     Fork(Fork),
+    #[command(about = "Change the model used by a session.")]
     Model(SessionModel),
+    #[command(about = "Cancel an active session turn.")]
     Cancel(Id),
+    #[command(about = "Delete a session and reclaim its worktree.")]
     Delete(Id),
 }
 
 #[derive(Debug, Subcommand)]
 enum DeliveryCommand {
+    #[command(about = "List pending and uncertain deliveries.")]
     List(Output),
+    #[command(about = "Retry a delivery explicitly.")]
     Retry(Name),
+    #[command(about = "Drop a delivery without retrying it.")]
     Drop(Name),
 }
 
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
+    #[command(about = "Install the native service definition.")]
     Install,
+    #[command(about = "Remove the native service definition.")]
     Remove,
+    #[command(about = "Show native service status.")]
     Status,
+    #[command(about = "Start the native service.")]
     Start,
+    #[command(about = "Stop the native service.")]
     Stop,
 }
 
 #[derive(Debug, Args)]
 struct SessionNew {
+    #[arg(help = "Session identifier.")]
     id: String,
-    #[arg(long, default_value = "gpt-4o-mini")]
+    #[arg(long, default_value = "gpt-4o-mini", help = "Model identifier.")]
     model: String,
 }
 
 #[derive(Debug, Args)]
 struct Fork {
+    #[arg(help = "Source session identifier.")]
     source: String,
+    #[arg(help = "Target session identifier.")]
     target: String,
 }
 
 #[derive(Debug, Args)]
 struct SessionModel {
+    #[arg(help = "Session identifier.")]
     id: String,
+    #[arg(help = "Model identifier.")]
     model: String,
 }
 
 #[derive(Debug, Args)]
 struct Output {
-    #[arg(long)]
+    #[arg(long, help = "Render the result as JSON.")]
     json: bool,
 }
 
 #[derive(Debug, Args)]
 struct Source {
+    #[arg(help = "Plugin identifier.")]
     id: String,
+    #[arg(help = "Local path, Git URL, or verified archive.")]
     source: Option<String>,
-    #[arg(long)]
+    #[arg(long, value_name = "REVISION", help = "Pin a Git revision.")]
     revision: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Confirm installation without prompting.")]
     yes: bool,
 }
 
@@ -517,22 +590,25 @@ impl Drop for SourceRoot {
 
 #[derive(Debug, Args)]
 struct Name {
+    #[arg(help = "Identifier.")]
     id: String,
-    #[arg(long)]
+    #[arg(long, help = "Confirm the operation.")]
     yes: bool,
 }
 
 #[derive(Debug, Args)]
 struct Id {
+    #[arg(help = "Identifier.")]
     id: String,
 }
 
 #[derive(Debug, Args)]
 struct Ask {
-    #[arg(long, default_value = "codex")]
+    #[arg(long, default_value = "codex", help = "Intelligence plugin identifier.")]
     plugin: String,
-    #[arg(long, default_value = "gpt-4o-mini")]
+    #[arg(long, default_value = "gpt-4o-mini", help = "Model identifier.")]
     model: String,
+    #[arg(help = "Prompt words.")]
     prompt: Vec<String>,
 }
 
@@ -754,32 +830,158 @@ struct Update {
 }
 
 pub async fn cli() -> ExitCode {
-    main_with(Cli::parse()).await
+    let cli = Cli::parse();
+    init_logging(cli.verbose, cli.debug, cli.json);
+    main_with(cli).await
 }
 
 pub async fn daemon() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging(false, false, false);
     serve().await
 }
 
+pub fn init_logging(verbose: bool, debug_mode: bool, json: bool) {
+    if json {
+        return;
+    }
+
+    let level = if debug_mode {
+        LevelFilter::DEBUG
+    } else if verbose {
+        LevelFilter::INFO
+    } else {
+        LevelFilter::WARN
+    };
+
+    let _ = tracing_subscriber::fmt()
+        .with_target(false)
+        .with_ansi(false)
+        .with_max_level(level)
+        .try_init();
+}
+
 async fn main_with(cli: Cli) -> ExitCode {
+    let json = cli.json;
+    let debug = cli.debug;
+    let verbose = cli.verbose;
+    let command = command_label(&cli.command);
+    let started = Instant::now();
+    if verbose {
+        info!("Command started.");
+    }
     match run(cli).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            if verbose {
+                info!(elapsed_ms = started.elapsed().as_millis(), "Command completed.");
+            }
+            ExitCode::SUCCESS
+        }
         Err(error) => {
-            eprintln!("Error: {}", sentence(error.to_string()));
+            let report =
+                debug.then(|| write_debug_report(command, error.as_ref(), started.elapsed()));
+            if json {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": diagnostic(sentence(error.to_string()))})
+                );
+            } else {
+                let message = sentence(error.to_string());
+                error!(error = %diagnostic(&message), "Command failed.");
+                if debug {
+                    debug!(
+                        error = %diagnostic(format!("{error:?}")),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "Command failure details."
+                    );
+                } else if verbose {
+                    let details = error_chain(error.as_ref());
+                    if details != error.to_string() {
+                        info!(causes = %diagnostic(&details), "Command failure causes.");
+                    }
+                    info!(elapsed_ms = started.elapsed().as_millis(), "Command failed.");
+                }
+            }
+            if let Some(report) = report {
+                match report {
+                    Ok(path) if !json => info!(path = %path.display(), "Debug report written."),
+                    Ok(_) => {}
+                    Err(report_error) if !json => {
+                        warn!(error = %diagnostic(report_error.to_string()), "Debug report could not be written.")
+                    }
+                    Err(_) => {}
+                }
+            }
             ExitCode::FAILURE
         }
     }
 }
 
+fn command_label(command: &Command) -> &'static str {
+    match command {
+        Command::Init => "init",
+        Command::Doctor => "doctor",
+        Command::Status(_) => "status",
+        Command::Version => "version",
+        Command::Plugin { .. } => "plugin",
+        Command::Session { .. } => "session",
+        Command::Delivery { .. } => "delivery",
+        Command::Service { .. } => "service",
+        Command::Ask(_) => "ask",
+        Command::Export(_) => "export",
+        Command::Import(_) => "import",
+        Command::External(_) => "external",
+    }
+}
+
+fn write_debug_report(
+    command: &str,
+    error: &(dyn std::error::Error + 'static),
+    elapsed: Duration,
+) -> std::io::Result<PathBuf> {
+    write_debug_report_at(&home(), command, error, elapsed)
+}
+
+fn write_debug_report_at(
+    root: &Path,
+    command: &str,
+    error: &(dyn std::error::Error + 'static),
+    elapsed: Duration,
+) -> std::io::Result<PathBuf> {
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let path = root.join("debug").join(format!("crabbot-{stamp}-{}.log", std::process::id()));
+    let chain = redact(error_chain(error).as_bytes());
+    let details = redact(format!("{error:?}").as_bytes());
+    let backtrace = std::backtrace::Backtrace::capture();
+    let report = format!(
+        "Crabbot debug report\nversion: {VERSION}\ncommand: {command}\nos: {}\narch: {}\nelapsed_ms: {}\nerror: {chain}\ndetails: {details}\nbacktrace: {backtrace}\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        elapsed.as_millis(),
+    );
+    secure(&path, report.as_bytes())?;
+    Ok(path)
+}
+
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut messages = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        messages.push(cause.to_string());
+        source = cause.source();
+    }
+    messages.join(": ")
+}
+
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let json = cli.json;
     match cli.command {
         Command::Init => init()?,
         Command::Doctor => doctor()?,
-        Command::Status(output) => status_command(output.json).await?,
+        Command::Status(output) => status_command(output.json || json).await?,
         Command::Version => version(),
-        Command::Plugin { command } => plugin(command).await?,
-        Command::Session { command } => session(command).await?,
-        Command::Delivery { command } => delivery(command).await?,
+        Command::Plugin { command } => plugin(command, json).await?,
+        Command::Session { command } => session(command, json).await?,
+        Command::Delivery { command } => delivery(command, json).await?,
         Command::Service { command } => service(command.unwrap_or(ServiceCommand::Status))?,
         Command::Ask(ask) => ask_model(ask).await?,
         Command::Export(args) => export_crabfile(args)?,
@@ -981,14 +1183,44 @@ async fn model_at(
     }
 }
 
-async fn session(command: SessionCommand) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    session_at(command, &home()).await
+async fn session(
+    command: SessionCommand,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    session_at(with_session_json(command, json), &home()).await
 }
 
 async fn delivery(
     command: DeliveryCommand,
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    delivery_at(command, &home()).await
+    delivery_at(with_delivery_json(command, json), &home()).await
+}
+
+fn with_session_json(command: SessionCommand, json: bool) -> SessionCommand {
+    if !json {
+        return command;
+    }
+    match command {
+        SessionCommand::List(mut output) => {
+            output.json = true;
+            SessionCommand::List(output)
+        }
+        command => command,
+    }
+}
+
+fn with_delivery_json(command: DeliveryCommand, json: bool) -> DeliveryCommand {
+    if !json {
+        return command;
+    }
+    match command {
+        DeliveryCommand::List(mut output) => {
+            output.json = true;
+            DeliveryCommand::List(output)
+        }
+        command => command,
+    }
 }
 
 async fn delivery_at(
@@ -1167,9 +1399,14 @@ async fn session_at(
             {
                 if value["worktree"]["status"] == "pending" {
                     println!(
-                        "Deleted session {}, but worktree cleanup is pending: {}",
-                        value["id"].as_str().unwrap_or_default(),
-                        value["worktree"]["error"].as_str().unwrap_or("Retry at daemon startup.")
+                        "{}",
+                        sentence(format!(
+                            "Deleted session {}, but worktree cleanup is pending: {}",
+                            value["id"].as_str().unwrap_or_default(),
+                            value["worktree"]["error"]
+                                .as_str()
+                                .unwrap_or("Retry at daemon startup.")
+                        ))
                     );
                 } else {
                     println!("Deleted session {}.", value["id"].as_str().unwrap_or_default());
@@ -1230,9 +1467,11 @@ fn local_session(
             store.remove(&args.id)?;
             if let Err(error) = state::remove_worktree(&workspace_root(), &args.id) {
                 println!(
-                    "Session {} was deleted, but its worktree could not be reclaimed: {}",
-                    args.id,
-                    sentence(error.to_string())
+                    "{}",
+                    sentence(format!(
+                        "Session {} was deleted, but its worktree could not be reclaimed: {}",
+                        args.id, error
+                    ))
                 );
             }
             println!("Deleted session {}.", args.id);
@@ -1310,7 +1549,9 @@ fn workspace_root() -> PathBuf {
 
 fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let root = home();
-    init_at(&root)
+    init_at(&root)?;
+    println!("Initialized {}.", root.display());
+    Ok(())
 }
 
 fn init_at(root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1320,7 +1561,6 @@ fn init_at(root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
         let config = toml::to_string_pretty(&Config::default())?;
         secure(&path, config.as_bytes())?;
     }
-    println!("Initialized {}.", root.display());
     Ok(())
 }
 
@@ -1384,7 +1624,7 @@ async fn serve_inner(
 
     if channel_id == model_id {
         if let Err(error) = load_plugin(root, channel_id, None, force, &config, &plugins).await {
-            println!("Plugin {channel_id} failed to start: {}", sentence(error.to_string()));
+            warn!(plugin = channel_id, error = %diagnostic(sentence(error.to_string())), "Plugin failed to start.");
         }
     } else {
         if (force || ready(channel_id))
@@ -1392,14 +1632,14 @@ async fn serve_inner(
                 load_plugin(root, channel_id, Some(Capability::Channel), force, &config, &plugins)
                     .await
         {
-            println!("Plugin {channel_id} failed to start: {}", sentence(error.to_string()));
+            warn!(plugin = channel_id, error = %diagnostic(sentence(error.to_string())), "Plugin failed to start.");
         }
 
         if (force || ready(model_id))
             && let Err(error) =
                 load_plugin(root, model_id, Some(Capability::Model), force, &config, &plugins).await
         {
-            println!("Plugin {model_id} failed to start: {}", sentence(error.to_string()));
+            warn!(plugin = model_id, error = %diagnostic(sentence(error.to_string())), "Plugin failed to start.");
         }
     }
 
@@ -1408,11 +1648,11 @@ async fn serve_inner(
             && id != model_id
             && let Err(error) = load_plugin(root, &id, None, force, &config, &plugins).await
         {
-            println!("Plugin {id} failed to start: {}", sentence(error.to_string()));
+            warn!(plugin = %id, error = %diagnostic(sentence(error.to_string())), "Plugin failed to start.");
         }
     }
 
-    println!("Crabbot daemon is running on local IPC. Plugins can be loaded while it is running.");
+    info!(channel = channel_id, model = model_id, "Daemon is running on local IPC.");
 
     let approval_mode = config.approval_mode();
     let outcome = bridge_with_media(
@@ -1445,7 +1685,7 @@ async fn serve_inner(
         return Err(error.into());
     }
 
-    println!("Stopped.");
+    info!("Daemon stopped.");
     Ok(())
 }
 
@@ -1643,12 +1883,12 @@ pub(crate) async fn load_plugin(
     if let Some(previous) = plugins.insert(Live::new(process)).await {
         tokio::spawn(async move {
             if let Err(error) = previous.stop().await {
-                eprintln!("Could not stop replaced plugin: {}", sentence(error.to_string()));
+                warn!(error = %diagnostic(sentence(error.to_string())), "Replaced plugin could not be stopped.");
             }
         });
     }
 
-    println!("Loaded plugin {} {} into the running daemon.", hello.id, hello.version);
+    info!(plugin = %hello.id, version = %hello.version, "Plugin loaded.");
     Ok(hello)
 }
 
@@ -1665,7 +1905,7 @@ pub(crate) async fn unload_plugin(
         return Ok(false);
     };
     plugin.stop().await?;
-    println!("Unloaded plugin {id} from the running daemon.");
+    info!(plugin = id, "Plugin unloaded.");
     Ok(true)
 }
 
@@ -1897,7 +2137,11 @@ fn updates(root: &Path, mode: &str) -> Result<(), Box<dyn std::error::Error + Se
         match changed(root, id, entry) {
             Ok(true) => changed_ids.push(id.as_str()),
             Ok(false) => {}
-            Err(error) => println!("Could not check plugin {id}: {}", sentence(error.to_string())),
+            Err(error) => warn!(
+                plugin = %id,
+                error = %diagnostic(sentence(error.to_string())),
+                "Plugin update check failed."
+            ),
         }
     }
     let changed = changed_ids;
@@ -1905,8 +2149,8 @@ fn updates(root: &Path, mode: &str) -> Result<(), Box<dyn std::error::Error + Se
         return Ok(());
     }
     match mode {
-        "check" => println!("Plugin updates available: {}.", changed.join(", ")),
-        "prompt" => println!("Plugin updates available; run `crabbot plugin update` to review."),
+        "check" => info!(plugins = %changed.join(", "), "Plugin updates are available."),
+        "prompt" => info!("Plugin updates are available; run `crabbot plugin update` to review."),
         "auto" => update_at(root, false)?,
         _ => unreachable!("update mode was validated above"),
     }
@@ -2119,7 +2363,7 @@ async fn bridge_with_media(
                         || "Channel rejected the delivery without a reason.".into(),
                         |error| sentence(error.message),
                     );
-                    println!("Channel delivery is uncertain: {message}");
+                    warn!(channel = channel_id, error = %diagnostic(&message), "Channel delivery is uncertain.");
                     sessions
                         .lock()
                         .map_err(|_| "Session lock is poisoned.")?
@@ -2127,7 +2371,7 @@ async fn bridge_with_media(
                 }
                 Err(error) => {
                     let message = sentence(error.to_string());
-                    println!("Channel delivery is uncertain: {message}");
+                    warn!(channel = channel_id, error = %diagnostic(&message), "Channel delivery is uncertain.");
                     sessions
                         .lock()
                         .map_err(|_| "Session lock is poisoned.")?
@@ -2219,7 +2463,7 @@ async fn bridge_with_media(
             let polled = match polled {
                 Ok(response) => response,
                 Err(message) => {
-                    println!("{message}");
+                    warn!(channel = channel_id, error = %diagnostic(&message), "Channel polling failed.");
                     if !recover(&channel, &mut channel_failures, "channel", stop.as_ref()).await? {
                         return Ok(());
                     }
@@ -2233,7 +2477,7 @@ async fn bridge_with_media(
 
         let Some(value) = response.result else {
             if let Some(error) = response.error {
-                println!("Channel polling failed: {}", sentence(error.message));
+                warn!(channel = channel_id, error = %diagnostic(sentence(error.message)), "Channel polling failed.");
             }
             if !recover(&channel, &mut channel_failures, "channel", stop.as_ref()).await? {
                 return Ok(());
@@ -2424,7 +2668,7 @@ async fn bridge_with_media(
 
             let session_name = session_id(channel_id, &chat, thread.as_deref());
             if !valid(&session_name) {
-                println!("Message {event_key} has invalid routing metadata.");
+                warn!(channel = channel_id, event = %event_key, "Message has invalid routing metadata.");
                 commit_event(
                     &channel,
                     &sessions,
@@ -2463,16 +2707,17 @@ async fn bridge_with_media(
                 let workspace = if !store.sessions.contains_key(&session_name)
                     && store.sessions.len() >= state::LIMIT
                 {
-                    println!("Session capacity reached; message {event_id} was rejected.");
+                    warn!(session = %session_name, event = %event_id, "Session capacity reached; message rejected.");
                     commit = true;
                     None
                 } else if event["private"] != true && channel_policy.worktree {
                     match isolate(&session_name) {
                         Ok(workspace) => workspace,
                         Err(error) => {
-                            println!(
-                                "Group workspace isolation failed for event {event_key}: {}",
-                                sentence(error.to_string())
+                            warn!(
+                                event = %event_key,
+                                error = %diagnostic(sentence(error.to_string())),
+                                "Group workspace isolation failed."
                             );
                             commit = true;
                             None
@@ -2485,11 +2730,11 @@ async fn bridge_with_media(
                     None
                 } else if let Err(error) = store.ensure(&session_name, model) {
                     if error.kind() == std::io::ErrorKind::WouldBlock {
-                        println!("Session capacity reached; message {event_id} was rejected.");
+                        warn!(session = %session_name, event = %event_id, "Session capacity reached; message rejected.");
                         commit = true;
                         None
                     } else {
-                        println!("Could not create session: {}", sentence(error.to_string()));
+                        error!(session = %session_name, error = %diagnostic(sentence(error.to_string())), "Session creation failed.");
                         break;
                     }
                 } else if let Err(error) = store.route(
@@ -2499,7 +2744,7 @@ async fn bridge_with_media(
                     thread.as_deref(),
                     event["private"] == true,
                 ) {
-                    println!("Could not route message: {}", sentence(error.to_string()));
+                    error!(session = %session_name, error = %diagnostic(sentence(error.to_string())), "Message routing failed.");
                     break;
                 } else {
                     let existing = store.sessions.get(&session_name).is_some_and(|session| {
@@ -2521,13 +2766,14 @@ async fn bridge_with_media(
                             store.queue_with_roles(&session_name, message, roles.clone())
                         {
                             if error.kind() == std::io::ErrorKind::WouldBlock {
-                                println!("Session queue is full; message {event_id} was rejected.");
+                                warn!(session = %session_name, event = %event_id, "Session queue is full; message rejected.");
                                 commit = true;
                                 None
                             } else {
-                                println!(
-                                    "Could not queue message: {}",
-                                    sentence(error.to_string())
+                                error!(
+                                    session = %session_name,
+                                    error = %diagnostic(sentence(error.to_string())),
+                                    "Message queueing failed."
                                 );
                                 break;
                             }
@@ -2552,9 +2798,10 @@ async fn bridge_with_media(
                                 roles.clone(),
                             )
                         {
-                            println!(
-                                "Could not start session turn: {}",
-                                sentence(error.to_string())
+                            error!(
+                                session = %session_name,
+                                error = %diagnostic(sentence(error.to_string())),
+                                "Session turn could not start."
                             );
                             break;
                         }
@@ -2675,7 +2922,7 @@ async fn bridge_with_media(
                                         &stop,
                                     ).await {
                                         approvals.lock().await.cancel(&approve);
-                                        println!("Inline approval failed: {}", sentence(error.to_string()));
+                                        warn!(error = %diagnostic(sentence(error.to_string())), "Inline approval failed.");
                                     }
                                 }
                                 notice => {
@@ -2686,7 +2933,7 @@ async fn bridge_with_media(
                                             &delivery_id, &chat, thread.as_deref(), &mut stream_call,
                                         ).await {
                                         output.disabled = true;
-                                        println!("Channel streaming paused: {}", sentence(error.to_string()));
+                                        warn!(error = %diagnostic(sentence(error.to_string())), "Channel streaming paused.");
                                     }
                                 }
                             }
@@ -2697,7 +2944,7 @@ async fn bridge_with_media(
                                 &delivery_id, &chat, thread.as_deref(), &mut stream_call,
                             ).await {
                                 output.disabled = true;
-                                println!("Channel streaming paused: {}", sentence(error.to_string()));
+                                warn!(error = %diagnostic(sentence(error.to_string())), "Channel streaming paused.");
                             }
                         }
                     }
@@ -2720,7 +2967,7 @@ async fn bridge_with_media(
                     )
                     .await
                 {
-                    println!("Channel streaming paused: {}", sentence(error.to_string()));
+                    warn!(error = %diagnostic(sentence(error.to_string())), "Channel streaming paused.");
                 }
                 result
             };
@@ -2754,7 +3001,7 @@ async fn bridge_with_media(
                     if let Some(id) = failed_tool {
                         restart_tool(plugins, &id).await;
                     }
-                    println!("Model turn failed: {}", sentence(error.to_string()));
+                    warn!(session = %session_name, error = %diagnostic(sentence(error.to_string())), "Model turn failed.");
                     let failure = Message {
                         id: format!("failure-{call}"),
                         session: session_name.clone(),
@@ -2781,9 +3028,10 @@ async fn bridge_with_media(
                         ) {
                             Ok(()) => true,
                             Err(error) => {
-                                println!(
-                                    "Could not persist model failure: {}",
-                                    sentence(error.to_string())
+                                error!(
+                                    session = %session_name,
+                                    error = %diagnostic(sentence(error.to_string())),
+                                    "Model failure could not be persisted."
                                 );
                                 false
                             }
@@ -2799,14 +3047,16 @@ async fn bridge_with_media(
                             if let Err(error) =
                                 store.queue_with_roles(&session_name, retry_message, roles)
                             {
-                                println!(
-                                    "Could not queue model retry: {}",
-                                    sentence(error.to_string())
+                                error!(
+                                    session = %session_name,
+                                    error = %diagnostic(sentence(error.to_string())),
+                                    "Model retry could not be queued."
                                 );
                             }
                         } else {
-                            println!(
-                                "The failed turn contained a mutating tool; it will not be retried."
+                            warn!(
+                                session = %session_name,
+                                "Failed turn contained a mutating tool; it will not be retried."
                             );
                         }
                     }
@@ -2859,7 +3109,8 @@ async fn bridge_with_media(
                 }
             };
             let Some(delivery) = delivery else {
-                println!(
+                warn!(
+                    session = %session_name,
                     "Channel delivery is uncertain; retry it only after checking the channel."
                 );
                 continue;
@@ -2879,7 +3130,7 @@ async fn bridge_with_media(
                     Ok(sent) => sent,
                     Err(error) => {
                         let message = sentence(error.to_string());
-                        println!("Channel delivery is uncertain: {message}");
+                        warn!(channel = channel_id, error = %diagnostic(&message), "Channel delivery is uncertain.");
                         sessions.lock().map_err(|_| "Session lock is poisoned.")?.uncertain(&delivery_id, message)?;
                         status_if_present(&sessions, &session_name, "idle")?;
                         if !recover(&channel, &mut channel_failures, "channel", stop.as_ref()).await? {
@@ -2893,7 +3144,7 @@ async fn bridge_with_media(
 
             if let Some(error) = sent.error {
                 let message = sentence(error.message);
-                println!("Channel delivery is uncertain: {message}");
+                warn!(channel = channel_id, error = %diagnostic(&message), "Channel delivery is uncertain.");
                 sessions
                     .lock()
                     .map_err(|_| "Session lock is poisoned.")?
@@ -2951,7 +3202,7 @@ async fn recover(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     *failures = failures.saturating_add(1);
     if *failures >= 3 {
-        println!("The {name} plugin restart circuit is open; stopping retries.");
+        warn!(plugin = name, "Plugin restart circuit is open; stopping retries.");
         return Ok(false);
     }
     let delay = retry_delay(*failures);
@@ -2961,7 +3212,7 @@ async fn recover(
         _ = tokio::time::sleep(delay) => {}
     }
     process.restart().await?;
-    println!("Restarted {name} plugin after a transport failure.");
+    info!(plugin = name, "Plugin restarted after a transport failure.");
     Ok(true)
 }
 
@@ -3004,7 +3255,7 @@ async fn resolve_media(
         let request = Request::call(*call, "media", serde_json::json!({"uri": uri}));
         *call = (*call).saturating_add(1);
         let Ok(response) = channel.call(request).await else {
-            println!("Media could not be resolved; retaining its reference.");
+            warn!(channel = channel_id, "Media could not be resolved; retaining its reference.");
             continue;
         };
         let Some(resolved) = response
@@ -3012,7 +3263,7 @@ async fn resolve_media(
             .and_then(|value| value["uri"].as_str().map(str::to_owned))
             .filter(|value| value.starts_with("file://"))
         else {
-            println!("Media could not be resolved; retaining its reference.");
+            warn!(channel = channel_id, "Media could not be resolved; retaining its reference.");
             continue;
         };
         match item {
@@ -3043,12 +3294,18 @@ async fn transcribe_media(
             continue;
         };
         let Some(path) = media_file(uri, media_root) else {
-            println!("Voice attachment is unavailable or outside the media cache.");
+            warn!(
+                channel = channel_id,
+                "Voice attachment is unavailable or outside the media cache."
+            );
             output.push(unavailable_voice());
             continue;
         };
         let Some((id, plugin)) = &speech else {
-            println!("Voice transcription is unavailable because no speech plugin is loaded.");
+            warn!(
+                channel = channel_id,
+                "Voice transcription is unavailable because no speech plugin is loaded."
+            );
             output.push(unavailable_voice());
             continue;
         };
@@ -3068,11 +3325,14 @@ async fn transcribe_media(
         };
         if let Some(text) = transcript {
             if std::fs::remove_file(&path).is_err() {
-                println!("Transcription completed, but the raw voice file could not be removed.");
+                warn!(
+                    channel = channel_id,
+                    "Transcription completed, but the raw voice file could not be removed."
+                );
             }
             output.push(Content::Text { text });
         } else {
-            println!("Voice transcription failed in plugin {id}.");
+            warn!(plugin = %id, "Voice transcription failed.");
             output.push(unavailable_voice());
         }
     }
@@ -3750,11 +4010,11 @@ async fn commit_event(
                             format!("Channel acknowledgement failed: {}", sentence(error.message))
                         },
                     );
-                    println!("{message}");
+                    warn!(error = %diagnostic(&message), "Channel acknowledgement failed.");
                 }
-                Err(error) => println!(
-                    "Channel acknowledgement transport failed: {}",
-                    sentence(error.to_string())
+                Err(error) => warn!(
+                    error = %diagnostic(sentence(error.to_string())),
+                    "Channel acknowledgement transport failed."
                 ),
             }
             attempts += 1;
@@ -3763,7 +4023,7 @@ async fn commit_event(
             }
             tokio::time::sleep(retry_delay(attempts)).await;
             channel_process.restart().await?;
-            println!("Restarted channel plugin after an acknowledgement failure.");
+            info!("Channel plugin restarted after an acknowledgement failure.");
         }
     }
     Ok(())
@@ -3836,7 +4096,7 @@ async fn handle_callback(
         .await;
     *call = (*call).saturating_add(1);
     if let Err(error) = callback {
-        println!("Channel approval acknowledgement failed: {}", sentence(error.to_string()));
+        warn!(error = %diagnostic(sentence(error.to_string())), "Channel approval acknowledgement failed.");
     }
     commit_event(channel, sessions, channel_id, &id, next_offset, offset, gateway_sequence, call)
         .await
@@ -3984,9 +4244,10 @@ async fn queue_during_turn(
                 && policy.worktree
                 && let Err(error) = isolate(&session)
             {
-                println!(
-                    "Group workspace isolation failed for event {id}: {}",
-                    sentence(error.to_string())
+                warn!(
+                    event = %id,
+                    error = %diagnostic(sentence(error.to_string())),
+                    "Group workspace isolation failed."
                 );
                 rejected = true;
             }
@@ -4010,7 +4271,7 @@ async fn queue_during_turn(
         }
     }
     if rejected {
-        println!("Message {id} was rejected because the session queue is unavailable.");
+        warn!(event = %id, "Message was rejected because the session queue is unavailable.");
     }
     commit_event(channel, sessions, channel_id, &id, next_offset, offset, gateway_sequence, call)
         .await
@@ -4920,10 +5181,11 @@ async fn restart_tool(plugins: &Plugins, id: &str) {
         return;
     };
     match process.restart().await {
-        Ok(()) => println!("Restarted {id} after a tool transport failure."),
-        Err(restart) => println!(
-            "Could not restart {id} after a tool transport failure: {}",
-            sentence(restart.to_string())
+        Ok(()) => info!(plugin = id, "Plugin restarted after a tool transport failure."),
+        Err(restart) => warn!(
+            plugin = id,
+            error = %diagnostic(sentence(restart.to_string())),
+            "Plugin could not restart after a tool transport failure."
         ),
     }
 }
@@ -5670,9 +5932,12 @@ fn prompt_code_approval(name: &str, args: &serde_json::Value) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-async fn plugin(command: PluginCommand) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn plugin(
+    command: PluginCommand,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
-        PluginCommand::List(output) => list(output.json)?,
+        PluginCommand::List(output) => list(output.json || json)?,
         PluginCommand::Install(source) => {
             let id = source.id.clone();
             link(source, false)?;
@@ -5683,7 +5948,7 @@ async fn plugin(command: PluginCommand) -> Result<(), Box<dyn std::error::Error 
             link(source, true)?;
             activate(&id).await?;
         }
-        PluginCommand::Update(output) => update_plugins(output.json).await?,
+        PluginCommand::Update(output) => update_plugins(output.json || json).await?,
         PluginCommand::Remove(name) => {
             if !name.yes {
                 return Err("Removing a plugin requires --yes.".into());
@@ -7081,10 +7346,10 @@ mod tests {
         reclaim_worktrees, recover, recover_plugins, redact, resolve, restart_tool, revision,
         safe_archive, send_params, service_at, service_at_with, service_environment_from,
         service_path_value, service_text, session_at, stream_fits, tool, update_at,
-        validate_archive, verify_archive,
+        validate_archive, verify_archive, write_debug_report_at,
     };
     use base64::Engine;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser, error::ErrorKind};
     use crabbot_core::types::{Content, Event, Message, ModelReply, Protocol, Request, Role};
     use sha2::Digest;
     use std::{
@@ -7092,7 +7357,7 @@ mod tests {
         fs,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     fn test_root(label: &str) -> PathBuf {
@@ -7113,6 +7378,25 @@ mod tests {
         for (_, plugin) in plugins.all().await {
             plugin.stop().await.unwrap();
         }
+    }
+
+    #[test]
+    fn debug_report_is_redacted_and_private() {
+        let root = test_root("debug-report");
+        let error = std::io::Error::other(
+            "request failed at https://user:secret@example.com/path Authorization: Bearer token",
+        );
+        let path = write_debug_report_at(&root, "ask", &error, Duration::from_millis(12)).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("command: ask"));
+        assert!(text.contains("elapsed_ms: 12"));
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("Bearer token"));
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7624,6 +7908,33 @@ mod tests {
         assert!(widths.iter().all(|width| *width == widths[0]));
         assert!(BANNER.contains(" ██████╗"));
         assert!(BANNER.contains("╚═════╝"));
+        assert!(!BANNER.ends_with('\n'));
+    }
+
+    #[test]
+    fn cli_exposes_global_modes_and_aliases() {
+        let cli =
+            Cli::try_parse_from(["crabbot", "--json", "--debug", "--verbose", "status"]).unwrap();
+        assert!(cli.json);
+        assert!(cli.debug);
+        assert!(cli.verbose);
+
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("Initialize the Crabbot home directory and configuration."));
+        assert!(help.contains("-h, --help"));
+        assert!(help.contains("alias: -H"));
+        assert!(help.contains("-v, --version"));
+        assert!(help.contains("--verbose"));
+        assert!(!help.contains("--verbose..."));
+
+        for argument in ["-h", "-H", "--help"] {
+            let error = Cli::try_parse_from(["crabbot", argument]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        }
+        for argument in ["-v", "-V", "--version"] {
+            let error = Cli::try_parse_from(["crabbot", argument]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        }
     }
 
     #[test]
@@ -8200,11 +8511,24 @@ mod tests {
     #[tokio::test]
     async fn main_reports_success_and_failure() {
         assert_eq!(
-            super::main_with(Cli { command: Command::Version }).await,
+            super::main_with(Cli {
+                json: false,
+                debug: false,
+                verbose: false,
+                version_flag: None,
+                help: None,
+                command: Command::Version,
+            })
+            .await,
             std::process::ExitCode::SUCCESS
         );
         assert_eq!(
             super::main_with(Cli {
+                json: false,
+                debug: false,
+                verbose: false,
+                version_flag: None,
+                help: None,
                 command: Command::Ask(super::Ask {
                     plugin: "missing".into(),
                     model: "test".into(),
@@ -8235,7 +8559,15 @@ mod tests {
             Command::Service { command: None },
             Command::Doctor,
         ] {
-            let result = super::run(Cli { command }).await;
+            let result = super::run(Cli {
+                json: false,
+                debug: false,
+                verbose: false,
+                version_flag: None,
+                help: None,
+                command,
+            })
+            .await;
             result.unwrap();
         }
     }
@@ -8426,12 +8758,15 @@ mod tests {
         super::list_at(&root, false).unwrap();
         assert!(super::remove_at(Name { id: "missing".into(), yes: false }, &root).is_err());
         assert!(
-            super::plugin(super::PluginCommand::Install(Source {
-                id: "bad_id".into(),
-                source: None,
-                revision: None,
-                yes: true,
-            }))
+            super::plugin(
+                super::PluginCommand::Install(Source {
+                    id: "bad_id".into(),
+                    source: None,
+                    revision: None,
+                    yes: true,
+                }),
+                false,
+            )
             .await
             .is_err()
         );
