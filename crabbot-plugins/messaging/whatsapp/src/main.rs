@@ -595,6 +595,13 @@ mod tests {
         }
     }
 
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("the WhatsApp test client should build")
+    }
+
     #[test]
     fn normalizes_supported_messages() {
         let value = json!({"entry":[{"changes":[{"value":{"messages":[{"id":"m1","from":"1","type":"text","text":{"body":"hello"}},{"id":"m2","from":"1","type":"audio","audio":{"id":"a1","mime_type":"audio/ogg"}},{"id":"m3","from":"1","type":"image","image":{"id":"i1","caption":"diagram"}},{"id":"m4","from":"1","type":"document","document":{"id":"d1","filename":"note.txt","mime_type":"text/plain","caption":"note"}}]}}]}]});
@@ -668,7 +675,7 @@ mod tests {
         };
         let address = listener.local_addr().unwrap();
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             queue: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
         };
         let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"id":"m","from":"1","type":"text","text":{"body":"hi"}}]}}]}]}"#;
@@ -709,7 +716,7 @@ mod tests {
     #[tokio::test]
     async fn polls_and_reports_unknown_channel_methods() {
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             queue: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(
                 [json!({"id":"m1"})],
             ))),
@@ -738,7 +745,7 @@ mod tests {
             stream.write_all(body).await.unwrap();
         });
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             queue: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
         };
         let value = graph(&app, &format!("http://{address}"), "token", json!({"type":"text"}))
@@ -751,7 +758,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_invalid_send_and_media_requests_before_network_access() {
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             queue: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
         };
         assert!(call(&app, Request::call(1, "send", json!({}))).await.is_err());
@@ -788,7 +795,7 @@ mod tests {
             stream.write_all(body).await.unwrap();
         });
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             queue: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
         };
         assert!(graph(&app, &format!("http://{address}"), "token", json!({})).await.is_err());
@@ -823,7 +830,7 @@ mod tests {
             }
         });
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             queue: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
         };
         let value = send_media_at(
@@ -876,7 +883,7 @@ mod tests {
             stream.write_all(body).await.unwrap();
         });
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             queue: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
         };
         let value =
