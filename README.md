@@ -43,19 +43,25 @@ Install the core on your operating system:
 curl -fsSL https://raw.githubusercontent.com/airscripts/crabbot/main/install.sh | sh
 ```
 
-On Unix-like systems, use `install.sh`:
+On Unix-like systems, `install.sh` installs the core by default. Optional
+plugins are installed separately with their plugin ID:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/airscripts/crabbot/main/install.sh | sh -s -- codex
-curl -fsSL https://raw.githubusercontent.com/airscripts/crabbot/main/install.sh | sh -s -- telegram
+curl -fsSL https://raw.githubusercontent.com/airscripts/crabbot/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/airscripts/crabbot/main/install.sh | sh -s -- PLUGIN_ID
 ```
 
 On Windows, use `install.ps1` from PowerShell:
 
 ```powershell
 .\install.ps1
-.\install.ps1 telegram
+.\install.ps1 PLUGIN_ID
 ```
+
+Replace `PLUGIN_ID` with an official plugin such as `codex` or `telegram` only
+when that capability is needed. The base installation remains useful on its
+own for initialization, diagnostics, status, service management, and plugin
+management.
 
 The core archive ships the `crabbot` CLI and `crabbot-daemon` binaries, plus
 license files; it contains no plugin binaries. Each official plugin is a
@@ -106,15 +112,18 @@ directory under `crabbot-plugins/`, so run these commands from the repository
 root or pass an absolute source path:
 
 ```sh
-cargo build -p crabbot-plugin-telegram --locked
+cargo build -p crabbot-plugin-PLUGIN_ID --locked
 crabbot init
-crabbot plugin link telegram --yes
+crabbot plugin link PLUGIN_ID --yes
 crabbot doctor
 ```
 
+Replace `PLUGIN_ID` with the optional capability you want to build. The core
+does not require a particular intelligence or messaging plugin.
+
 Use `crabbot plugin list` to inspect installed capabilities. A local link
 records the canonical source and executable in `plugins.lock`; rebuild and run
-`crabbot plugin link telegram --yes` again to validate and hot-load your
+`crabbot plugin link PLUGIN_ID --yes` again to validate and hot-load your
 changes. `crabbot plugin update` also applies verified updates to the running
 daemon: it unloads and reloads only plugins that were active, without
 restarting the daemon. Review every manifest's permissions and declared secrets
@@ -184,6 +193,18 @@ Use `crabbot service install` followed by `crabbot service start` to activate
 the native service. `crabbot service stop` and `crabbot service remove` reverse
 those actions. See the [configuration guide](crabbot-docs/configuration.md)
 for the full `config.toml` reference and recovery behavior.
+
+### Command Sandbox
+
+The optional command sandbox isolates approved shell commands from the host
+workspace boundary. Configure a local Docker or Podman engine with
+`CRABBOT_SANDBOX_RUNTIME` and a locally available `CRABBOT_SANDBOX_IMAGE`.
+Commands then run without network access, with a read-only container root,
+dropped Linux capabilities, bounded resources, and only the active workspace
+mounted writable. This protects the host from routine command mistakes; it is
+not a complete deployment boundary and does not replace host or container
+engine hardening. See the [configuration](crabbot-docs/configuration.md) and
+[security](crabbot-docs/security.md) guides for the limits and setup details.
 
 ## Plugins
 
