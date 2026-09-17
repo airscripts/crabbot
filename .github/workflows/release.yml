@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    uses: ./.github/workflows/prepare.yml
+    with:
+      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+  verify:
+    needs: prepare
+    uses: ./.github/workflows/verify.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+
+  package:
+    needs: [prepare, verify]
+    uses: ./.github/workflows/package.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+      version: ${{ needs.prepare.outputs.version }}
+
+  checksum:
+    needs: [prepare, package]
+    uses: ./.github/workflows/checksum.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+
+  publish:
+    needs: [prepare, checksum]
+    uses: ./.github/workflows/publish.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+      version: ${{ needs.prepare.outputs.version }}
+      prerelease: ${{ needs.prepare.outputs.prerelease }}

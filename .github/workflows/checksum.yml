@@ -1,0 +1,36 @@
+name: Checksum
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  checksum:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: crabbot-v${{ inputs.version }}-*
+          path: dist
+          merge-multiple: true
+      - name: Generate Checksums
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -printf '%f\0' \
+              | sort -z \
+              | xargs -0 -r sha256sum
+          ) > dist/SHA256SUMS
+          test "$(wc -l < dist/SHA256SUMS)" -ge 78
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crabbot-v${{ inputs.version }}-checksums
+          path: dist/SHA256SUMS
+          if-no-files-found: error

@@ -1,0 +1,190 @@
+name: Package
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - if: matrix.archive == 'tar.gz'
+        name: Build Unix Archives
+        run: bash crabbot-scripts/package.sh "${{ inputs.version }}" "${{ matrix.target }}"
+      - if: matrix.archive == 'zip'
+        name: Build Windows Archives
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --workspace --release --locked --target "${{ matrix.target }}"
+          $version = "${{ inputs.version }}"
+          $target = "${{ matrix.target }}"
+          $plugins = @("core", "codex", "claude", "gemini", "ollama", "openrouter", "telegram", "discord", "whatsapp", "signal", "slack", "sqlite", "memory", "timer", "tools", "mcp", "whisper", "tui", "pi")
+          foreach ($plugin in $plugins) {
+            $name = if ($plugin -eq "core") { "crabbot" } else { "crabbot-plugin-$plugin" }
+            $package = "crabbot-$plugin-v$version-$target"
+            New-Item -ItemType Directory -Force -Path $package | Out-Null
+            New-Item -ItemType Directory -Force -Path "$package/bin" | Out-Null
+            Copy-Item "target/$target/release/$name.exe" "$package/bin/"
+            if ($plugin -eq "core") {
+              Copy-Item "target/$target/release/crabbot-daemon.exe" "$package/bin/"
+            }
+            Copy-Item LICENSE, NOTICE "$package/"
+            if ($plugin -ne "core") {
+              $manifest = Get-ChildItem "crabbot-plugins" -Recurse -Filter "crabbot-plugin.toml" |
+                Where-Object { $_.Directory.Name -eq $plugin } | Select-Object -First 1
+              if (-not $manifest) { throw "Plugin manifest is missing: $plugin." }
+              Copy-Item $manifest.FullName "$package/"
+            }
+            Compress-Archive -Path $package -DestinationPath "$package.zip" -Force
+            Remove-Item -Recurse -Force $package
+            Write-Output "Created $package.zip."
+          }
+      - if: matrix.archive == 'tar.gz'
+        name: Validate Unix Archives
+        shell: bash
+        env:
+          CRABBOT_VERSION: ${{ inputs.version }}
+          CRABBOT_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          archives=(crabbot-*-v${CRABBOT_VERSION}-${CRABBOT_TARGET}.tar.gz)
+          [[ ${#archives[@]} -eq 19 ]]
+          stage=$(mktemp -d)
+          for archive in "${archives[@]}"; do
+            crabbot-scripts/check.sh "$archive"
+            name=${archive%.tar.gz}
+            tar -xzf "$archive" -C "$stage"
+            package="$stage/$name"
+            [[ -f "$package/LICENSE" && -f "$package/NOTICE" ]]
+            [[ -d "$package/bin" ]]
+            if [[ "$name" == crabbot-core-* ]]; then
+              [[ -x "$package/bin/crabbot" && -x "$package/bin/crabbot-daemon" ]]
+              "$package/bin/crabbot" version
+              smoke="$stage/service-smoke"
+              mkdir -p "$smoke/home" "$smoke/config"
+              HOME="$smoke/home" XDG_CONFIG_HOME="$smoke/config" CRABBOT_HOME="$smoke/home/crabbot" \
+                "$package/bin/crabbot" service install
+              HOME="$smoke/home" XDG_CONFIG_HOME="$smoke/config" CRABBOT_HOME="$smoke/home/crabbot" \
+                "$package/bin/crabbot" service status
+              test -f "$smoke/config/systemd/user/crabbot.service"
+              rm -f "$smoke/config/systemd/user/crabbot.service"
+            else
+              [[ -f "$package/crabbot-plugin.toml" ]]
+              plugin=${name#crabbot-}
+              plugin=${plugin%-v*}
+              [[ -x "$package/bin/crabbot-plugin-$plugin" ]]
+            fi
+          done
+      - if: matrix.archive == 'tar.gz'
+        name: Validate Unix Installer
+        shell: bash
+        env:
+          CRABBOT_VERSION: ${{ inputs.version }}
+          CRABBOT_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum crabbot-*-v${CRABBOT_VERSION}-${CRABBOT_TARGET}.tar.gz > SHA256SUMS
+          else
+            shasum -a 256 crabbot-*-v${CRABBOT_VERSION}-${CRABBOT_TARGET}.tar.gz > SHA256SUMS
+          fi
+          prefix="$RUNNER_TEMP/crabbot-prefix"
+          CRABBOT_VERSION="$CRABBOT_VERSION" \
+            CRABBOT_RELEASE_BASE="file://$PWD" \
+            CRABBOT_PREFIX="$prefix" \
+            sh install.sh
+          "$prefix/bin/crabbot" version
+      - if: matrix.archive == 'zip'
+        name: Validate Windows Archives
+        shell: pwsh
+        env:
+          CRABBOT_VERSION: ${{ inputs.version }}
+          CRABBOT_TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archives = @(Get-ChildItem "crabbot-*-v$env:CRABBOT_VERSION-$env:CRABBOT_TARGET.zip")
+          if ($archives.Count -ne 19) { throw "Expected 19 plugin and core archives, found $($archives.Count)." }
+          foreach ($archive in $archives) {
+            $destination = Join-Path $env:RUNNER_TEMP $archive.BaseName
+            Expand-Archive -Path $archive.FullName -DestinationPath $destination -Force
+            $package = Join-Path $destination $archive.BaseName
+            if (!(Test-Path "$package/LICENSE") -or !(Test-Path "$package/NOTICE")) {
+              throw "Archive is missing license files: $($archive.Name)."
+            }
+            if (!(Test-Path "$package/bin")) { throw "Archive is missing binaries: $($archive.Name)." }
+            if ($archive.BaseName -like "crabbot-core-*") {
+              if (!(Test-Path "$package/bin/crabbot.exe") -or !(Test-Path "$package/bin/crabbot-daemon.exe")) {
+                throw "Core archive is missing an executable."
+              }
+              & "$package/bin/crabbot.exe" version
+              if ($LASTEXITCODE -ne 0) { throw "Packaged CLI failed to start." }
+            } else {
+              if (!(Test-Path "$package/crabbot-plugin.toml")) { throw "Plugin manifest is missing." }
+              $plugin = $archive.BaseName -replace "^crabbot-", "" -replace "-v.*$", ""
+              if (!(Test-Path "$package/bin/crabbot-plugin-$plugin.exe")) { throw "Plugin executable is missing." }
+            }
+          }
+      - if: matrix.archive == 'zip'
+        name: Validate Windows Installer
+        shell: pwsh
+        env:
+          CRABBOT_VERSION: ${{ inputs.version }}
+          CRABBOT_TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $lines = Get-ChildItem "crabbot-*-v$env:CRABBOT_VERSION-$env:CRABBOT_TARGET.zip" |
+            ForEach-Object { "$( (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() )  $($_.Name)" }
+          $lines | Set-Content -Encoding ascii SHA256SUMS
+          $env:CRABBOT_RELEASE_BASE = ([Uri]((Get-Location).Path)).AbsoluteUri.TrimEnd('/')
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "crabbot-local"
+          New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
+          & "$env:GITHUB_WORKSPACE/install.ps1"
+          if ($LASTEXITCODE -ne 0) { throw "Packaged installer failed." }
+          & "$env:LOCALAPPDATA/Crabbot/bin/crabbot.exe" version
+          if ($LASTEXITCODE -ne 0) { throw "Installed CLI failed to start." }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crabbot-v${{ inputs.version }}-${{ matrix.target }}
+          path: crabbot-*-v${{ inputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error

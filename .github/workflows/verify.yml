@@ -1,0 +1,61 @@
+name: Verify
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: CARGO_BUILD_JOBS=4 cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: CARGO_BUILD_JOBS=4 cargo check --workspace --all-targets --locked
+      - run: CARGO_BUILD_JOBS=4 cargo test --workspace --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: make coverage
+      - run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
+      - run: bash -n crabbot-scripts/*.sh install.sh
+      - run: bash crabbot-scripts/metrics.sh
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@1.89
+      - run: CARGO_BUILD_JOBS=4 cargo check --workspace --all-targets --locked
+  windows-gnu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Install MinGW
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gcc-mingw-w64-x86-64
+          x86_64-w64-mingw32-gcc --version
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Check Windows GNU Target
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu --locked
