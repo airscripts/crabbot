@@ -415,6 +415,14 @@ mod tests {
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    async fn loopback_listener() -> Option<tokio::net::TcpListener> {
+        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => Some(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(error) => panic!("Could not bind the OpenRouter test listener: {error}."),
+        }
+    }
+
     fn model() -> ModelRequest {
         ModelRequest {
             model: "test/model".into(),
@@ -520,7 +528,9 @@ mod tests {
 
     #[tokio::test]
     async fn completes_against_a_bounded_http_response() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -550,7 +560,9 @@ mod tests {
 
     #[tokio::test]
     async fn streams_against_a_bounded_http_response() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();

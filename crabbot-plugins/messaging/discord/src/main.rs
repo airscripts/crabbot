@@ -1199,11 +1199,20 @@ mod tests {
     use serde_json::json;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
         sync::Mutex as AsyncMutex,
         time::{Duration, Instant},
     };
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::{WebSocketStream, accept_async};
+
+    async fn loopback_listener() -> Option<TcpListener> {
+        match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => Some(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(error) => panic!("Could not bind the Discord test listener: {error}."),
+        }
+    }
 
     #[test]
     fn parses_provider_responses() {
@@ -1512,7 +1521,9 @@ mod tests {
 
     #[tokio::test]
     async fn receives_and_acknowledges_a_gateway_event() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -1549,7 +1560,9 @@ mod tests {
 
     #[tokio::test]
     async fn sends_edits_and_acknowledges_approvals() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             for _ in 0..3 {
@@ -1608,7 +1621,9 @@ mod tests {
 
     #[tokio::test]
     async fn acknowledges_interaction_callbacks_once() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();

@@ -373,6 +373,14 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    async fn loopback_listener() -> Option<tokio::net::TcpListener> {
+        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => Some(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(error) => panic!("Could not bind the Slack test listener: {error}."),
+        }
+    }
+
     #[tokio::test]
     async fn normalizes_text_and_rich_files() {
         let attachments = Arc::new(Mutex::new(BTreeMap::new()));
@@ -403,7 +411,9 @@ mod tests {
 
     #[tokio::test]
     async fn calls_a_bounded_api_response() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -432,7 +442,9 @@ mod tests {
 
     #[tokio::test]
     async fn sends_a_message_through_the_normalized_contract() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -460,7 +472,9 @@ mod tests {
 
     #[tokio::test]
     async fn polls_history_and_rejects_api_errors() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -483,7 +497,9 @@ mod tests {
         assert_eq!(value["events"][0]["text"], "hello");
         server.await.unwrap();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();

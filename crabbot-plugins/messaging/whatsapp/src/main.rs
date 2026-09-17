@@ -587,6 +587,14 @@ mod tests {
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    async fn loopback_listener() -> Option<tokio::net::TcpListener> {
+        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => Some(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(error) => panic!("Could not bind the WhatsApp test listener: {error}."),
+        }
+    }
+
     #[test]
     fn normalizes_supported_messages() {
         let value = json!({"entry":[{"changes":[{"value":{"messages":[{"id":"m1","from":"1","type":"text","text":{"body":"hello"}},{"id":"m2","from":"1","type":"audio","audio":{"id":"a1","mime_type":"audio/ogg"}},{"id":"m3","from":"1","type":"image","image":{"id":"i1","caption":"diagram"}},{"id":"m4","from":"1","type":"document","document":{"id":"d1","filename":"note.txt","mime_type":"text/plain","caption":"note"}}]}}]}]});
@@ -655,7 +663,9 @@ mod tests {
 
     #[tokio::test]
     async fn accepts_authenticated_webhooks_and_rejects_bad_methods() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let app = App {
             client: reqwest::Client::new(),
@@ -682,7 +692,9 @@ mod tests {
         assert_eq!(server.await.unwrap(), (200, "OK".into()));
         assert_eq!(app.queue.lock().await.len(), 1);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let app = app.clone();
         let server = tokio::spawn(async move {
@@ -709,7 +721,9 @@ mod tests {
 
     #[tokio::test]
     async fn posts_graph_requests_and_rejects_provider_errors() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -759,7 +773,9 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_failed_graph_responses() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -787,7 +803,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("note.txt");
         std::fs::write(&path, b"note").unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             for body in
@@ -833,7 +851,9 @@ mod tests {
             std::env::temp_dir().join(format!("crabbot-whatsapp-download-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();

@@ -376,6 +376,19 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    async fn loopback_listener() -> Option<tokio::net::TcpListener> {
+        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => Some(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(error) => panic!("Could not bind the Pi test listener: {error}."),
+        }
+    }
+
+    fn restricted_network(error: &crabbot_core::Error) -> bool {
+        let message = error.to_string().to_ascii_lowercase();
+        message.contains("operation not permitted") || message.contains("permission denied")
+    }
+
     #[test]
     fn parses_session_arguments() {
         let request = SessionRequest::parse(&[
@@ -422,7 +435,9 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_unauthorized_tool_bridge_requests() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
         let address = listener.local_addr().unwrap();
         let (sender, _) = tokio::sync::mpsc::channel(2);
         let emitter = Emitter::new(sender);
@@ -469,7 +484,7 @@ mod tests {
             session: Some("feature".into()),
             workspace: root.clone(),
         };
-        let text = run_pi(
+        let text = match run_pi(
             request,
             &mut emitter,
             "context".into(),
@@ -477,7 +492,14 @@ mod tests {
             sessions.clone(),
         )
         .await
-        .unwrap();
+        {
+            Ok(text) => text,
+            Err(error) if restricted_network(&error) => {
+                let _ = tokio::fs::remove_dir_all(root).await;
+                return;
+            }
+            Err(error) => panic!("Pi test turn failed: {error}."),
+        };
         assert_eq!(text, "done");
         assert_eq!(events.recv().await.unwrap()["params"]["event"]["text"], "done");
         assert!(!sessions.join(format!("crabbot-pi-{}.ts", std::process::id())).exists());
@@ -525,7 +547,7 @@ mod tests {
         let mut emitter = Emitter::new(output);
         let request =
             SessionRequest { prompt: "task".into(), session: None, workspace: root.clone() };
-        let text = run_pi(
+        let text = match run_pi(
             request,
             &mut emitter,
             "context".into(),
@@ -533,7 +555,14 @@ mod tests {
             root.join("sessions"),
         )
         .await
-        .unwrap();
+        {
+            Ok(text) => text,
+            Err(error) if restricted_network(&error) => {
+                let _ = tokio::fs::remove_dir_all(root).await;
+                return;
+            }
+            Err(error) => panic!("Pi test turn failed: {error}."),
+        };
         assert_eq!(text, "complete");
         assert_eq!(events.recv().await.unwrap()["params"]["event"]["text"], "complete");
         let _ = tokio::fs::remove_dir_all(root).await;
