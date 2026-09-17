@@ -1145,7 +1145,8 @@ mod tests {
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
         fs::write(
             &binary,
-            r#"while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc":"2.0","method":"event","params":{"event":{"kind":"text","text":"Reply"}}}'; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"text":"Reply","stop":"stop","events":[]}}' ;; *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"codex","version":"0.1.0","capabilities":["model"]}}' ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;; esac; done"#,
+            r#"#!/bin/sh
+while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc":"2.0","method":"event","params":{"event":{"kind":"text","text":"Reply"}}}'; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"text":"Reply","stop":"stop","events":[]}}' ;; *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"codex","version":"0.1.0","capabilities":["model"]}}' ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;; esac; done"#,
         )
         .unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();

@@ -719,7 +719,8 @@ mod tests {
 
         let state = state_at("capability-call");
         let binary = PathBuf::from(format!("/tmp/crabbot-ipc-capability-{}", std::process::id()));
-        let script = r#"while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); case "$line" in *'"method":"hello"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol":{"major":0,"minor":1},"id":"timer","version":"0.1.0","capabilities":["timer"]}}' ;; *'"method":"list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"items":[{"id":7,"text":"reminder"}]}}' ;; *'"method":"shutdown"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}'; exit 0 ;; esac; done"#;
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); case "$line" in *'"method":"hello"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol":{"major":0,"minor":1},"id":"timer","version":"0.1.0","capabilities":["timer"]}}' ;; *'"method":"list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"items":[{"id":7,"text":"reminder"}]}}' ;; *'"method":"shutdown"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}'; exit 0 ;; esac; done"#;
         std::fs::write(&binary, script).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let process = crabbot_core::plugin::Process::start(&binary).await.unwrap();
