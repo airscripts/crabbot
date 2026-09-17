@@ -1,0 +1,14 @@
+[package]
+name = "crabbot-plugin-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+crabbot-core = { path = "../../crabbot-core" }
+crabbot-file = { path = "../../crabbot-libs/file" }
+serde_json.workspace = true
+serde.workspace = true
+tokio.workspace = true
