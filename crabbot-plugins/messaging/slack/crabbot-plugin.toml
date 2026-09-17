@@ -1,0 +1,9 @@
+id = "slack"
+version = "0.1.0"
+capabilities = ["channel"]
+permissions = ["network", "filesystem"]
+secrets = ["CRABBOT_SLACK_BOT_TOKEN", "CRABBOT_SLACK_APP_TOKEN"]
+
+[protocol]
+major = 0
+minor = 1
