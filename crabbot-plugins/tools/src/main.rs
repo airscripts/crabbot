@@ -385,8 +385,8 @@ async fn shell_with(
 
     #[cfg(not(windows))]
     {
-        let mut process = Command::new("setsid");
-        process.args(["sh", "-c", command]);
+        let mut process = Command::new("sh");
+        process.process_group(0).args(["-c", command]);
         process.current_dir(root);
         capture(process, None, true).await
     }

@@ -863,24 +863,28 @@ mod tests {
         };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (mut response, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).await.unwrap();
+            let _ = response.read(&mut request).await.unwrap();
             let body = format!(r#"{{"url":"http://{address}/file"}}"#);
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
-            stream.write_all(header.as_bytes()).await.unwrap();
-            stream.write_all(body.as_bytes()).await.unwrap();
-            let (mut stream, _) = listener.accept().await.unwrap();
+            response.write_all(header.as_bytes()).await.unwrap();
+            response.write_all(body.as_bytes()).await.unwrap();
+            response.shutdown().await.unwrap();
+            drop(response);
+            let (mut response, _) = listener.accept().await.unwrap();
             let body = b"voice";
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
-            stream.write_all(header.as_bytes()).await.unwrap();
-            stream.write_all(body).await.unwrap();
+            response.write_all(header.as_bytes()).await.unwrap();
+            response.write_all(body).await.unwrap();
+            response.shutdown().await.unwrap();
+            drop(response);
         });
         let app = App {
             client: test_client(),
