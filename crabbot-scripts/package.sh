@@ -59,24 +59,25 @@ info "Building workspace for $target."
 for plugin in "${plugins[@]}"; do
     case "$plugin" in
         core)
+            artifact=crabbot
             name=crabbot
             ;;
-        pi)
-            name=crabbot-agent-pi
-            ;;
         *)
+            artifact="crabbot-plugin-$plugin"
             name="crabbot-plugin-$plugin"
             ;;
     esac
 
     package_name="crabbot-$plugin-v$version-$target"
     package_dir="$stage/$package_name"
-    binary="$release/$name"
-    [[ -f "$binary" ]] || binary="$release/$name.exe"
-    [[ -f "$binary" ]] || die "Built binary '$name' was not found for '$target'."
+    binary="$release/$artifact"
+    [[ -f "$binary" ]] || binary="$release/$artifact.exe"
+    [[ -f "$binary" ]] || die "Built binary '$artifact' was not found for '$target'."
 
     mkdir -p "$package_dir/bin"
-    cp "$binary" "$package_dir/bin/"
+    destination="$package_dir/bin/$name"
+    [[ "$binary" == *.exe ]] && destination+='.exe'
+    cp "$binary" "$destination"
     if [[ "$plugin" == core ]]; then
         daemon="$release/crabbot-daemon"
         [[ -f "$daemon" ]] || daemon="$release/crabbot-daemon.exe"

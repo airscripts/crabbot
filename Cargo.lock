@@ -476,15 +476,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crabbot-agent-pi"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "crabbot-core"
 version = "0.1.0"
 dependencies = [
@@ -604,6 +595,15 @@ dependencies = [
  "crabbot-core",
  "futures-util",
  "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "crabbot-plugin-pi"
+version = "0.1.0"
+dependencies = [
+ "crabbot-core",
  "serde_json",
  "tokio",
 ]

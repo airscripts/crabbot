@@ -97,16 +97,12 @@ jobs:
           $target = "${{ matrix.target }}"
           $plugins = @("core", "codex", "claude", "gemini", "ollama", "openrouter", "telegram", "discord", "whatsapp", "signal", "slack", "sqlite", "memory", "timer", "tools", "mcp", "whisper", "tui", "pi")
           foreach ($plugin in $plugins) {
-            $name = switch ($plugin) {
-              "core" { "crabbot"; break }
-              "pi" { "crabbot-agent-pi"; break }
-              default { "crabbot-plugin-$plugin" }
-            }
+            $name = if ($plugin -eq "core") { "crabbot" } else { "crabbot-plugin-$plugin" }
 
             $package = "crabbot-$plugin-v$version-$target"
             New-Item -ItemType Directory -Force -Path $package | Out-Null
             New-Item -ItemType Directory -Force -Path "$package/bin" | Out-Null
-            Copy-Item "target/$target/release/$name.exe" "$package/bin/"
+            Copy-Item "target/$target/release/$name.exe" "$package/bin/$name.exe"
             if ($plugin -eq "core") {
               Copy-Item "target/$target/release/crabbot-daemon.exe" "$package/bin/"
             }
@@ -165,7 +161,6 @@ jobs:
               plugin=${name#crabbot-}
               plugin=${plugin%-v*}
               binary="crabbot-plugin-$plugin"
-              [[ "$plugin" == pi ]] && binary=crabbot-agent-pi
               [[ -x "$package/bin/$binary" ]]
             fi
           done
@@ -228,7 +223,7 @@ jobs:
             } else {
               if (!(Test-Path "$package/crabbot-plugin.toml")) { throw "Plugin manifest is missing." }
               $plugin = $archive.BaseName -replace "^crabbot-", "" -replace "-v.*$", ""
-              $binary = if ($plugin -eq "pi") { "crabbot-agent-pi.exe" } else { "crabbot-plugin-$plugin.exe" }
+              $binary = "crabbot-plugin-$plugin.exe"
               if (!(Test-Path "$package/bin/$binary")) { throw "Plugin executable is missing." }
             }
           }

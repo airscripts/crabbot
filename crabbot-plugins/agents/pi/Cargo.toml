@@ -1,5 +1,5 @@
 [package]
-name = "crabbot-agent-pi"
+name = "crabbot-plugin-pi"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

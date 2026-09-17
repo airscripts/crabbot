@@ -117,7 +117,7 @@ jobs:
             package: crabbot-plugin-slack
 
           - name: Pi Agent
-            package: crabbot-agent-pi
+            package: crabbot-plugin-pi
 
           - name: Tools Plugin
             package: crabbot-plugin-tools
