@@ -24,6 +24,10 @@ Semantic Versioning.
 - Added timer and session-scoped memory controls to the TUI through bounded,
   authenticated daemon capability calls.
 - Added native binary startup and release archive content checks to CI.
+- Added exhaustive revloop finding reports while retaining bounded blocker-first
+  worker cycles.
+- Added canonical `crabbot-plugin-pi` naming to Pi builds and release archives
+  so packaged agent plugins are discoverable by the runtime.
 - Added checked local archive installer smoke tests through
   `CRABBOT_RELEASE_BASE` while keeping release installs on HTTPS.
 - Added an independently installable runtime library with thin CLI and daemon
