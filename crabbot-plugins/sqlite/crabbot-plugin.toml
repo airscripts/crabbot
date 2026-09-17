@@ -1,0 +1,8 @@
+id = "sqlite"
+version = "0.1.0"
+capabilities = ["store"]
+permissions = ["filesystem"]
+
+[protocol]
+major = 0
+minor = 1
