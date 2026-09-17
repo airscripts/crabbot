@@ -1,0 +1,16 @@
+[package]
+name = "crabbot-plugin-ollama"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+crabbot-core = { path = "../../../crabbot-core" }
+crabbot-file = { path = "../../../crabbot-libs/file" }
+futures-util.workspace = true
+keyring.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

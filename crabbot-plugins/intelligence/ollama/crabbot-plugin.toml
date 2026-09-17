@@ -1,0 +1,9 @@
+id = "ollama"
+version = "0.1.0"
+capabilities = ["model", "vision"]
+permissions = ["network"]
+secrets = ["CRABBOT_OLLAMA_API_KEY"]
+
+[protocol]
+major = 0
+minor = 1
