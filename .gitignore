@@ -1,0 +1,12 @@
+target/
+.revloop/
+metadata/
+*.db
+*.db-shm
+*.db-wal
+*.profraw
+*.profdata
+.env
+.env.*
+!.env.example
+SENSITIVE.md

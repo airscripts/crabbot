@@ -1,0 +1,58 @@
+[workspace]
+members = [
+    "crabbot-core",
+    "crabbot-libs/file",
+    "crabbot-runtime",
+    "crabbot",
+    "crabbot-daemon",
+    "crabbot-plugins/intelligence/claude",
+    "crabbot-plugins/intelligence/codex",
+    "crabbot-plugins/intelligence/gemini",
+    "crabbot-plugins/intelligence/ollama",
+    "crabbot-plugins/intelligence/openrouter",
+    "crabbot-plugins/agents/pi",
+    "crabbot-plugins/mcp",
+    "crabbot-plugins/memory",
+    "crabbot-plugins/messaging/discord",
+    "crabbot-plugins/messaging/signal",
+    "crabbot-plugins/messaging/slack",
+    "crabbot-plugins/messaging/telegram",
+    "crabbot-plugins/messaging/whatsapp",
+    "crabbot-plugins/sqlite",
+    "crabbot-plugins/timer",
+    "crabbot-plugins/tools",
+    "crabbot-plugins/tui",
+    "crabbot-plugins/whisper",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+authors = ["Francesco Sardone"]
+repository = "https://github.com/airscripts/crabbot"
+homepage = "https://github.com/airscripts/crabbot"
+readme = "README.md"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = { version = "0.3", features = ["sink"] }
+getrandom = "0.4"
+jiff = { version = "0.2.28", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
+keyring = { version = "4.2.0", default-features = true }
+ring = "0.17"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2.6"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "io-std", "fs", "net", "process", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+toml = "0.9"

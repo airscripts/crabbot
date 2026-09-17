@@ -1,0 +1,13 @@
+pre-commit:
+  piped: true
+  follow: true
+
+  commands:
+    fmt:
+      run: cargo fmt --check
+
+    check:
+      run: CARGO_BUILD_JOBS=4 cargo check --workspace --locked
+
+    test:
+      run: CARGO_BUILD_JOBS=4 cargo test --workspace --locked --lib --bins
