@@ -1,0 +1,9 @@
+id = "claude"
+version = "0.1.0"
+capabilities = ["model", "vision"]
+permissions = ["network"]
+secrets = ["CRABBOT_CLAUDE_KEY"]
+
+[protocol]
+major = 0
+minor = 1
