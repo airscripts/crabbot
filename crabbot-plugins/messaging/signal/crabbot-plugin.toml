@@ -1,0 +1,9 @@
+id = "signal"
+version = "0.1.0"
+capabilities = ["channel"]
+permissions = ["process", "filesystem"]
+secrets = ["CRABBOT_SIGNAL_ACCOUNT"]
+
+[protocol]
+major = 0
+minor = 1
