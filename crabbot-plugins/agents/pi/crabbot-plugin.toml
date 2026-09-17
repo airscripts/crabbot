@@ -1,0 +1,13 @@
+id = "pi"
+version = "0.1.0"
+capabilities = ["agent"]
+permissions = ["process", "filesystem"]
+
+[[commands]]
+name = "code"
+description = "Run a Crabbot-managed Pi coding session."
+interactive = false
+
+[protocol]
+major = 0
+minor = 1
