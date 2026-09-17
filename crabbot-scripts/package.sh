@@ -57,8 +57,17 @@ info "Building workspace for $target."
 (cd "$repo_root" && cargo build --workspace --release --locked --target "$target")
 
 for plugin in "${plugins[@]}"; do
-    name=crabbot
-    [[ "$plugin" == core ]] || name="crabbot-plugin-$plugin"
+    case "$plugin" in
+        core)
+            name=crabbot
+            ;;
+        pi)
+            name=crabbot-agent-pi
+            ;;
+        *)
+            name="crabbot-plugin-$plugin"
+            ;;
+    esac
 
     package_name="crabbot-$plugin-v$version-$target"
     package_dir="$stage/$package_name"
