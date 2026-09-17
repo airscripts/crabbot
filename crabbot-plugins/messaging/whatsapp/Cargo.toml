@@ -1,0 +1,16 @@
+[package]
+name = "crabbot-plugin-whatsapp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+crabbot-core = { path = "../../../crabbot-core" }
+crabbot-file = { path = "../../../crabbot-libs/file" }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+ring = "0.17"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "io-std", "fs", "net", "process", "signal", "sync", "time"] }

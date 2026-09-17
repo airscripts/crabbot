@@ -1,0 +1,9 @@
+id = "whatsapp"
+version = "0.1.0"
+capabilities = ["channel"]
+permissions = ["network", "filesystem"]
+secrets = ["CRABBOT_WHATSAPP_TOKEN", "CRABBOT_WHATSAPP_APP_SECRET", "CRABBOT_WHATSAPP_VERIFY"]
+
+[protocol]
+major = 0
+minor = 1
