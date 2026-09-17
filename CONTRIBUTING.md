@@ -36,7 +36,9 @@ tests use local fixtures and never call paid APIs.
 
 Use lowercase Conventional Commits. When a scope applies, use the
 corresponding monorepo module without the `crabbot-` prefix. The CLI is the
-exception and uses `cli`; plugin scopes use the plugin ID.
+exception and uses `cli`; plugin scopes use the plugin ID. Do not use `repo` as
+a scope. For genuinely cross-cutting or repository-wide changes, omit the
+scope entirely.
 
 ```text
 feat(core): add turn contracts
@@ -44,7 +46,7 @@ feat(runtime): add session state
 feat(telegram): add telegram channel
 fix(tools): reject unsafe paths
 docs(cli): document commands
-ci(repo): add verification workflow
+ci: add verification workflow
 ```
 
 Keep each commit atomic: one user-visible capability, module, fix, or support
