@@ -28,6 +28,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Install Archive Tools
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y zip
+
       - name: Check Rust Formatting
         run: cargo fmt --all --check
 
@@ -56,7 +61,7 @@ jobs:
         run: bash crabbot-scripts/metrics.sh
 
   modules:
-    name: Modules
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     container: rust:1.89-trixie
 
@@ -145,6 +150,11 @@ jobs:
 
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install Archive Tools
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y zip
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2

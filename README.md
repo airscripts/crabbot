@@ -276,7 +276,8 @@ make verify
 ```
 
 The workflow checks formatting, Clippy, locked compilation, tests, coverage,
-builds, and metrics. Workspace line coverage must remain at or above 80%:
+builds, and metrics. Core and host package line coverage must remain at or above
+80%:
 
 ```sh
 make coverage

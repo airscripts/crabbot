@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   test:
-    name: Modules
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
 
     strategy:

@@ -136,8 +136,8 @@ Brand positioning:
 - CI covers verification, builds, tests, security, Agentskill, release
   preparation, packaging, and checksums.
 - Stable and MSRV builds, all-target compilation, doctests, Clippy, formatting,
-  dependency audits, documentation validation, and at least 80% workspace line
-  coverage are release requirements.
+  dependency audits, documentation validation, and at least 80% core and host
+  package line coverage are release requirements.
 - Releases provide separate core and plugin archives for Linux, macOS, and
   Windows on x86_64 and ARM64, with checksums and provenance.
 - Unix and PowerShell installers support core and one-line plugin installation.

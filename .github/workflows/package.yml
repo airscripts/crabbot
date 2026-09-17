@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   package:
-    name: Modules
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
 

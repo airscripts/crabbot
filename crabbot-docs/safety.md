@@ -18,6 +18,20 @@ instructions, traversal, dangling write links, and worktree paths outside the
 active workspace are rejected. Shell commands require both `shell = true` and
 an approval decision, and output and execution time are bounded.
 
+### Optional Container Sandbox
+
+When shell tools are enabled, a Docker or Podman sandbox can keep approved
+commands away from the host filesystem and network. Set
+`CRABBOT_SANDBOX_RUNTIME` to `docker` or `podman` and
+`CRABBOT_SANDBOX_IMAGE` to an image already available locally. Crabbot mounts
+only the active workspace writable, uses a read-only container root, drops
+Linux capabilities, disables networking, and applies bounded resource limits.
+Runtime errors never fall back to host execution. This reduces the impact of
+routine command mistakes; it is not a complete security boundary, so the
+container engine, image, kernel, and host still need to be trusted and
+maintained. See the [configuration](configuration.md) and
+[security](security.md) guides for setup and threat-model details.
+
 ## Recovery
 
 Accepted events, leases, transcripts, and outbox entries are durable. A crash

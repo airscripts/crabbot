@@ -472,6 +472,12 @@ fn git_command(args: &[String]) -> Command {
     }
     process.env("GIT_CONFIG_NOSYSTEM", "1");
     process.env("GIT_CONFIG_COUNT", "0");
+    process.env_remove("GIT_DIR");
+    process.env_remove("GIT_WORK_TREE");
+    process.env_remove("GIT_INDEX_FILE");
+    process.env_remove("GIT_COMMON_DIR");
+    process.env_remove("GIT_OBJECT_DIRECTORY");
+    process.env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
     process.env_remove("GIT_EXTERNAL_DIFF");
     process.env_remove("GIT_DIFF_OPTS");
     process.env_remove("GIT_PAGER");
@@ -1184,7 +1190,22 @@ mod tests {
     };
     use crabbot_core::types::{Request, Response};
     use serde_json::json;
-    use std::{fs, path::Path, sync::Arc, time::Duration};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    static TEST_TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_root(prefix: &str) -> PathBuf {
+        let nonce = TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()))
+    }
 
     fn policy(root: &Path) -> Policy {
         Policy { shell: Shell::Off, root: Some(root.to_path_buf()) }
@@ -1206,7 +1227,7 @@ mod tests {
 
     #[test]
     fn restricts_sandbox_command_to_the_active_workspace() {
-        let root = std::env::temp_dir().join("crabbot-tools-sandbox");
+        let root = test_root("crabbot-tools-sandbox");
         let sandbox = Sandbox { runtime: "docker".into(), image: "local/tool:latest".into() };
         let command = sandbox.process("touch note", &root, Path::new("/tmp/container-id")).unwrap();
         let args = command
@@ -1241,8 +1262,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn configured_sandbox_does_not_fall_back_to_host_shell() {
-        let root =
-            std::env::temp_dir().join(format!("crabbot-tools-sandbox-{}", std::process::id()));
+        let root = test_root("crabbot-tools-sandbox");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let sandbox = Sandbox {
@@ -1260,8 +1280,7 @@ mod tests {
     async fn sandbox_smoke_runs_through_the_configured_runtime() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = std::env::temp_dir()
-            .join(format!("crabbot-tools-sandbox-smoke-{}", std::process::id()));
+        let root = test_root("crabbot-tools-sandbox-smoke");
         let runtime = root.join("runtime");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -1283,7 +1302,7 @@ mod tests {
 
     #[tokio::test]
     async fn tools_read_write_list_and_search_within_root() {
-        let root = std::env::temp_dir().join(format!("crabbot-tools-{}", std::process::id()));
+        let root = test_root("crabbot-tools");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let policy = Arc::new(policy(&root));
@@ -1363,7 +1382,7 @@ mod tests {
 
     #[test]
     fn list_enforces_entry_limit_while_reading() {
-        let root = std::env::temp_dir().join(format!("crabbot-tools-list-{}", std::process::id()));
+        let root = test_root("crabbot-tools-list");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         for index in 0..=ENTRY_LIMIT {
@@ -1382,9 +1401,8 @@ mod tests {
     fn search_skips_symlinks() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join(format!("crabbot-tools-link-{}", std::process::id()));
-        let outside =
-            std::env::temp_dir().join(format!("crabbot-tools-outside-{}", std::process::id()));
+        let root = test_root("crabbot-tools-link");
+        let outside = test_root("crabbot-tools-outside");
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_file(&outside);
         fs::create_dir_all(&root).unwrap();
@@ -1404,10 +1422,8 @@ mod tests {
     async fn rejects_dangling_write_symlinks() {
         use std::os::unix::fs::symlink;
 
-        let root =
-            std::env::temp_dir().join(format!("crabbot-tools-dangling-{}", std::process::id()));
-        let outside = std::env::temp_dir()
-            .join(format!("crabbot-tools-dangling-target-{}", std::process::id()));
+        let root = test_root("crabbot-tools-dangling");
+        let outside = test_root("crabbot-tools-dangling-target");
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_file(&outside);
         fs::create_dir_all(&root).unwrap();
@@ -1452,7 +1468,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_requires_approval() {
-        let root = std::env::temp_dir().join(format!("crabbot-tools-shell-{}", std::process::id()));
+        let root = test_root("crabbot-tools-shell");
         fs::create_dir_all(&root).unwrap();
         let policy = Arc::new(policy(&root));
         let error =
@@ -1463,8 +1479,7 @@ mod tests {
 
     #[tokio::test]
     async fn tools_validate_requests_and_can_run_approved_shell() {
-        let root =
-            std::env::temp_dir().join(format!("crabbot-tools-approved-{}", std::process::id()));
+        let root = test_root("crabbot-tools-approved");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let mut approved = policy(&root);
@@ -1575,8 +1590,7 @@ mod tests {
     async fn approved_worktrees_do_not_run_hooks() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root =
-            std::env::temp_dir().join(format!("crabbot-tools-worktree-{}", std::process::id()));
+        let root = test_root("crabbot-tools-worktree");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("README"), "test\n").unwrap();
@@ -1620,7 +1634,12 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(result.result.unwrap()["status"], 0);
+        let payload = result.result.unwrap();
+        assert_eq!(
+            payload["status"], 0,
+            "git worktree add failed: stdout={} stderr={}",
+            payload["stdout"], payload["stderr"]
+        );
         assert!(target.join("README").is_file());
         assert!(!marker.exists());
         let _ = fs::remove_dir_all(root);
@@ -1628,8 +1647,7 @@ mod tests {
 
     #[tokio::test]
     async fn tools_cover_command_helpers_and_missing_workspace() {
-        let root =
-            std::env::temp_dir().join(format!("crabbot-tools-helpers-{}", std::process::id()));
+        let root = test_root("crabbot-tools-helpers");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         assert!(shell("printf hello", &root).await.unwrap().status.success());
@@ -1645,7 +1663,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_stops_background_processes_after_completion() {
-        let root = std::env::temp_dir().join(format!("crabbot-tools-group-{}", std::process::id()));
+        let root = test_root("crabbot-tools-group");
         let marker = root.join("marker");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -1672,7 +1690,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn applies_approved_patches() {
-        let root = std::env::temp_dir().join(format!("crabbot-tools-patch-{}", std::process::id()));
+        let root = test_root("crabbot-tools-patch");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("note.txt"), "before\n").unwrap();

@@ -271,6 +271,21 @@ pub fn redact_diagnostic(value: impl AsRef<str>) -> String {
     redact(value.as_ref().as_bytes())
 }
 
+fn git_command() -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        command.env_remove(variable);
+    }
+    command
+}
+
 fn command_output(command: &mut std::process::Command) -> std::io::Result<std::process::Output> {
     command_output_limited(command, None, u64::MAX)
 }
@@ -3814,7 +3829,7 @@ fn isolate_at(
         Ok(root) => root,
         Err(_) => return Ok(None),
     };
-    let check = command_output(std::process::Command::new("git").args([
+    let check = command_output(git_command().args([
         "-C",
         &root.display().to_string(),
         "rev-parse",
@@ -3832,7 +3847,7 @@ fn isolate_at(
         if !path.starts_with(&root) {
             return Err("The isolated room worktree leaves the configured root.".into());
         }
-        let check = command_output(std::process::Command::new("git").args([
+        let check = command_output(git_command().args([
             "-C",
             &path.display().to_string(),
             "rev-parse",
@@ -3851,7 +3866,7 @@ fn isolate_at(
         }
     }
     let output = command_output(
-        std::process::Command::new("git")
+        git_command()
             .args(["-C", &root.display().to_string(), "worktree", "add", "--detach"])
             .arg(&path)
             .arg("HEAD"),
@@ -6560,16 +6575,11 @@ fn digest(
 }
 
 fn revision(path: impl AsRef<Path>) -> String {
-    command_output(
-        std::process::Command::new("git")
-            .args(["-C"])
-            .arg(path.as_ref())
-            .args(["rev-parse", "HEAD"]),
-    )
-    .ok()
-    .filter(|output| output.status.success())
-    .and_then(|output| String::from_utf8(output.stdout).ok())
-    .map_or_else(|| "local".into(), |value| value.trim().into())
+    command_output(git_command().args(["-C"]).arg(path.as_ref()).args(["rev-parse", "HEAD"]))
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map_or_else(|| "local".into(), |value| value.trim().into())
 }
 
 fn resolve(
@@ -6672,10 +6682,7 @@ fn resolve(
     let result = (|| {
         let repo = staging.join("repo");
         let output = command_output_limited(
-            std::process::Command::new("git")
-                .args(["clone", "--depth", "1", "--no-tags"])
-                .arg(url)
-                .arg(&repo),
+            git_command().args(["clone", "--depth", "1", "--no-tags"]).arg(url).arg(&repo),
             Some(&staging),
             ARCHIVE_EXPANDED,
         )?;
@@ -6689,16 +6696,13 @@ fn resolve(
 
         if let Some(wanted) = wanted.filter(|value| !value.is_empty()) {
             let checkout = command_output_limited(
-                std::process::Command::new("git")
-                    .args(["-C"])
-                    .arg(&repo)
-                    .args(["checkout", "--detach", wanted]),
+                git_command().args(["-C"]).arg(&repo).args(["checkout", "--detach", wanted]),
                 Some(&staging),
                 ARCHIVE_EXPANDED,
             )?;
             if !checkout.status.success() {
                 let fetch = command_output_limited(
-                    std::process::Command::new("git")
+                    git_command()
                         .args(["-C"])
                         .arg(&repo)
                         .args(["fetch", "--depth", "1", "origin", wanted]),
@@ -6713,10 +6717,7 @@ fn resolve(
                     .into());
                 }
                 let checkout = command_output_limited(
-                    std::process::Command::new("git")
-                        .args(["-C"])
-                        .arg(&repo)
-                        .args(["checkout", "--detach", wanted]),
+                    git_command().args(["-C"]).arg(&repo).args(["checkout", "--detach", wanted]),
                     Some(&staging),
                     ARCHIVE_EXPANDED,
                 )?;

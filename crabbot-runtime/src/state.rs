@@ -1092,7 +1092,7 @@ pub fn remove_worktree(root: &Path, id: &str) -> std::io::Result<()> {
             "The worktree path leaves the configured root.",
         ));
     }
-    let mut command = std::process::Command::new("git");
+    let mut command = super::git_command();
     command
         .args(["-C", &root.display().to_string(), "worktree", "remove"])
         .arg(path)

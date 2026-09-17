@@ -46,4 +46,4 @@ make verify
 
 Tests use deterministic local fixtures. They do not call paid provider APIs.
 Before opening a pull request, update the relevant guide and run the complete
-verification workflow, including the 80% workspace line-coverage gate.
+verification workflow, including the 80% core and host package line-coverage gate.

@@ -13,7 +13,6 @@ jobs:
   dependencies:
     name: Dependencies
     runs-on: ubuntu-latest
-    container: rust:1.89-trixie
 
     steps:
       - name: Checkout
@@ -27,3 +26,6 @@ jobs:
 
       - name: Check Dependency Policy
         uses: EmbarkStudios/cargo-deny-action@v2
+
+        with:
+          rust-version: "1.89.0"
