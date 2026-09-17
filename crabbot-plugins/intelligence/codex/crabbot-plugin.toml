@@ -1,0 +1,14 @@
+id = "codex"
+version = "0.1.0"
+capabilities = ["model", "vision"]
+permissions = ["network"]
+secrets = ["CRABBOT_CODEX_KEY"]
+
+[[commands]]
+name = "codex"
+description = "Manage Codex ChatGPT sign-in."
+interactive = false
+
+[protocol]
+major = 0
+minor = 1
