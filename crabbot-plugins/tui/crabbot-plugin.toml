@@ -1,0 +1,13 @@
+id = "tui"
+version = "0.1.0"
+capabilities = ["client"]
+permissions = ["terminal"]
+
+[[commands]]
+name = "tui"
+description = "Start the terminal interface."
+interactive = true
+
+[protocol]
+major = 0
+minor = 1
