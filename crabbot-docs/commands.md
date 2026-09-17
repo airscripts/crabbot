@@ -32,6 +32,23 @@ crabbot <plugin-command> [arguments...]
 `crabbot --version` and `crabbot version` print the same package version for
 scripts and automation.
 
+The global `--json` flag selects JSON output wherever a command supports it;
+the command-level form remains available for `status`, plugin lists and
+updates, session lists, and delivery lists. `--debug` prints detailed error
+diagnostics. `--verbose` prints diagnostic progress, elapsed time, and nested
+error causes.
+Help is available as `-h`, `-H`, or `--help`; version is available as `-v`,
+`-V`, or `--version`. Global flags may appear before or after the subcommand.
+Diagnostics use Rust's structured `tracing` output on stderr. Recoverable
+degradations are warnings visible by default, normal failures are emitted at
+error level, `--verbose` enables informational timing and cause events, and
+`--debug` enables debug representations as well. JSON mode suppresses
+human-readable logging so stderr remains safe for automation.
+When `--debug` handles a failure, Crabbot also makes a redacted, private report
+under `<CRABBOT_HOME>/debug/` when the filesystem permits it. The report path is
+logged at info level; report creation is best effort and never replaces the
+original command error.
+
 `crabbot status` prints installation health, daemon state, intelligence setup,
 messaging setup, and the installed plugin count in one comma-separated line.
 Use `--json` for automation.

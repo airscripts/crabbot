@@ -7,6 +7,11 @@ Semantic Versioning.
 
 ### Added
 
+- Added descriptive CLI command help, global JSON and diagnostic modes, and
+  `-h`/`-H`/`--help`, `--verbose`, and `-v`/`-V`/`--version` options.
+- Added structured `tracing` diagnostics for CLI and daemon failures.
+- Added warning-level operational diagnostics and best-effort redacted debug
+  reports for `--debug` failures.
 - Added current product and onboarding documentation covering cross-platform
   installation, first-run setup, provider and messaging prerequisites, custom
   plugin authoring, and deterministic acceptance flows.
