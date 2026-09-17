@@ -440,8 +440,8 @@ impl Process {
     ) -> Result<Self> {
         #[cfg(unix)]
         let mut command = {
-            let mut command = Command::new("setsid");
-            command.arg(&path);
+            let mut command = Command::new(&path);
+            command.process_group(0);
             command
         };
         #[cfg(not(unix))]
