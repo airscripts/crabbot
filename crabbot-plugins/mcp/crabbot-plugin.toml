@@ -1,0 +1,8 @@
+id = "mcp"
+version = "0.1.0"
+capabilities = ["mcp", "resource"]
+permissions = ["network", "process"]
+
+[protocol]
+major = 0
+minor = 1
