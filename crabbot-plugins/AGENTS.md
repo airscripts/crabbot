@@ -9,11 +9,13 @@
 ## Mission And Repository Map
 
 Each child is one capability process with a manifest, README, and binary. Keep
-provider or channel behavior inside its own child.
+provider, channel, store, client, or tool behavior inside its own child; the
+runtime loads children through the public core JSON-RPC contract.
 
 ## Non-Negotiables
 
-- Use the public core protocol; do not create private host paths.
+- Use the public core JSON-RPC protocol with JSONL framing; do not create
+  private host paths.
 - Keep stdout protocol-only and put logs on stderr.
 - Declare capabilities, permissions, and protocol ranges in the manifest.
 - Do not put credentials in source, tests, manifests, or README examples.
@@ -22,7 +24,7 @@ provider or channel behavior inside its own child.
 
 ```bash
 cargo test --workspace
-cargo build -p crabbot-plugin-openai
+cargo build -p crabbot-plugin-codex --locked
 ```
 
 ## Implementation Conventions

@@ -6,7 +6,9 @@ Crabbot is a small, self-hosted Rust agent with an experimental process-plugin
 protocol.
 
 - `crabbot-core` owns normalized types, the turn loop, policy, and protocol.
-- `crabbot` owns the daemon, CLI, configuration, IPC, and update flow.
+- `crabbot-runtime` owns host orchestration, daemon state, IPC, and plugin
+  lifecycle; `crabbot` and `crabbot-daemon` are thin entrypoints.
+- `crabbot-libs/file` owns shared crash-safe filesystem primitives.
 - `crabbot-plugins` owns optional model, channel, store, memory, timer, tool,
   MCP, speech, and client processes.
 - `crabbot-docs/`, `crabbot-scripts/`, `.github/`, and release files own user guidance,
@@ -15,7 +17,8 @@ protocol.
 ## Non-Negotiables
 
 - Keep the core capability-free and provider-neutral.
-- Keep plugin stdout as protocol-only JSONL; send diagnostics to stderr.
+- Keep plugin stdout as protocol-only JSON-RPC messages framed by JSONL; send
+  diagnostics to stderr.
 - Normalize external payloads before they cross a plugin boundary.
 - Keep filesystem access confined, shell disabled by default, and secrets out
   of logs, manifests, issues, and planning files.
@@ -40,9 +43,11 @@ crabbot doctor
 
 ## Change Routing
 
-Put shared contracts in `crabbot-core`, host orchestration in `crabbot`, and
-provider/channel/capability behavior in its plugin. Update `crabbot-docs/`, tests, and
-`CHANGELOG.md` with public behavior changes.
+Put shared contracts in `crabbot-core`, host orchestration in
+`crabbot-runtime`, thin entrypoint behavior in `crabbot` or `crabbot-daemon`,
+filesystem primitives in `crabbot-libs/file`, and provider/channel/capability
+behavior in its plugin. Update `crabbot-docs/`, tests, and `CHANGELOG.md` with
+public behavior changes.
 
 ## Implementation Conventions
 

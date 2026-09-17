@@ -8,14 +8,16 @@
 
 ## Mission And Repository Map
 
-Own the capability-free kernel, normalized domain types, policy, JSONL protocol,
-plugin supervision, and bounded agent loop.
+Own the capability-free kernel, normalized domain types, policy, JSON-RPC
+protocol framing, and bounded agent loop. Plugin supervision and host lifecycle
+belong to `crabbot-runtime`.
 
 ## Non-Negotiables
 
 - Do not add providers, network clients, storage engines, tools, UI, or vendor
   payloads here.
-- Keep protocol data serializable, versioned, and provider-neutral.
+- Keep protocol data serializable, versioned, provider-neutral, and framed as
+  bounded JSON-RPC messages.
 - Preserve bounded frames, deadlines, cancellation, and typed errors.
 
 ## Quick Start

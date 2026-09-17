@@ -8,12 +8,15 @@
 
 ## Mission And Repository Map
 
-Own the `crabbot` daemon and CLI: setup, configuration, plugin discovery,
-authenticated IPC, native services, and safe update activation.
+Own the `crabbot` CLI entrypoint: command parsing, setup, configuration
+selection, and delegation to `crabbot-runtime`. Host lifecycle, plugin
+discovery, authenticated IPC, native services, and update activation belong to
+the runtime library.
 
 ## Non-Negotiables
 
-- Keep command handlers thin and delegate capability behavior to plugins.
+- Keep command handlers thin and delegate host behavior to `crabbot-runtime`
+  and capability behavior to plugins.
 - Keep human output default and support stable JSON output where exposed.
 - Never print secrets or run shell commands implicitly.
 - Preserve staged update verification and rollback.

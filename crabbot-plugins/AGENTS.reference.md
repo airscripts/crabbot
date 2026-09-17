@@ -4,7 +4,7 @@
 
 - Agentskill Version: `2.1.0`.
 - Evidence Schema Version: `4`.
-- Repository Revision: initial workspace scaffold; no commit exists yet.
+- Repository Revision: `03c79ff484255bb0b14ac00111d65f9239e88300`.
 - Configuration: inherited from the repository root; default signature enabled.
 - Maintainer-Confirmed Decisions: adopt crabbot-plugins as a nested scope; all official capabilities are separate process plugins and release in lockstep with the core.
 - Unresolved Uncertainty: none specific to this scope.
@@ -12,8 +12,8 @@
 ## Boundary
 
 Child plugin IDs and manifests define installation and capability discovery.
-Each process uses `crabbot_core::plugin::serve` or `serve_with` and negotiates
-protocol `0.1`.
+Each process uses `crabbot_core::plugin::serve` or `serve_with`, emits only
+JSON-RPC protocol frames on stdout, and negotiates protocol `0.1`.
 
 ---
 
