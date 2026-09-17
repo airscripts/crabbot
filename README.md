@@ -266,15 +266,18 @@ See [AGENTS.md](AGENTS.md) for repository boundaries and conventions,
 [product guide](crabbot-docs/product.md) for Crabbot’s current capabilities and
 boundaries.
 
-Run the independent review loop through the short compatibility entrypoint:
+Run the independent review loop:
 
 ```sh
-./scripts/revloop.sh
+./crabbot-scripts/revloop.sh
 ```
 
-Its canonical implementation is `crabbot-scripts/revloop.sh`; use
-`CRABBOT_REVLOOP_OUTPUT=verbose` when the full orchestrator and worker stream
-is useful during diagnosis.
+Use `CRABBOT_REVLOOP_OUTPUT=verbose` when the full orchestrator and worker
+stream is useful during diagnosis. Each orchestrator pass performs a deep
+review and records every distinct material finding it identifies. Blocking
+findings still control worker cycles and the bounded
+`CRABBOT_REVLOOP_MAX_CYCLES` convergence limit; non-blocking findings remain
+visible without forcing additional cycles.
 
 ## Contributing
 

@@ -334,15 +334,31 @@ tooling failure.
 
 Review only realistically reachable and materially important defects.
 
-Perform an exhaustive pass over the in-scope changes before writing the report.
-Continue looking after each finding and report every distinct actionable finding
-identified in this invocation. Do not intentionally limit the report to one
-finding or defer an identifiable finding to a later cycle.
+This is a deep review, not a first-finding triage. Perform an exhaustive pass
+over the in-scope changes before writing the report. Continue looking after
+each finding and report every distinct actionable finding identified in this
+invocation. Do not stop after the first finding, select only the highest
+severity finding, or defer an identifiable finding to a later cycle. Combine
+only findings that have the same root cause and failure mode; keep independent
+defects as separate blocks.
+
+Before emitting the final report, perform a second completeness pass over the
+changed files, their callers and callees, tests, manifests, release packaging,
+and verification configuration. Include valid non-blocking findings as well
+as blocking findings. The blocker-priority loop is applied after this complete
+report is produced: Blocking: Yes findings gate worker cycles, while
+Blocking: No findings remain recorded without forcing extra cycles.
 
 Classify merge impact separately from severity. Mark a finding Blocking: Yes
-only when it must prevent release; mark it Blocking: No when it is valid but
-does not need to prevent release. If a concern is not a concrete bug or problem,
-do not report it as a finding.
+when the defect prevents a released feature from installing, activating, or
+performing its advertised behavior, or when it would make a release artifact
+unusable. This remains true when the workspace builds and unit tests pass but
+the failure appears only in packaging, installation, discovery, or runtime
+integration. Mark Blocking: No only for a valid defect that does not affect a
+released workflow and can safely ship without user-visible loss of function.
+For example, a release archive that contains an executable name the runtime
+cannot discover is Blocking: Yes, even when source tests pass.
+If a concern is not a concrete bug or problem, do not report it as a finding.
 
 Valid review categories include:
 
@@ -861,6 +877,13 @@ has_blocking_findings() {
     awk '/^Blocking: Yes$/ { found = 1 } END { exit found ? 0 : 1 }' "$review_file"
 }
 
+finding_count() {
+    local review_file=$1
+
+    awk '/^Severity: (Critical|High|Medium)$/ { count++ } END { print count + 0 }' \
+        "$review_file"
+}
+
 run_fast_verification() {
     local log_file=$1
     local status
@@ -884,7 +907,7 @@ run_fast_verification() {
         make test
 
         print_info 'Running shell syntax check (4/4)...'
-        bash -n crabbot-scripts/*.sh scripts/*.sh install.sh
+        bash -n crabbot-scripts/*.sh install.sh
     ) </dev/null 2>&1 | write_log "$log_file"
     pipeline_status=("${PIPESTATUS[@]}")
     status=${pipeline_status[0]}
@@ -949,7 +972,7 @@ run_final_verification() {
                 --locked
 
         print_info 'Running shell syntax check (3/10)...'
-        bash -n crabbot-scripts/*.sh scripts/*.sh install.sh
+        bash -n crabbot-scripts/*.sh install.sh
 
         print_info 'Running all-target workspace check (4/10)...'
         env CARGO_BUILD_JOBS=4 \
@@ -1114,6 +1137,10 @@ while (( cycle <= MAX_CYCLES )); do
     fi
 
     report_content="$(<"$review_file")"
+
+    if [[ "$report_content" != "$REVIEW_CLEAR" ]]; then
+        print_info "Orchestrator reported $(finding_count "$review_file") finding(s)."
+    fi
 
     if [[ "$report_content" == "$REVIEW_CLEAR" ]] || \
         ! has_blocking_findings "$review_file"
