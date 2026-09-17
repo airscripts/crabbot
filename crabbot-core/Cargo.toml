@@ -1,0 +1,15 @@
+[package]
+name = "crabbot-core"
+description = "Small, provider-neutral agent kernel and plugin protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
