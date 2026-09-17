@@ -35,3 +35,20 @@ plugins without adding a hosted runtime to Crabbot.
 - Include pinned sources, project details, capabilities, permissions, secrets, targets, maintainers, and security status.
 - Generate copyable install commands for immutable GitHub revisions.
 - Keep private plugins directly installable but outside the public catalog.
+
+## v0.5 | Deployments
+
+Make Crabbot straightforward to operate in containerized environments without
+coupling users to one container engine or bundling optional plugins into the
+core image.
+
+- Publish reproducible OCI-compatible deployment images for the CLI and daemon.
+- Keep Docker, Podman, and other OCI runtimes supported through the same image
+  and documented entrypoints.
+- Document environment and file-based secret injection, persistent volumes for
+  `CRABBOT_HOME` and `CRABBOT_ROOT`, health checks, graceful shutdown, and
+  restart behavior.
+- Keep plugins independently installable and hot-loadable, with explicit IPC,
+  network, and volume boundaries in the container deployment guide.
+- Avoid privileged defaults and add CI smoke coverage for an OCI runtime,
+  image metadata, persistence, and daemon lifecycle.
