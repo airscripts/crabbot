@@ -24,6 +24,11 @@ jobs:
   prepare:
     name: Prepare Release
     runs-on: ubuntu-latest
+    container: rust:1.89-trixie
+
+    defaults:
+      run:
+        shell: bash
 
     outputs:
       tag: ${{ steps.release.outputs.tag }}
@@ -32,7 +37,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.tag }}
@@ -71,7 +76,7 @@ jobs:
           test -s release-notes.md
 
       - name: Upload Release Notes
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
 
         with:
           name: crabbot-release-notes-${{ steps.release.outputs.version }}

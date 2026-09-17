@@ -60,13 +60,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.89
 
         with:
           components: llvm-tools-preview
@@ -125,13 +125,13 @@ jobs:
     steps:
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.89
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2

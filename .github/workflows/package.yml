@@ -69,12 +69,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
       - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.89
 
         with:
           targets: ${{ matrix.target }}
@@ -252,7 +252,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Installed CLI failed to start." }
 
       - name: Upload Archives
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
 
         with:
           name: crabbot-v${{ inputs.version }}-${{ matrix.target }}

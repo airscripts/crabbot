@@ -15,19 +15,18 @@ jobs:
   workspace:
     name: Workspace
     runs-on: ubuntu-latest
+    container: rust:1.89-trixie
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.ref || github.ref }}
-
-      - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-        with:
-          components: rustfmt, clippy
 
       - name: Check Rust Formatting
         run: cargo fmt --all --check
@@ -59,7 +58,7 @@ jobs:
   modules:
     name: Modules
     runs-on: ubuntu-latest
-    container: node:22-bookworm
+    container: rust:1.89-trixie
 
     defaults:
       run:
@@ -142,13 +141,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.ref || github.ref }}
-
-      - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -159,16 +155,18 @@ jobs:
   msrv:
     name: Minimum Rust Version
     runs-on: ubuntu-latest
+    container: rust:1.89-trixie
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.ref || github.ref }}
-
-      - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@1.89
 
       - name: Check Workspace
         run: CARGO_BUILD_JOBS=4 cargo check --workspace --all-targets --locked
@@ -176,32 +174,33 @@ jobs:
   windows_gnu:
     name: Windows GNU
     runs-on: ubuntu-latest
+    container: rust:1.89-trixie
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install MinGW
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y gcc-mingw-w64-x86-64
+          apt-get update
+          apt-get install --no-install-recommends -y gcc-mingw-w64-x86-64
           x86_64-w64-mingw32-gcc --version
-
-      - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-        with:
-          targets: x86_64-pc-windows-gnu
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
       - name: Check Windows GNU Target
 
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          cargo check --workspace --all-targets --target x86_64-pc-windows-gnu --locked
+
         env:
           CARGO_BUILD_JOBS: 4
-
-        run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu --locked

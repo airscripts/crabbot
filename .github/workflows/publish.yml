@@ -22,16 +22,18 @@ jobs:
   publish:
     name: Publish Release
     runs-on: ubuntu-latest
+    container: rust:1.89-trixie
+
     steps:
       - name: Download Release Notes
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
 
         with:
           name: crabbot-release-notes-${{ inputs.version }}
           path: notes
 
       - name: Download Archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
 
         with:
           pattern: crabbot-v${{ inputs.version }}-*
@@ -39,7 +41,7 @@ jobs:
           merge-multiple: true
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
 
         with:
           tag_name: ${{ inputs.tag }}

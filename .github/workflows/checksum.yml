@@ -14,10 +14,15 @@ jobs:
   checksum:
     name: Generate Checksums
     runs-on: ubuntu-latest
+    container: rust:1.89-trixie
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Download Archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
 
         with:
           pattern: crabbot-v${{ inputs.version }}-*
@@ -36,7 +41,7 @@ jobs:
           test "$(wc -l < dist/SHA256SUMS)" -ge 78
 
       - name: Upload Checksums
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
 
         with:
           name: crabbot-v${{ inputs.version }}-checksums
