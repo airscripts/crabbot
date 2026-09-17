@@ -36,7 +36,7 @@ jobs:
           test "$(wc -l < dist/SHA256SUMS)" -ge 78
 
       - name: Upload Checksums
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
 
         with:
           name: crabbot-v${{ inputs.version }}-checksums

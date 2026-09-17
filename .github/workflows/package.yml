@@ -257,7 +257,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Installed CLI failed to start." }
 
       - name: Upload Archives
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
 
         with:
           name: crabbot-v${{ inputs.version }}-${{ matrix.target }}
