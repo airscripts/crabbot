@@ -33,6 +33,9 @@ jobs:
           apt-get update
           apt-get install --no-install-recommends -y zip
 
+      - name: Install Rust Components
+        run: rustup component add rustfmt clippy
+
       - name: Check Rust Formatting
         run: cargo fmt --all --check
 
