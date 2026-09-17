@@ -31,7 +31,7 @@ jobs:
       - name: Install Archive Tools
         run: |
           apt-get update
-          apt-get install --no-install-recommends -y zip
+          apt-get install --no-install-recommends -y ripgrep zip
 
       - name: Install Rust Components
         run: rustup component add rustfmt clippy
