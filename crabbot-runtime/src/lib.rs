@@ -3028,10 +3028,10 @@ async fn bridge_with_media(
                     };
                     {
                         let mut store = sessions.lock().map_err(|_| "Session lock is poisoned.")?;
-                        let replay = !store
+                        let replay = store
                             .sessions
                             .get(&session_name)
-                            .is_some_and(|session| session.phase == "unsafe");
+                            .is_none_or(|session| session.phase != "unsafe");
                         let replied = match store.reply(
                             &session_name,
                             failure,
