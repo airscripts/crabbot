@@ -12,50 +12,196 @@ permissions:
   contents: read
 
 jobs:
-  rust:
+  workspace:
+    name: Workspace
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
         with:
           ref: ${{ inputs.ref || github.ref }}
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
         with:
           components: rustfmt, clippy
-      - run: cargo fmt --all --check
-      - run: CARGO_BUILD_JOBS=4 cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: CARGO_BUILD_JOBS=4 cargo check --workspace --all-targets --locked
-      - run: CARGO_BUILD_JOBS=4 cargo test --workspace --locked
-      - uses: taiki-e/install-action@v2
+
+      - name: Check Rust Formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: CARGO_BUILD_JOBS=4 cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check Workspace
+        run: CARGO_BUILD_JOBS=4 cargo check --workspace --all-targets --locked
+
+      - name: Install Coverage Tool
+        uses: taiki-e/install-action@v2
+
         with:
           tool: cargo-llvm-cov
-      - run: make coverage
-      - run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
-      - run: bash -n crabbot-scripts/*.sh install.sh
-      - run: bash crabbot-scripts/metrics.sh
+
+      - name: Check Coverage
+        run: make coverage
+
+      - name: Check Documentation
+        run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
+
+      - name: Check Shell Scripts
+        run: bash -n crabbot-scripts/*.sh install.sh
+
+      - name: Report Metrics
+        run: bash crabbot-scripts/metrics.sh
+
+  modules:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    container: node:22-bookworm
+
+    defaults:
+      run:
+        shell: bash
+
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+
+      matrix:
+        include:
+          - name: Core
+            package: crabbot-core
+
+          - name: File
+            package: crabbot-file
+
+          - name: Runtime
+            package: crabbot-runtime
+
+          - name: CLI
+            package: crabbot
+
+          - name: Daemon
+            package: crabbot-daemon
+
+          - name: Claude Plugin
+            package: crabbot-plugin-claude
+
+          - name: Codex Plugin
+            package: crabbot-plugin-codex
+
+          - name: Gemini Plugin
+            package: crabbot-plugin-gemini
+
+          - name: Ollama Plugin
+            package: crabbot-plugin-ollama
+
+          - name: OpenRouter Plugin
+            package: crabbot-plugin-openrouter
+
+          - name: Telegram Plugin
+            package: crabbot-plugin-telegram
+
+          - name: Discord Plugin
+            package: crabbot-plugin-discord
+
+          - name: WhatsApp Plugin
+            package: crabbot-plugin-whatsapp
+
+          - name: Signal Plugin
+            package: crabbot-plugin-signal
+
+          - name: Slack Plugin
+            package: crabbot-plugin-slack
+
+          - name: Pi Agent
+            package: crabbot-agent-pi
+
+          - name: Tools Plugin
+            package: crabbot-plugin-tools
+
+          - name: Memory Plugin
+            package: crabbot-plugin-memory
+
+          - name: Timer Plugin
+            package: crabbot-plugin-timer
+
+          - name: SQLite Plugin
+            package: crabbot-plugin-sqlite
+
+          - name: Whisper Plugin
+            package: crabbot-plugin-whisper
+
+          - name: MCP Plugin
+            package: crabbot-plugin-mcp
+
+          - name: TUI Plugin
+            package: crabbot-plugin-tui
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test ${{ matrix.name }}
+        run: cargo test --locked -p "${{ matrix.package }}"
+
   msrv:
+    name: Minimum Rust Version
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
         with:
           ref: ${{ inputs.ref || github.ref }}
-      - uses: dtolnay/rust-toolchain@1.89
-      - run: CARGO_BUILD_JOBS=4 cargo check --workspace --all-targets --locked
-  windows-gnu:
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@1.89
+
+      - name: Check Workspace
+        run: CARGO_BUILD_JOBS=4 cargo check --workspace --all-targets --locked
+
+  windows_gnu:
+    name: Windows GNU
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
         with:
           ref: ${{ inputs.ref || github.ref }}
+
       - name: Install MinGW
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y gcc-mingw-w64-x86-64
           x86_64-w64-mingw32-gcc --version
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
         with:
           targets: x86_64-pc-windows-gnu
-      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
       - name: Check Windows GNU Target
+
         env:
           CARGO_BUILD_JOBS: 4
+
         run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu --locked

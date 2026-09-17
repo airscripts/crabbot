@@ -12,13 +12,18 @@ permissions:
 
 jobs:
   checksum:
+    name: Generate Checksums
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download Archives
+        uses: actions/download-artifact@v4
+
         with:
           pattern: crabbot-v${{ inputs.version }}-*
           path: dist
           merge-multiple: true
+
       - name: Generate Checksums
         run: |
           set -euo pipefail
@@ -29,7 +34,10 @@ jobs:
               | xargs -0 -r sha256sum
           ) > dist/SHA256SUMS
           test "$(wc -l < dist/SHA256SUMS)" -ge 78
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload Checksums
+        uses: actions/upload-artifact@v4
+
         with:
           name: crabbot-v${{ inputs.version }}-checksums
           path: dist/SHA256SUMS

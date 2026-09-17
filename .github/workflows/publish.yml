@@ -6,9 +6,11 @@ on:
       tag:
         required: true
         type: string
+
       version:
         required: true
         type: string
+
       prerelease:
         required: true
         type: string
@@ -18,18 +20,27 @@ permissions:
 
 jobs:
   publish:
+    name: Publish Release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download Release Notes
+        uses: actions/download-artifact@v4
+
         with:
           name: crabbot-release-notes-${{ inputs.version }}
           path: notes
-      - uses: actions/download-artifact@v4
+
+      - name: Download Archives
+        uses: actions/download-artifact@v4
+
         with:
           pattern: crabbot-v${{ inputs.version }}-*
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+
         with:
           tag_name: ${{ inputs.tag }}
           name: Crabbot ${{ inputs.tag }}

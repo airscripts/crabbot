@@ -11,10 +11,18 @@ permissions:
 
 jobs:
   dependencies:
+    name: Dependencies
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Audit Rust Dependencies
+        uses: rustsec/audit-check@v2
+
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: EmbarkStudios/cargo-deny-action@v2
+
+      - name: Check Dependency Policy
+        uses: EmbarkStudios/cargo-deny-action@v2

@@ -6,11 +6,14 @@ on:
       tag:
         required: true
         type: string
+
     outputs:
       tag:
         value: ${{ jobs.prepare.outputs.tag }}
+
       version:
         value: ${{ jobs.prepare.outputs.version }}
+
       prerelease:
         value: ${{ jobs.prepare.outputs.prerelease }}
 
@@ -19,42 +22,57 @@ permissions:
 
 jobs:
   prepare:
+    name: Prepare Release
     runs-on: ubuntu-latest
+
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
       prerelease: ${{ steps.release.outputs.prerelease }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
         with:
           ref: ${{ inputs.tag }}
+
       - id: release
-        name: Validate Release
+        name: Validate Release Metadata
+
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          CRABBOT_RELEASE_TAG: ${{ inputs.tag }}
+
         run: |
           set -euo pipefail
-          tag="$RELEASE_TAG"
+          tag="$CRABBOT_RELEASE_TAG"
           tag="${tag#refs/tags/}"
+
           [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
           version="${tag#v}"
           test "$tag" != "$version"
           test "$version" = "$(tr -d '[:space:]' < VERSION)"
           grep -q "## \[$version\]" CHANGELOG.md
           prerelease=false
+
           [[ "$version" == *-* ]] && prerelease=true
           {
             echo "tag=$tag"
             echo "version=$version"
             echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
+
           awk -v version="$version" '
             index($0, "## [" version "]") == 1 { found=1 }
             found && $0 ~ /^## / && index($0, "## [" version "]") != 1 { exit }
             found { print }
           ' CHANGELOG.md > release-notes.md
+
           test -s release-notes.md
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload Release Notes
+        uses: actions/upload-artifact@v4
+
         with:
           name: crabbot-release-notes-${{ steps.release.outputs.version }}
           path: release-notes.md
