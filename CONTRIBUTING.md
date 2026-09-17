@@ -45,9 +45,13 @@ feat(core): add turn contracts
 feat(runtime): add session state
 feat(telegram): add telegram channel
 fix(tools): reject unsafe paths
-docs(cli): document commands
+docs: document commands
 ci: add verification workflow
 ```
+
+Documentation changes are intentionally unscoped: use `docs: ...`, never
+`docs(docs): ...`. A module-specific scope is appropriate only when the commit
+changes that module's implementation rather than merely documenting it.
 
 Keep each commit atomic: one user-visible capability, module, fix, or support
 change per commit. Commit messages must be one short, entirely lowercase line
