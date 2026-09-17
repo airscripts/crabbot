@@ -1,0 +1,9 @@
+id = "discord"
+version = "0.1.0"
+capabilities = ["channel"]
+permissions = ["network"]
+secrets = ["CRABBOT_DISCORD_TOKEN"]
+
+[protocol]
+major = 0
+minor = 1
