@@ -10326,14 +10326,36 @@ done
         let plugins = registry([channel, provider]).await;
         let root = std::env::temp_dir().join(format!("crabbot-retry-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
+
         let sessions =
             Arc::new(Mutex::new(super::state::Store::load(root.join("sessions.json")).unwrap()));
+
         let stop = Arc::new(Stop::new());
+        let sessions_for_signal = Arc::clone(&sessions);
         let signal = Arc::clone(&stop);
+
         let notifier = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            for _ in 0..200 {
+                let ready = {
+                    let store = sessions_for_signal.lock().unwrap();
+
+                    store.sessions.get("telegram-7").is_some_and(|session| session.status == "idle")
+                        && store.outbox.first().is_some_and(|delivery| {
+                            delivery.status == super::state::DeliveryStatus::Uncertain
+                        })
+                };
+
+                if ready {
+                    signal.signal();
+                    return;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
             signal.signal();
         });
+
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
             super::bridge(
