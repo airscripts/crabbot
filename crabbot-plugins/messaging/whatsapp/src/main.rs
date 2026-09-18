@@ -598,6 +598,7 @@ mod tests {
     fn test_client() -> reqwest::Client {
         reqwest::Client::builder()
             .no_proxy()
+            .pool_max_idle_per_host(0)
             .build()
             .expect("the WhatsApp test client should build")
     }
@@ -873,7 +874,6 @@ mod tests {
             );
             response.write_all(header.as_bytes()).await.unwrap();
             response.write_all(body.as_bytes()).await.unwrap();
-            response.shutdown().await.unwrap();
             drop(response);
             let (mut response, _) = listener.accept().await.unwrap();
             let body = b"voice";
@@ -883,7 +883,6 @@ mod tests {
             );
             response.write_all(header.as_bytes()).await.unwrap();
             response.write_all(body).await.unwrap();
-            response.shutdown().await.unwrap();
             drop(response);
         });
         let app = App {

@@ -592,7 +592,7 @@ async fn stop(child: &mut Child, process_id: Option<u32>, group: bool) {
         let group = format!("-{id}");
         let _ = Command::new("kill").args(["-TERM", &group]).status().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = Command::new("kill").args(["-KILL", &group]).status().await;
+        kill_group(id, "-KILL");
     }
     #[cfg(windows)]
     if group && let Some(id) = process_id {
@@ -600,6 +600,29 @@ async fn stop(child: &mut Child, process_id: Option<u32>, group: bool) {
     }
     let _ = child.kill().await;
     let _ = child.wait().await;
+}
+
+#[cfg(unix)]
+fn kill_group(group: u32, signal: &str) {
+    let group_arg = format!("-{group}");
+    let _ = std::process::Command::new("kill").args([signal, &group_arg]).status();
+
+    let Ok(output) = std::process::Command::new("ps").args(["-eo", "pid=,pgid="]).output() else {
+        return;
+    };
+    let current = std::process::id();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(pgid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pgid == group && pid != current {
+            let _ = std::process::Command::new("kill").args([signal, &pid.to_string()]).status();
+        }
+    }
 }
 
 fn denied(error: impl Into<String>) -> crabbot_core::Error {

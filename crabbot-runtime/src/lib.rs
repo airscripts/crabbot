@@ -6925,14 +6925,37 @@ fn archive_bounds(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + 
 }
 
 fn tar_size(fields: &[&str]) -> Option<u64> {
-    fields
-        .windows(2)
-        .find_map(|window| {
-            let size = window[0].parse::<u64>().ok()?;
-            let date = window[1].as_bytes();
-            (date.len() >= 10 && date[4] == b'-' && date[7] == b'-').then_some(size)
-        })
-        .or_else(|| fields.get(2).and_then(|value| value.parse::<u64>().ok()))
+    fields.iter().enumerate().skip(1).find_map(|(index, field)| {
+        if !tar_date(field) {
+            return None;
+        }
+        fields[..index].iter().rev().find_map(|value| value.parse::<u64>().ok())
+    })
+}
+
+fn tar_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..].iter().all(u8::is_ascii_digit))
+        || matches!(
+            value,
+            "Jan"
+                | "Feb"
+                | "Mar"
+                | "Apr"
+                | "May"
+                | "Jun"
+                | "Jul"
+                | "Aug"
+                | "Sep"
+                | "Oct"
+                | "Nov"
+                | "Dec"
+        )
 }
 
 fn validate_archive(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -6993,9 +7016,10 @@ fn archive_listing(
 }
 
 fn safe_archive(root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let root = std::fs::canonicalize(root)?;
     let mut files = 0_usize;
     let mut bytes = 0_u64;
-    safe_archive_at(root, &mut files, &mut bytes)
+    safe_archive_at(&root, &mut files, &mut bytes)
 }
 
 fn safe_archive_at(

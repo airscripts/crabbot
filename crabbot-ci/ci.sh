@@ -54,7 +54,7 @@ local_make() {
 }
 
 printf '\n[INFO] Local Verify preflight\n'
-local_make fmt clippy check coverage metrics
+local_make fmt clippy metrics
 
 RUSTDOCFLAGS='-D warnings' CARGO_TARGET_DIR="$local_target_dir" \
     cargo doc --workspace --no-deps --locked
@@ -62,6 +62,7 @@ RUSTDOCFLAGS='-D warnings' CARGO_TARGET_DIR="$local_target_dir" \
 bash -n crabbot-scripts/*.sh install.sh
 
 printf '\n[INFO] Local Test preflight\n'
+local_make coverage
 local_make test
 
 printf '\n[INFO] Local Build preflight\n'

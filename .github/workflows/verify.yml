@@ -53,11 +53,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Install Archive Tools
+      - name: Install Metrics Tools
         if: inputs.local != 'true'
         run: |
           apt-get update
-          apt-get install --no-install-recommends -y ripgrep zip
+          apt-get install --no-install-recommends -y ripgrep
 
       - name: Install Rust Components
         run: rustup component add rustfmt clippy
@@ -67,18 +67,6 @@ jobs:
 
       - name: Run Clippy
         run: CARGO_BUILD_JOBS=4 cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: Check Workspace
-        run: CARGO_BUILD_JOBS=4 cargo check --workspace --all-targets --locked
-
-      - name: Install Coverage Tool
-        uses: taiki-e/install-action@v2
-
-        with:
-          tool: cargo-llvm-cov
-
-      - name: Check Coverage
-        run: make coverage
 
       - name: Check Documentation
         run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
