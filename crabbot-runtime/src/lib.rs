@@ -40,13 +40,16 @@ pub(crate) mod state;
 
 const NAME: &str = "crabbot";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const BANNER: &str = r#"
- ██████╗ ██████╗   █████╗  ██████╗  ██████╗   ██████╗  ████████╗
-██╔════╝ ██╔══██╗ ██╔══██╗ ██╔══██╗ ██╔══██╗ ██╔═══██╗ ╚══██╔══╝
-██║      ██████╔╝ ███████║ ██████╔╝ ██████╔╝ ██║   ██║    ██║   
-██║      ██╔══██╗ ██╔══██║ ██╔══██╗ ██╔══██╗ ██║   ██║    ██║   
-╚██████╗ ██║  ██║ ██║  ██║ ██████╔╝ ██████╔╝ ╚██████╔╝    ██║   
- ╚═════╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝   ╚═════╝     ╚═╝   "#;
+const BANNER: &str = concat!(
+    "\n",
+    " ██████╗ ██████╗   █████╗  ██████╗  ██████╗   ██████╗  ████████╗\n",
+    "██╔════╝ ██╔══██╗ ██╔══██╗ ██╔══██╗ ██╔══██╗ ██╔═══██╗ ╚══██╔══╝\n",
+    "██║      ██████╔╝ ███████║ ██████╔╝ ██████╔╝ ██║   ██║    ██║   \n",
+    "██║      ██╔══██╗ ██╔══██║ ██╔══██╗ ██╔══██╗ ██║   ██║    ██║   \n",
+    "╚██████╗ ██║  ██║ ██║  ██║ ██████╔╝ ██████╔╝ ╚██████╔╝    ██║   \n",
+    " ╚═════╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝   ╚═════╝     ╚═╝   ",
+);
+
 const TOOL_STEPS: usize = 8;
 const TOOL_CALLS: usize = 16;
 const TURN_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -7367,6 +7370,23 @@ mod tests {
         std::env::temp_dir().join(format!("crabbot-{label}-{}-{nonce}", std::process::id()))
     }
 
+    fn approval_finished(sessions: &Arc<Mutex<super::state::Store>>) -> bool {
+        let Ok(store) = sessions.lock() else {
+            return false;
+        };
+
+        let Some(session) = store.sessions.get("telegram-7") else {
+            return false;
+        };
+
+        session.status == "idle"
+            && session.messages.iter().any(|message| {
+                message.content.iter().any(|content| {
+                    matches!(content, Content::Text { text } if text == "The note was written.")
+                })
+            })
+    }
+
     async fn registry(processes: impl IntoIterator<Item = Process>) -> Plugins {
         let plugins = Plugins::default();
         for process in processes {
@@ -9859,13 +9879,23 @@ mod tests {
             Arc::new(Mutex::new(super::state::Store::load(root.join("sessions.json")).unwrap()));
         let stop = Arc::new(Stop::new());
         let signal = Arc::clone(&stop);
+        let marker_for_signal = marker.clone();
+        let sessions_for_signal = Arc::clone(&sessions);
+
         let notifier = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            for _ in 0..500 {
+                if marker_for_signal.is_file() && approval_finished(&sessions_for_signal) {
+                    break;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
             signal.signal();
         });
 
         tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(6),
             super::bridge(
                 &plugins,
                 "telegram",
