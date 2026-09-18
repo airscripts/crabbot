@@ -859,28 +859,42 @@ mod tests {
             std::env::temp_dir().join(format!("crabbot-whatsapp-download-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let Some(listener) = loopback_listener().await else {
+
+        let Some(graph_listener) = loopback_listener().await else {
             return;
         };
-        let address = listener.local_addr().unwrap();
+
+        let Some(media_listener) = loopback_listener().await else {
+            return;
+        };
+
+        let graph_address = graph_listener.local_addr().unwrap();
+        let media_address = media_listener.local_addr().unwrap();
+
         let server = tokio::spawn(async move {
-            let (mut response, _) = listener.accept().await.unwrap();
+            let (mut response, _) = graph_listener.accept().await.unwrap();
             let mut request = [0_u8; 4096];
             let _ = response.read(&mut request).await.unwrap();
-            let body = format!(r#"{{"url":"http://{address}/file"}}"#);
+            let body = format!(r#"{{"url":"http://{media_address}/file"}}"#);
+
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
+
             response.write_all(header.as_bytes()).await.unwrap();
             response.write_all(body.as_bytes()).await.unwrap();
             drop(response);
-            let (mut response, _) = listener.accept().await.unwrap();
+            let (mut response, _) = media_listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = response.read(&mut request).await.unwrap();
             let body = b"voice";
+
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
+
             response.write_all(header.as_bytes()).await.unwrap();
             response.write_all(body).await.unwrap();
             drop(response);
@@ -889,10 +903,12 @@ mod tests {
             client: test_client(),
             queue: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
         };
+
         let value =
-            media_at(&app, "media-1", "token", &format!("http://{address}"), &root, |_| true)
+            media_at(&app, "media-1", "token", &format!("http://{graph_address}"), &root, |_| true)
                 .await
                 .unwrap();
+
         let path = value["uri"].as_str().unwrap().strip_prefix("file://").unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"voice");
         server.await.unwrap();
