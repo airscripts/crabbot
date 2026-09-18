@@ -5475,12 +5475,14 @@ fn windows_service_install(
     executable: &Path,
     environment: &[(String, String)],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let command = format!("binPath= \"{}\"", executable.display());
+    let executable = executable.display().to_string();
     let output = command_output(std::process::Command::new("sc.exe").args([
         "create",
         "Crabbot",
-        &command,
-        "start= auto",
+        "binPath=",
+        &executable,
+        "start=",
+        "auto",
     ]))?;
     if !output.status.success() {
         let detail = format!(
@@ -7798,13 +7800,13 @@ mod tests {
             "id = 'echo'\nversion = '0.1.0'\nprotocol = { major = 0, minor = 1 }\ncapabilities = ['model']\n",
         )
         .unwrap();
-        let binary = plugin.join("bin/crabbot-plugin-echo");
+        let binary = plugin.join("bin").join(super::plugin_name("echo"));
         fs::write(&binary, "binary").unwrap();
         assert_eq!(installed_at(&root), vec!["echo"]);
         assert_eq!(binary_at("echo", &root), Some(binary.clone()));
         assert!(binary_at("../escape", &root).is_none());
         let default_source = root.join("repo/crabbot-plugins/echo");
-        let default_binary = root.join("repo/target/debug/crabbot-plugin-echo");
+        let default_binary = root.join("repo/target/debug").join(super::plugin_name("echo"));
         fs::create_dir_all(&default_source).unwrap();
         fs::create_dir_all(default_binary.parent().unwrap()).unwrap();
         fs::write(&default_binary, "default binary").unwrap();
@@ -8612,6 +8614,7 @@ mod tests {
     #[tokio::test]
     async fn manages_local_sessions_and_plugins() {
         let root = test_root("host");
+        let memory_binary = super::plugin_name("memory");
         let _ = fs::remove_dir_all(&root);
         local_session(SessionCommand::List(Output { json: false }), &root).unwrap();
         local_session(
@@ -8638,7 +8641,7 @@ mod tests {
         super::init_at(&root).unwrap();
         fs::create_dir_all(root.join("plugins/memory/bin")).unwrap();
         fs::write(
-            root.join("plugins/memory/bin/crabbot-plugin-memory"),
+            root.join("plugins/memory/bin").join(&memory_binary),
             "#!/bin/sh\nwhile IFS= read -r line; do\ncase \"$line\" in\n*hello*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol\":{\"major\":0,\"minor\":1},\"id\":\"memory\",\"version\":\"0.1.0\",\"capabilities\":[\"memory\"]}}' ;;\n*shutdown*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":9999,\"result\":{\"ok\":true}}'; exit 0 ;;\nesac\ndone\n",
         )
         .unwrap();
@@ -8656,7 +8659,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            plugin_root.join("bin/crabbot-plugin-memory"),
+            plugin_root.join("bin").join(&memory_binary),
             "#!/bin/sh\nwhile IFS= read -r line; do\ncase \"$line\" in\n*hello*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol\":{\"major\":0,\"minor\":1},\"id\":\"memory\",\"version\":\"0.1.0\",\"capabilities\":[\"memory\"]}}' ;;\n*shutdown*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":9999,\"result\":{\"ok\":true}}'; exit 0 ;;\nesac\ndone\n",
         )
         .unwrap();
@@ -8665,10 +8668,9 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
 
             let mut permissions =
-                fs::metadata(plugin_root.join("bin/crabbot-plugin-memory")).unwrap().permissions();
+                fs::metadata(plugin_root.join("bin").join(&memory_binary)).unwrap().permissions();
             permissions.set_mode(0o755);
-            fs::set_permissions(plugin_root.join("bin/crabbot-plugin-memory"), permissions)
-                .unwrap();
+            fs::set_permissions(plugin_root.join("bin").join(&memory_binary), permissions).unwrap();
         }
         let source = Source {
             id: "memory".into(),
@@ -8693,7 +8695,7 @@ mod tests {
         );
         #[cfg(unix)]
         assert!(
-            fs::symlink_metadata(root.join("plugins/memory/bin/crabbot-plugin-memory"))
+            fs::symlink_metadata(root.join("plugins/memory/bin").join(&memory_binary))
                 .unwrap()
                 .file_type()
                 .is_symlink()
@@ -8715,10 +8717,9 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
 
             let mut permissions =
-                fs::metadata(plugin_root.join("bin/crabbot-plugin-memory")).unwrap().permissions();
+                fs::metadata(plugin_root.join("bin").join(&memory_binary)).unwrap().permissions();
             permissions.set_mode(0o700);
-            fs::set_permissions(plugin_root.join("bin/crabbot-plugin-memory"), permissions)
-                .unwrap();
+            fs::set_permissions(plugin_root.join("bin").join(&memory_binary), permissions).unwrap();
         }
         update_at(&root, true).unwrap();
         assert_eq!(read_manifest(&root.join("plugins/memory")).unwrap().version, "0.2.0");
@@ -8775,7 +8776,7 @@ mod tests {
             )
             .is_err()
         );
-        fs::remove_file(plugin_root.join("bin/crabbot-plugin-memory")).unwrap();
+        fs::remove_file(plugin_root.join("bin").join(&memory_binary)).unwrap();
         assert!(
             super::link_at(
                 Source {

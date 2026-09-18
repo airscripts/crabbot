@@ -688,21 +688,27 @@ mod tests {
     }
 
     fn state_at(label: &str) -> State {
-        let path = PathBuf::from(format!(
-            "/tmp/crabbot-ipc-test-{}-{}-{}.json",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test"),
-            label
-        ));
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .chars()
+            .map(|value| if value.is_ascii_alphanumeric() { value } else { '_' })
+            .collect::<String>();
+
+        let path = std::env::temp_dir()
+            .join(format!("crabbot-ipc-test-{}-{thread}-{label}.json", std::process::id()));
+
         let _ = std::fs::remove_file(&path);
+        let temp = std::env::temp_dir();
+
         State {
             token: "secret".into(),
             sessions: Arc::new(Mutex::new(Store::load(path).unwrap())),
             stop: Arc::new(Stop::new()),
             slots: Arc::new(Semaphore::new(super::CLIENTS)),
             cancels: Arc::new(Mutex::new(BTreeMap::new())),
-            root: PathBuf::from("/tmp"),
-            home: PathBuf::from(format!("/tmp/crabbot-ipc-home-{}-{}", std::process::id(), label)),
+            root: temp.clone(),
+            home: temp.join(format!("crabbot-ipc-home-{}-{thread}-{label}", std::process::id())),
             approval_mode: "off".into(),
             pending: Arc::new(tokio::sync::Mutex::new(crate::approval::Gate::new().unwrap())),
             plugins: crate::Plugins::default(),
@@ -1081,13 +1087,13 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         );
         let shutdown =
             dispatch(&IpcRequest::call(15, "secret", "shutdown", json!({})), &state).unwrap();
+
         assert_eq!(shutdown.result.unwrap()["ok"], true);
-        let _ = std::fs::remove_file(format!("/tmp/crabbot-ipc-test-{}.json", std::process::id()));
     }
 
     #[test]
     fn lists_safe_plugins_only() {
-        let root = PathBuf::from(format!("/tmp/crabbot-ipc-plugins-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("crabbot-ipc-plugins-{}", std::process::id()));
         let plugin_root = root.join("plugins");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&plugin_root).unwrap();
@@ -1163,7 +1169,10 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
     #[test]
     fn stores_only_canonical_session_workspaces() {
         let state = state_at("workspace");
-        let root = PathBuf::from(format!("/tmp/crabbot-ipc-workspace-{}", std::process::id()));
+
+        let root =
+            std::env::temp_dir().join(format!("crabbot-ipc-workspace-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         dispatch(&IpcRequest::call(1, "secret", "session.new", json!({"id": "one"})), &state)
@@ -1346,10 +1355,6 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
             dispatch(&IpcRequest::call(2, "secret", "session.get", json!({"id": "large"})), &state)
                 .unwrap();
         assert!(serde_json::to_vec(&detail).unwrap().len().saturating_add(1) <= FRAME);
-        let _ = std::fs::remove_file(format!(
-            "/tmp/crabbot-ipc-test-{}-large.json",
-            std::process::id()
-        ));
     }
 
     #[test]
