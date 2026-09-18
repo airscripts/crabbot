@@ -9885,7 +9885,10 @@ mod tests {
         let notifier = tokio::spawn(async move {
             for _ in 0..500 {
                 if marker_for_signal.is_file() && approval_finished(&sessions_for_signal) {
-                    break;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if approval_finished(&sessions_for_signal) {
+                        break;
+                    }
                 }
 
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
