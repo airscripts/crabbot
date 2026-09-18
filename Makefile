@@ -1,12 +1,5 @@
 CARGO ?= cargo
 JOBS ?= 4
-COVERAGE_PACKAGES = \
-  -p crabbot-core \
-  -p crabbot-file \
-  -p crabbot-runtime \
-  -p crabbot \
-  -p crabbot-daemon
-
 .DEFAULT_GOAL := help
 .PHONY: help install hooks fmt clippy check test coverage build release metrics ci verify
 
@@ -45,7 +38,7 @@ test:
 	CARGO_BUILD_JOBS=$(JOBS) $(CARGO) test --workspace --locked
 
 coverage:
-	$(CARGO) llvm-cov --fail-under-lines 80 --locked $(COVERAGE_PACKAGES)
+	bash crabbot-scripts/coverage.sh
 
 build:
 	CARGO_BUILD_JOBS=$(JOBS) $(CARGO) build --workspace --locked

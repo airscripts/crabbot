@@ -1030,17 +1030,23 @@ struct CrabPlugin {
 }
 
 fn export_crabfile(args: CrabfileExport) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    export_crabfile_at(args, &home())
+}
+
+fn export_crabfile_at(
+    args: CrabfileExport,
+    root: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = args.path.unwrap_or_else(|| PathBuf::from("Crabfile"));
     if path.exists() {
         return Err(format!("{} already exists; choose another path.", path.display()).into());
     }
-    let root = home();
     let config = if root.join("config.toml").is_file() {
         toml::from_str(&std::fs::read_to_string(root.join("config.toml"))?)?
     } else {
         Config::default()
     };
-    let lock = load_lock_at(&root)?;
+    let lock = load_lock_at(root)?;
     let mut plugins = lock
         .plugins
         .into_iter()
@@ -1061,6 +1067,13 @@ fn export_crabfile(args: CrabfileExport) -> Result<(), Box<dyn std::error::Error
 }
 
 fn import_crabfile(args: CrabfileImport) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    import_crabfile_at(args, &home())
+}
+
+fn import_crabfile_at(
+    args: CrabfileImport,
+    root: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = args.path.unwrap_or_else(|| PathBuf::from("Crabfile"));
     if !args.yes {
         return Err("Import requires --yes.".into());
@@ -1077,13 +1090,12 @@ fn import_crabfile(args: CrabfileImport) -> Result<(), Box<dyn std::error::Error
             );
         }
     }
-    let root = home();
     let destination = root.join("config.toml");
     if destination.exists() && !args.force {
         return Err("Configuration already exists; use --force to replace it.".into());
     }
     let previous_config = std::fs::read(&destination).ok();
-    init_at(&root)?;
+    init_at(root)?;
     secure(&destination, toml::to_string_pretty(&file.config)?.as_bytes())?;
     let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for plugin in &file.plugins {
@@ -1097,9 +1109,10 @@ fn import_crabfile(args: CrabfileImport) -> Result<(), Box<dyn std::error::Error
                     yes: args.force,
                 },
                 false,
-                &root,
+                root,
             )?;
-            let lock = load_lock_at(&root)?;
+
+            let lock = load_lock_at(root)?;
             let entry = lock
                 .plugins
                 .get(&plugin.id)
@@ -7359,20 +7372,25 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ARCHIVE_LIMIT, BANNER, Cancellation, Cli, Command, CommandSpec, Config, Fork, Id, Live,
-        Manifest, Name, Output, Plugins, Process, ServiceCommand, SessionCommand, SessionModel,
-        SessionNew, Sha256, Source, Stop, answer, archive, archive_root, archive_url, assistant,
-        binary_at, canonical_source, changed, channel_message_id, command_output_limited,
-        commit_event, daemon_lock, delivery_request, download, embedded, ensure_home, env_for,
-        init_at, installed_at, isolate_at, local_session, plugin_binary, read_manifest,
-        reclaim_worktrees, recover, recover_plugins, redact, resolve, restart_tool, revision,
-        safe_archive, send_params, service_at, service_at_with, service_environment_from,
+        ARCHIVE_LIMIT, BANNER, Cancellation, Cli, Command, CommandSpec, Config, CrabfileExport,
+        CrabfileImport, DeliveryCommand, Fork, Id, Live, Manifest, Name, Output, Plugins, Process,
+        ServiceCommand, SessionCommand, SessionModel, SessionNew, Sha256, Source, Stop, answer,
+        archive, archive_root, archive_url, assistant, binary_at, canonical_source, changed,
+        channel_message_id, command_output_limited, commit_event, daemon_lock, delivery_at,
+        delivery_request, download, embedded, ensure_home, env_for, export_crabfile_at,
+        import_crabfile_at, init_at, installed_at, isolate_at, local_session, plugin_binary,
+        read_manifest, reclaim_worktrees, recover, recover_plugins, redact, resolve, restart_tool,
+        revision, safe_archive, send_params, service_at, service_at_with, service_environment_from,
         service_path_value, service_text, session_at, stream_fits, tool, update_at,
         validate_archive, verify_archive, write_debug_report_at,
     };
+
     use base64::Engine;
     use clap::{CommandFactory, Parser, error::ErrorKind};
-    use crabbot_core::types::{Content, Event, Message, ModelReply, Protocol, Request, Role};
+    use crabbot_core::types::{
+        Capability, Content, Event, Message, ModelReply, Protocol, Request, Role,
+    };
+
     use sha2::Digest;
     use std::{
         collections::BTreeMap,
@@ -7501,6 +7519,151 @@ mod tests {
             assert!(Config { approval: approval.into(), ..Config::default() }.validate().is_ok());
         }
         assert!(Config { approval: "unsafe".into(), ..Config::default() }.validate().is_err());
+    }
+
+    #[test]
+    fn covers_runtime_helpers() {
+        assert_eq!(super::sentence("hello"), "Hello.");
+        assert_eq!(super::sentence("Already!"), "Already!");
+        assert_eq!(super::sentence(""), ".");
+
+        assert_eq!(
+            super::diagnostic("https://user:secret@example.com/path"),
+            "https://[redacted]@example.com/path"
+        );
+
+        assert_eq!(
+            super::redact_diagnostic("Authorization: Bearer secret"),
+            "Authorization: [redacted]"
+        );
+
+        for capability in [
+            Capability::Model,
+            Capability::Vision,
+            Capability::Channel,
+            Capability::Store,
+            Capability::Memory,
+            Capability::Timer,
+            Capability::Tool,
+            Capability::Mcp,
+            Capability::Speech,
+            Capability::Client,
+            Capability::Resource,
+            Capability::Agent,
+        ] {
+            assert!(!super::capability_name(&capability).is_empty());
+        }
+
+        for name in [
+            "help", "init", "doctor", "status", "version", "plugin", "session", "delivery",
+            "service", "ask", "export", "import",
+        ] {
+            assert!(super::native_command(name));
+        }
+
+        assert!(!super::native_command("custom"));
+        assert!(super::valid("memory-2"));
+        assert!(!super::valid("Memory"));
+        assert!(!super::valid(""));
+
+        for approval in ["off", "prompt", "auto"] {
+            let config = Config { approval: approval.into(), ..Config::default() };
+            assert_eq!(config.approval_mode().enabled(), approval != "off");
+        }
+
+        assert_eq!(super::ApprovalMode::Off, super::ApprovalMode::Off);
+        assert!(super::plugin_name("memory").contains("memory"));
+        assert_eq!(super::command_label(&Command::Init), "init");
+        assert_eq!(super::command_label(&Command::Doctor), "doctor");
+        assert_eq!(super::command_label(&Command::Status(Output { json: false })), "status");
+        assert_eq!(super::command_label(&Command::Version), "version");
+
+        assert_eq!(
+            super::command_label(&Command::Plugin {
+                command: super::PluginCommand::List(Output { json: false })
+            }),
+            "plugin"
+        );
+
+        assert_eq!(
+            super::command_label(&Command::Session {
+                command: SessionCommand::List(Output { json: false })
+            }),
+            "session"
+        );
+
+        assert_eq!(
+            super::command_label(&Command::Delivery {
+                command: super::DeliveryCommand::List(Output { json: false })
+            }),
+            "delivery"
+        );
+
+        assert_eq!(
+            super::command_label(&Command::Service { command: Some(ServiceCommand::Status) }),
+            "service"
+        );
+
+        assert_eq!(
+            super::command_label(&Command::Ask(super::Ask {
+                plugin: "x".into(),
+                model: "m".into(),
+                prompt: vec![]
+            })),
+            "ask"
+        );
+
+        assert_eq!(
+            super::command_label(&Command::Export(super::CrabfileExport { path: None })),
+            "export"
+        );
+
+        assert_eq!(
+            super::command_label(&Command::Import(super::CrabfileImport {
+                path: None,
+                yes: false,
+                force: false
+            })),
+            "import"
+        );
+
+        assert_eq!(super::command_label(&Command::External(vec!["custom".into()])), "external");
+
+        let session = SessionCommand::List(Output { json: false });
+        assert!(matches!(
+            super::with_session_json(session, true),
+            SessionCommand::List(Output { json: true })
+        ));
+
+        let delivery = super::DeliveryCommand::List(Output { json: false });
+        assert!(matches!(
+            super::with_delivery_json(delivery, true),
+            super::DeliveryCommand::List(Output { json: true })
+        ));
+
+        let command = super::git_command();
+        assert_eq!(command.get_program(), "git");
+
+        assert!(
+            super::command_output_limited(&mut std::process::Command::new("true"), None, 0).is_ok()
+        );
+
+        assert_eq!(super::read_output(std::io::Cursor::new(b"output")).unwrap(), b"output");
+        assert!(
+            super::read_output(std::io::Cursor::new(vec![b'x'; super::COMMAND_OUTPUT + 1]))
+                .is_err()
+        );
+
+        let root = test_root("helpers");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("file"), b"123").unwrap();
+        assert_eq!(super::staging_size(&root).unwrap(), 3);
+        assert!(super::read_bounded(&root.join("file"), 3).is_ok());
+        assert!(super::read_bounded(&root.join("file"), 2).is_err());
+        assert!(super::read_bounded(&root.join("missing"), 3).is_err());
+        assert!(super::read_bounded(&root, 3).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -8640,11 +8803,13 @@ mod tests {
         super::init_at(&root).unwrap();
         super::init_at(&root).unwrap();
         fs::create_dir_all(root.join("plugins/memory/bin")).unwrap();
-        fs::write(
-            root.join("plugins/memory/bin").join(&memory_binary),
-            "#!/bin/sh\nwhile IFS= read -r line; do\ncase \"$line\" in\n*hello*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol\":{\"major\":0,\"minor\":1},\"id\":\"memory\",\"version\":\"0.1.0\",\"capabilities\":[\"memory\"]}}' ;;\n*shutdown*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":9999,\"result\":{\"ok\":true}}'; exit 0 ;;\nesac\ndone\n",
-        )
-        .unwrap();
+        write_test_plugin(
+            &root.join("plugins/memory/bin").join(&memory_binary),
+            "memory",
+            "memory",
+            "0.1.0",
+        );
+
         assert!(super::binary_at("memory", &root).is_some());
         assert!(super::binary_at("missing", &root).is_none());
         assert!(super::binary_at("../escape", &root).is_none());
@@ -8658,20 +8823,14 @@ mod tests {
             "id = 'memory'\nversion = '0.1.0'\nprotocol = { major = 0, minor = 1 }\ncapabilities = ['memory']\n",
         )
         .unwrap();
-        fs::write(
-            plugin_root.join("bin").join(&memory_binary),
-            "#!/bin/sh\nwhile IFS= read -r line; do\ncase \"$line\" in\n*hello*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol\":{\"major\":0,\"minor\":1},\"id\":\"memory\",\"version\":\"0.1.0\",\"capabilities\":[\"memory\"]}}' ;;\n*shutdown*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":9999,\"result\":{\"ok\":true}}'; exit 0 ;;\nesac\ndone\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
 
-            let mut permissions =
-                fs::metadata(plugin_root.join("bin").join(&memory_binary)).unwrap().permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(plugin_root.join("bin").join(&memory_binary), permissions).unwrap();
-        }
+        write_test_plugin(
+            &plugin_root.join("bin").join(&memory_binary),
+            "memory",
+            "memory",
+            "0.1.0",
+        );
+
         let source = Source {
             id: "memory".into(),
             source: Some(plugin_root.display().to_string()),
@@ -8810,6 +8969,82 @@ mod tests {
         );
         assert!(super::remove(Name { id: "bad_id".into(), yes: true }).is_err());
         local_session(SessionCommand::List(Output { json: false }), &root).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn covers_offline_delivery_and_crabfile_commands() {
+        let root = test_root("offline-delivery");
+        let _ = fs::remove_dir_all(&root);
+        super::init_at(&root).unwrap();
+
+        let mut store = super::state::Store::load(root.join("sessions.json")).unwrap();
+        store.create("main", "test").unwrap();
+
+        store
+            .reply(
+                "main",
+                Message {
+                    id: "message".into(),
+                    session: "main".into(),
+                    role: Role::User,
+                    sender: None,
+                    content: vec![Content::Text { text: "hello".into() }],
+                },
+                "delivery",
+                "telegram",
+                "chat",
+                None,
+                "reply",
+            )
+            .unwrap();
+
+        store.uncertain("delivery", "interrupted").unwrap();
+
+        delivery_at(DeliveryCommand::List(Output { json: false }), &root).await.unwrap();
+        delivery_at(DeliveryCommand::List(Output { json: true }), &root).await.unwrap();
+
+        assert!(
+            delivery_at(DeliveryCommand::Retry(Name { id: "delivery".into(), yes: false }), &root)
+                .await
+                .is_err()
+        );
+
+        delivery_at(DeliveryCommand::Retry(Name { id: "delivery".into(), yes: true }), &root)
+            .await
+            .unwrap();
+
+        assert!(
+            delivery_at(DeliveryCommand::Drop(Name { id: "missing".into(), yes: true }), &root)
+                .await
+                .is_err()
+        );
+
+        delivery_at(DeliveryCommand::Drop(Name { id: "delivery".into(), yes: true }), &root)
+            .await
+            .unwrap();
+
+        let crabfile = root.join("Crabfile");
+        export_crabfile_at(CrabfileExport { path: Some(crabfile.clone()) }, &root).unwrap();
+
+        assert!(
+            export_crabfile_at(CrabfileExport { path: Some(crabfile.clone()) }, &root).is_err()
+        );
+
+        assert!(
+            import_crabfile_at(
+                CrabfileImport { path: Some(crabfile), yes: false, force: false },
+                &root
+            )
+            .is_err()
+        );
+
+        import_crabfile_at(
+            CrabfileImport { path: Some(root.join("Crabfile")), yes: true, force: true },
+            &root,
+        )
+        .unwrap();
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9001,8 +9236,9 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn write_test_plugin(path: &Path, id: &str, capability: &str, version: &str) {
+        #[cfg(unix)]
         fs::write(
             path,
             format!(
@@ -9010,6 +9246,64 @@ mod tests {
             ),
         )
         .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+
+        #[cfg(windows)]
+        {
+            let source = path.with_extension("rs");
+            let source_code = r##"
+use std::io::{BufRead, Write};
+
+fn main() {
+    for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+        let id = line
+            .split_once("\"id\":")
+            .and_then(|(_, rest)| rest.split(',').next())
+            .unwrap_or("1");
+        let response = if line.contains("\"method\":\"hello\"") {
+            format!(r#"{{"jsonrpc":"2.0","id":{},"result":{{"protocol":{{"major":0,"minor":1}},"id":"__PLUGIN_ID__","version":"__PLUGIN_VERSION__","capabilities":["__PLUGIN_CAPABILITY__"]}}}}"#, id)
+        } else if line.contains("\"method\":\"shutdown\"") {
+            format!(r#"{{"jsonrpc":"2.0","id":{},"result":{{"ok":true}}}}"#, id)
+        } else {
+            continue;
+        };
+        println!("{response}");
+        std::io::stdout().flush().unwrap();
+        if line.contains("\"method\":\"shutdown\"") {
+            break;
+        }
+    }
+}
+"##
+            .replace("__PLUGIN_ID__", id)
+            .replace("__PLUGIN_VERSION__", version)
+            .replace("__PLUGIN_CAPABILITY__", capability);
+            fs::write(&source, source_code).unwrap();
+
+            let output = std::process::Command::new("rustc")
+                .args(["--edition", "2024"])
+                .arg(&source)
+                .arg("-o")
+                .arg(path)
+                .output()
+                .unwrap();
+
+            assert!(
+                output.status.success(),
+                "could not compile the Windows test plugin: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            fs::remove_file(source).unwrap();
+        }
     }
 
     #[cfg(unix)]

@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 
+#[cfg(not(test))]
+use crabbot_core::types::{Request, Response};
+#[cfg(not(test))]
 use crabbot_core::{
     plugin::serve_with,
-    types::{Capability, Hello, Protocol, Request, Response},
+    types::{Capability, Hello, Protocol},
 };
 use serde_json::{Value, json};
 use std::{
@@ -15,6 +18,7 @@ const OUTPUT_LIMIT: usize = crabbot_core::jsonl::MAX / 2;
 const MEDIA_LIMIT: usize = 4 * 1024 * 1024;
 
 #[tokio::main]
+#[cfg(not(test))]
 async fn main() -> crabbot_core::Result<()> {
     serve_with(
         Hello {
@@ -29,6 +33,7 @@ async fn main() -> crabbot_core::Result<()> {
     .await
 }
 
+#[cfg(not(test))]
 async fn call(request: Request) -> crabbot_core::Result<Option<Response>> {
     let (id, method, params) = match request {
         Request::Call { id, method, params, .. } => (id, method, params),
@@ -71,6 +76,7 @@ async fn run_with(command: &str, args: &[String]) -> crabbot_core::Result<Value>
     Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({"output": text})))
 }
 
+#[cfg(not(test))]
 async fn poll(account: &str) -> crabbot_core::Result<Value> {
     let command = std::env::var("CRABBOT_SIGNAL_COMMAND").unwrap_or_else(|_| "signal-cli".into());
     poll_with(account, &command, &[]).await
@@ -140,6 +146,7 @@ fn content(data: &Value) -> Vec<Value> {
     items
 }
 
+#[cfg(not(test))]
 async fn send(account: &str, params: &Value) -> crabbot_core::Result<Value> {
     let command = std::env::var("CRABBOT_SIGNAL_COMMAND").unwrap_or_else(|_| "signal-cli".into());
     send_with(account, params, &command, &[]).await
@@ -170,6 +177,7 @@ async fn send_with(
     run_with(command, &args).await
 }
 
+#[cfg(not(test))]
 async fn media(params: &Value) -> crabbot_core::Result<Value> {
     let uri = params["uri"]
         .as_str()
@@ -204,6 +212,7 @@ fn local_media(uri: &str) -> crabbot_core::Result<std::path::PathBuf> {
     local_media_at(uri, &root)
 }
 
+#[cfg(not(test))]
 fn media_root() -> crabbot_core::Result<PathBuf> {
     std::env::var_os("CRABBOT_MEDIA")
         .or_else(|| {
@@ -320,6 +329,14 @@ mod tests {
         let value = media_at(&format!("file://{}", path.display()), &root).await.unwrap();
         assert!(value["uri"].as_str().unwrap().ends_with("voice.ogg"));
         assert!(media_at("file://missing", &root).await.is_err());
+        assert!(media_at("signal://attachment/1", &root).await.is_err());
+
+        let outside =
+            std::env::temp_dir().join(format!("crabbot-signal-outside-{}", std::process::id()));
+
+        std::fs::write(&outside, b"outside").unwrap();
+        assert!(media_at(&format!("file://{}", outside.display()), &root).await.is_err());
+        let _ = std::fs::remove_file(outside);
         let _ = std::fs::remove_dir_all(root);
     }
 }

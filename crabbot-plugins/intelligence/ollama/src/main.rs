@@ -1,10 +1,13 @@
 #![forbid(unsafe_code)]
 
 use crabbot_core::{
-    plugin::{Emitter, serve_events},
-    types::{
-        Capability, Content, Event, Hello, ModelReply, ModelRequest, Protocol, Request, Response,
-    },
+    plugin::Emitter,
+    types::{Content, Event, ModelReply, ModelRequest, Request, Response},
+};
+#[cfg(not(test))]
+use crabbot_core::{
+    plugin::serve_events,
+    types::{Capability, Hello, Protocol},
 };
 use futures_util::{Stream, StreamExt};
 use serde_json::json;
@@ -14,6 +17,7 @@ use std::time::Duration;
 const BODY_LIMIT: usize = crabbot_core::jsonl::MAX / 2;
 
 #[tokio::main]
+#[cfg(not(test))]
 async fn main() -> crabbot_core::Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -532,9 +536,10 @@ fn response(id: u64, result: serde_json::Value) -> crabbot_core::Result<Option<R
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_LIMIT, Emitter, collect, generate, generate_at, generate_request, live_stream,
-        messages, response_body, stream_body, tools,
+        BODY_LIMIT, Emitter, collect, credential, generate, generate_at, generate_request,
+        image_data, keyring, live_stream, messages, response_body, stream_body, tools,
     };
+
     use crabbot_core::types::{Content, Message, ModelRequest, Request, Role, ToolSpec};
     use serde_json::json;
 
@@ -633,6 +638,11 @@ mod tests {
         input.messages[1].content[2] =
             Content::Image { uri: "file:///private/image.png".into(), alt: None };
         assert!(messages(&input).is_err());
+        assert_eq!(image_data("data:image/png;base64,aW1hZ2U=").unwrap(), "aW1hZ2U=");
+        assert!(image_data("data:image/bmp;base64,abc").is_err());
+        assert!(image_data("data:image/png;base64,").is_err());
+        assert!(keyring("ollama").is_none());
+        assert!(credential().is_none());
     }
 
     #[tokio::test]

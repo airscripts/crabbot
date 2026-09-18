@@ -567,9 +567,11 @@ fn response(id: u64, result: serde_json::Value) -> crabbot_core::Result<Option<R
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_LIMIT, Emitter, collect, generate, generate_at, generate_request, key, live_stream,
-        messages, response_body, stream_body, tools,
+        BODY_LIMIT, Emitter, anthropic_line, append_text, collect, generate, generate_at,
+        generate_request, image_block, key, keyring, live_stream, messages, response,
+        response_body, stream_body, tool_index, tools,
     };
+
     use crabbot_core::types::{Content, Message, ModelRequest, Request, Role, ToolSpec};
     use serde_json::json;
 
@@ -692,6 +694,10 @@ mod tests {
             .content
             .push(Content::Image { uri: "file:///private/image.png".into(), alt: None });
         assert!(messages(&input).is_err());
+        assert!(image_block("https://example.com/image.png").is_ok());
+        assert!(image_block("data:image/bmp;base64,abc").is_err());
+        assert!(image_block("data:image/png;base64,").is_err());
+        assert!(image_block("data:image/png;base64,not ok").is_err());
     }
 
     #[test]
@@ -699,6 +705,74 @@ mod tests {
         assert_eq!(key(Some("primary")).unwrap(), "primary");
         assert!(key(Some(" ")).is_err());
         assert!(key(None).is_err());
+        assert!(keyring("claude").is_none());
+        assert!(tool_index(&json!(16)).is_err());
+        let mut text = String::new();
+        let mut pending = String::new();
+        assert!(append_text(&"x".repeat(BODY_LIMIT + 1), &mut text, &mut pending).is_err());
+    }
+
+    #[test]
+    fn covers_stream_line_error_and_tool_limit_paths() {
+        let mut text = String::new();
+        let mut pending = String::new();
+        let mut tools = std::collections::BTreeMap::new();
+        let mut stop = String::new();
+        assert!(anthropic_line(&[0xff], &mut text, &mut pending, &mut tools, &mut stop).is_err());
+
+        assert!(
+            anthropic_line(
+                br#"data: {"type":"error"}"#,
+                &mut text,
+                &mut pending,
+                &mut tools,
+                &mut stop,
+            )
+            .is_err()
+        );
+
+        assert!(
+            anthropic_line(
+                br#"data: {"type":"content_block_delta","index":16,"delta":{"partial_json":"{}"}}"#,
+                &mut text,
+                &mut pending,
+                &mut tools,
+                &mut stop,
+            )
+            .is_err()
+        );
+
+        assert!(
+            anthropic_line(
+                br#"data: {"type":"message_delta","delta":{"stop_reason":"stop"}}"#,
+                &mut text,
+                &mut pending,
+                &mut tools,
+                &mut stop,
+            )
+            .is_ok()
+        );
+
+        assert_eq!(stop, "stop");
+    }
+
+    #[tokio::test]
+    async fn covers_tool_defaults_and_frame_bounds() {
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let mut emitter = Emitter::new(output);
+
+        let result = live_stream(
+            1,
+            futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+                br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","input":{}}}
+"#.to_vec(),
+            )]),
+            &mut emitter,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(response(1, json!({"large": "x".repeat(crabbot_core::jsonl::MAX)})).is_err());
     }
 
     #[tokio::test]

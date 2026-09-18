@@ -1,19 +1,28 @@
 #![forbid(unsafe_code)]
 
+#[cfg(not(test))]
+use crabbot_core::types::{Request, Response};
+#[cfg(not(test))]
 use crabbot_core::{
     plugin::serve_with,
-    types::{Capability, Hello, Protocol, Request, Response},
+    types::{Capability, Hello, Protocol},
 };
+#[cfg(not(test))]
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+#[cfg(not(test))]
+use std::time::Duration;
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::{fs, io::AsyncWriteExt, net::TcpStream, sync::Mutex};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+#[cfg(not(test))]
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 struct App {
     client: reqwest::Client,
+    #[cfg_attr(test, allow(dead_code))]
     socket: Arc<Mutex<Option<Socket>>>,
     attachments: Arc<Mutex<BTreeMap<String, Attachment>>>,
 }
@@ -29,6 +38,7 @@ struct Attachment {
 const MEDIA_LIMIT: usize = 4 * 1024 * 1024;
 
 #[tokio::main]
+#[cfg(not(test))]
 async fn main() -> crabbot_core::Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -56,6 +66,7 @@ async fn main() -> crabbot_core::Result<()> {
     .await
 }
 
+#[cfg(not(test))]
 async fn call(app: &App, request: Request) -> crabbot_core::Result<Option<Response>> {
     let (id, method, params) = match request {
         Request::Call { id, method, params, .. } => (id, method, params),
@@ -74,6 +85,7 @@ async fn call(app: &App, request: Request) -> crabbot_core::Result<Option<Respon
     Ok(Some(Response::ok(id, result)))
 }
 
+#[cfg(not(test))]
 async fn api(
     client: &reqwest::Client,
     token: &str,
@@ -108,6 +120,7 @@ async fn api_at(
     Ok(value)
 }
 
+#[cfg(not(test))]
 async fn poll(app: &App, token: &str) -> crabbot_core::Result<Value> {
     if let Ok(app_token) = std::env::var("CRABBOT_SLACK_APP_TOKEN")
         && !app_token.trim().is_empty()
@@ -159,6 +172,7 @@ async fn poll_at(
     Ok(json!({"events": events}))
 }
 
+#[cfg(not(test))]
 async fn socket_poll(app: &App, token: &str) -> crabbot_core::Result<Option<Vec<Value>>> {
     let mut socket = app.socket.lock().await;
     if socket.is_none() {
@@ -338,6 +352,7 @@ fn safe_name(value: &str) -> Option<String> {
     .then_some(value)
 }
 
+#[cfg(not(test))]
 async fn send(
     client: &reqwest::Client,
     token: &str,

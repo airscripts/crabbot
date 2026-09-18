@@ -39,36 +39,42 @@ jobs:
             arch: x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            coverage: true
 
           - name: Linux aarch64
             os: linux
             arch: aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            coverage: true
 
           - name: macOS x86_64
             os: macos
             arch: x86_64
             runner: macos-15-intel
             target: x86_64-apple-darwin
+            coverage: true
 
           - name: macOS aarch64
             os: macos
             arch: aarch64
             runner: macos-15
             target: aarch64-apple-darwin
+            coverage: true
 
           - name: Windows x86_64
             os: windows
             arch: x86_64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
+            coverage: true
 
           - name: Windows aarch64
             os: windows
             arch: aarch64
             runner: windows-11-arm
             target: aarch64-pc-windows-msvc
+            coverage: false
 
     steps:
       - name: Checkout
@@ -89,18 +95,19 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - if: matrix.coverage
         name: Install Coverage Tool
         uses: taiki-e/install-action@v2
 
         with:
           tool: cargo-llvm-cov
 
-      - if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - if: matrix.coverage
         name: Run Coverage
-        run: make coverage
+        shell: bash
+        run: bash crabbot-scripts/coverage.sh
 
-      - if: matrix.target != 'x86_64-unknown-linux-gnu'
+      - if: matrix.coverage == false
         name: Run Workspace Tests
         run: cargo test --workspace --locked --target "${{ matrix.target }}"
 

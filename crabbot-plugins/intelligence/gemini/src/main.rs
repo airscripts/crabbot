@@ -1,18 +1,19 @@
 #![forbid(unsafe_code)]
 
+use crabbot_core::types::{Content, Event, ModelReply, ModelRequest, Request, Response, Role};
+#[cfg(not(test))]
 use crabbot_core::{
     plugin::serve_events,
-    types::{
-        Capability, Content, Event, Hello, ModelReply, ModelRequest, Protocol, Request, Response,
-        Role,
-    },
+    types::{Capability, Hello, Protocol},
 };
 use serde_json::{Value, json};
+#[cfg(not(test))]
 use std::time::Duration;
 
 const BODY_LIMIT: usize = crabbot_core::jsonl::MAX / 2;
 
 #[tokio::main]
+#[cfg(not(test))]
 async fn main() -> crabbot_core::Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -220,6 +221,39 @@ mod tests {
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "Be concise.");
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["tools"][0]["functionDeclarations"][0]["name"], "read");
+
+        let mut input = request;
+        input.messages.push(Message {
+            id: "assistant".into(),
+            session: "s".into(),
+            role: Role::Assistant,
+            sender: None,
+            content: vec![Content::Text { text: "done".into() }],
+        });
+
+        input.messages.push(Message {
+            id: "tool".into(),
+            session: "s".into(),
+            role: Role::Tool,
+            sender: None,
+            content: vec![Content::Image { uri: "file://image".into(), alt: Some("alt".into()) }],
+        });
+
+        let body = request_body(&input).unwrap();
+        assert_eq!(body["contents"][1]["role"], "model");
+        assert_eq!(body["contents"][2]["parts"][0]["text"], "alt");
+    }
+
+    #[tokio::test]
+    async fn rejects_notes_and_unknown_calls_before_credentials() {
+        let client = reqwest::Client::new();
+
+        let note =
+            Request::Note { jsonrpc: "2.0".into(), method: "note".into(), params: json!({}) };
+
+        assert!(generate(&client, note).await.unwrap().is_none());
+        assert!(generate(&client, Request::call(1, "other", json!({}))).await.unwrap().is_none());
+        assert!(generate(&client, Request::call(1, "generate", json!("bad"))).await.is_err());
     }
 
     #[test]

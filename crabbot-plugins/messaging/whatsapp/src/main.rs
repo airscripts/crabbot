@@ -1,19 +1,18 @@
 #![forbid(unsafe_code)]
 
+use crabbot_core::types::{Content, Request, Response};
+#[cfg(not(test))]
 use crabbot_core::{
     plugin::serve_with,
-    types::{Capability, Content, Hello, Protocol, Request, Response},
+    types::{Capability, Hello, Protocol},
 };
 use futures_util::StreamExt;
 use ring::hmac;
 use serde_json::{Value, json};
 use std::{collections::VecDeque, fs, path::PathBuf, sync::Arc};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-    sync::Mutex,
-    time::Duration,
-};
+use tokio::{io::AsyncReadExt, sync::Mutex};
+#[cfg(not(test))]
+use tokio::{io::AsyncWriteExt, net::TcpListener, time::Duration};
 
 const BODY_LIMIT: usize = crabbot_core::jsonl::MAX / 2;
 const MEDIA_LIMIT: usize = 4 * 1024 * 1024;
@@ -26,6 +25,7 @@ struct App {
 }
 
 #[tokio::main]
+#[cfg(not(test))]
 async fn main() -> crabbot_core::Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -83,6 +83,7 @@ async fn call(app: &App, request: Request) -> crabbot_core::Result<Option<Respon
     Ok(Some(Response::ok(id, result)))
 }
 
+#[cfg(not(test))]
 async fn webhook_loop(listener: TcpListener, app: App) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else { continue };
@@ -528,15 +529,18 @@ fn chunks(value: &str, limit: usize) -> Vec<String> {
     }
     output
 }
+#[cfg(not(test))]
 fn listen() -> String {
     std::env::var("CRABBOT_WHATSAPP_LISTEN").unwrap_or_else(|_| "127.0.0.1:8787".into())
 }
 fn token() -> crabbot_core::Result<String> {
     env("CRABBOT_WHATSAPP_TOKEN")
 }
+#[cfg(not(test))]
 fn app_secret() -> Result<String, String> {
     env("CRABBOT_WHATSAPP_APP_SECRET").map_err(|error| error.to_string())
 }
+#[cfg(not(test))]
 fn verify_token() -> Result<String, String> {
     env("CRABBOT_WHATSAPP_VERIFY").map_err(|error| error.to_string())
 }
@@ -579,8 +583,8 @@ fn media_root() -> crabbot_core::Result<PathBuf> {
 mod tests {
     use super::{
         App, BODY_LIMIT, MEDIA_LIMIT, Request, allowed_url, call, challenge_with, chunks, collect,
-        constant_time, graph, handle_http_with, media_at, media_ref, normalize, send_media_at,
-        verify_with,
+        constant_time, env, graph, graph_url, handle_http_with, media_at, media_ref, media_root,
+        normalize, phone, send_media_at, token, verify_with,
     };
     use futures_util::stream;
     use ring::hmac;
@@ -657,6 +661,24 @@ mod tests {
         assert!(normalize(&json!({"entry": [{"changes": [{"value": {"messages": [{"id": "x", "from": "1", "type": "sticker"}]}}]}]})).is_empty());
         assert!(normalize(&json!({})).is_empty());
         assert_eq!(chunks("", 2), vec![String::new()]);
+    }
+
+    #[test]
+    fn validates_environment_and_message_shape_bounds() {
+        assert!(token().is_err());
+        assert!(phone().is_err());
+        assert!(graph_url().is_err());
+        assert!(env("CRABBOT_MISSING").is_err());
+        assert!(media_root().is_err());
+
+        assert!(
+            normalize(&json!({"entry":[{"changes":[{"value":{"messages":[
+                {"id":"","from":"1","type":"text"},
+                {"id":"m","from":"","type":"text"},
+                {"id":"m2","from":"1","type":"image","image":{"id":""}}
+            ]}}]}]}))
+            .is_empty()
+        );
     }
 
     #[tokio::test]

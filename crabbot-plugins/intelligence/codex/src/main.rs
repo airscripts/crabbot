@@ -529,8 +529,8 @@ fn credentials_path() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_LIMIT, Emitter, collect, credential_file, generate, generate_at, generate_request,
-        messages, response_body, stream_body,
+        BODY_LIMIT, Emitter, collect, credential, credential_file, credentials_path, generate,
+        generate_at, generate_request, keyring, messages, response_body, stream_body,
     };
     use crabbot_core::types::{Content, ModelRequest, Request, Role, ToolSpec};
     use serde_json::json;
@@ -614,6 +614,13 @@ mod tests {
         }
         assert_eq!(credential_file(&path.with_file_name("missing-auth.json")).unwrap(), None);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn checks_optional_credential_sources_without_fallbacks() {
+        assert!(keyring("codex").is_none());
+        assert!(credentials_path().is_none());
+        assert!(credential().unwrap().is_none());
     }
 
     #[tokio::test]

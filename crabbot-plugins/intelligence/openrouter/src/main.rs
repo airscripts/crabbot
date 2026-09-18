@@ -408,9 +408,11 @@ fn credential() -> crabbot_core::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_LIMIT, collect, image, messages, response_body, stream_body, stream_line, tools,
+        BODY_LIMIT, base_url, collect, credential, generate, headers, image, messages, response,
+        response_body, stream_body, stream_line, tools,
     };
-    use crabbot_core::types::{Content, Message, ModelRequest, Role, ToolSpec};
+
+    use crabbot_core::types::{Content, Message, ModelRequest, Request, Role, ToolSpec};
     use futures_util::stream;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -475,6 +477,48 @@ mod tests {
         assert_eq!(messages(&tool).unwrap().last().unwrap()["role"], "user");
     }
 
+    #[tokio::test]
+    async fn ignores_notes_and_unknown_calls_without_provider_access() {
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let emitter = crabbot_core::plugin::Emitter::new(output);
+        assert!(
+            generate(
+                &reqwest::Client::new(),
+                Request::Note { jsonrpc: "2.0".into(), method: "note".into(), params: json!({}) },
+                emitter,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let emitter = crabbot_core::plugin::Emitter::new(output);
+        assert!(
+            generate(&reqwest::Client::new(), Request::call(1, "other", json!({})), emitter,)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let emitter = crabbot_core::plugin::Emitter::new(output);
+        assert!(
+            generate(&reqwest::Client::new(), Request::call(1, "generate", json!({})), emitter,)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validates_provider_configuration_and_protocol_size() {
+        assert!(base_url().is_ok());
+        assert!(credential().is_err());
+        assert!(headers().is_ok());
+        assert!(response(1, json!({"ok": true})).unwrap().is_some());
+        assert!(response_body(1, reqwest::StatusCode::OK, json!({"choices": []})).is_err());
+    }
+
     #[test]
     fn parses_complete_and_tool_replies() {
         let response = response_body(
@@ -524,6 +568,22 @@ mod tests {
         .is_ok());
         assert_eq!(calls[&0].0, "read");
         assert!(stream_line(b"invalid", &mut text, &mut pending, &mut calls).is_ok());
+        assert!(stream_line(&[0xff], &mut text, &mut pending, &mut calls).is_err());
+        assert!(stream_line(b"data: {", &mut text, &mut pending, &mut calls).is_err());
+        assert!(
+            stream_line(
+                br#"data: {"choices":[{"delta":{"tool_calls":[{"index":16}]}}]}"#,
+                &mut text,
+                &mut pending,
+                &mut calls,
+            )
+            .is_err()
+        );
+
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let mut emitter = crabbot_core::plugin::Emitter::new(output);
+        let chunks = stream::iter(vec![Ok::<_, std::io::Error>(b"data: nope\n".to_vec())]);
+        assert!(stream_body(2, chunks, &mut emitter).await.is_err());
     }
 
     #[tokio::test]

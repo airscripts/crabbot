@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
+#[cfg(not(test))]
+use crabbot_core::plugin::serve_with;
 use crabbot_core::{
-    plugin::serve_with,
     policy::Policy,
     types::{Capability, Hello, Protocol, Request, Response},
 };
@@ -17,6 +18,7 @@ const OUTPUT_LIMIT: usize = (crabbot_core::jsonl::MAX - FRAME_HEADROOM) / 2;
 const COMMAND_LIMIT: Duration = Duration::from_secs(120);
 const ERROR_LIMIT: usize = 4 * 1024;
 
+#[cfg(not(test))]
 #[tokio::main]
 async fn main() -> crabbot_core::Result<()> {
     let root = media_root();
@@ -28,6 +30,7 @@ async fn main() -> crabbot_core::Result<()> {
     .await
 }
 
+#[cfg(not(test))]
 fn media_root() -> Option<std::path::PathBuf> {
     std::env::var_os("CRABBOT_MEDIA")
         .filter(|value| !value.is_empty())
@@ -195,20 +198,39 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    fn write_transcriber(path: &std::path::Path, output: &str, error: &str, status: i32) {
+        let source = path.with_extension("rs");
+        let source_code = format!(
+            "fn main() {{ print!({output:?}); eprint!({error:?}); std::process::exit({status}); }}"
+        );
+
+        std::fs::write(&source, source_code).unwrap();
+        let result = std::process::Command::new("rustc")
+            .args(["--edition", "2024"])
+            .arg(&source)
+            .arg("-o")
+            .arg(path)
+            .output()
+            .unwrap();
+
+        assert!(
+            result.status.success(),
+            "could not compile the transcriber fixture: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+
+        std::fs::remove_file(source).unwrap();
+    }
+
     #[tokio::test]
     async fn runs_a_local_transcriber() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = std::env::temp_dir().join(format!("crabbot-whisper-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("voice"), b"audio").unwrap();
-        let script = root.join("transcriber");
-        std::fs::write(&script, "#!/bin/sh\nprintf 'hello from whisper\\n'\n").unwrap();
-        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&script, permissions).unwrap();
+        let extension = if cfg!(windows) { "exe" } else { "" };
+        let script = root.join(format!("transcriber.{extension}"));
+        write_transcriber(&script, "hello from whisper\n", "", 0);
         let policy = Policy { root: Some(root.clone()), ..Policy::default() };
         let reply = call_at(
             &policy,
@@ -220,11 +242,8 @@ mod tests {
         .unwrap();
         assert_eq!(reply.result.unwrap()["text"], "hello from whisper");
 
-        let empty = root.join("empty");
-        std::fs::write(&empty, "#!/bin/sh\n").unwrap();
-        let mut permissions = std::fs::metadata(&empty).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&empty, permissions).unwrap();
+        let empty = root.join(format!("empty.{extension}"));
+        write_transcriber(&empty, "", "", 0);
         assert!(
             call_at(
                 &policy,
@@ -235,11 +254,8 @@ mod tests {
             .is_err()
         );
 
-        let failed = root.join("failed");
-        std::fs::write(&failed, "#!/bin/sh\nprintf 'nope\\n' >&2\nexit 1\n").unwrap();
-        let mut permissions = std::fs::metadata(&failed).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&failed, permissions).unwrap();
+        let failed = root.join(format!("failed.{extension}"));
+        write_transcriber(&failed, "", "nope\n", 1);
         assert!(
             call_at(
                 &policy,
@@ -252,12 +268,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn bounds_transcriber_output() {
-        let mut command = tokio::process::Command::new("sh");
-        command.args(["-c", "yes output"]);
-        let error = super::capture(command).await.unwrap_err();
+        let error = super::limited(tokio::io::repeat(b'o')).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
     }
 }

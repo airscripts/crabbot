@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
+use crabbot_core::plugin::Emitter;
+#[cfg(not(test))]
 use crabbot_core::{
-    plugin::{Emitter, serve_events},
+    plugin::serve_events,
     types::{
         Capability, CommandSpec, Content, Hello, Message, ModelReply, ModelRequest, Protocol,
         Request, Response, Role,
@@ -20,6 +22,7 @@ const LINE_LIMIT: usize = crabbot_core::jsonl::MAX / 2;
 const OUTPUT_LIMIT: usize = 512 * 1024;
 
 #[tokio::main]
+#[cfg(not(test))]
 async fn main() -> crabbot_core::Result<()> {
     serve_events(
         Hello {
@@ -38,6 +41,7 @@ async fn main() -> crabbot_core::Result<()> {
     .await
 }
 
+#[cfg(not(test))]
 async fn call(request: Request, mut emitter: Emitter) -> crabbot_core::Result<Option<Response>> {
     let (id, method, params) = match request {
         Request::Call { id, method, params, .. } => (id, method, params),
@@ -97,6 +101,7 @@ impl SessionRequest {
     }
 }
 
+#[cfg(not(test))]
 async fn run(request: SessionRequest, emitter: &mut Emitter) -> crabbot_core::Result<String> {
     let model = emitter
         .call(

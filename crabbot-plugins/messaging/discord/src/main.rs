@@ -1,18 +1,21 @@
 #![forbid(unsafe_code)]
 
+use crabbot_core::types::{Content, Request, Response};
+#[cfg(not(test))]
 use crabbot_core::{
     plugin::serve_with,
-    types::{Capability, Content, Hello, Protocol, Request, Response},
+    types::{Capability, Hello, Protocol},
 };
 use crabbot_file::{load as load_file, save as save_file};
 use futures_util::{SinkExt, Stream, StreamExt};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde_json::{Value, json};
+#[cfg(not(test))]
+use std::sync::Arc;
 use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
     time::SystemTime,
 };
 use tokio::{
@@ -83,6 +86,7 @@ impl Default for GatewayState {
 }
 
 #[tokio::main]
+#[cfg(not(test))]
 async fn main() -> crabbot_core::Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -1189,9 +1193,9 @@ fn response_body(
 mod tests {
     use super::{
         Action, BODY_LIMIT, GatewayState, Operation, acknowledge, action, approval_request, call,
-        call_with, chunks, collect, custom_id, discord_media_url, edit_request, edit_requests,
-        gateway_url, heartbeat, intents, load_cursor_at, local_media, media_root, normalize,
-        normalize_interaction, operation, prepare_gateway_value, remember_attachments,
+        call_with, chunks, cleanup, collect, custom_id, discord_media_url, edit_request,
+        edit_requests, gateway_url, heartbeat, intents, load_cursor_at, local_media, media_root,
+        normalize, normalize_interaction, operation, prepare_gateway_value, remember_attachments,
         response_body, safe_name, save_cursor_at, snowflake, stage_event,
     };
     use crabbot_core::types::Request;
@@ -1218,6 +1222,8 @@ mod tests {
     fn parses_provider_responses() {
         assert_eq!(response_body(reqwest::StatusCode::OK, json!({"id": "1"})).unwrap()["id"], "1");
         assert!(response_body(reqwest::StatusCode::UNAUTHORIZED, json!({"message":"no"})).is_err());
+        assert!(super::credential().is_err());
+        assert!(super::keyring("discord").is_none());
     }
 
     #[test]
@@ -1397,6 +1403,8 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
+        assert_eq!(load_cursor_at(&path), (None, None));
+        std::fs::write(&path, "{}").unwrap();
         assert_eq!(load_cursor_at(&path), (None, None));
         save_cursor_at(&path, Some(7), Some("session")).unwrap();
         assert_eq!(load_cursor_at(&path), (Some(7), Some("session".into())));
@@ -1703,6 +1711,10 @@ mod tests {
 
     #[test]
     fn validates_media_metadata_and_identifiers() {
+        assert!(super::parse_content(&json!({})).unwrap().is_empty());
+        assert!(super::parse_content(&json!([{"kind": "unknown"}])).is_err());
+        let too_many = (0..9).map(|_| json!({"kind": "text", "text": "x"})).collect::<Vec<_>>();
+        assert!(super::parse_content(&json!(too_many)).is_err());
         assert!(discord_media_url("https://cdn.discordapp.com/files/a.png"));
         assert!(discord_media_url("https://media.discordapp.net/files/a.png"));
         assert!(!discord_media_url("http://cdn.discordapp.com/files/a.png"));
@@ -1718,6 +1730,7 @@ mod tests {
         assert!(!custom_id("not valid"));
 
         let mut attachments = std::collections::BTreeMap::new();
+        remember_attachments(&json!({}), &mut attachments);
         remember_attachments(
             &json!({
                 "attachments": [
@@ -1730,6 +1743,20 @@ mod tests {
         );
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments["1"].name, "a.txt");
+
+        let many = (0..257)
+            .map(|id| {
+                json!({
+                    "id": (id + 10).to_string(),
+                    "url": "https://cdn.discordapp.com/a.txt",
+                    "filename": "a.txt"
+                })
+            })
+            .collect::<Vec<_>>();
+
+        remember_attachments(&json!({"attachments": many}), &mut attachments);
+        assert_eq!(attachments.len(), 256);
+        cleanup(std::path::Path::new("/path/that/does/not/exist"));
 
         let content = json!([{"kind":"text","text":"hello"}]);
         assert!(matches!(

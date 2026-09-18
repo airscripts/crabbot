@@ -3,6 +3,7 @@
 use std::{future::Future, process::ExitCode};
 
 #[tokio::main]
+#[cfg(not(test))]
 async fn main() -> ExitCode {
     run(crabbot_runtime::daemon()).await
 }

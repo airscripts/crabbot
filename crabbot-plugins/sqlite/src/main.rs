@@ -1,13 +1,14 @@
 #![forbid(unsafe_code)]
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+#[cfg(not(test))]
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use crabbot_core::types::{Request, Response};
+#[cfg(not(test))]
 use crabbot_core::{
     plugin::serve_with,
-    types::{Capability, Hello, Protocol, Request, Response},
+    types::{Capability, Hello, Protocol},
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -21,6 +22,7 @@ const FRAME_HEADROOM: usize = 64 * 1024;
 const DB_LIMIT: i64 = 32 * 1024 * 1024;
 
 #[tokio::main]
+#[cfg(not(test))]
 async fn main() -> crabbot_core::Result<()> {
     let path = std::env::var_os("CRABBOT_DB")
         .map(PathBuf::from)
@@ -62,6 +64,7 @@ fn private(path: &std::path::Path) -> crabbot_core::Result<()> {
     Ok(())
 }
 
+#[cfg(not(test))]
 fn private_sidecars(path: &std::path::Path) -> crabbot_core::Result<()> {
     for suffix in ["-wal", "-shm"] {
         let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
