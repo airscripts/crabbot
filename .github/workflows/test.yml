@@ -80,7 +80,7 @@ jobs:
 
       - name: Install Rust Toolchain
         if: inputs.local != 'true'
-        uses: dtolnay/rust-toolchain@1.89
+        uses: dtolnay/rust-toolchain@1.120
 
         with:
           components: llvm-tools-preview
@@ -147,7 +147,7 @@ jobs:
 
       - name: Install Rust Toolchain
         if: inputs.local != 'true'
-        uses: dtolnay/rust-toolchain@1.89
+        uses: dtolnay/rust-toolchain@1.120
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
