@@ -1,9 +1,29 @@
 name: Verify
 
 on:
+  workflow_dispatch:
+    inputs:
+      container_image:
+        description: "Optional local CI container image"
+        required: false
+        type: string
+        default: ""
+      local:
+        description: "Use the local act working tree"
+        required: false
+        type: string
+        default: ""
   workflow_call:
     inputs:
       ref:
+        required: false
+        type: string
+        default: ""
+      container_image:
+        required: false
+        type: string
+        default: ""
+      local:
         required: false
         type: string
         default: ""
@@ -15,7 +35,7 @@ jobs:
   workspace:
     name: Workspace
     runs-on: ubuntu-latest
-    container: rust:1.89-trixie
+    container: ${{ inputs.container_image || 'rust:1.89-trixie' }}
 
     defaults:
       run:
@@ -23,12 +43,14 @@ jobs:
 
     steps:
       - name: Checkout
+        if: inputs.local != 'true'
         uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install Archive Tools
+        if: inputs.local != 'true'
         run: |
           apt-get update
           apt-get install --no-install-recommends -y ripgrep zip
@@ -66,7 +88,7 @@ jobs:
   modules:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
-    container: rust:1.89-trixie
+    container: ${{ inputs.container_image || 'rust:1.89-trixie' }}
 
     defaults:
       run:
@@ -149,12 +171,14 @@ jobs:
 
     steps:
       - name: Checkout
+        if: inputs.local != 'true'
         uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install Archive Tools
+        if: inputs.local != 'true'
         run: |
           apt-get update
           apt-get install --no-install-recommends -y zip
@@ -168,7 +192,7 @@ jobs:
   msrv:
     name: Minimum Rust Version
     runs-on: ubuntu-latest
-    container: rust:1.89-trixie
+    container: ${{ inputs.container_image || 'rust:1.89-trixie' }}
 
     defaults:
       run:
@@ -176,6 +200,7 @@ jobs:
 
     steps:
       - name: Checkout
+        if: inputs.local != 'true'
         uses: actions/checkout@v7
 
         with:
@@ -187,7 +212,7 @@ jobs:
   windows_gnu:
     name: Windows GNU
     runs-on: ubuntu-latest
-    container: rust:1.89-trixie
+    container: ${{ inputs.container_image || 'rust:1.89-trixie' }}
 
     defaults:
       run:
@@ -195,12 +220,14 @@ jobs:
 
     steps:
       - name: Checkout
+        if: inputs.local != 'true'
         uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install MinGW
+        if: inputs.local != 'true'
         run: |
           apt-get update
           apt-get install --no-install-recommends -y gcc-mingw-w64-x86-64

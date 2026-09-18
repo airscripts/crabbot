@@ -3,6 +3,12 @@ name: Security
 on:
   workflow_call:
   workflow_dispatch:
+    inputs:
+      local:
+        description: "Use the local act working tree"
+        required: false
+        type: string
+        default: ""
   schedule:
     - cron: "23 4 * * 1"
 
@@ -16,6 +22,7 @@ jobs:
 
     steps:
       - name: Checkout
+        if: inputs.local != 'true'
         uses: actions/checkout@v7
 
       - name: Audit Rust Dependencies

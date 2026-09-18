@@ -2,9 +2,19 @@ name: Test
 
 on:
   workflow_dispatch:
+    inputs:
+      local:
+        description: "Use the local act working tree"
+        required: false
+        type: string
+        default: ""
   workflow_call:
     inputs:
       ref:
+        required: false
+        type: string
+        default: ""
+      local:
         required: false
         type: string
         default: ""
@@ -60,12 +70,14 @@ jobs:
 
     steps:
       - name: Checkout
+        if: inputs.local != 'true'
         uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install Rust Toolchain
+        if: inputs.local != 'true'
         uses: dtolnay/rust-toolchain@1.89
 
         with:
@@ -125,12 +137,14 @@ jobs:
     steps:
 
       - name: Checkout
+        if: inputs.local != 'true'
         uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install Rust Toolchain
+        if: inputs.local != 'true'
         uses: dtolnay/rust-toolchain@1.89
 
       - name: Cache Cargo

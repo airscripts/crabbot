@@ -19,6 +19,24 @@ Lefthook runs fast checks before commits. `make verify` runs formatting,
 Clippy, locked compilation, all tests, coverage, builds, and metrics. Provider
 tests use local fixtures and never call paid APIs.
 
+For the complete non-release CI pipeline, install Docker and
+[act](https://github.com/nektos/act), then run:
+
+```sh
+make ci
+```
+
+The command first runs the Verify, Test, and Build preflight commands directly
+on the current machine. Only after that passes does it use act's medium
+`catthehacker/ubuntu:act-latest` image and a cached local CI image based on it
+with Rust 1.89 and the native Docker architecture (`linux/arm64` or
+`linux/amd64`). Docker keeps the images and action cache locally, so subsequent
+runs do not download the runner again.
+The command runs Verify, Agentskill, Security, the native Linux tests, the
+sandbox test, and the native Linux build. Release, package, checksum, and
+publish workflows are intentionally excluded. Native macOS, Windows, and
+cross-architecture jobs still run only on their GitHub-hosted runners.
+
 ## Change Rules
 
 - Keep the core capability-free and provider-neutral.
