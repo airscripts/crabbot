@@ -58,7 +58,17 @@ async fn generate(
 
     let base = std::env::var("CRABBOT_GEMINI_BASE_URL")
         .unwrap_or_else(|_| "https://generativelanguage.googleapis.com/v1beta".into());
-    let base_url = reqwest::Url::parse(&base)
+    generate_configured(client, id, input, &key, &base).await
+}
+
+async fn generate_configured(
+    client: &reqwest::Client,
+    id: u64,
+    input: ModelRequest,
+    key: &str,
+    base: &str,
+) -> crabbot_core::Result<Option<Response>> {
+    let base_url = reqwest::Url::parse(base)
         .map_err(|_| crabbot_core::Error::Denied("Gemini base URL is invalid.".into()))?;
     if base_url.scheme() != "https"
         && !matches!(base_url.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
@@ -68,7 +78,7 @@ async fn generate(
         ));
     }
 
-    generate_at(client, id, input, &key, base_url.as_str()).await
+    generate_at(client, id, input, key, base_url.as_str()).await
 }
 
 async fn generate_at(
@@ -236,12 +246,22 @@ mod tests {
             session: "s".into(),
             role: Role::Tool,
             sender: None,
-            content: vec![Content::Image { uri: "file://image".into(), alt: Some("alt".into()) }],
+            content: vec![
+                Content::Image { uri: "file://image".into(), alt: Some("alt".into()) },
+                Content::File {
+                    uri: "file://note".into(),
+                    name: "note.txt".into(),
+                    mime: Some("text/plain".into()),
+                },
+                Content::Audio { uri: "file://voice".into(), mime: None },
+            ],
         });
 
         let body = request_body(&input).unwrap();
         assert_eq!(body["contents"][1]["role"], "model");
         assert_eq!(body["contents"][2]["parts"][0]["text"], "alt");
+        assert_eq!(body["contents"][2]["parts"][1]["text"], "[File: note.txt]");
+        assert_eq!(body["contents"][2]["parts"][2]["text"], "[Audio attachment.]");
     }
 
     #[tokio::test]
@@ -254,6 +274,32 @@ mod tests {
         assert!(generate(&client, note).await.unwrap().is_none());
         assert!(generate(&client, Request::call(1, "other", json!({}))).await.unwrap().is_none());
         assert!(generate(&client, Request::call(1, "generate", json!("bad"))).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn validates_gemini_configuration_before_network_access() {
+        let client = reqwest::Client::new();
+        let request = ModelRequest {
+            model: "test".into(),
+            workspace: None,
+            messages: Vec::new(),
+            stream: false,
+            tools: Vec::new(),
+        };
+
+        assert!(
+            generate_configured(&client, 1, request.clone(), "key", "not a URL").await.is_err()
+        );
+
+        assert!(
+            generate_configured(&client, 1, request.clone(), "key", "http://example.com")
+                .await
+                .is_err()
+        );
+
+        assert!(
+            generate_configured(&client, 1, request, "key", "http://127.0.0.1:1").await.is_err()
+        );
     }
 
     #[test]
@@ -271,7 +317,15 @@ mod tests {
             events[0],
             Event::Tool { name: "read".into(), args: json!({"path": "README.md"}) }
         );
+
         assert_eq!(parse_reply(&json!({})), (String::new(), Vec::new()));
+        assert_eq!(
+            parse_reply(&json!({"candidates": [{"content": {"parts": [
+                {"functionCall": {"args": {}}},
+                {}
+            ]}}]})),
+            (String::new(), Vec::new())
+        );
     }
 
     #[tokio::test]

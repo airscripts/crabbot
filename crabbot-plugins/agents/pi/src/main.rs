@@ -477,7 +477,7 @@ mod tests {
         tokio::fs::create_dir_all(&root).await.unwrap();
         tokio::fs::write(
             &command,
-            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"message_update\",\"assistantMessageEvent\":{\"delta\":\"done\"}}'\nprintf '%s\\n' '{\"type\":\"agent_end\"}'\n",
+            "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"message_update\",\"assistantMessageEvent\":{\"delta\":\"done\"}}'\nprintf '%s\\n' '{\"type\":\"agent_end\"}'\n",
         )
         .await
         .unwrap();

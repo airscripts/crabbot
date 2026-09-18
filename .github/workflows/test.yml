@@ -138,6 +138,7 @@ jobs:
           $env:CRABBOT_VERSION = 'invalid'
           pwsh -NoProfile -File .\install.ps1
           if ($LASTEXITCODE -eq 0) { throw 'Installer accepted an invalid version.' }
+          exit 0
 
   sandbox:
     name: Tools Plugin Sandbox

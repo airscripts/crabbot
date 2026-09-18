@@ -711,6 +711,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn temp_path(name: &str, suffix: &str) -> std::path::PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -719,6 +720,139 @@ mod tests {
         std::env::temp_dir()
             .join(format!("crabbot-plugin-{name}-{}-{nonce}.{suffix}", std::process::id()))
     }
+
+    #[cfg(unix)]
+    async fn start_test_plugin(_mode: &str, script: &str) -> crate::Result<Process> {
+        Process::start_with("sh", ["-c", script]).await
+    }
+
+    #[cfg(windows)]
+    fn windows_test_plugin() -> std::path::PathBuf {
+        static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+        PATH.get_or_init(|| {
+            let root = std::env::temp_dir().join(format!("crabbot-plugin-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let source = root.join("fixture.rs");
+            let binary = root.join("fixture.exe");
+            std::fs::write(&source, WINDOWS_TEST_PLUGIN).unwrap();
+
+            let output = std::process::Command::new("rustc")
+                .args(["--edition", "2024"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&binary)
+                .output()
+                .unwrap();
+
+            assert!(
+                output.status.success(),
+                "could not compile the Windows plugin fixture: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let _ = std::fs::remove_file(source);
+            binary
+        })
+        .clone()
+    }
+
+    #[cfg(windows)]
+    async fn start_test_plugin(mode: &str, _script: &str) -> crate::Result<Process> {
+        Process::start_with(windows_test_plugin(), [mode]).await
+    }
+
+    #[cfg(windows)]
+    const WINDOWS_TEST_PLUGIN: &str = r###"
+use std::io::{BufRead, Write};
+
+fn send(value: &str) {
+    println!("{value}");
+    std::io::stdout().flush().unwrap();
+}
+
+fn main() {
+    let mode = std::env::args().nth(1).unwrap_or_default();
+    let mut lines = std::io::stdin().lock().lines();
+
+    match mode.as_str() {
+        "bad_handshake" => send(r#"{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"","version":"0.1.0","capabilities":[]}}"#),
+
+        "bad_version" => {
+            send(r#"{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":1,"minor":0},"id":"test","version":"0.1.0","capabilities":[]}}"#);
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+
+        "bad_jsonrpc" => {
+            send(r#"{"jsonrpc":"1.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"test","version":"0.1.0","capabilities":[]}}"#);
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+
+        "bad_result" => {
+            send(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"failed"}}"#);
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+
+        "invalid_calls" => {
+            for line in lines.by_ref().map_while(Result::ok) {
+                if line.contains("\"method\":\"hello\"") {
+                    send(r#"{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"test","version":"0.1.0","capabilities":[]}}"#);
+                } else if line.contains("\"method\":\"ping\"") {
+                    send(r#"{"jsonrpc":"1.0","id":2,"result":{}}"#);
+                } else if line.contains("\"method\":\"shutdown\"") {
+                    break;
+                }
+            }
+        }
+
+        "stream" => {
+            for line in lines.by_ref().map_while(Result::ok) {
+                if line.contains("\"method\":\"hello\"") {
+                    send(r#"{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"test","version":"0.1.0","capabilities":["model"]}}"#);
+                } else if line.contains("\"method\":\"generate\"") {
+                    send(r#"{"jsonrpc":"2.0","method":"event","params":{"kind":"text","text":"part"}}"#);
+                    send(r#"{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#);
+                } else if line.contains("\"method\":\"shutdown\"") {
+                    send(r#"{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}"#);
+                    break;
+                }
+            }
+        }
+
+        "server_request" => {
+            while let Some(Ok(line)) = lines.next() {
+                if line.contains("\"method\":\"hello\"") {
+                    send(r#"{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"test","version":"0.1.0","capabilities":["model"]}}"#);
+                } else if line.contains("\"method\":\"generate\"") {
+                    send(r#"{"jsonrpc":"2.0","id":7,"method":"host/tool","params":{"name":"read"}}"#);
+
+                    if lines.next().map(|reply| reply.unwrap_or_default().contains("accepted")).unwrap_or(false) {
+                        send(r#"{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#);
+                    } else {
+                        break;
+                    }
+                } else if line.contains("\"method\":\"shutdown\"") {
+                    send(r#"{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}"#);
+                    break;
+                }
+            }
+        }
+
+        _ => {
+            for line in lines.map_while(Result::ok) {
+                if line.contains("\"method\":\"hello\"") {
+                    send(r#"{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"test","version":"0.1.0","capabilities":["model"]}}"#);
+                } else if line.contains("\"method\":\"ping\"") {
+                    send(r#"{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#);
+                } else if line.contains("\"method\":\"shutdown\"") {
+                    send(r#"{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}"#);
+                    break;
+                }
+            }
+        }
+    }
+}
+"###;
 
     #[tokio::test]
     async fn serves_protocol_and_handler_paths() {
@@ -871,11 +1005,11 @@ mod tests {
         task.await.unwrap().unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn supervises_a_plugin_process() {
         let script = "#!/bin/sh\nwhile IFS= read -r line; do\ncase \"$line\" in\n*hello*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol\":{\"major\":0,\"minor\":1},\"id\":\"test\",\"version\":\"0.1.0\",\"capabilities\":[\"model\"]}}' ;;\n*ping*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}' ;;\n*shutdown*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":9999,\"result\":{\"ok\":true}}'; exit 0 ;;\nesac\ndone\n";
-        let mut process = Process::start_with("sh", ["-c", script]).await.unwrap();
+        let mut process = start_test_plugin("normal", script).await.unwrap();
         let response = process.call(Request::call(2, "ping", json!({}))).await.unwrap();
         assert_eq!(response.result.unwrap()["ok"], true);
         process.restart().await.unwrap();
@@ -884,30 +1018,42 @@ mod tests {
         timeout(Duration::from_secs(2), process.stop()).await.unwrap().unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn stops_plugin_after_bad_handshake() {
-        let marker = temp_path("bad", "pid");
-        let script = format!(
-            "#!/bin/sh\necho $$ > '{}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocol\":{{\"major\":0,\"minor\":1}},\"id\":\"\",\"version\":\"0.1.0\",\"capabilities\":[]}}}}'\nwhile IFS= read -r line; do :; done\n",
-            marker.display()
-        );
-        assert!(Process::start_with("sh", ["-c", &script]).await.is_err());
-        for _ in 0..100 {
-            if marker.is_file() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        #[cfg(windows)]
+        {
+            assert!(start_test_plugin("bad_handshake", "").await.is_err());
+            return;
         }
-        let pid = std::fs::read_to_string(&marker).unwrap();
-        let status = std::process::Command::new("kill")
-            .args(["-0", pid.trim()])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(!status.success());
 
-        let _ = std::fs::remove_file(marker);
+        #[cfg(unix)]
+        {
+            let marker = temp_path("bad", "pid");
+            let script = format!(
+                "#!/bin/sh\necho $$ > '{}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocol\":{{\"major\":0,\"minor\":1}},\"id\":\"\",\"version\":\"0.1.0\",\"capabilities\":[]}}}}'\nwhile IFS= read -r line; do :; done\n",
+                marker.display()
+            );
+
+            assert!(start_test_plugin("bad_handshake", &script).await.is_err());
+            for _ in 0..100 {
+                if marker.is_file() {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            let pid = std::fs::read_to_string(&marker).unwrap();
+            let status = std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+
+            assert!(!status.success());
+            let _ = std::fs::remove_file(marker);
+        }
     }
 
     #[cfg(unix)]
@@ -948,30 +1094,30 @@ mod tests {
         let _ = std::fs::remove_file(marker);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn rejects_incompatible_and_malformed_handshakes() {
-        for (_name, response) in [
+        for (mode, response) in [
             (
-                "bad-version",
+                "bad_version",
                 r#"{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":1,"minor":0},"id":"test","version":"0.1.0","capabilities":[]}}"#,
             ),
             (
-                "bad-jsonrpc",
+                "bad_jsonrpc",
                 r#"{"jsonrpc":"1.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"test","version":"0.1.0","capabilities":[]}}"#,
             ),
-            ("bad-result", r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"failed"}}"#),
+            ("bad_result", r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"failed"}}"#),
         ] {
             let script = format!("#!/bin/sh\nprintf '%s\\n' '{}'\nsleep 5\n", response);
-            assert!(Process::start_with("sh", ["-c", &script]).await.is_err());
+            assert!(start_test_plugin(mode, &script).await.is_err());
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn rejects_invalid_calls_and_responses() {
         let script = "#!/bin/sh\nwhile IFS= read -r line; do case \"$line\" in *hello*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol\":{\"major\":0,\"minor\":1},\"id\":\"test\",\"version\":\"0.1.0\",\"capabilities\":[]}}' ;; *ping*) printf '%s\\n' '{\"jsonrpc\":\"1.0\",\"id\":2,\"result\":{}}' ;; *shutdown*) exit 0 ;; esac; done\n";
-        let mut process = Process::start_with("sh", ["-c", script]).await.unwrap();
+        let mut process = start_test_plugin("invalid_calls", script).await.unwrap();
         assert!(
             process
                 .call(Request::Note {
@@ -986,11 +1132,11 @@ mod tests {
         process.stop().await.unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn forwards_stream_notifications_before_response() {
         let script = r#"while IFS= read -r line; do case "$line" in *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"test","version":"0.1.0","capabilities":["model"]}}' ;; *generate*) printf '%s\n' '{"jsonrpc":"2.0","method":"event","params":{"kind":"text","text":"part"}}'; printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"ok":true}}' ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;; esac; done"#;
-        let mut process = Process::start_with("sh", ["-c", script]).await.unwrap();
+        let mut process = start_test_plugin("stream", script).await.unwrap();
         let mut notes = Vec::new();
         let response = process
             .call_stream(Request::call(2, "generate", json!({})), |note| notes.push(note))
@@ -1005,11 +1151,11 @@ mod tests {
         process.stop().await.unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn answers_plugin_server_requests() {
         let script = r#"while IFS= read -r line; do case "$line" in *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"test","version":"0.1.0","capabilities":["model"]}}' ;; *generate*) printf '%s\n' '{"jsonrpc":"2.0","id":7,"method":"host/tool","params":{"name":"read"}}'; IFS= read -r reply; case "$reply" in *"accepted"*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"ok":true}}' ;; *) exit 1 ;; esac ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;; esac; done"#;
-        let mut process = Process::start_with("sh", ["-c", script]).await.unwrap();
+        let mut process = start_test_plugin("server_request", script).await.unwrap();
         let response = process
             .call_full_async(
                 Request::call(2, "generate", json!({})),
