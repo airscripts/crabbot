@@ -538,7 +538,7 @@ mod tests {
         tokio::fs::create_dir_all(&root).await.unwrap();
         tokio::fs::write(
             &command,
-            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"complete\"}]}}'\nprintf '%s\\n' '{\"type\":\"session_end\"}'\n",
+            "#!/bin/sh\nIFS= read -r _\nprintf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"complete\"}]}}'\nprintf '%s\\n' '{\"type\":\"session_end\"}'\n",
         )
         .await
         .unwrap();
