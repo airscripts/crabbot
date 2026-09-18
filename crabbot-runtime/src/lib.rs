@@ -6929,33 +6929,25 @@ fn tar_size(fields: &[&str]) -> Option<u64> {
         if !tar_date(field) {
             return None;
         }
+
         fields[..index].iter().rev().find_map(|value| value.parse::<u64>().ok())
     })
 }
 
+const TAR_MONTHS: [&str; 12] =
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
 fn tar_date(value: &str) -> bool {
     let bytes = value.as_bytes();
-    (bytes.len() == 10
+
+    let iso_date = bytes.len() == 10
         && bytes[4] == b'-'
         && bytes[7] == b'-'
         && bytes[..4].iter().all(u8::is_ascii_digit)
         && bytes[5..7].iter().all(u8::is_ascii_digit)
-        && bytes[8..].iter().all(u8::is_ascii_digit))
-        || matches!(
-            value,
-            "Jan"
-                | "Feb"
-                | "Mar"
-                | "Apr"
-                | "May"
-                | "Jun"
-                | "Jul"
-                | "Aug"
-                | "Sep"
-                | "Oct"
-                | "Nov"
-                | "Dec"
-        )
+        && bytes[8..].iter().all(u8::is_ascii_digit);
+
+    iso_date || TAR_MONTHS.contains(&value)
 }
 
 fn validate_archive(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

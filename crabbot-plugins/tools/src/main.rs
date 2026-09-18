@@ -611,14 +611,17 @@ fn kill_group(group: u32, signal: &str) {
         return;
     };
     let current = std::process::id();
+
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut fields = line.split_whitespace();
         let Some(pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
             continue;
         };
+
         let Some(pgid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
             continue;
         };
+
         if pgid == group && pid != current {
             let _ = std::process::Command::new("kill").args([signal, &pid.to_string()]).status();
         }
