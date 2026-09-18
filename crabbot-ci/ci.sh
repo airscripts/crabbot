@@ -23,12 +23,15 @@ case "$(uname -m)" in
         die "Unsupported host architecture '$(uname -m)'."
         ;;
 esac
+
 act_arch=${CRABBOT_ACT_ARCH:-$native_arch}
 act_jobs=${CRABBOT_CI_JOBS:-1}
+
 case "$act_arch" in
     linux/arm64|linux/amd64) ;;
     *) die "Unsupported act architecture '$act_arch'." ;;
 esac
+
 ci_target=${CRABBOT_CI_TARGET:-$native_target}
 cache_dir=${CRABBOT_CI_CACHE:-${repo_root}/crabbot-ci/.cache}
 artifact_dir=${CRABBOT_CI_ARTIFACTS:-${repo_root}/crabbot-ci/.artifacts}
@@ -42,8 +45,8 @@ cleanup() {
     fi
     rm -rf "$workspace_dir"
 }
-trap cleanup EXIT
 
+trap cleanup EXIT
 mkdir -p "$cache_dir" "$artifact_dir" "$local_target_dir"
 
 local_make() {
@@ -52,8 +55,10 @@ local_make() {
 
 printf '\n[INFO] Local Verify preflight\n'
 local_make fmt clippy check coverage metrics
+
 RUSTDOCFLAGS='-D warnings' CARGO_TARGET_DIR="$local_target_dir" \
     cargo doc --workspace --no-deps --locked
+
 bash -n crabbot-scripts/*.sh install.sh
 
 printf '\n[INFO] Local Test preflight\n'
@@ -78,7 +83,7 @@ tar \
     | tar -xf - -C "$workspace_dir"
 
 git -C "$workspace_dir" init -q
-git -C "$workspace_dir" config user.name "Crabbot Local CI"
+git -C "$workspace_dir" config user.name "Crabbot"
 git -C "$workspace_dir" config user.email "ci@localhost"
 git -C "$workspace_dir" config commit.gpgsign false
 git -C "$workspace_dir" add -A
@@ -134,18 +139,18 @@ run_workflow "Security" workflow_dispatch \
     --workflows "$workspace_dir/.github/workflows/security.yml" \
     --input local=true
 
-run_workflow "Test / Linux ${ci_target}" workflow_dispatch \
+run_workflow "Test, Linux ${ci_target}" workflow_dispatch \
     --workflows "$workspace_dir/.github/workflows/test.yml" \
     --job test \
     --matrix "target:${ci_target}" \
     --input local=true
 
-run_workflow "Test / Sandbox" workflow_dispatch \
+run_workflow "Test, Sandbox" workflow_dispatch \
     --workflows "$workspace_dir/.github/workflows/test.yml" \
     --job sandbox \
     --input local=true
 
-run_workflow "Build / Linux ${ci_target}" workflow_dispatch \
+run_workflow "Build, Linux ${ci_target}" workflow_dispatch \
     --workflows "$workspace_dir/.github/workflows/build.yml" \
     --job build \
     --matrix "target:${ci_target}" \

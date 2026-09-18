@@ -8,21 +8,25 @@ on:
         required: false
         type: string
         default: ""
+
       local:
         description: "Use the local act working tree"
         required: false
         type: string
         default: ""
+
   workflow_call:
     inputs:
       ref:
         required: false
         type: string
         default: ""
+
       container_image:
         required: false
         type: string
         default: ""
+
       local:
         required: false
         type: string
