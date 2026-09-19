@@ -308,11 +308,12 @@ boundaries.
 Run the independent review loop:
 
 ```sh
-./crabbot-scripts/revloop.sh
+make revloop
 ```
 
-Use `CRABBOT_REVLOOP_OUTPUT=verbose` when the full orchestrator and worker
-stream is useful during diagnosis. Each orchestrator pass performs a deep
+Use `make revloop REVLOOP_ARGS=--verbose` or
+`CRABBOT_REVLOOP_OUTPUT=verbose` when the full orchestrator and worker stream
+is useful during diagnosis. Each orchestrator pass performs a deep
 review and records every distinct material finding it identifies. Blocking
 findings still control worker cycles and the bounded
 `CRABBOT_REVLOOP_MAX_CYCLES` convergence limit; non-blocking findings remain

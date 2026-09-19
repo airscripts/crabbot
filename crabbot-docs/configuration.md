@@ -83,16 +83,36 @@ All Crabbot configuration variables use the `CRABBOT_` prefix:
 
 | Variable | Purpose |
 | --- | --- |
+| `CRABBOT_HOME` | Crabbot state and plugin directory |
+| `CRABBOT_ROOT` | Workspace exposed to file and search tools |
+| `CRABBOT_CREDENTIALS` | Protected JSON credential file |
+| `CRABBOT_KEYRING` | Set to `1` to use the operating-system keyring |
+| `CRABBOT_CHANNEL` | Default messaging plugin ID |
+| `CRABBOT_MODEL_PLUGIN` | Default intelligence plugin ID |
+| `CRABBOT_MODEL` | Default model identifier |
+| `CRABBOT_MEMORY` | Memory plugin persistence path |
+| `CRABBOT_TIMER` | Timer plugin persistence path |
+| `CRABBOT_DB` | SQLite plugin database path |
+| `CRABBOT_MEDIA` | Private media cache directory |
+| `CRABBOT_WHISPER` | Default speech plugin ID |
+| `CRABBOT_WHISPER_COMMAND` | Local Whisper-compatible executable |
 | `CRABBOT_CODEX_KEY` | OpenAI-compatible API key |
+| `CRABBOT_CODEX_BASE_URL` | Codex-compatible API base |
 | `CRABBOT_CLAUDE_KEY` | Anthropic API key |
+| `CRABBOT_CLAUDE_BASE_URL` | Claude-compatible API base |
+| `CRABBOT_GEMINI_KEY` | Gemini Developer API key |
+| `CRABBOT_GEMINI_BASE_URL` | Gemini-compatible API base |
 | `CRABBOT_OLLAMA_HOST` | Ollama endpoint |
 | `CRABBOT_OLLAMA_API_KEY` | Ollama cloud API key |
 | `CRABBOT_TELEGRAM_TOKEN` | Telegram bot token |
 | `CRABBOT_DISCORD_TOKEN` | Discord bot token |
+| `CRABBOT_DISCORD_GATEWAY_URL` | Optional Discord Gateway URL |
+| `CRABBOT_DISCORD_INTENTS` | Discord Gateway intent bitmask |
 | `CRABBOT_OPENROUTER_KEY` | OpenRouter API key |
 | `CRABBOT_OPENROUTER_MODEL` | Default OpenRouter model slug |
 | `CRABBOT_OPENROUTER_BASE_URL` | OpenRouter-compatible API base |
-| `CRABBOT_GEMINI_KEY` | Gemini Developer API key |
+| `CRABBOT_OPENROUTER_REFERER` | Optional OpenRouter attribution URL |
+| `CRABBOT_OPENROUTER_TITLE` | Optional OpenRouter attribution title |
 | `CRABBOT_WHATSAPP_TOKEN` | WhatsApp Cloud API token |
 | `CRABBOT_WHATSAPP_APP_SECRET` | WhatsApp webhook signing secret |
 | `CRABBOT_WHATSAPP_VERIFY` | WhatsApp webhook verification token |
@@ -104,6 +124,7 @@ All Crabbot configuration variables use the `CRABBOT_` prefix:
 | `CRABBOT_SLACK_BOT_TOKEN` | Slack bot token |
 | `CRABBOT_SLACK_APP_TOKEN` | Slack Socket Mode app token |
 | `CRABBOT_SLACK_CHANNELS` | Comma-separated Slack channel IDs |
+| `CRABBOT_PI_COMMAND` | Optional Pi agent executable |
 | `CRABBOT_CODEX_HOME` | Codex configuration directory |
 | `CRABBOT_CODEX_BINARY` | Optional Codex CLI executable |
 | `CRABBOT_SANDBOX_RUNTIME` | Optional `docker`, `podman`, or `off` shell sandbox |
