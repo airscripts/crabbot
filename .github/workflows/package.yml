@@ -15,8 +15,8 @@ permissions:
   contents: read
 
 jobs:
-  package:
-    name: ${{ matrix.name }}
+  crates:
+    name: Crates
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
 
@@ -96,6 +96,7 @@ jobs:
           $version = "${{ inputs.version }}"
           $target = "${{ matrix.target }}"
           $plugins = @("core", "codex", "claude", "gemini", "ollama", "openrouter", "telegram", "discord", "whatsapp", "signal", "slack", "sqlite", "memory", "timer", "tools", "mcp", "whisper", "tui", "pi")
+
           foreach ($plugin in $plugins) {
             $name = if ($plugin -eq "core") { "crabbot" } else { "crabbot-plugin-$plugin" }
 
@@ -103,6 +104,7 @@ jobs:
             New-Item -ItemType Directory -Force -Path $package | Out-Null
             New-Item -ItemType Directory -Force -Path "$package/bin" | Out-Null
             Copy-Item "target/$target/release/$name.exe" "$package/bin/$name.exe"
+
             if ($plugin -eq "core") {
               Copy-Item "target/$target/release/crabbot-daemon.exe" "$package/bin/"
             }
@@ -111,6 +113,7 @@ jobs:
             if ($plugin -ne "core") {
               $manifest = Get-ChildItem "crabbot-plugins" -Recurse -Filter "crabbot-plugin.toml" |
                 Where-Object { $_.Directory.Name -eq $plugin } | Select-Object -First 1
+
               if (-not $manifest) { throw "Plugin manifest is missing: $plugin." }
               Copy-Item $manifest.FullName "$package/"
             }

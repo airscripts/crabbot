@@ -7,6 +7,7 @@ use crabbot_core::{
     plugin::serve_with,
     types::{Capability, Hello, Protocol},
 };
+
 #[cfg(not(test))]
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -45,11 +46,13 @@ async fn main() -> crabbot_core::Result<()> {
         .timeout(Duration::from_secs(45))
         .build()
         .map_err(|error| crabbot_core::Error::Denied(format!("Slack client failed: {error}.")))?;
+
     let app = Arc::new(App {
         client,
         socket: Arc::new(Mutex::new(None)),
         attachments: Arc::new(Mutex::new(BTreeMap::new())),
     });
+
     serve_with(
         Hello {
             protocol: Protocol::CURRENT,
@@ -72,9 +75,11 @@ async fn call(app: &App, request: Request) -> crabbot_core::Result<Option<Respon
         Request::Call { id, method, params, .. } => (id, method, params),
         Request::Note { .. } => return Ok(None),
     };
+
     let token = std::env::var("CRABBOT_SLACK_BOT_TOKEN").map_err(|_| {
         crabbot_core::Error::Denied("CRABBOT_SLACK_BOT_TOKEN is not configured.".into())
     })?;
+
     let result = match method.as_str() {
         "poll" => poll(app, &token).await?,
         "send" => send(&app.client, &token, &params).await?,
@@ -82,6 +87,7 @@ async fn call(app: &App, request: Request) -> crabbot_core::Result<Option<Respon
         "info" => json!({"mode": "web_api", "socket_mode": true}),
         _ => return Ok(None),
     };
+
     Ok(Some(Response::ok(id, result)))
 }
 
@@ -109,14 +115,17 @@ async fn api_at(
         .send()
         .await
         .map_err(|error| crabbot_core::Error::Denied(format!("Slack request failed: {error}.")))?;
+
     let value: Value = response.json().await.map_err(|error| {
         crabbot_core::Error::Denied(format!("Slack response was invalid: {error}."))
     })?;
+
     if value["ok"] != true {
         return Err(crabbot_core::Error::Denied(
             value["error"].as_str().unwrap_or("Slack rejected the request.").into(),
         ));
     }
+
     Ok(value)
 }
 
@@ -128,6 +137,7 @@ async fn poll(app: &App, token: &str) -> crabbot_core::Result<Value> {
     {
         return Ok(json!({"events": events}));
     }
+
     let channels = std::env::var("CRABBOT_SLACK_CHANNELS").unwrap_or_default();
     poll_at(app, token, &channels, "https://slack.com/api").await
 }
@@ -139,6 +149,7 @@ async fn poll_at(
     base: &str,
 ) -> crabbot_core::Result<Value> {
     let mut events = Vec::new();
+
     for channel in channels.split(',').map(str::trim).filter(|value| !value.is_empty()) {
         let value = api_at(
             &app.client,
@@ -148,16 +159,22 @@ async fn poll_at(
             base,
         )
         .await?;
+
         for message in value["messages"].as_array().into_iter().flatten() {
             let Some(timestamp) = message["ts"].as_str() else { continue };
+
             let text = message["text"].as_str().unwrap_or_default();
+
             if message["subtype"].is_string() {
                 continue;
             }
+
             let content = remember_files(message, &app.attachments).await;
+
             if text.is_empty() && content.is_empty() {
                 continue;
             }
+
             events.push(json!({
                 "id": timestamp,
                 "chat": channel,
@@ -169,17 +186,20 @@ async fn poll_at(
             }));
         }
     }
+
     Ok(json!({"events": events}))
 }
 
 #[cfg(not(test))]
 async fn socket_poll(app: &App, token: &str) -> crabbot_core::Result<Option<Vec<Value>>> {
     let mut socket = app.socket.lock().await;
+
     if socket.is_none() {
         let value = api(&app.client, token, "apps.connections.open", json!({})).await?;
         let url = value["url"].as_str().ok_or_else(|| {
             crabbot_core::Error::Denied("Slack Socket Mode did not return a URL.".into())
         })?;
+
         *socket = Some(
             connect_async(url)
                 .await
@@ -191,6 +211,7 @@ async fn socket_poll(app: &App, token: &str) -> crabbot_core::Result<Option<Vec<
                 .0,
         );
     }
+
     let stream = socket.as_mut().expect("socket was initialized");
     let Some(message) = tokio::time::timeout(Duration::from_secs(25), stream.next())
         .await
@@ -202,12 +223,15 @@ async fn socket_poll(app: &App, token: &str) -> crabbot_core::Result<Option<Vec<
     else {
         return Ok(Some(Vec::new()));
     };
+
     let Message::Text(text) = message else {
         return Ok(Some(Vec::new()));
     };
+
     let value: Value = serde_json::from_str(&text).map_err(|error| {
         crabbot_core::Error::Denied(format!("Slack Socket Mode event was invalid: {error}."))
     })?;
+
     if let Some(envelope) = value["envelope_id"].as_str() {
         stream
             .send(Message::Text(json!({"envelope_id": envelope}).to_string().into()))
@@ -218,18 +242,24 @@ async fn socket_poll(app: &App, token: &str) -> crabbot_core::Result<Option<Vec<
                 ))
             })?;
     }
+
     let event = &value["payload"]["event"];
+
     if event["type"] != "message" || event["subtype"].is_string() {
         return Ok(Some(Vec::new()));
     }
+
     let Some(chat) = event["channel"].as_str() else {
         return Ok(Some(Vec::new()));
     };
+
     let text = event["text"].as_str().unwrap_or_default();
     let content = remember_files(event, &app.attachments).await;
+
     if text.is_empty() && content.is_empty() {
         return Ok(Some(Vec::new()));
     }
+
     Ok(Some(vec![json!({
         "id": event["ts"].as_str().unwrap_or_default(),
         "chat": chat,
@@ -246,21 +276,28 @@ async fn remember_files(
     attachments: &Arc<Mutex<BTreeMap<String, Attachment>>>,
 ) -> Vec<Value> {
     let mut content = Vec::new();
+
     if let Some(text) = value["text"].as_str().filter(|text| !text.is_empty()) {
         content.push(json!({"kind": "text", "text": text}));
     }
+
     let Some(files) = value["files"].as_array() else { return content };
+
     let mut stored = attachments.lock().await;
+
     for file in files.iter().take(8) {
         let Some(id) = file["id"].as_str().filter(|value| safe_id(value)) else { continue };
+
         let Some(url) =
             file["url_private_download"].as_str().or_else(|| file["url_private"].as_str())
         else {
             continue;
         };
+
         if !allowed_url(url) {
             continue;
         }
+
         let name = file["name"].as_str().unwrap_or("attachment").to_owned();
         let mime = file["mimetype"].as_str().map(str::to_owned);
         let size = file["size"].as_u64().and_then(|value| usize::try_from(value).ok());
@@ -276,6 +313,7 @@ async fn remember_files(
         } else {
             "file"
         };
+
         if kind == "image" {
             content.push(json!({"kind": kind, "uri": uri, "alt": name}));
         } else if kind == "audio" {
@@ -284,10 +322,13 @@ async fn remember_files(
             content.push(json!({"kind": kind, "uri": uri, "name": name, "mime": mime}));
         }
     }
+
     while stored.len() > 256 {
         let Some(key) = stored.keys().next().cloned() else { break };
+
         stored.remove(&key);
     }
+
     content
 }
 
@@ -297,35 +338,45 @@ async fn media(app: &App, token: &str, params: &Value) -> crabbot_core::Result<V
         .and_then(|value| value.strip_prefix("slack://file/"))
         .filter(|value| safe_id(value))
         .ok_or_else(|| crabbot_core::Error::Denied("Slack media URI is invalid.".into()))?;
+
     let attachment =
         app.attachments.lock().await.get(uri).cloned().ok_or_else(|| {
             crabbot_core::Error::Denied("Slack attachment is unavailable.".into())
         })?;
+
     if attachment.size.is_some_and(|size| size > MEDIA_LIMIT) {
         return Err(crabbot_core::Error::Denied("Slack attachment is too large.".into()));
     }
+
     let response =
         app.client.get(&attachment.url).bearer_auth(token).send().await.map_err(|error| {
             crabbot_core::Error::Denied(format!("Slack media failed: {error}."))
         })?;
+
     if !response.status().is_success() {
         return Err(crabbot_core::Error::Denied("Slack media download was rejected.".into()));
     }
+
     let bytes = response.bytes().await.map_err(|error| {
         crabbot_core::Error::Denied(format!("Slack media response failed: {error}."))
     })?;
+
     if bytes.len() > MEDIA_LIMIT {
         return Err(crabbot_core::Error::Denied("Slack attachment is too large.".into()));
     }
+
     let root = std::env::var_os("CRABBOT_MEDIA")
         .map(PathBuf::from)
         .ok_or_else(|| crabbot_core::Error::Denied("CRABBOT_MEDIA is not configured.".into()))?;
+
     fs::create_dir_all(&root).await?;
     let name = safe_name(&attachment.name).unwrap_or_else(|| "attachment.bin".into());
     let path = root.join(format!("slack-{uri}-{name}"));
+
     if fs::symlink_metadata(&path).await.is_ok() {
         return Err(crabbot_core::Error::Denied("Slack media destination already exists.".into()));
     }
+
     let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path).await?;
     file.write_all(&bytes).await?;
     Ok(json!({"uri": format!("file://{}", path.display()), "mime": attachment.mime}))
@@ -370,9 +421,11 @@ async fn send_at(
     let channel = params["chat"]
         .as_str()
         .ok_or_else(|| crabbot_core::Error::Denied("Slack send requires a chat.".into()))?;
+
     let text = params["text"]
         .as_str()
         .ok_or_else(|| crabbot_core::Error::Denied("Slack send requires text.".into()))?;
+
     api_at(
         client,
         token,
@@ -407,6 +460,7 @@ mod tests {
                 {"id": "F3", "name": "note.txt", "mimetype": "text/plain", "url_private": "https://files.slack.com/files-pri/F3/download"}
             ]
         });
+
         let content = remember_files(&value, &attachments).await;
         assert_eq!(content[0]["kind"], "text");
         assert_eq!(content[1]["kind"], "image");
@@ -429,6 +483,7 @@ mod tests {
         let Some(listener) = loopback_listener().await else {
             return;
         };
+
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -442,6 +497,7 @@ mod tests {
             stream.write_all(header.as_bytes()).await.unwrap();
             stream.write_all(body).await.unwrap();
         });
+
         let value = api_at(
             &reqwest::Client::new(),
             "xoxb-test",
@@ -451,6 +507,7 @@ mod tests {
         )
         .await
         .unwrap();
+
         assert_eq!(value["ok"], true);
         server.await.unwrap();
     }
@@ -460,6 +517,7 @@ mod tests {
         let Some(listener) = loopback_listener().await else {
             return;
         };
+
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -473,6 +531,7 @@ mod tests {
             stream.write_all(header.as_bytes()).await.unwrap();
             stream.write_all(body).await.unwrap();
         });
+
         let value = send_at(
             &reqwest::Client::new(),
             "xoxb-test",
@@ -481,6 +540,7 @@ mod tests {
         )
         .await
         .unwrap();
+
         assert_eq!(value["ts"], "1");
         server.await.unwrap();
     }
@@ -490,6 +550,7 @@ mod tests {
         let Some(listener) = loopback_listener().await else {
             return;
         };
+
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -503,11 +564,13 @@ mod tests {
             stream.write_all(header.as_bytes()).await.unwrap();
             stream.write_all(body).await.unwrap();
         });
+
         let app = App {
             client: reqwest::Client::new(),
             socket: Arc::new(Mutex::new(None)),
             attachments: Arc::new(Mutex::new(BTreeMap::new())),
         };
+
         let value = poll_at(&app, "token", "C1", &format!("http://{address}")).await.unwrap();
         assert_eq!(value["events"][0]["text"], "hello");
         server.await.unwrap();
@@ -515,6 +578,7 @@ mod tests {
         let Some(listener) = loopback_listener().await else {
             return;
         };
+
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -526,6 +590,7 @@ mod tests {
             stream.write_all(header.as_bytes()).await.unwrap();
             stream.write_all(body).await.unwrap();
         });
+
         assert!(
             api_at(
                 &reqwest::Client::new(),
@@ -547,6 +612,7 @@ mod tests {
             socket: Arc::new(Mutex::new(None)),
             attachments: Arc::new(Mutex::new(BTreeMap::new())),
         };
+
         assert!(media(&app, "token", &json!({})).await.is_err());
         assert!(
             send_at(&reqwest::Client::new(), "token", &json!({}), "http://unused").await.is_err()

@@ -31,7 +31,9 @@ locking your data into a hosted service.
 
 When working on the repository, read `AGENTS.md`, the nearest scoped guidance,
 and the relevant local documentation before making changes. Treat the
-repository’s implementation and documentation as the source of truth.
+repository’s implementation and documentation as the source of truth. For
+Rust changes, run `cargo fmt --all`, `make spacing`, and `make fmt` before
+testing; keep the spacing formatter’s blank lines between multiline statements.
 
 ## Installation
 
@@ -282,6 +284,16 @@ builds, and metrics. Core and host package line coverage must remain at or above
 ```sh
 make coverage
 ```
+
+`make fmt` checks both `cargo fmt` and the repository spacing formatter. Use
+`cargo fmt --all` followed by `make spacing` to apply formatting, then rerun
+`make fmt` to confirm the result. The spacing formatter is idempotent and
+preserves Rust raw-string contents.
+
+Use `make ci` only when adding or changing GitHub Actions workflows, or when
+debugging the workflow’s own ordering, inputs, runners, or action behavior. It
+uses `crabbot-ci/ci.sh` and `act` after a local preflight. For normal code
+changes, `make verify`, `make test`, and `make build` are enough.
 
 See [AGENTS.md](AGENTS.md) for repository boundaries and conventions,
 [ROADMAP.md](ROADMAP.md) for planned work, and the

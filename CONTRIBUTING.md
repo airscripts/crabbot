@@ -19,6 +19,28 @@ Lefthook runs fast checks before commits. `make verify` runs formatting,
 Clippy, locked compilation, all tests, coverage, builds, and metrics. Provider
 tests use local fixtures and never call paid APIs.
 
+## Formatting
+
+Rust formatting has two checks: `cargo fmt` handles syntax formatting, while
+`crabbot-scripts/spacing.sh` keeps blank lines between adjacent Rust blocks and
+multiline statements. Run the complete formatting check with:
+
+```sh
+make fmt
+```
+
+To apply both formatters before checking the result, run:
+
+```sh
+cargo fmt --all
+make spacing
+make fmt
+```
+
+The spacing formatter is idempotent and understands Rust raw strings, so it
+does not alter their contents. Keep the resulting blank lines in the source;
+do not remove them as cosmetic noise.
+
 For the complete non-release CI pipeline, install Docker and
 [act](https://github.com/nektos/act), then run:
 
@@ -36,6 +58,19 @@ The command runs Verify, Agentskill, Security, the native Linux tests, the
 sandbox test, and the native Linux build. Release, package, checksum, and
 publish workflows are intentionally excluded. Native macOS, Windows, and
 cross-architecture jobs still run only on their GitHub-hosted runners.
+
+Use `make ci` when adding or changing GitHub Actions workflows, or when the
+workflow itself needs debugging: it runs the local preflight and then executes
+the important Actions flow through `crabbot-ci/ci.sh` and `act`. For ordinary
+Rust or plugin changes, the local commands are sufficient:
+
+```sh
+make verify
+make test
+make build
+```
+
+This keeps action-flow debugging separate from normal implementation checks.
 
 ## Change Rules
 

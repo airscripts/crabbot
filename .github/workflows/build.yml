@@ -20,8 +20,8 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: ${{ matrix.name }}
+  crates:
+    name: Crates
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
 

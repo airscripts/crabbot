@@ -4,11 +4,13 @@ use crabbot_core::{
     plugin::Emitter,
     types::{Content, Event, ModelReply, ModelRequest, Request, Response},
 };
+
 #[cfg(not(test))]
 use crabbot_core::{
     plugin::serve_events,
     types::{Capability, Hello, Protocol},
 };
+
 use futures_util::{Stream, StreamExt};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -24,6 +26,7 @@ async fn main() -> crabbot_core::Result<()> {
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|error| crabbot_core::Error::Denied(format!("Ollama client failed: {error}.")))?;
+
     serve_events(
         Hello {
             protocol: Protocol::CURRENT,
@@ -49,12 +52,15 @@ async fn generate(
         Request::Call { id, method, params, .. } => (id, method, params),
         Request::Note { .. } => return Ok(None),
     };
+
     if method != "generate" {
         return Ok(None);
     }
+
     let input: ModelRequest = serde_json::from_value(params)?;
     let host =
         std::env::var("CRABBOT_OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
+
     generate_at(client, id, input, &host, &mut emitter).await
 }
 
@@ -89,9 +95,11 @@ async fn request(
     stream: bool,
 ) -> crabbot_core::Result<Option<Response>> {
     let mut post = client.post(format!("{host}/api/chat"));
+
     if let Some(key) = credential() {
         post = post.bearer_auth(key);
     }
+
     let messages = messages(&input)?;
     let response = post
         .json(&json!({"model": input.model, "messages": messages, "tools": tools(&input), "stream": stream}))
@@ -99,16 +107,21 @@ async fn request(
         .await
         .map_err(|error| {
             let kind = if stream { "stream" } else { "request" };
+
             crabbot_core::Error::Denied(format!("Ollama {kind} failed: {error}."))
         })?;
+
     let status = response.status();
     let body = read(response, "Ollama").await?;
+
     if stream {
         return stream_body(id, status, &body);
     }
+
     let body: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
         crabbot_core::Error::Denied(format!("Ollama response failed: {error}."))
     })?;
+
     response_body(id, status, body)
 }
 
@@ -128,11 +141,13 @@ where
         let chunk = chunk.map_err(|error| {
             crabbot_core::Error::Denied(format!("{provider} response failed: {error}."))
         })?;
+
         if chunk.as_ref().len() > BODY_LIMIT.saturating_sub(bytes.len()) {
             return Err(crabbot_core::Error::Denied(format!(
                 "{provider} response exceeded the {BODY_LIMIT}-byte limit."
             )));
         }
+
         bytes.extend_from_slice(chunk.as_ref());
     }
 
@@ -172,18 +187,23 @@ where
         tokio::select! {
             chunk = stream.next() => {
                 let Some(chunk) = chunk else { break };
+
                 let chunk = chunk.map_err(|error| {
                     crabbot_core::Error::Denied(format!("Ollama stream failed: {error}."))
                 })?;
+
                 if chunk.as_ref().len() > BODY_LIMIT.saturating_sub(bytes) {
                     return Err(crabbot_core::Error::Denied(format!(
                         "Ollama stream exceeded the {BODY_LIMIT}-byte limit."
                     )));
                 }
+
                 bytes = bytes.saturating_add(chunk.as_ref().len());
                 buffered.extend_from_slice(chunk.as_ref());
+
                 while let Some(end) = buffered.iter().position(|byte| *byte == b'\n') {
                     let line = buffered.drain(..=end).collect::<Vec<_>>();
+
                     if ollama_line(
                         &line,
                         &mut text,
@@ -195,14 +215,17 @@ where
                     )? {
                         break 'stream;
                     }
+
                     if pending.len() >= 128 {
                         emit(&mut pending, emitter).await?;
                     }
                 }
             }
+
             _ = ticker.tick(), if !pending.is_empty() => emit(&mut pending, emitter).await?,
         }
     }
+
     if !buffered.is_empty() {
         ollama_line(
             &buffered,
@@ -214,6 +237,7 @@ where
             &mut output_tokens,
         )?;
     }
+
     emit(&mut pending, emitter).await?;
 
     let events = tools
@@ -224,6 +248,7 @@ where
                     "Ollama stream returned a tool call without a name.".into(),
                 ));
             }
+
             let arguments = if let Some(value) = tool.arguments.as_str() {
                 serde_json::from_str(value).map_err(|error| {
                     crabbot_core::Error::Denied(format!(
@@ -233,6 +258,7 @@ where
             } else {
                 tool.arguments
             };
+
             Ok(Event::Tool { name: tool.name, args: arguments })
         })
         .collect::<crabbot_core::Result<Vec<_>>>()?;
@@ -261,44 +287,56 @@ fn ollama_line(
     if line.iter().all(u8::is_ascii_whitespace) {
         return Ok(false);
     }
+
     let line = std::str::from_utf8(line).map_err(|error| {
         crabbot_core::Error::Denied(format!("Ollama stream was not UTF-8: {error}."))
     })?;
+
     let value: serde_json::Value = serde_json::from_str(line.trim())?;
+
     if let Some(error) = value["error"].as_str() {
         return Err(crabbot_core::Error::Denied(format!("Ollama stream failed: {error}.")));
     }
+
     if let Some(part) = value["message"]["content"].as_str() {
         append_text(part, text, pending)?;
     }
+
     if let Some(calls) = value["message"]["tool_calls"].as_array() {
         if calls.len() > 16 {
             return Err(crabbot_core::Error::Limit(
                 "Ollama stream exceeded the tool-call limit.".into(),
             ));
         }
+
         for (position, call) in calls.iter().enumerate() {
             let index = call["index"]
                 .as_u64()
                 .and_then(|index| usize::try_from(index).ok())
                 .unwrap_or(position);
+
             if index >= 16 {
                 return Err(crabbot_core::Error::Limit(
                     "Ollama stream exceeded the tool-call limit.".into(),
                 ));
             }
+
             let tool = tools.entry(index).or_default();
+
             if let Some(name) = call["function"]["name"].as_str() {
                 tool.name = name.into();
             }
+
             if !call["function"]["arguments"].is_null() {
                 tool.arguments = call["function"]["arguments"].clone();
             }
         }
     }
+
     if let Some(reason) = value["done_reason"].as_str() {
         *stop = reason.into();
     }
+
     *input_tokens = value["prompt_eval_count"].as_u64().or(*input_tokens);
     *output_tokens = value["eval_count"].as_u64().or(*output_tokens);
     Ok(value["done"] == true)
@@ -310,6 +348,7 @@ fn append_text(part: &str, text: &mut String, pending: &mut String) -> crabbot_c
             "Ollama stream exceeded the response limit.".into(),
         ));
     }
+
     text.push_str(part);
     pending.push_str(part);
     Ok(())
@@ -319,6 +358,7 @@ async fn emit(pending: &mut String, emitter: &mut Emitter) -> crabbot_core::Resu
     if !pending.is_empty() {
         emitter.event(json!({"kind": "text", "text": std::mem::take(pending)})).await?;
     }
+
     Ok(())
 }
 
@@ -343,6 +383,7 @@ fn keyring(name: &str) -> Option<String> {
     if std::env::var("CRABBOT_KEYRING").ok().as_deref() != Some("1") {
         return None;
     }
+
     keyring::Entry::new("dev.airscripts.crabbot", name)
         .ok()?
         .get_password()
@@ -359,20 +400,25 @@ async fn stream_request(
 ) -> crabbot_core::Result<Option<Response>> {
     let mut post = client.post(format!("{host}/api/chat"));
     let messages = messages(&input)?;
+
     if let Some(key) = credential() {
         post = post.bearer_auth(key);
     }
+
     let response = post
         .json(&json!({"model": input.model, "messages": messages, "tools": tools(&input), "stream": true}))
         .send()
         .await
         .map_err(|error| crabbot_core::Error::Denied(format!("Ollama stream failed: {error}.")))?;
+
     let status = response.status();
+
     if !status.is_success() {
         return Err(crabbot_core::Error::Denied(format!(
             "Ollama stream was rejected with {status}."
         )));
     }
+
     live_stream(id, response.bytes_stream(), emitter).await
 }
 
@@ -387,8 +433,10 @@ fn messages(input: &ModelRequest) -> crabbot_core::Result<Vec<serde_json::Value>
                 crabbot_core::types::Role::Assistant => "assistant",
                 crabbot_core::types::Role::Tool => "tool",
             };
+
             let mut text = Vec::new();
             let mut images = Vec::new();
+
             for content in &message.content {
                 match content {
                     Content::Text { text: value } => text.push(value.clone()),
@@ -396,10 +444,13 @@ fn messages(input: &ModelRequest) -> crabbot_core::Result<Vec<serde_json::Value>
                     content => text.push(content.render()),
                 }
             }
+
             let mut value = json!({"role": role, "content": text.join("\n")});
+
             if !images.is_empty() {
                 value["images"] = json!(images);
             }
+
             Ok(value)
         })
         .collect()
@@ -413,6 +464,7 @@ fn image_data(uri: &str) -> crabbot_core::Result<&str> {
             "Ollama received an unsupported image reference.".into(),
         ));
     };
+
     if !matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp")
         || encoded.is_empty()
         || !encoded
@@ -423,6 +475,7 @@ fn image_data(uri: &str) -> crabbot_core::Result<&str> {
             "Ollama received an invalid image data URL.".into(),
         ));
     }
+
     Ok(encoded)
 }
 
@@ -453,20 +506,26 @@ fn stream_body(
             "Ollama stream was rejected with {status}."
         )));
     }
+
     let mut text = String::new();
     let mut stop = "stream".to_string();
+
     for line in body.lines() {
         if line.trim().is_empty() {
             continue;
         }
+
         let value: serde_json::Value = serde_json::from_str(line.trim())?;
+
         if let Some(part) = value["message"]["content"].as_str() {
             text.push_str(part);
         }
+
         if let Some(reason) = value["done_reason"].as_str() {
             stop = reason.into();
         }
     }
+
     response(
         id,
         serde_json::to_value(ModelReply {
@@ -490,6 +549,7 @@ fn response_body(
             body["error"].as_str().unwrap_or("request failed")
         )));
     }
+
     let text = body["message"]["content"].as_str().unwrap_or_default().to_string();
     let events = body["message"]["tool_calls"]
         .as_array()
@@ -506,11 +566,13 @@ fn response_body(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+
     if text.is_empty() && events.is_empty() {
         return Err(crabbot_core::Error::Denied(
             "Ollama response contained no text or tools.".into(),
         ));
     }
+
     response(
         id,
         serde_json::to_value(ModelReply {
@@ -525,11 +587,13 @@ fn response_body(
 
 fn response(id: u64, result: serde_json::Value) -> crabbot_core::Result<Option<Response>> {
     let response = Response::ok(id, result);
+
     if serde_json::to_vec(&response)?.len().saturating_add(1) > crabbot_core::jsonl::MAX {
         return Err(crabbot_core::Error::Denied(
             "Ollama response exceeds the protocol frame limit.".into(),
         ));
     }
+
     Ok(Some(response))
 }
 
@@ -612,6 +676,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+
         assert_eq!(tool.result.unwrap()["events"][0]["name"], "read");
     }
 
@@ -666,6 +731,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+
         let reply = result.result.unwrap();
         assert_eq!(reply["text"], "hello");
         assert_eq!(reply["stop"], "stop");
@@ -684,6 +750,7 @@ mod tests {
         );
         let note =
             Request::Note { jsonrpc: "2.0".into(), method: "generate".into(), params: json!({}) };
+
         assert!(generate(&client, note, test_emitter()).await.unwrap().is_none());
         assert!(generate_request(&client, 1, model(), "http://127.0.0.1:1").await.is_err());
         let mut emitter = test_emitter();
@@ -711,6 +778,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+
         assert_eq!(result.result.unwrap()["text"], "hello");
     }
 
@@ -724,6 +792,7 @@ mod tests {
             "{\"message\":{\"content\":\"Ready.\"},\"done\":false}\n",
             "{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"read\",\"arguments\":{\"path\":\"README.md\"}}}]},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":4,\"eval_count\":2}\n",
         );
+
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(body.as_bytes().to_vec())]);
         let response = live_stream(5, chunks, &mut emitter).await.unwrap().unwrap();
 
@@ -733,9 +802,11 @@ mod tests {
         assert_eq!(response.result.as_ref().unwrap()["input"], 4);
         let event: crabbot_core::types::Request =
             serde_json::from_value(events.try_recv().unwrap()).unwrap();
+
         assert!(matches!(
             event,
             crabbot_core::types::Request::Note { params, .. }
+
                 if params["event"]["text"] == "Ready."
         ));
     }

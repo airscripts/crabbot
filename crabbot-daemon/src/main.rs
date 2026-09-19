@@ -14,6 +14,7 @@ where
 {
     match future.await {
         Ok(()) => ExitCode::SUCCESS,
+
         Err(error) => {
             tracing::error!(
                 error = %crabbot_runtime::redact_diagnostic(sentence(error.to_string())),
@@ -27,6 +28,7 @@ where
 fn sentence(value: String) -> String {
     let value = value.trim().trim_end_matches('.');
     let mut chars = value.chars();
+
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => "Unknown error".into(),

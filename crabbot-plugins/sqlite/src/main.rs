@@ -10,6 +10,7 @@ use crabbot_core::{
     plugin::serve_with,
     types::{Capability, Hello, Protocol},
 };
+
 use rusqlite::{Connection, OptionalExtension, params};
 
 #[cfg(unix)]
@@ -32,8 +33,10 @@ async fn main() -> crabbot_core::Result<()> {
         .ok_or_else(|| {
             crabbot_core::Error::Denied("CRABBOT_DB or CRABBOT_HOME is required.".into())
         })?;
+
     let db = Connection::open(&path)
         .map_err(|error| crabbot_core::Error::Denied(format!("SQLite open failed: {error}.")))?;
+
     private(&path)?;
     migrate(&db)?;
     private_sidecars(&path)?;
@@ -61,6 +64,7 @@ fn private(path: &std::path::Path) -> crabbot_core::Result<()> {
         permissions.set_mode(0o600);
         std::fs::set_permissions(path, permissions)?;
     }
+
     Ok(())
 }
 
@@ -68,10 +72,12 @@ fn private(path: &std::path::Path) -> crabbot_core::Result<()> {
 fn private_sidecars(path: &std::path::Path) -> crabbot_core::Result<()> {
     for suffix in ["-wal", "-shm"] {
         let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
+
         if sidecar.exists() {
             private(&sidecar)?;
         }
     }
+
     Ok(())
 }
 
@@ -80,8 +86,10 @@ fn store(db: &Arc<Mutex<Connection>>, request: Request) -> crabbot_core::Result<
         Request::Call { id, method, params, .. } => (id, method, params),
         Request::Note { .. } => return Ok(None),
     };
+
     let db =
         db.lock().map_err(|_| crabbot_core::Error::Denied("SQLite lock is poisoned.".into()))?;
+
     let result = match method.as_str() {
         "put" => {
             let key = key(&params, "put.key")?;
@@ -93,6 +101,7 @@ fn store(db: &Arc<Mutex<Connection>>, request: Request) -> crabbot_core::Result<
             .map_err(|error| crabbot_core::Error::Denied(format!("SQLite put failed: {error}.")))?;
             serde_json::json!({"ok": true})
         }
+
         "get" => {
             let key = key(&params, "get.key")?;
             let value = db
@@ -103,21 +112,26 @@ fn store(db: &Arc<Mutex<Connection>>, request: Request) -> crabbot_core::Result<
                 .map_err(|error| {
                     crabbot_core::Error::Denied(format!("SQLite get failed: {error}."))
                 })?;
+
             match value {
                 Some(value) => {
                     serde_json::json!({"found": true, "value": serde_json::from_str::<serde_json::Value>(&value)?})
                 }
+
                 None => serde_json::json!({"found": false}),
             }
         }
+
         "delete" => {
             let key = key(&params, "delete.key")?;
             let count =
                 db.execute("DELETE FROM item WHERE key = ?1", params![key]).map_err(|error| {
                     crabbot_core::Error::Denied(format!("SQLite delete failed: {error}."))
                 })?;
+
             serde_json::json!({"deleted": count == 1})
         }
+
         "lease" => lease(&db, &params)?,
         "release" => release(&db, &params)?,
         "enqueue" => enqueue(&db, &params)?,
@@ -127,7 +141,9 @@ fn store(db: &Arc<Mutex<Connection>>, request: Request) -> crabbot_core::Result<
         "seen" => seen(&db, &params)?,
         _ => return Ok(None),
     };
+
     let response = Response::ok(id, result);
+
     if serde_json::to_vec(&response)?.len().saturating_add(1 + FRAME_HEADROOM)
         > crabbot_core::jsonl::MAX
     {
@@ -135,6 +151,7 @@ fn store(db: &Arc<Mutex<Connection>>, request: Request) -> crabbot_core::Result<
             "SQLite response exceeds the protocol frame limit.".into(),
         ));
     }
+
     Ok(Some(response))
 }
 
@@ -149,18 +166,23 @@ fn migrate(db: &Connection) -> crabbot_core::Result<()> {
          INSERT OR IGNORE INTO schema_version(version, applied) VALUES(1, strftime('%s', 'now'));",
     )
         .map_err(|error| crabbot_core::Error::Denied(format!("SQLite migration failed: {error}.")))?;
+
     let page_size =
         db.query_row("PRAGMA page_size;", [], |row| row.get::<_, i64>(0)).map_err(|error| {
             crabbot_core::Error::Denied(format!("SQLite size limit failed: {error}."))
         })?;
+
     let page_count =
         db.query_row("PRAGMA page_count;", [], |row| row.get::<_, i64>(0)).map_err(|error| {
             crabbot_core::Error::Denied(format!("SQLite size limit failed: {error}."))
         })?;
+
     let max_pages = DB_LIMIT / page_size.max(1);
+
     if page_count > max_pages {
         return Err(crabbot_core::Error::Denied("SQLite database exceeds the size limit.".into()));
     }
+
     db.query_row(&format!("PRAGMA max_page_count = {max_pages};"), [], |row| row.get::<_, i64>(0))
         .map_err(|error| {
             crabbot_core::Error::Denied(format!("SQLite size limit failed: {error}."))
@@ -169,6 +191,7 @@ fn migrate(db: &Connection) -> crabbot_core::Result<()> {
     let mut columns = db.prepare("PRAGMA table_info(item)").map_err(|error| {
         crabbot_core::Error::Denied(format!("SQLite migration failed: {error}."))
     })?;
+
     let has_updated = columns
         .query_map([], |row| row.get::<_, String>(1))
         .map_err(|error| crabbot_core::Error::Denied(format!("SQLite migration failed: {error}.")))?
@@ -176,6 +199,7 @@ fn migrate(db: &Connection) -> crabbot_core::Result<()> {
         .map_err(|error| crabbot_core::Error::Denied(format!("SQLite migration failed: {error}.")))?
         .iter()
         .any(|name| name == "updated");
+
     if !has_updated {
         db.execute_batch("ALTER TABLE item ADD COLUMN updated INTEGER NOT NULL DEFAULT 0;")
             .map_err(|error| {
@@ -190,20 +214,25 @@ fn key<'a>(params: &'a serde_json::Value, label: &str) -> crabbot_core::Result<&
     let key = params["key"]
         .as_str()
         .ok_or_else(|| crabbot_core::Error::Denied(format!("{label} is required.")))?;
+
     if key.trim().is_empty() {
         return Err(crabbot_core::Error::Denied(format!("{label} cannot be empty.")));
     }
+
     if key.len() > KEY_LIMIT {
         return Err(crabbot_core::Error::Denied(format!("{label} exceeds the size limit.")));
     }
+
     Ok(key)
 }
 
 fn value(value: &serde_json::Value, label: &str) -> crabbot_core::Result<String> {
     let value = serde_json::to_string(value)?;
+
     if value.len() > VALUE_LIMIT {
         return Err(crabbot_core::Error::Denied(format!("{label} exceeds the size limit.")));
     }
+
     Ok(value)
 }
 
@@ -212,10 +241,12 @@ fn lease(db: &Connection, params: &serde_json::Value) -> crabbot_core::Result<se
         .as_str()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| crabbot_core::Error::Denied("lease.name is required.".into()))?;
+
     let owner = params["owner"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| crabbot_core::Error::Denied("lease.owner is required.".into()))?;
+
     let ttl = params["ttl"].as_u64().unwrap_or(30).clamp(1, 86_400) as i64;
     let expires = now() + ttl;
     let count = db
@@ -224,6 +255,7 @@ fn lease(db: &Connection, params: &serde_json::Value) -> crabbot_core::Result<se
             params![name, owner, expires, now()],
         )
         .map_err(|error| crabbot_core::Error::Denied(format!("SQLite lease failed: {error}.")))?;
+
     Ok(serde_json::json!({"acquired": count == 1, "expires": expires}))
 }
 
@@ -232,13 +264,16 @@ fn release(db: &Connection, params: &serde_json::Value) -> crabbot_core::Result<
         .as_str()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| crabbot_core::Error::Denied("release.name is required.".into()))?;
+
     let owner = params["owner"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| crabbot_core::Error::Denied("release.owner is required.".into()))?;
+
     let count = db
         .execute("DELETE FROM lease WHERE name = ?1 AND owner = ?2", params![name, owner])
         .map_err(|error| crabbot_core::Error::Denied(format!("SQLite release failed: {error}.")))?;
+
     Ok(serde_json::json!({"released": count == 1}))
 }
 
@@ -253,28 +288,34 @@ fn enqueue(db: &Connection, params: &serde_json::Value) -> crabbot_core::Result<
         .map_err(|error| {
             crabbot_core::Error::Denied(format!("SQLite enqueue lookup failed: {error}."))
         })?;
+
     if let Some(id) = existing {
         return Ok(serde_json::json!({"id": id}));
     }
+
     let count: i64 =
         db.query_row("SELECT COUNT(*) FROM outbox", [], |row| row.get(0)).map_err(|error| {
             crabbot_core::Error::Denied(format!("SQLite outbox count failed: {error}."))
         })?;
+
     if count >= LIMIT {
         return Err(crabbot_core::Error::Denied(
             "SQLite outbox is full; no message was discarded.".into(),
         ));
     }
+
     db.execute(
         "INSERT INTO outbox(dedupe, value, created) VALUES(?1, ?2, ?3) ON CONFLICT(dedupe) DO NOTHING",
         params![dedupe, value, now()],
     )
     .map_err(|error| crabbot_core::Error::Denied(format!("SQLite enqueue failed: {error}.")))?;
+
     let id: i64 = db
         .query_row("SELECT id FROM outbox WHERE dedupe = ?1", params![dedupe], |row| row.get(0))
         .map_err(|error| {
             crabbot_core::Error::Denied(format!("SQLite enqueue lookup failed: {error}."))
         })?;
+
     Ok(serde_json::json!({"id": id}))
 }
 
@@ -283,6 +324,7 @@ fn outbox(db: &Connection, params: &serde_json::Value) -> crabbot_core::Result<s
     let mut statement = db
         .prepare("SELECT id, dedupe, value, attempts FROM outbox ORDER BY id LIMIT ?1")
         .map_err(|error| crabbot_core::Error::Denied(format!("SQLite outbox failed: {error}.")))?;
+
     let rows = statement
         .query_map(params![limit], |row| {
             Ok((
@@ -295,11 +337,14 @@ fn outbox(db: &Connection, params: &serde_json::Value) -> crabbot_core::Result<s
         .map_err(|error| {
             crabbot_core::Error::Denied(format!("SQLite outbox read failed: {error}."))
         })?;
+
     let mut items = Vec::new();
+
     for row in rows {
         let (id, key, value, attempts) = row.map_err(|error| {
             crabbot_core::Error::Denied(format!("SQLite outbox row failed: {error}."))
         })?;
+
         items.push(serde_json::json!({
             "id": id,
             "key": key,
@@ -307,6 +352,7 @@ fn outbox(db: &Connection, params: &serde_json::Value) -> crabbot_core::Result<s
             "attempts": attempts,
         }));
     }
+
     Ok(serde_json::json!({"items": items}))
 }
 
@@ -315,9 +361,11 @@ fn ack(db: &Connection, params: &serde_json::Value) -> crabbot_core::Result<serd
         .as_i64()
         .filter(|value| *value > 0)
         .ok_or_else(|| crabbot_core::Error::Denied("ack.id is required.".into()))?;
+
     let count = db
         .execute("DELETE FROM outbox WHERE id = ?1", params![id])
         .map_err(|error| crabbot_core::Error::Denied(format!("SQLite ack failed: {error}.")))?;
+
     Ok(serde_json::json!({"acked": count == 1}))
 }
 
@@ -326,9 +374,11 @@ fn retry(db: &Connection, params: &serde_json::Value) -> crabbot_core::Result<se
         .as_i64()
         .filter(|value| *value > 0)
         .ok_or_else(|| crabbot_core::Error::Denied("retry.id is required.".into()))?;
+
     let count = db
         .execute("UPDATE outbox SET attempts = attempts + 1 WHERE id = ?1", params![id])
         .map_err(|error| crabbot_core::Error::Denied(format!("SQLite retry failed: {error}.")))?;
+
     Ok(serde_json::json!({"retried": count == 1}))
 }
 
@@ -339,6 +389,7 @@ fn seen(db: &Connection, params: &serde_json::Value) -> crabbot_core::Result<ser
     db.execute("DELETE FROM seen WHERE expires <= ?1", params![now]).map_err(|error| {
         crabbot_core::Error::Denied(format!("SQLite deduplication failed: {error}."))
     })?;
+
     let count = db
         .execute(
             "INSERT INTO seen(key, expires) VALUES(?1, ?2) ON CONFLICT(key) DO NOTHING",
@@ -347,6 +398,7 @@ fn seen(db: &Connection, params: &serde_json::Value) -> crabbot_core::Result<ser
         .map_err(|error| {
             crabbot_core::Error::Denied(format!("SQLite deduplication failed: {error}."))
         })?;
+
     Ok(serde_json::json!({"new": count == 1}))
 }
 
@@ -359,6 +411,7 @@ fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{DB_LIMIT, migrate, private, store};
+
     use crabbot_core::types::Request;
     use rusqlite::Connection;
     use serde_json::json;
@@ -386,6 +439,7 @@ mod tests {
         let put = store(&db, Request::call(1, "put", json!({"key": "answer", "value": 42})))
             .unwrap()
             .unwrap();
+
         assert_eq!(put.result.unwrap()["ok"], true);
 
         let get = store(&db, Request::call(2, "get", json!({"key": "answer"}))).unwrap().unwrap();
@@ -393,19 +447,23 @@ mod tests {
 
         let deleted =
             store(&db, Request::call(3, "delete", json!({"key": "answer"}))).unwrap().unwrap();
+
         assert_eq!(deleted.result.unwrap()["deleted"], true);
 
         let missing =
             store(&db, Request::call(4, "get", json!({"key": "answer"}))).unwrap().unwrap();
+
         assert_eq!(missing.result.unwrap()["found"], false);
     }
 
     #[test]
     fn store_validates_requests() {
         let db = db();
+
         for method in ["put", "get", "delete"] {
             assert!(store(&db, Request::call(1, method, json!({}))).is_err());
         }
+
         assert!(store(&db, Request::call(2, "unknown", json!({}))).unwrap().is_none());
         let note = Request::Note { jsonrpc: "2.0".into(), method: "get".into(), params: json!({}) };
         assert!(store(&db, note).unwrap().is_none());
@@ -418,11 +476,13 @@ mod tests {
             .unwrap()
             .execute("INSERT INTO item(key, value, updated) VALUES('broken', 'not json', 0)", [])
             .unwrap();
+
         assert!(store(&db, Request::call(1, "get", json!({"key": "broken"}))).is_err());
         let updated =
             store(&db, Request::call(2, "put", json!({"key": "broken", "value": {"ok": true}})))
                 .unwrap()
                 .unwrap();
+
         assert_eq!(updated.result.unwrap()["ok"], true);
         db.lock()
             .unwrap()
@@ -431,9 +491,11 @@ mod tests {
                 [],
             )
             .unwrap();
+
         assert!(store(&db, Request::call(3, "outbox", json!({}))).is_err());
         let deleted =
             store(&db, Request::call(4, "delete", json!({"key": "missing"}))).unwrap().unwrap();
+
         assert_eq!(deleted.result.unwrap()["deleted"], false);
     }
 
@@ -446,21 +508,25 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+
         assert_eq!(acquired.result.unwrap()["acquired"], true);
         let contested =
             store(&db, Request::call(2, "lease", json!({"name": "bridge", "owner": "two"})))
                 .unwrap()
                 .unwrap();
+
         assert_eq!(contested.result.unwrap()["acquired"], false);
         let renewed =
             store(&db, Request::call(3, "lease", json!({"name": "bridge", "owner": "one"})))
                 .unwrap()
                 .unwrap();
+
         assert_eq!(renewed.result.unwrap()["acquired"], true);
         let released =
             store(&db, Request::call(4, "release", json!({"name": "bridge", "owner": "one"})))
                 .unwrap()
                 .unwrap();
+
         assert_eq!(released.result.unwrap()["released"], true);
 
         let first = store(
@@ -469,12 +535,14 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+
         let second = store(
             &db,
             Request::call(6, "enqueue", json!({"key": "event-1", "value": {"ok": false}})),
         )
         .unwrap()
         .unwrap();
+
         assert_eq!(first.result.unwrap()["id"], second.result.unwrap()["id"]);
         let listed = store(&db, Request::call(7, "outbox", json!({"limit": 10}))).unwrap().unwrap();
         assert_eq!(listed.result.as_ref().unwrap()["items"].as_array().unwrap().len(), 1);
@@ -487,15 +555,18 @@ mod tests {
         assert_eq!(acked.result.unwrap()["acked"], true);
         let seen =
             store(&db, Request::call(11, "seen", json!({"key": "event-1"}))).unwrap().unwrap();
+
         assert_eq!(seen.result.unwrap()["new"], true);
         let duplicate =
             store(&db, Request::call(12, "seen", json!({"key": "event-1"}))).unwrap().unwrap();
+
         assert_eq!(duplicate.result.unwrap()["new"], false);
     }
 
     #[test]
     fn store_rejects_reliability_requests_without_keys() {
         let db = db();
+
         for (method, params) in [
             ("lease", json!({"owner": "one"})),
             ("release", json!({"name": "bridge"})),
@@ -506,11 +577,14 @@ mod tests {
         ] {
             assert!(store(&db, Request::call(1, method, params)).is_err());
         }
+
         assert!(store(&db, Request::call(2, "put", json!({"key": ""}))).is_err());
+
         let missing =
             store(&db, Request::call(3, "release", json!({"name": "missing", "owner": "one"})))
                 .unwrap()
                 .unwrap();
+
         assert_eq!(missing.result.unwrap()["released"], false);
         let unacked = store(&db, Request::call(4, "ack", json!({"id": 42}))).unwrap().unwrap();
         assert_eq!(unacked.result.unwrap()["acked"], false);
@@ -525,6 +599,7 @@ mod tests {
         let result = store(&db, Request::call(1, "put", json!({"key": "old", "value": true})))
             .unwrap()
             .unwrap();
+
         assert_eq!(result.result.unwrap()["ok"], true);
     }
 

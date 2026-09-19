@@ -19,8 +19,8 @@ permissions:
   contents: write
 
 jobs:
-  publish:
-    name: Publish Release
+  release:
+    name: Release
     runs-on: ubuntu-latest
     container: rust:1.89-trixie
 

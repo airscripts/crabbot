@@ -6,6 +6,7 @@ use crabbot_core::{
     plugin::serve_events,
     types::{Capability, Hello, Protocol},
 };
+
 use serde_json::{Value, json};
 #[cfg(not(test))]
 use std::time::Duration;
@@ -45,6 +46,7 @@ async fn generate(
         Request::Call { id, method, params, .. } => (id, method, params),
         Request::Note { .. } => return Ok(None),
     };
+
     if method != "generate" {
         return Ok(None);
     }
@@ -52,12 +54,14 @@ async fn generate(
     let input: ModelRequest = serde_json::from_value(params)?;
     let key = std::env::var("CRABBOT_GEMINI_KEY")
         .map_err(|_| crabbot_core::Error::Denied("CRABBOT_GEMINI_KEY is not configured.".into()))?;
+
     if key.trim().is_empty() {
         return Err(crabbot_core::Error::Denied("CRABBOT_GEMINI_KEY is not configured.".into()));
     }
 
     let base = std::env::var("CRABBOT_GEMINI_BASE_URL")
         .unwrap_or_else(|_| "https://generativelanguage.googleapis.com/v1beta".into());
+
     generate_configured(client, id, input, &key, &base).await
 }
 
@@ -70,6 +74,7 @@ async fn generate_configured(
 ) -> crabbot_core::Result<Option<Response>> {
     let base_url = reqwest::Url::parse(base)
         .map_err(|_| crabbot_core::Error::Denied("Gemini base URL is invalid.".into()))?;
+
     if base_url.scheme() != "https"
         && !matches!(base_url.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
     {
@@ -93,6 +98,7 @@ async fn generate_at(
     } else {
         input.model.clone()
     };
+
     let response = client
         .post(format!("{}/models/{}:generateContent", base.trim_end_matches('/'), model))
         .query(&[("key", key.to_owned())])
@@ -100,25 +106,31 @@ async fn generate_at(
         .send()
         .await
         .map_err(|error| crabbot_core::Error::Denied(format!("Gemini request failed: {error}.")))?;
+
     let status = response.status();
     let body = response.bytes().await.map_err(|error| {
         crabbot_core::Error::Denied(format!("Gemini response failed: {error}."))
     })?;
+
     if body.len() > BODY_LIMIT {
         return Err(crabbot_core::Error::Denied(
             "Gemini response exceeded the protocol limit.".into(),
         ));
     }
+
     let value: Value = serde_json::from_slice(&body).map_err(|error| {
         crabbot_core::Error::Denied(format!("Gemini response was invalid: {error}."))
     })?;
+
     if !status.is_success() {
         return Err(crabbot_core::Error::Denied(format!(
             "Gemini request was rejected with {status}."
         )));
     }
+
     let (text, events) = parse_reply(&value);
     let stop = if events.is_empty() { "stop" } else { "tool" };
+
     Ok(Some(Response::ok(
         id,
         serde_json::to_value(ModelReply {
@@ -134,34 +146,41 @@ async fn generate_at(
 fn parse_reply(value: &Value) -> (String, Vec<Event>) {
     let mut text = String::new();
     let mut events = Vec::new();
+
     for part in value["candidates"][0]["content"]["parts"].as_array().into_iter().flatten() {
         if let Some(value) = part["text"].as_str() {
             text.push_str(value);
         }
+
         if let Some(call) = part.get("functionCall")
             && let Some(name) = call["name"].as_str()
         {
             events.push(Event::Tool { name: name.into(), args: call["args"].clone() });
         }
     }
+
     (text, events)
 }
 
 fn request_body(input: &ModelRequest) -> crabbot_core::Result<Value> {
     let mut contents = Vec::new();
     let mut system = Vec::new();
+
     for message in &input.messages {
         let parts = message
             .content
             .iter()
             .map(|content| match content {
                 Content::Text { text } => json!({"text": text}),
+
                 Content::Image { alt, .. } => {
                     json!({"text": alt.as_deref().unwrap_or("[Image attachment.]" )})
                 }
+
                 content => json!({"text": content.render()}),
             })
             .collect::<Vec<_>>();
+
         if message.role == Role::System {
             system.extend(parts);
         } else {
@@ -171,10 +190,13 @@ fn request_body(input: &ModelRequest) -> crabbot_core::Result<Value> {
             }));
         }
     }
+
     let mut body = json!({"contents": contents});
+
     if !system.is_empty() {
         body["systemInstruction"] = json!({"parts": system});
     }
+
     if !input.tools.is_empty() {
         body["tools"] = json!([{"functionDeclarations": input.tools.iter().map(|tool| json!({
             "name": tool.name,
@@ -182,6 +204,7 @@ fn request_body(input: &ModelRequest) -> crabbot_core::Result<Value> {
             "parameters": tool.schema,
         })).collect::<Vec<_>>()}]);
     }
+
     Ok(body)
 }
 
@@ -227,6 +250,7 @@ mod tests {
                 schema: json!({"type": "object"}),
             }],
         };
+
         let body = request_body(&request).unwrap();
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "Be concise.");
         assert_eq!(body["contents"][0]["role"], "user");
@@ -310,6 +334,7 @@ mod tests {
                 {"functionCall": {"name": "read", "args": {"path": "README.md"}}}
             ]}}]
         });
+
         let (text, events) = parse_reply(&value);
         assert_eq!(text, "I will read it.");
         assert_eq!(events.len(), 1);
@@ -333,6 +358,7 @@ mod tests {
         let Some(listener) = loopback_listener().await else {
             return;
         };
+
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -346,6 +372,7 @@ mod tests {
             stream.write_all(header.as_bytes()).await.unwrap();
             stream.write_all(body).await.unwrap();
         });
+
         let client = reqwest::Client::new();
         let request = ModelRequest {
             model: "test".into(),
@@ -354,10 +381,12 @@ mod tests {
             stream: false,
             tools: Vec::new(),
         };
+
         let response = generate_at(&client, 1, request, "key", &format!("http://{address}"))
             .await
             .unwrap()
             .unwrap();
+
         assert_eq!(response.result.unwrap()["text"], "ok");
         server.await.unwrap();
     }
@@ -371,6 +400,7 @@ mod tests {
             let Some(listener) = loopback_listener().await else {
                 return;
             };
+
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -381,6 +411,7 @@ mod tests {
                 stream.write_all(header.as_bytes()).await.unwrap();
                 stream.write_all(body).await.unwrap();
             });
+
             let request = ModelRequest {
                 model: "test".into(),
                 workspace: None,
@@ -388,6 +419,7 @@ mod tests {
                 stream: false,
                 tools: Vec::new(),
             };
+
             assert!(
                 generate_at(
                     &reqwest::Client::new(),

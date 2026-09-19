@@ -21,8 +21,8 @@ permissions:
   contents: read
 
 jobs:
-  prepare:
-    name: Prepare Release
+  release:
+    name: Release
     runs-on: ubuntu-latest
     container: rust:1.89-trixie
 

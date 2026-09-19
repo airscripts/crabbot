@@ -6,6 +6,7 @@ use crabbot_core::{
     policy::Policy,
     types::{Capability, Hello, Protocol, Request, Response},
 };
+
 use serde_json::json;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -44,6 +45,7 @@ fn media_root() -> Option<std::path::PathBuf> {
 
 async fn call(policy: &Policy, request: Request) -> crabbot_core::Result<Option<Response>> {
     let command = std::env::var("CRABBOT_WHISPER_COMMAND").ok();
+
     call_at(policy, request, command.as_deref()).await
 }
 
@@ -56,49 +58,63 @@ async fn call_at(
         Request::Call { id, method, params, .. } => (id, method, params),
         Request::Note { .. } => return Ok(None),
     };
+
     if method != "transcribe" {
         return Ok(None);
     }
+
     let path = params["path"]
         .as_str()
         .ok_or_else(|| crabbot_core::Error::Denied("transcribe.path is required.".into()))?;
+
     let path = policy.path(path)?;
     let command = command.filter(|command| !command.trim().is_empty()).ok_or_else(|| {
         crabbot_core::Error::Denied("A Whisper command is not configured.".into())
     })?;
+
     let mut process = Command::new(command);
     process.arg(path);
     let output = capture(process)
         .await
         .map_err(|error| crabbot_core::Error::Denied(format!("Whisper failed: {error}.")))?;
+
     if !output.status.success() {
         return Err(crabbot_core::Error::Denied(format!(
             "Whisper failed: {}.",
             clip(&String::from_utf8_lossy(&output.stderr), ERROR_LIMIT)
         )));
     }
+
     let text = clip(&String::from_utf8_lossy(&output.stdout), OUTPUT_LIMIT);
+
     if text.is_empty() {
         return Err(crabbot_core::Error::Denied("Whisper returned no text.".into()));
     }
+
     let response = Response::ok(id, json!({"text": text}));
+
     if serde_json::to_vec(&response)?.len().saturating_add(1) > crabbot_core::jsonl::MAX {
         return Err(crabbot_core::Error::Denied(
             "Whisper response exceeds the protocol frame limit.".into(),
         ));
     }
+
     Ok(Some(response))
 }
 
 fn clip(value: &str, limit: usize) -> String {
     let mut clipped = value.trim().to_owned();
+
     if clipped.len() <= limit {
         return clipped;
     }
+
     let mut end = limit.saturating_sub(3).min(clipped.len());
+
     while !clipped.is_char_boundary(end) {
         end = end.saturating_sub(1);
     }
+
     clipped.truncate(end);
     clipped.push('…');
     clipped
@@ -113,9 +129,11 @@ async fn capture(mut command: Command) -> std::io::Result<std::process::Output> 
     let stdout = child.stdout.take().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Process has no stdout.")
     })?;
+
     let stderr = child.stderr.take().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Process has no stderr.")
     })?;
+
     let result = timeout(COMMAND_LIMIT, async {
         let stdout = limited(stdout);
         let stderr = limited(stderr);
@@ -124,12 +142,15 @@ async fn capture(mut command: Command) -> std::io::Result<std::process::Output> 
         Ok::<_, std::io::Error>(std::process::Output { status, stdout, stderr })
     })
     .await;
+
     match result {
         Ok(Ok(output)) => Ok(output),
+
         Ok(Err(error)) => {
             stop(&mut child).await;
             Err(error)
         }
+
         Err(_) => {
             stop(&mut child).await;
             Err(std::io::Error::new(
@@ -143,17 +164,21 @@ async fn capture(mut command: Command) -> std::io::Result<std::process::Output> 
 async fn limited<R: AsyncRead + Unpin>(mut input: R) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 16 * 1024];
+
     loop {
         let count = input.read(&mut buffer).await?;
+
         if count == 0 {
             return Ok(bytes);
         }
+
         if count > OUTPUT_LIMIT.saturating_sub(bytes.len()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::FileTooLarge,
                 "Process output exceeds the size limit.",
             ));
         }
+
         bytes.extend_from_slice(&buffer[..count]);
     }
 }
@@ -229,6 +254,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("voice"), b"audio").unwrap();
         let extension = if cfg!(windows) { "exe" } else { "" };
+
         let script = root.join(format!("transcriber.{extension}"));
         write_transcriber(&script, "hello from whisper\n", "", 0);
         let policy = Policy { root: Some(root.clone()), ..Policy::default() };
@@ -240,6 +266,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+
         assert_eq!(reply.result.unwrap()["text"], "hello from whisper");
 
         let empty = root.join(format!("empty.{extension}"));

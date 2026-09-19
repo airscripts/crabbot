@@ -99,18 +99,24 @@ impl Store {
         let path = path.into();
         let bytes = match load_file(&path, BYTE_LIMIT) {
             Ok(bytes) => bytes,
+
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                 private_file(&path)?;
                 load_file(&path, BYTE_LIMIT)?
             }
+
             Err(error) => return Err(error),
         };
+
         let Some(bytes) = bytes else {
             return Ok(Self { path: Some(path), ..Self::default() });
         };
+
         let text = String::from_utf8(bytes)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+
         let mut store: Self = serde_json::from_str(&text).map_err(std::io::Error::other)?;
+
         for (id, session) in &mut store.sessions {
             if !valid(id) || session.id != *id {
                 return Err(std::io::Error::new(
@@ -118,24 +124,30 @@ impl Store {
                     "Session state contains an invalid ID.",
                 ));
             }
+
             if session.messages.len() > LIMIT {
                 session.messages.drain(..session.messages.len() - LIMIT);
             }
+
             if session.inflight.is_some() && session.queued.len() > LIMIT {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "Session recovery queue exceeds the temporary lease bound.",
                 ));
             }
+
             if session.queued.len() > LIMIT && session.inflight.is_none() {
                 session.queued.drain(..session.queued.len() - LIMIT);
             }
+
             session
                 .queue_roles
                 .retain(|id, _| session.queued.iter().any(|message| &message.id == id));
+
             if session.status == "working" || session.inflight.is_some() {
                 let roles = std::mem::take(&mut session.inflight_roles);
                 session.stream_delivery = None;
+
                 if let Some(message) = session.inflight.take()
                     && session.status != "cancelled"
                     && session.phase == "safe"
@@ -143,18 +155,24 @@ impl Store {
                     if !roles.is_empty() {
                         session.queue_roles.insert(message.id.clone(), roles);
                     }
+
                     session.queued.insert(0, message);
                 }
+
                 session.phase = safe();
+
                 session.status = "interrupted".into();
             }
         }
+
         let mut changed = false;
+
         for delivery in &mut store.outbox {
             if delivery.updated == 0 {
                 delivery.updated = delivery.created;
                 changed = true;
             }
+
             if matches!(delivery.status, DeliveryStatus::Sending | DeliveryStatus::Streaming) {
                 delivery.status = DeliveryStatus::Uncertain;
                 delivery.last_error = Some("The daemon stopped during channel delivery.".into());
@@ -162,6 +180,7 @@ impl Store {
                 changed = true;
             }
         }
+
         if store.sessions.len() > LIMIT {
             let excess = store.sessions.len() - LIMIT;
             let ids = {
@@ -173,28 +192,36 @@ impl Store {
                     .map(|session| session.id.clone())
                     .collect::<Vec<_>>()
             };
+
             for id in ids {
                 store.sessions.remove(&id);
             }
         }
+
         if store.outbox.len() > LIMIT {
             store.outbox.drain(..store.outbox.len() - LIMIT);
         }
+
         if store.dead.len() > LIMIT {
             store.dead.drain(..store.dead.len() - LIMIT);
         }
+
         if store.offsets.len() > LIMIT {
             let excess = store.offsets.len() - LIMIT;
             let keys = store.offsets.keys().take(excess).cloned().collect::<Vec<_>>();
+
             for key in keys {
                 store.offsets.remove(&key);
             }
         }
+
         trim_seen(&mut store.seen, None);
         store.path = Some(path);
+
         if changed {
             store.save()?;
         }
+
         Ok(store)
     }
 
@@ -202,13 +229,16 @@ impl Store {
         let Some(path) = &self.path else {
             return Ok(());
         };
+
         let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+
         if bytes.len() as u64 > BYTE_LIMIT {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::FileTooLarge,
                 "Session state exceeds the size limit.",
             ));
         }
+
         save_file(path, bytes)
     }
 
@@ -219,24 +249,28 @@ impl Store {
     ) -> std::io::Result<()> {
         let id = id.into();
         let model = model.into();
+
         if !valid(&id) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Session ID must contain lowercase letters, digits, or hyphens.",
             ));
         }
+
         if model.trim().is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Model must not be empty.",
             ));
         }
+
         if self.sessions.contains_key(&id) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "Session already exists.",
             ));
         }
+
         if self.sessions.len() >= LIMIT {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -277,9 +311,11 @@ impl Store {
         model: impl Into<String>,
     ) -> std::io::Result<()> {
         let id = id.into();
+
         if !self.sessions.contains_key(&id) {
             self.create(id, model)?;
         }
+
         Ok(())
     }
 
@@ -297,6 +333,7 @@ impl Store {
                 "Session was not found.",
             ));
         }
+
         self.change(|store| {
             if let Some(session) = store.sessions.get_mut(id) {
                 session.channel = Some(channel.into());
@@ -327,15 +364,20 @@ impl Store {
                 "Session was not found.",
             ));
         }
+
         self.change(|store| {
             let Some(session) = store.sessions.get_mut(id) else {
                 return;
             };
+
             session.messages.push(message);
+
             if session.messages.len() > LIMIT {
                 session.messages.drain(..session.messages.len() - LIMIT);
             }
+
             session.updated = now();
+
             if session.status != "cancelled" || resume_cancelled {
                 session.status = "idle".into();
             }
@@ -349,6 +391,7 @@ impl Store {
                 "Session was not found.",
             ));
         }
+
         self.change(|store| {
             if let Some(session) = store.sessions.get_mut(id) {
                 session.messages.clear();
@@ -374,6 +417,7 @@ impl Store {
                 "Session was not found.",
             ));
         }
+
         if self
             .sessions
             .get(id)
@@ -381,6 +425,7 @@ impl Store {
         {
             return Ok(());
         }
+
         if self.sessions.get(id).is_some_and(|session| {
             session.queued.len() + usize::from(session.inflight.is_some()) >= LIMIT
         }) {
@@ -389,19 +434,24 @@ impl Store {
                 "Session queue is full; no message was discarded.",
             ));
         }
+
         self.change(|store| {
             let Some(session) = store.sessions.get_mut(id) else {
                 return;
             };
+
             if roles.is_empty() {
                 session.queue_roles.remove(&message.id);
             } else {
                 session.queue_roles.insert(message.id.clone(), roles);
             }
+
             session.queued.push(message);
+
             if session.status == "cancelled" {
                 session.status = "idle".into();
             }
+
             session.updated = now();
         })
     }
@@ -414,18 +464,22 @@ impl Store {
                 "Session was not found.",
             ));
         }
+
         let mut message = None;
         self.change(|store| {
             if let Some(session) = store.sessions.get_mut(id)
                 && !session.queued.is_empty()
             {
                 message = Some(session.queued.remove(0));
+
                 if let Some(message) = &message {
                     session.queue_roles.remove(&message.id);
                 }
+
                 session.updated = now();
             }
         })?;
+
         Ok(message)
     }
 
@@ -446,6 +500,7 @@ impl Store {
                 "Session was not found.",
             ));
         };
+
         if session.inflight.is_some()
             || (session.status == "working"
                 && !session.queued.iter().any(|item| item.id == message.id))
@@ -455,22 +510,29 @@ impl Store {
                 "Session is already working.",
             ));
         }
+
         self.change(|store| {
             let Some(session) = store.sessions.get_mut(id) else {
                 return;
             };
+
             if let Some(index) = session.queued.iter().position(|item| item.id == message.id) {
                 session.queued.remove(index);
             }
+
             let queued_roles = session.queue_roles.remove(&message.id).unwrap_or_default();
+
             if !session.messages.iter().any(|item| item.id == message.id) {
                 session.messages.push(message.clone());
+
                 if session.messages.len() > LIMIT {
                     session.messages.drain(..session.messages.len() - LIMIT);
                 }
             }
+
             session.inflight = Some(message);
             session.inflight_roles = if roles.is_empty() { queued_roles } else { roles };
+
             session.stream_delivery = None;
             session.phase = safe();
             session.status = "working".into();
@@ -485,20 +547,25 @@ impl Store {
                 "Session was not found.",
             ));
         }
+
         self.change(|store| {
             let Some(session) = store.sessions.get_mut(id) else {
                 return;
             };
+
             let delivery_id = session.stream_delivery.take();
             session.inflight = None;
             session.inflight_roles.clear();
+
             if status == "cancelled" {
                 session.queued.clear();
                 session.queue_roles.clear();
             }
+
             session.phase = safe();
             session.status = status.into();
             session.updated = now();
+
             if let Some(delivery_id) = delivery_id
                 && let Some(delivery) =
                     store.outbox.iter_mut().find(|delivery| delivery.id == delivery_id)
@@ -528,6 +595,7 @@ impl Store {
                 "Session was not found.",
             ));
         }
+
         let id = id.into();
         let channel = channel.into();
         let chat = chat.into();
@@ -536,27 +604,33 @@ impl Store {
             delivery.id == id
                 && matches!(delivery.status, DeliveryStatus::Sending | DeliveryStatus::Uncertain)
         });
+
         let completing_stream = self
             .sessions
             .get(session)
             .and_then(|session| session.stream_delivery.as_deref())
             .is_some_and(|stream_id| stream_id == id);
+
         let message_id = completing_stream
             .then(|| self.outbox.iter().find(|delivery| delivery.id == id))
             .flatten()
             .and_then(|delivery| delivery.message_id.clone());
+
         if !self.outbox.iter().any(|delivery| delivery.id == id) && self.outbox.len() >= LIMIT {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "Delivery outbox is full; no message was discarded.",
             ));
         }
+
         self.change(|store| {
             if let Some(session) = store.sessions.get_mut(session) {
                 session.messages.push(message);
+
                 if session.messages.len() > LIMIT {
                     session.messages.drain(..session.messages.len() - LIMIT);
                 }
+
                 session.updated = now();
                 session.status = "idle".into();
                 session.inflight = None;
@@ -564,6 +638,7 @@ impl Store {
                 session.stream_delivery = None;
                 session.phase = safe();
             }
+
             if let Some(delivery) = store.outbox.iter_mut().find(|delivery| delivery.id == id) {
                 if completing_stream {
                     delivery.channel = channel;
@@ -575,9 +650,11 @@ impl Store {
                     } else {
                         DeliveryStatus::Pending
                     };
+
                     if !uncertain_delivery {
                         delivery.last_error = None;
                     }
+
                     delivery.message_id = message_id;
                     delivery.updated = now();
                 }
@@ -618,30 +695,35 @@ impl Store {
                 "Session was not found.",
             ));
         };
+
         if current.inflight.is_none() || current.stream_delivery.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "Session cannot start a streamed delivery.",
             ));
         }
+
         if self.outbox.iter().any(|delivery| delivery.id == id) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "Streamed delivery already exists.",
             ));
         }
+
         if self.outbox.len() >= LIMIT {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "Delivery outbox is full; no message was discarded.",
             ));
         }
+
         self.change(|store| {
             if let Some(session) = store.sessions.get_mut(session) {
                 session.phase = "unsafe".into();
                 session.stream_delivery = Some(id.clone());
                 session.updated = now();
             }
+
             store.outbox.push(Delivery {
                 id,
                 channel,
@@ -697,18 +779,22 @@ impl Store {
                 "Session was not found.",
             ));
         }
+
         self.change(|store| {
             let Some(session) = store.sessions.get_mut(id) else {
                 return;
             };
+
             if session.status == "cancelled" && session.inflight.is_some() && status != "cancelled"
             {
                 return;
             }
+
             if status == "cancelled" {
                 session.queued.clear();
                 session.queue_roles.clear();
             }
+
             session.status = status.into();
             session.updated = now();
         })
@@ -721,16 +807,19 @@ impl Store {
                 "Model must not be empty.",
             ));
         }
+
         if !self.sessions.contains_key(id) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "Session was not found.",
             ));
         }
+
         self.change(|store| {
             let Some(session) = store.sessions.get_mut(id) else {
                 return;
             };
+
             session.model = model.into();
             session.updated = now();
         })
@@ -744,12 +833,14 @@ impl Store {
                 "Workspace path is invalid.",
             ));
         }
+
         if !self.sessions.contains_key(id) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "Session was not found.",
             ));
         }
+
         if self
             .sessions
             .get(id)
@@ -760,6 +851,7 @@ impl Store {
                 "A working session cannot change its workspace.",
             ));
         }
+
         self.change(|store| {
             if let Some(session) = store.sessions.get_mut(id) {
                 session.workspace = workspace.map(str::to_owned);
@@ -775,21 +867,25 @@ impl Store {
                 "Session ID must contain lowercase letters, digits, or hyphens.",
             ));
         }
+
         if self.sessions.contains_key(target) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "Session already exists.",
             ));
         }
+
         let source = self.sessions.get(source).cloned().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "Source session was not found.")
         })?;
+
         if self.sessions.len() >= LIMIT {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "Session capacity is full.",
             ));
         }
+
         let now = now();
         let target = target.to_owned();
         self.change(|store| {
@@ -801,6 +897,7 @@ impl Store {
                     message
                 })
                 .collect();
+
             store.sessions.insert(
                 target.clone(),
                 Session {
@@ -828,6 +925,7 @@ impl Store {
 
     pub fn cancel(&mut self, id: &str) -> std::io::Result<()> {
         let active = self.sessions.get(id).is_some_and(|session| session.inflight.is_some());
+
         if active { self.set_status(id, "cancelled") } else { self.clear(id, "cancelled") }
     }
 
@@ -838,18 +936,21 @@ impl Store {
                 "Lease phase is invalid.",
             ));
         }
+
         let Some(session) = self.sessions.get(id) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "Session was not found.",
             ));
         };
+
         if session.inflight.is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Session has no active lease.",
             ));
         }
+
         self.change(|store| {
             if let Some(session) = store.sessions.get_mut(id) {
                 session.phase = phase.into();
@@ -865,6 +966,7 @@ impl Store {
                 "Session was not found.",
             ));
         }
+
         if self
             .sessions
             .get(id)
@@ -875,6 +977,7 @@ impl Store {
                 "Session is working; cancel it and wait before deleting it.",
             ));
         }
+
         self.change(|store| {
             store.sessions.remove(id);
         })
@@ -886,6 +989,7 @@ impl Store {
                 store.outbox.remove(index);
             })?;
         }
+
         Ok(())
     }
 
@@ -898,6 +1002,7 @@ impl Store {
                 store.outbox[index].updated = now();
             })?;
         }
+
         Ok(())
     }
 
@@ -930,6 +1035,7 @@ impl Store {
                 "Only uncertain deliveries can be retried.",
             ));
         }
+
         self.update_delivery(id, |delivery| {
             delivery.status = DeliveryStatus::Pending;
             delivery.last_error = None;
@@ -944,6 +1050,7 @@ impl Store {
                 "Delivery was not found.",
             ));
         }
+
         self.dead(id)
     }
 
@@ -951,10 +1058,12 @@ impl Store {
         if !self.outbox.iter().any(|delivery| delivery.id == id) {
             return Ok(());
         }
+
         self.change(|store| {
             if let Some(index) = store.outbox.iter().position(|item| item.id == id) {
                 let delivery = store.outbox.remove(index);
                 store.dead.push(delivery);
+
                 if store.dead.len() > LIMIT {
                     store.dead.drain(..store.dead.len() - LIMIT);
                 }
@@ -979,6 +1088,7 @@ impl Store {
         let key = seen_key(channel, id);
         self.change(|store| {
             store.seen.insert(key.clone(), seen_now());
+
             if let Some(offset) = offset {
                 store
                     .offsets
@@ -986,6 +1096,7 @@ impl Store {
                     .and_modify(|current| *current = (*current).max(offset))
                     .or_insert(offset);
             }
+
             trim_seen(&mut store.seen, Some(&key));
         })
     }
@@ -998,6 +1109,7 @@ impl Store {
         let seen = self.seen.clone();
         let path = self.path.clone();
         update(self);
+
         if let Err(error) = self.save() {
             self.sessions = previous;
             self.outbox = outbox;
@@ -1007,6 +1119,7 @@ impl Store {
             self.path = path;
             return Err(error);
         }
+
         Ok(())
     }
 
@@ -1021,6 +1134,7 @@ impl Store {
                 "Delivery was not found.",
             ));
         }
+
         self.change(|store| {
             if let Some(delivery) = store.outbox.iter_mut().find(|delivery| delivery.id == id) {
                 update(delivery);
@@ -1038,15 +1152,19 @@ fn trim_seen(seen: &mut BTreeMap<String, u64>, keep: Option<&str>) {
     if seen.len() <= SEEN_LIMIT {
         return;
     }
+
     let excess = seen.len() - SEEN_LIMIT;
+
     let mut entries = seen
         .iter()
         .filter(|(key, _)| Some(key.as_str()) != keep)
         .map(|(key, timestamp)| (key.clone(), *timestamp))
         .collect::<Vec<_>>();
+
     entries.sort_by(|(left_key, left_time), (right_key, right_time)| {
         left_time.cmp(right_time).then_with(|| left_key.cmp(right_key))
     });
+
     for (key, _) in entries.into_iter().take(excess) {
         seen.remove(&key);
     }
@@ -1054,9 +1172,11 @@ fn trim_seen(seen: &mut BTreeMap<String, u64>, keep: Option<&str>) {
 
 fn seen_key(channel: &str, id: &str) -> String {
     let key = format!("{channel}\0{id}");
+
     if key.len() <= SEEN_KEY_LIMIT {
         return key;
     }
+
     let mut hash = Sha256::new();
     hash.update(key.as_bytes());
     format!("#oversized:{:x}", hash.finalize())
@@ -1069,9 +1189,11 @@ pub fn remove_worktree(root: &Path, id: &str) -> std::io::Result<()> {
             "Session ID is invalid.",
         ));
     }
+
     if !root.exists() {
         return Ok(());
     }
+
     let root = std::fs::canonicalize(root)?;
     let path = root.join(".crabbot/worktrees").join(id);
     let metadata = match std::fs::symlink_metadata(&path) {
@@ -1079,19 +1201,23 @@ pub fn remove_worktree(root: &Path, id: &str) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
+
     if metadata.file_type().is_symlink() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "The worktree path cannot be a symbolic link.",
         ));
     }
+
     let path = std::fs::canonicalize(path)?;
+
     if !path.starts_with(&root) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "The worktree path leaves the configured root.",
         ));
     }
+
     let mut command = super::git_command();
     command
         .args(["-C", &root.display().to_string(), "worktree", "remove"])
@@ -1099,12 +1225,14 @@ pub fn remove_worktree(root: &Path, id: &str) -> std::io::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+
     let mut child = command.spawn()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
+
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
@@ -1113,8 +1241,10 @@ pub fn remove_worktree(root: &Path, id: &str) -> std::io::Result<()> {
                 "Git worktree removal exceeded the execution time limit.",
             ));
         }
+
         thread::sleep(Duration::from_millis(25));
     };
+
     if status.success() {
         Ok(())
     } else {
@@ -1147,6 +1277,7 @@ fn seen_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{DeliveryStatus, LIMIT, Session, Store, valid};
+
     use crabbot_core::types::{Content, Message, Role};
     use std::collections::BTreeMap;
 
@@ -1163,13 +1294,16 @@ mod tests {
     #[test]
     fn sessions_persist_and_bound_history() {
         let root = std::env::temp_dir().join(format!("crabbot-state-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         let path = root.join("sessions.json");
         let mut store = Store::load(&path).unwrap();
         store.create("main", "local").unwrap();
+
         for id in 0..=LIMIT {
             store.push("main", message(id, "main")).unwrap();
         }
+
         assert_eq!(store.sessions["main"].messages.len(), LIMIT);
 
         let loaded = Store::load(path.clone()).unwrap();
@@ -1198,9 +1332,11 @@ mod tests {
         assert!(valid("copy-2"));
         assert!(!valid("../escape"));
         store.remove("copy").unwrap();
+
         for id in 0..LIMIT - 1 {
             store.create(format!("session-{id}"), "local").unwrap();
         }
+
         assert!(store.fork("main", "copy").is_err());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1209,8 +1345,10 @@ mod tests {
     fn load_bounds_session_count() {
         let path =
             std::env::temp_dir().join(format!("crabbot-state-bound-{}.json", std::process::id()));
+
         let _ = std::fs::remove_file(&path);
         let mut sessions = serde_json::Map::new();
+
         for id in 0..=LIMIT {
             let id = format!("session-{id}");
             sessions.insert(
@@ -1225,11 +1363,13 @@ mod tests {
                 }),
             );
         }
+
         std::fs::write(
             &path,
             serde_json::to_vec(&serde_json::json!({"sessions": sessions})).unwrap(),
         )
         .unwrap();
+
         let store = Store::load(&path).unwrap();
         assert_eq!(store.sessions.len(), LIMIT);
         let _ = std::fs::remove_file(path);
@@ -1239,6 +1379,7 @@ mod tests {
     fn rejects_invalid_state_operations() {
         let root =
             std::env::temp_dir().join(format!("crabbot-state-errors-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let malformed = root.join("broken.json");
@@ -1251,6 +1392,7 @@ mod tests {
             r#"{"sessions":{"Bad":{"id":"Bad","model":"model","messages":[],"status":"idle","created":0,"updated":0}}}"#,
         )
         .unwrap();
+
         assert!(Store::load(invalid).is_err());
 
         let path = root.join("sessions.json");
@@ -1309,11 +1451,13 @@ mod tests {
                 updated: 0,
             },
         );
+
         assert!(
             failed
                 .reply("safe", message(1, "safe"), "delivery", "telegram", "7", None, "hello")
                 .is_err()
         );
+
         assert!(failed.sessions["safe"].messages.is_empty());
         assert!(failed.outbox.is_empty());
 
@@ -1327,6 +1471,7 @@ mod tests {
 
         let path =
             std::env::temp_dir().join(format!("crabbot-state-mode-{}.json", std::process::id()));
+
         let _ = std::fs::remove_file(&path);
         let mut store = Store::load(&path).unwrap();
         store.create("main", "model").unwrap();
@@ -1338,6 +1483,7 @@ mod tests {
     fn outbox_persists_retries_and_acknowledgements() {
         let root =
             std::env::temp_dir().join(format!("crabbot-state-outbox-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         let path = root.join("sessions.json");
         let mut store = Store::load(&path).unwrap();
@@ -1345,9 +1491,11 @@ mod tests {
         store
             .reply("main", message(1, "main"), "delivery", "telegram", "7", None, "hello")
             .unwrap();
+
         store
             .reply("main", message(2, "main"), "delivery", "telegram", "7", None, "duplicate")
             .unwrap();
+
         assert_eq!(store.outbox[0].attempts, 0);
         assert_eq!(store.outbox.len(), 1);
         store.retry("delivery").unwrap();
@@ -1365,6 +1513,7 @@ mod tests {
     fn streamed_reply_reuses_the_channel_message() {
         let root =
             std::env::temp_dir().join(format!("crabbot-state-stream-{}", std::process::id()));
+
         let mut store = Store::load(root.join("sessions.json")).unwrap();
         store.create("main", "model").unwrap();
         store.begin("main", message(1, "main")).unwrap();
@@ -1391,6 +1540,7 @@ mod tests {
     fn interrupted_streams_are_uncertain_and_not_replayed() {
         let root = std::env::temp_dir()
             .join(format!("crabbot-state-stream-recovery-{}", std::process::id()));
+
         let path = root.join("sessions.json");
         let mut store = Store::load(&path).unwrap();
         store.create("main", "model").unwrap();
@@ -1417,6 +1567,7 @@ mod tests {
         store
             .reply("main", message(1, "main"), "delivery", "telegram", "7", None, "hello")
             .unwrap();
+
         let loaded = Store::load(path).unwrap();
         assert_eq!(loaded.sessions["main"].messages.len(), 1);
         assert_eq!(loaded.outbox[0].text, "hello");
@@ -1427,6 +1578,7 @@ mod tests {
     fn recovers_sending_deliveries_as_uncertain() {
         let root =
             std::env::temp_dir().join(format!("crabbot-state-delivery-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         let path = root.join("sessions.json");
         let mut store = Store::load(&path).unwrap();
@@ -1434,6 +1586,7 @@ mod tests {
         store
             .reply("main", message(1, "main"), "delivery", "telegram", "7", None, "hello")
             .unwrap();
+
         store.sending("delivery").unwrap();
         let recovered = Store::load(&path).unwrap();
         assert_eq!(recovered.outbox[0].status, DeliveryStatus::Uncertain);
@@ -1461,6 +1614,7 @@ mod tests {
     fn recovers_inflight_work_and_rejects_active_deletion() {
         let root =
             std::env::temp_dir().join(format!("crabbot-state-inflight-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         let path = root.join("sessions.json");
         let mut store = Store::load(&path).unwrap();
@@ -1480,6 +1634,7 @@ mod tests {
     fn does_not_replay_unsafe_inflight_work() {
         let root =
             std::env::temp_dir().join(format!("crabbot-state-unsafe-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         let path = root.join("sessions.json");
         let mut store = Store::load(&path).unwrap();
@@ -1498,6 +1653,7 @@ mod tests {
     fn treats_legacy_leases_as_unsafe() {
         let root =
             std::env::temp_dir().join(format!("crabbot-state-legacy-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         let path = root.join("sessions.json");
         let mut store = Store::load(&path).unwrap();
@@ -1516,20 +1672,25 @@ mod tests {
     fn preserves_full_queue_during_safe_recovery() {
         let root =
             std::env::temp_dir().join(format!("crabbot-state-recovery-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         let path = root.join("sessions.json");
         let mut store = Store::load(&path).unwrap();
         store.create("main", "model").unwrap();
+
         for id in 0..LIMIT {
             store.queue("main", message(id, "main")).unwrap();
         }
+
         {
             let session = store.sessions.get_mut("main").unwrap();
             session.inflight = Some(message(999, "main"));
             session.phase = "safe".into();
             session.status = "working".into();
         }
+
         store.save().unwrap();
+
         let recovered = Store::load(path).unwrap();
         let session = &recovered.sessions["main"];
         assert_eq!(session.queued.len(), LIMIT + 1);
@@ -1542,6 +1703,7 @@ mod tests {
     fn cancels_without_retrying_inflight_work() {
         let root =
             std::env::temp_dir().join(format!("crabbot-state-cancel-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         let path = root.join("sessions.json");
         let mut store = Store::load(&path).unwrap();
@@ -1572,6 +1734,7 @@ mod tests {
     fn does_not_restore_a_canceled_lease() {
         let root = std::env::temp_dir()
             .join(format!("crabbot-state-canceled-recovery-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         let path = root.join("sessions.json");
         let mut store = Store::load(&path).unwrap();
@@ -1590,6 +1753,7 @@ mod tests {
     fn validates_worktree_cleanup_inputs() {
         let root =
             std::env::temp_dir().join(format!("crabbot-state-worktree-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         assert!(super::remove_worktree(&root, "../escape").is_err());
         assert!(super::remove_worktree(&root, "safe").is_ok());
@@ -1599,6 +1763,7 @@ mod tests {
     fn tracks_offsets_seen_and_dead_deliveries() {
         let root =
             std::env::temp_dir().join(format!("crabbot-state-tracking-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         let path = root.join("sessions.json");
         let mut store = Store::load(&path).unwrap();
@@ -1615,6 +1780,7 @@ mod tests {
         store
             .reply("main", message(1, "main"), "delivery", "telegram", "7", None, "hello")
             .unwrap();
+
         store.retry("delivery").unwrap();
         assert_eq!(store.attempts("delivery"), Some(1));
         store.dead("delivery").unwrap();
@@ -1635,15 +1801,18 @@ mod tests {
                 )
                 .unwrap();
         }
+
         assert!(
             store
                 .reply("main", message(999, "main"), "overflow", "telegram", "7", None, "hello")
                 .is_err()
         );
+
         while store.sessions["main"].queued.len() < LIMIT {
             let id = store.sessions["main"].queued.len();
             store.queue("main", message(id, "main")).unwrap();
         }
+
         assert!(store.queue("main", message(10_001, "main")).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1651,9 +1820,11 @@ mod tests {
     #[test]
     fn keeps_new_seen_keys_when_trimming_by_age() {
         let mut store = Store::default();
+
         for id in 1..=10_000 {
             store.seen.insert(format!("telegram\0{id:05}"), id as u64);
         }
+
         store.commit("telegram", "00000", None).unwrap();
         assert!(store.known("telegram", "00000"));
         assert_eq!(store.seen.len(), 10_000);

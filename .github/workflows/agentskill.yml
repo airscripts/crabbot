@@ -7,10 +7,12 @@ on:
         required: false
         type: string
         default: ""
+
       local:
         required: false
         type: string
         default: ""
+
   workflow_dispatch:
     inputs:
       container_image:
@@ -18,6 +20,7 @@ on:
         required: false
         type: string
         default: ""
+
       local:
         description: "Use the local act working tree"
         required: false
@@ -54,6 +57,7 @@ jobs:
             x86_64|amd64) target="x86_64-unknown-linux-gnu" ;;
             *) printf 'Unsupported architecture: %s\n' "$(uname -m)" >&2; exit 1 ;;
           esac
+
           package="agentskill-${AGENTSKILL_VERSION}-${target}"
           archive="${package}.tar.gz"
           work="${RUNNER_TEMP}/agentskill"
@@ -62,6 +66,7 @@ jobs:
           curl --fail --silent --show-error --location \
             "https://github.com/airscripts/agentskill/releases/download/${AGENTSKILL_VERSION}/${archive}" \
             --output "${work}/${archive}"
+
           curl --fail --silent --show-error --location \
             "https://github.com/airscripts/agentskill/releases/download/${AGENTSKILL_VERSION}/SHA256SUMS" \
             --output "${work}/SHA256SUMS"

@@ -26,12 +26,16 @@ impl Policy {
     pub fn path(&self, path: impl AsRef<std::path::Path>) -> Result<std::path::PathBuf> {
         let root =
             self.root.as_ref().ok_or_else(|| Error::Denied("Workspace root is unset.".into()))?;
+
         let root =
             std::fs::canonicalize(root).map_err(|e| Error::Denied(format!("Workspace: {e}.")))?;
+
         let path = path.as_ref();
         let joined = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
+
         let clean =
             std::fs::canonicalize(&joined).map_err(|e| Error::Denied(format!("Path: {e}.")))?;
+
         if clean.starts_with(&root) {
             Ok(clean)
         } else {
@@ -71,6 +75,7 @@ mod tests {
             policy.path("note.txt").unwrap(),
             fs::canonicalize(root.join("note.txt")).unwrap()
         );
+
         assert!(policy.path("../crabbot-policy-outside").is_err());
 
         let _ = fs::remove_dir_all(root);

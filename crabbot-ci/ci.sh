@@ -10,15 +10,18 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 act_bin=${CRABBOT_ACT_BIN:-act}
 act_image=${CRABBOT_ACT_IMAGE:-catthehacker/ubuntu:act-latest}
 container_image=${CRABBOT_CI_IMAGE:-crabbot-ci:rust-1.89}
+
 case "$(uname -m)" in
     aarch64|arm64)
         native_arch=linux/arm64
         native_target=aarch64-unknown-linux-gnu
         ;;
+
     x86_64|amd64)
         native_arch=linux/amd64
         native_target=x86_64-unknown-linux-gnu
         ;;
+
     *)
         die "Unsupported host architecture '$(uname -m)'."
         ;;
@@ -43,6 +46,7 @@ cleanup() {
         docker run --rm -v "$workspace_dir:/workspace" "$container_image" \
             rm -rf /workspace/target >/dev/null 2>&1 || true
     fi
+
     rm -rf "$workspace_dir"
 }
 
@@ -92,6 +96,7 @@ git -C "$workspace_dir" commit -qm "chore: local ci snapshot"
 
 if ! docker image inspect "$container_image" >/dev/null 2>&1; then
     printf '\n[INFO] Building %s\n' "$container_image"
+
     docker build \
         --build-arg "BASE_IMAGE=$act_image" \
         --tag "$container_image" \
@@ -119,6 +124,7 @@ act_common=(
 run_workflow() {
     local label=$1
     shift
+
     printf '\n[INFO] %s\n' "$label"
     (
         cd "$workspace_dir"
@@ -140,20 +146,20 @@ run_workflow "Security" workflow_dispatch \
     --workflows "$workspace_dir/.github/workflows/security.yml" \
     --input local=true
 
-run_workflow "Test, Linux ${ci_target}" workflow_dispatch \
+run_workflow "Test Crates" workflow_dispatch \
     --workflows "$workspace_dir/.github/workflows/test.yml" \
-    --job test \
+    --job crates \
     --matrix "target:${ci_target}" \
     --input local=true
 
-run_workflow "Test, Sandbox" workflow_dispatch \
+run_workflow "Test Sandbox" workflow_dispatch \
     --workflows "$workspace_dir/.github/workflows/test.yml" \
     --job sandbox \
     --input local=true
 
-run_workflow "Build, Linux ${ci_target}" workflow_dispatch \
+run_workflow "Build Crates" workflow_dispatch \
     --workflows "$workspace_dir/.github/workflows/build.yml" \
-    --job build \
+    --job crates \
     --matrix "target:${ci_target}" \
     --input local=true
 

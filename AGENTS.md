@@ -75,6 +75,11 @@ release or publication commands without explicit approval. When the active plan
 is complete, clear its completed details from `PLAN.md` and keep future work in
 `ROADMAP.md`.
 
+Rust style: separate logical phases with blank lines, including transitions
+around control flow, complex match arms, and distinct setup or assertion groups.
+Apply this spacing consistently across every crate and preserve it when
+formatting code.
+
 ## Further Context
 
 See [AGENTS.reference.md](AGENTS.reference.md) for provenance and decisions.
