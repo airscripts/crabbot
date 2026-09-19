@@ -7,6 +7,7 @@ crabbot init
 crabbot doctor
 crabbot status [--json]
 crabbot version
+crabbot completion <bash|fish|powershell|zsh>
 crabbot plugin list [--json]
 crabbot plugin install <id> [source] [--revision <rev>] [--yes]
 crabbot plugin link <id> [folder] [--revision <rev>] [--yes]
@@ -31,6 +32,25 @@ crabbot <plugin-command> [arguments...]
 `crabbot help` and `crabbot --help` show the command tree and Crabbot banner.
 `crabbot --version` and `crabbot version` print the same package version for
 scripts and automation.
+
+`crabbot completion <shell>` writes a completion script to standard output.
+Supported shells are Bash, Fish, PowerShell, and Zsh. Redirect the
+script to the shell’s normal completion directory or source it according to
+the shell’s installation conventions.
+
+For example:
+
+```sh
+crabbot completion bash > ~/.local/share/bash-completion/completions/crabbot
+crabbot completion zsh > ~/.zfunc/_crabbot
+crabbot completion fish > ~/.config/fish/completions/crabbot.fish
+```
+
+In PowerShell, add the generated script to the current profile:
+
+```powershell
+crabbot completion powershell >> $PROFILE
+```
 
 The global `--json` flag selects JSON output wherever a command supports it;
 the command-level form remains available for `status`, plugin lists and

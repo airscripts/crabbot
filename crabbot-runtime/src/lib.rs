@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     future::Future,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     pin::Pin,
     process::{ExitCode, Stdio},
@@ -16,7 +16,8 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, shells};
 use crabbot_core::{
     plugin::Process,
     types::{
@@ -478,6 +479,11 @@ enum Command {
     Status(Output),
     #[command(about = "Print the Crabbot version.")]
     Version,
+    #[command(about = "Generate shell completion scripts.")]
+    Completion {
+        #[arg(value_enum, help = "Shell to generate completions for.")]
+        shell: CompletionShell,
+    },
     #[command(about = "Manage installed plugins.")]
     Plugin {
         #[command(subcommand)]
@@ -510,6 +516,15 @@ enum Command {
     Import(CrabfileImport),
     #[command(external_subcommand, hide = true)]
     External(Vec<String>),
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Fish,
+    #[value(name = "powershell")]
+    PowerShell,
+    Zsh,
 }
 
 #[derive(Debug, Args)]
@@ -1009,6 +1024,7 @@ fn command_label(command: &Command) -> &'static str {
         Command::Doctor => "doctor",
         Command::Status(_) => "status",
         Command::Version => "version",
+        Command::Completion { .. } => "completion",
         Command::Plugin { .. } => "plugin",
         Command::Session { .. } => "session",
         Command::Delivery { .. } => "delivery",
@@ -1070,6 +1086,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Doctor => doctor()?,
         Command::Status(output) => status_command(output.json || json).await?,
         Command::Version => version(),
+        Command::Completion { shell } => completion(shell)?,
         Command::Plugin { command } => plugin(command, json).await?,
         Command::Session { command } => session(command, json).await?,
         Command::Delivery { command } => delivery(command, json).await?,
@@ -1081,6 +1098,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     Ok(())
+}
+
+fn completion(shell: CompletionShell) -> std::io::Result<()> {
+    let mut command = Cli::command();
+    let mut output = std::io::BufWriter::new(std::io::stdout().lock());
+
+    generate_completion(shell, &mut command, &mut output);
+    output.flush()
+}
+
+fn generate_completion(
+    shell: CompletionShell,
+    command: &mut clap::Command,
+    output: &mut dyn Write,
+) {
+    match shell {
+        CompletionShell::Bash => generate(shells::Bash, command, NAME, output),
+        CompletionShell::Fish => generate(shells::Fish, command, NAME, output),
+        CompletionShell::PowerShell => generate(shells::PowerShell, command, NAME, output),
+        CompletionShell::Zsh => generate(shells::Zsh, command, NAME, output),
+    }
 }
 
 async fn ask_model(ask: Ask) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -2148,6 +2186,7 @@ fn native_command(name: &str) -> bool {
             | "doctor"
             | "status"
             | "version"
+            | "completion"
             | "plugin"
             | "session"
             | "delivery"
@@ -8226,17 +8265,18 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ARCHIVE_LIMIT, BANNER, Cancellation, Cli, Command, CommandSpec, Config, CrabfileExport,
-        CrabfileImport, DeliveryCommand, Fork, Id, Live, Manifest, Name, Output, Plugins, Process,
-        ServiceCommand, SessionCommand, SessionModel, SessionNew, Sha256, Source, Stop, answer,
-        archive, archive_root, archive_url, assistant, binary_at, canonical_source, changed,
-        channel_message_id, command_output_limited, commit_event, daemon_lock, delivery_at,
-        delivery_request, download, embedded, ensure_home, env_for, export_crabfile_at,
-        import_crabfile_at, init_at, installed_at, isolate_at, local_session, plugin_binary,
-        read_manifest, reclaim_worktrees, recover, recover_plugins, redact, resolve, restart_tool,
-        revision, safe_archive, send_params, service_at, service_at_with, service_environment_from,
-        service_path_value, service_text, session_at, stream_fits, tool, update_at,
-        validate_archive, verify_archive, write_debug_report_at,
+        ARCHIVE_LIMIT, BANNER, Cancellation, Cli, Command, CommandSpec, CompletionShell, Config,
+        CrabfileExport, CrabfileImport, DeliveryCommand, Fork, Id, Live, Manifest, Name, Output,
+        Plugins, Process, ServiceCommand, SessionCommand, SessionModel, SessionNew, Sha256, Source,
+        Stop, answer, archive, archive_root, archive_url, assistant, binary_at, canonical_source,
+        changed, channel_message_id, command_output_limited, commit_event, daemon_lock,
+        delivery_at, delivery_request, download, embedded, ensure_home, env_for,
+        export_crabfile_at, generate_completion, import_crabfile_at, init_at, installed_at,
+        isolate_at, local_session, plugin_binary, read_manifest, reclaim_worktrees, recover,
+        recover_plugins, redact, resolve, restart_tool, revision, safe_archive, send_params,
+        service_at, service_at_with, service_environment_from, service_path_value, service_text,
+        session_at, stream_fits, tool, update_at, validate_archive, verify_archive,
+        write_debug_report_at,
     };
 
     use base64::Engine;
@@ -8414,8 +8454,19 @@ mod tests {
         }
 
         for name in [
-            "help", "init", "doctor", "status", "version", "plugin", "session", "delivery",
-            "service", "ask", "export", "import",
+            "help",
+            "init",
+            "doctor",
+            "status",
+            "version",
+            "completion",
+            "plugin",
+            "session",
+            "delivery",
+            "service",
+            "ask",
+            "export",
+            "import",
         ] {
             assert!(super::native_command(name));
         }
@@ -8436,6 +8487,10 @@ mod tests {
         assert_eq!(super::command_label(&Command::Doctor), "doctor");
         assert_eq!(super::command_label(&Command::Status(Output { json: false })), "status");
         assert_eq!(super::command_label(&Command::Version), "version");
+        assert_eq!(
+            super::command_label(&Command::Completion { shell: CompletionShell::Bash }),
+            "completion"
+        );
 
         assert_eq!(
             super::command_label(&Command::Plugin {
@@ -9011,6 +9066,28 @@ mod tests {
             let error = Cli::try_parse_from(["crabbot", argument]).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::DisplayVersion);
         }
+    }
+
+    #[test]
+    fn cli_parses_completion_shells_and_generates_commands() {
+        for (name, expected) in [
+            ("bash", "complete -F"),
+            ("fish", "complete -c crabbot"),
+            ("powershell", "Register-ArgumentCompleter"),
+            ("zsh", "#compdef crabbot"),
+        ] {
+            let cli = Cli::try_parse_from(["crabbot", "completion", name]).unwrap();
+            let Command::Completion { shell } = cli.command else {
+                panic!("completion command was not parsed");
+            };
+
+            let mut output = Vec::new();
+            generate_completion(shell, &mut Cli::command(), &mut output);
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains(expected), "completion output for {name} was unexpected");
+        }
+
+        assert!(Cli::try_parse_from(["crabbot", "completion", "nu"]).is_err());
     }
 
     #[test]

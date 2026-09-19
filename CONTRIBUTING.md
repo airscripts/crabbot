@@ -72,6 +72,10 @@ make build
 
 This keeps action-flow debugging separate from normal implementation checks.
 
+When changing CLI commands, update the completion command tests and verify at
+least one generated script contains the new command. The completion command
+supports Bash, Fish, PowerShell, and Zsh through `clap_complete`.
+
 ## Change Rules
 
 - Keep the core capability-free and provider-neutral.

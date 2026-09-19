@@ -295,6 +295,11 @@ debugging the workflow’s own ordering, inputs, runners, or action behavior. It
 uses `crabbot-ci/ci.sh` and `act` after a local preflight. For normal code
 changes, `make verify`, `make test`, and `make build` are enough.
 
+Generate shell completion scripts with `crabbot completion SHELL`. The command
+supports `bash`, `fish`, `powershell`, and `zsh`; write the output to
+the shell’s completion directory or source it according to that shell’s normal
+installation procedure.
+
 See [AGENTS.md](AGENTS.md) for repository boundaries and conventions,
 [ROADMAP.md](ROADMAP.md) for planned work, and the
 [product guide](crabbot-docs/product.md) for Crabbot’s current capabilities and
