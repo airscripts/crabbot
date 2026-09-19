@@ -508,8 +508,6 @@ enum Command {
         command: Option<ServiceCommand>,
     },
 
-    #[command(about = "Send one prompt through an intelligence plugin.")]
-    Ask(Ask),
     #[command(about = "Export the local configuration and plugin lock.")]
     Export(CrabfileExport),
     #[command(about = "Import a configuration and plugin lock.")]
@@ -678,10 +676,11 @@ struct Id {
     id: String,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Parser)]
+#[command(name = "ask", about = "Send one prompt through an intelligence plugin.")]
 struct Ask {
-    #[arg(long, default_value = "codex", help = "Intelligence plugin identifier.")]
-    plugin: String,
+    #[arg(long, help = "Intelligence plugin identifier.")]
+    plugin: Option<String>,
     #[arg(long, default_value = "gpt-4o-mini", help = "Model identifier.")]
     model: String,
     #[arg(help = "Prompt words.")]
@@ -918,10 +917,42 @@ struct Update {
 }
 
 pub async fn cli() -> ExitCode {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+
+    if root_help_requested(&args) {
+        print_help_with_plugins(&home());
+        return ExitCode::SUCCESS;
+    }
+
     let cli = Cli::parse();
 
     init_logging(cli.verbose, cli.debug, cli.json);
     main_with(cli).await
+}
+
+fn root_help_requested(args: &[String]) -> bool {
+    let mut command_seen = false;
+
+    for (index, argument) in args.iter().enumerate() {
+        match argument.as_str() {
+            "--json" | "--debug" | "--verbose" => {}
+
+            "-h" | "-H" | "--help" if !command_seen => return true,
+
+            "help"
+                if !command_seen
+                    && args[index + 1..].iter().all(|argument| {
+                        matches!(argument.as_str(), "--json" | "--debug" | "--verbose")
+                    }) =>
+            {
+                return true;
+            }
+
+            _ => command_seen = true,
+        }
+    }
+
+    false
 }
 
 pub async fn daemon() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1029,7 +1060,6 @@ fn command_label(command: &Command) -> &'static str {
         Command::Session { .. } => "session",
         Command::Delivery { .. } => "delivery",
         Command::Service { .. } => "service",
-        Command::Ask(_) => "ask",
         Command::Export(_) => "export",
         Command::Import(_) => "import",
         Command::External(_) => "external",
@@ -1091,7 +1121,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Session { command } => session(command, json).await?,
         Command::Delivery { command } => delivery(command, json).await?,
         Command::Service { command } => service(command.unwrap_or(ServiceCommand::Status))?,
-        Command::Ask(ask) => ask_model(ask).await?,
         Command::Export(args) => export_crabfile(args)?,
         Command::Import(args) => import_crabfile(args)?,
         Command::External(args) => plugin_command(args).await?,
@@ -1121,8 +1150,39 @@ fn generate_completion(
     }
 }
 
-async fn ask_model(ask: Ask) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    ask_model_at(ask, &home()).await
+fn print_help_with_plugins(root: &Path) {
+    print!("{}", help_text_with_plugins(root));
+}
+
+fn help_text_with_plugins(root: &Path) -> String {
+    let mut command = Cli::command();
+    let mut help = command.render_help().to_string();
+    let commands = plugin_commands(root);
+    let mut plugin_help = String::from("\nPlugin Commands:\n");
+
+    if commands.is_empty() {
+        plugin_help.push_str("  (none available)\n");
+    } else {
+        let width = commands.keys().map(String::len).max().unwrap_or_default();
+
+        for (name, owners) in commands {
+            let description = if owners.len() == 1 {
+                owners[0].1.description.as_str()
+            } else {
+                "conflicting registrations"
+            };
+
+            plugin_help.push_str(&format!("  {name:<width$}  {description}\n"));
+        }
+    }
+
+    if let Some(index) = help.find("\nOptions:") {
+        help.insert_str(index, &plugin_help);
+    } else {
+        help.push_str(&plugin_help);
+    }
+
+    help
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1272,23 +1332,48 @@ fn import_crabfile_at(
     Ok(())
 }
 
-async fn ask_model_at(
-    ask: Ask,
-    root: &Path,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let lock = load_lock_at(root)?;
-
-    if !lock
-        .plugins
-        .values()
-        .any(|entry| entry.capabilities.iter().any(|capability| capability == "model"))
-    {
-        return Err("An intelligence plugin is needed in order to ask something to Crabbot.".into());
-    }
-
-    let text = generate_at(ask, root, "cli").await?;
+async fn ask_at(ask: Ask, root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let plugin = model_plugin_at(root, ask.plugin.as_deref())?;
+    let text = generate_at(Ask { plugin: Some(plugin), ..ask }, root, "cli").await?;
     println!("{text}");
     Ok(())
+}
+
+fn model_plugin_at(root: &Path, requested: Option<&str>) -> Result<String, PluginError> {
+    let lock = load_lock_at(root)?;
+    let configured =
+        requested.map(str::to_owned).or_else(|| std::env::var("CRABBOT_MODEL_PLUGIN").ok());
+    let plugin = configured.or_else(|| {
+        lock.plugins
+            .iter()
+            .find(|(id, entry)| model_plugin_available(id, entry, root))
+            .map(|(id, _)| id.clone())
+    });
+
+    let Some(plugin) = plugin else {
+        return Err(
+            "An installed intelligence plugin is needed in order to ask something to Crabbot."
+                .into(),
+        );
+    };
+
+    let Some(entry) = lock.plugins.get(&plugin) else {
+        return Err(format!("Intelligence plugin {plugin} is not installed.").into());
+    };
+
+    if !model_plugin_available(&plugin, entry, root) {
+        return Err(format!(
+            "Intelligence plugin {plugin} is not installed or does not provide model capability."
+        )
+        .into());
+    }
+
+    Ok(plugin)
+}
+
+fn model_plugin_available(id: &str, entry: &Entry, root: &Path) -> bool {
+    entry.capabilities.iter().any(|capability| capability == "model")
+        && binary_at(id, root).is_some()
 }
 
 async fn generate_at(
@@ -1305,7 +1390,8 @@ async fn generate_at(
         content: vec![Content::Text { text: prompt }],
     };
 
-    Ok(model_at(ask.plugin, ask.model, root, vec![message]).await?.text)
+    let plugin = ask.plugin.ok_or("An intelligence plugin is required to ask Crabbot.")?;
+    Ok(model_at(plugin, ask.model, root, vec![message]).await?.text)
 }
 
 async fn model_at(
@@ -2230,13 +2316,24 @@ fn plugin_commands(root: &Path) -> BTreeMap<String, Vec<(String, CommandSpec)>> 
 
     let mut commands = BTreeMap::new();
 
-    for (id, entry) in lock.plugins {
-        for command in entry.commands {
+    for (id, entry) in &lock.plugins {
+        for command in &entry.commands {
             commands
                 .entry(command.name.clone())
                 .or_insert_with(Vec::new)
-                .push((id.clone(), command));
+                .push((id.clone(), command.clone()));
         }
+    }
+
+    if lock.plugins.iter().any(|(id, entry)| model_plugin_available(id, entry, root)) {
+        commands.entry("ask".into()).or_default().push((
+            "__runtime".into(),
+            CommandSpec {
+                name: "ask".into(),
+                description: "Send one prompt through an intelligence plugin.".into(),
+                interactive: false,
+            },
+        ));
     }
 
     commands
@@ -6473,8 +6570,10 @@ async fn plugin_command(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
 
     let root = home();
     let commands = plugin_commands(&root);
-    let owners =
-        commands.get(name).ok_or_else(|| format!("Plugin command {name} was not found."))?;
+    let Some(owners) = commands.get(name) else {
+        print_help_with_plugins(&root);
+        return Ok(());
+    };
 
     if owners.len() != 1 {
         return Err(format!("Plugin command {name} has conflicting registrations.").into());
@@ -6482,6 +6581,10 @@ async fn plugin_command(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
 
     let (plugin, _) =
         owners.first().cloned().ok_or_else(|| format!("Plugin command {name} was not found."))?;
+
+    if name == "ask" {
+        return ask_plugin_command(&args[1..], &root).await;
+    }
 
     if args.get(1).is_some_and(|argument| argument == "--help" || argument == "-h") {
         println!("Usage: crabbot {name} [arguments...]");
@@ -6594,6 +6697,25 @@ async fn plugin_command(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
     }
 
     Ok(())
+}
+
+async fn ask_plugin_command(
+    args: &[String],
+    root: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let argv = std::iter::once("ask".to_owned()).chain(args.iter().cloned());
+    let ask = match Ask::try_parse_from(argv) {
+        Ok(ask) => ask,
+
+        Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
+            print!("{error}");
+            return Ok(());
+        }
+
+        Err(error) => return Err(error.into()),
+    };
+
+    ask_at(ask, root).await
 }
 
 async fn agent_request(
@@ -8519,15 +8641,6 @@ mod tests {
         );
 
         assert_eq!(
-            super::command_label(&Command::Ask(super::Ask {
-                plugin: "x".into(),
-                model: "m".into(),
-                prompt: vec![]
-            })),
-            "ask"
-        );
-
-        assert_eq!(
             super::command_label(&Command::Export(super::CrabfileExport { path: None })),
             "export"
         );
@@ -9000,6 +9113,10 @@ mod tests {
             },
         );
         super::save_lock_at(&root, &lock).unwrap();
+        let help = super::help_text_with_plugins(&root);
+        assert!(help.contains("Plugin Commands:"));
+        assert!(help.contains("login"));
+        assert!(help.find("Plugin Commands:") < help.find("Options:"));
         assert!(
             super::validate_commands(
                 &root,
@@ -9024,6 +9141,40 @@ mod tests {
             )
             .is_err()
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ask_is_registered_only_for_an_installed_model_plugin() {
+        let root = test_root("ask-command");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("plugins/fake/bin")).unwrap();
+        let mut lock = super::Lock::default();
+        lock.plugins.insert(
+            "fake".into(),
+            super::Entry {
+                source: "local".into(),
+                revision: "local".into(),
+                pinned: false,
+                default: false,
+                hash: String::new(),
+                version: "0.1.0".into(),
+                protocol: Protocol::CURRENT,
+                capabilities: vec!["model".into()],
+                permissions: Vec::new(),
+                secrets: Vec::new(),
+                linked: false,
+                commands: Vec::new(),
+            },
+        );
+        super::save_lock_at(&root, &lock).unwrap();
+        assert!(!super::plugin_commands(&root).contains_key("ask"));
+
+        fs::write(root.join("plugins/fake/bin/crabbot-plugin-fake"), b"plugin").unwrap();
+        let commands = super::plugin_commands(&root);
+        assert_eq!(commands["ask"][0].0, "__runtime");
+        assert_eq!(super::model_plugin_at(&root, Some("fake")).unwrap(), "fake");
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9056,6 +9207,7 @@ mod tests {
         assert!(help.contains("-v, --version"));
         assert!(help.contains("--verbose"));
         assert!(!help.contains("--verbose..."));
+        assert!(!help.contains("Plugin Commands:"));
 
         for argument in ["-h", "-H", "--help"] {
             let error = Cli::try_parse_from(["crabbot", argument]).unwrap_err();
@@ -9066,6 +9218,15 @@ mod tests {
             let error = Cli::try_parse_from(["crabbot", argument]).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::DisplayVersion);
         }
+    }
+
+    #[test]
+    fn root_help_detection_leaves_subcommand_help_to_clap() {
+        assert!(super::root_help_requested(&["help".into()]));
+        assert!(super::root_help_requested(&["--json".into(), "help".into()]));
+        assert!(super::root_help_requested(&["--help".into()]));
+        assert!(!super::root_help_requested(&["help".into(), "status".into()]));
+        assert!(!super::root_help_requested(&["status".into(), "--help".into()]));
     }
 
     #[test]
@@ -9092,11 +9253,15 @@ mod tests {
 
     #[test]
     fn command_parser_keeps_prompt_words() {
-        let cli =
-            Cli::try_parse_from(["crabbot", "ask", "--model", "local", "hello", "world"]).unwrap();
-        assert!(matches!(cli.command, Command::Ask(ask) if ask.prompt == vec!["hello", "world"]));
+        let ask =
+            super::Ask::try_parse_from(["ask", "--model", "local", "hello", "world"]).unwrap();
+        assert_eq!(ask.prompt, vec!["hello", "world"]);
+        assert_eq!(ask.plugin, None);
+
+        let ask = super::Ask::try_parse_from(["ask", "hello"]).unwrap();
+        assert_eq!(ask.model, "gpt-4o-mini");
         let cli = Cli::try_parse_from(["crabbot", "ask", "hello"]).unwrap();
-        assert!(matches!(cli.command, Command::Ask(ask) if ask.model == "gpt-4o-mini"));
+        assert!(matches!(cli.command, Command::External(args) if args == vec!["ask", "hello"]));
     }
 
     #[test]
@@ -9698,11 +9863,7 @@ mod tests {
                 verbose: false,
                 version_flag: None,
                 help: None,
-                command: Command::Ask(super::Ask {
-                    plugin: "missing".into(),
-                    model: "test".into(),
-                    prompt: vec!["hello".into()]
-                })
+                command: Command::External(Vec::new())
             })
             .await,
             std::process::ExitCode::FAILURE
@@ -10851,9 +11012,9 @@ fn main() {
         );
         super::save_lock_at(&root, &lock).unwrap();
 
-        super::ask_model_at(
+        super::ask_at(
             super::Ask {
-                plugin: "fake".into(),
+                plugin: Some("fake".into()),
                 model: "test".into(),
                 prompt: vec!["greet".into(), "world".into()],
             },
@@ -10865,9 +11026,9 @@ fn main() {
         lock.plugins.get_mut("fake").unwrap().capabilities = vec!["tool".into()];
         super::save_lock_at(&root, &lock).unwrap();
         assert!(
-            super::ask_model_at(
+            super::ask_at(
                 super::Ask {
-                    plugin: "fake".into(),
+                    plugin: Some("fake".into()),
                     model: "test".into(),
                     prompt: vec!["again".into()],
                 },

@@ -78,9 +78,11 @@ Brand positioning:
   credentials, protected-file fallback, and systemd-user, launchd-agent, and
   Windows Service support.
 - CLI commands include init, doctor, status, version, plugin
-  install/link/list/update/remove, session, delivery, service, ask, export,
-  import, and plugin-registered commands such as `code`, `codex`, and `tui`.
-  Human output is default; JSON and noninteractive confirmation are explicit.
+  install/link/list/update/remove, session, delivery, service, export, and
+  import. The host-managed `ask` command appears when an installed model
+  plugin can run; other optional commands are registered by plugins such as
+  `code`, `codex`, and `tui`. Human output is default; JSON and noninteractive
+  confirmation are explicit.
 - TUI supports chat, sessions, model/workspace switching, approvals, timers,
   memory, plugin health, and streamed activity.
 - Sessions support new, resume, fork, cancel, and model switching. One turn

@@ -7,6 +7,10 @@ Semantic Versioning.
 
 ### Added
 
+- Added the host-managed `crabbot ask` command through the external command
+  path, exposing it only when an installed model plugin can run.
+- Added runtime-enriched CLI help with separate native and plugin command lists;
+  unknown external commands now display that help.
 - Added descriptive CLI command help, global JSON and diagnostic modes, and
   `-h`/`-H`/`--help`, `--verbose`, and `-v`/`-V`/`--version` options.
 - Added structured `tracing` diagnostics for CLI and daemon failures.

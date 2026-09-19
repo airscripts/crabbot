@@ -24,12 +24,13 @@ crabbot delivery list [--json]
 crabbot delivery retry <id> --yes
 crabbot delivery drop <id> --yes
 crabbot service [install|remove|status|start|stop]
-crabbot ask [--plugin <id>] [--model <name>] <prompt...>
-crabbot code [--session <id>] [--workspace <path>] <prompt...>
 crabbot <plugin-command> [arguments...]
 ```
 
 `crabbot help` and `crabbot --help` show the command tree and Crabbot banner.
+Native commands and currently registered plugin commands are shown in separate
+lists. The plugin list is rebuilt from the installed plugin registry, so it
+includes commands added by newly installed or linked plugins.
 `crabbot --version` and `crabbot version` print the same package version for
 scripts and automation.
 
@@ -81,9 +82,16 @@ plugin unloads its active process before removing its files. Updating plugins
 unloads and reloads only processes that were active, without restarting the
 daemon; inactive plugins stay inactive.
 
-Plugin commands are registered by installed plugins. The TUI plugin registers
-`crabbot tui`; native commands always take precedence, and duplicate plugin
-command names are rejected during installation or update.
+Plugin commands are registered by installed plugins. The Pi agent plugin
+registers `crabbot code`, the TUI plugin registers `crabbot tui`, and the Codex
+plugin registers `crabbot codex`; native commands always take precedence, and
+duplicate plugin command names are rejected during installation or update.
+
+When an installed model plugin is available, Crabbot also registers the
+host-managed `crabbot ask` command. It accepts `--plugin <id>`, `--model
+<name>`, and prompt words, and selects a configured or available model plugin
+when `--plugin` is omitted. The command is absent when no installed model
+plugin can run, so the CLI does not advertise an unusable intelligence path.
 
 Inside the terminal client, `/help` lists controls, `/status` reports the
 authenticated daemon state, and `/approval` reports the daemon approval mode.
@@ -172,10 +180,10 @@ and a two-minute execution deadline. Deleting an idle session reports whether
 its Git worktree was reclaimed; failed cleanup is retried when the daemon next
 starts.
 
-For a one-shot local request, use `crabbot ask --plugin codex --model
-<model> <prompt...>`. This bypasses channel routing and uses the selected model
-plugin directly. It still applies provider validation and protocol limits, but
-it does not create a durable chat session.
+For a one-shot local request, use `crabbot ask --plugin <id> --model <model>
+<prompt...>` when an installed model plugin is available. This bypasses channel
+routing and uses the selected model plugin directly. It still applies provider
+validation and protocol limits, but it does not create a durable chat session.
 
 `crabbot code` is provided by the optional Pi agent plugin. It keeps Crabbot as
 the session, intelligence, workspace, tool, and approval owner while using an
@@ -191,5 +199,5 @@ The Pi plugin disables its built-in tools and forwards registered coding tools
 through Crabbot's confined tools plugin. Mutating tools obey the configured
 `off`, `prompt`, or `auto` approval mode.
 
-If no intelligence plugin is installed, `ask` reports: “An intelligence plugin
-is needed in order to ask something to Crabbot.”
+If no installed model plugin can run, `ask` is unavailable and reports that an
+installed intelligence plugin is needed.
