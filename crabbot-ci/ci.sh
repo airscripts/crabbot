@@ -146,9 +146,9 @@ run_workflow "Security" workflow_dispatch \
     --workflows "$workspace_dir/.github/workflows/security.yml" \
     --input local=true
 
-run_workflow "Test Crates" workflow_dispatch \
+run_workflow "Test Agent" workflow_dispatch \
     --workflows "$workspace_dir/.github/workflows/test.yml" \
-    --job crates \
+    --job agent \
     --matrix "target:${ci_target}" \
     --input local=true
 
@@ -157,9 +157,9 @@ run_workflow "Test Sandbox" workflow_dispatch \
     --job sandbox \
     --input local=true
 
-run_workflow "Build Crates" workflow_dispatch \
+run_workflow "Build Agent" workflow_dispatch \
     --workflows "$workspace_dir/.github/workflows/build.yml" \
-    --job crates \
+    --job agent \
     --matrix "target:${ci_target}" \
     --input local=true
 

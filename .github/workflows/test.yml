@@ -25,8 +25,8 @@ permissions:
   contents: read
 
 jobs:
-  crates:
-    name: Crates
+  agent:
+    name: Agent (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
 
     strategy:
