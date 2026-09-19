@@ -53,21 +53,21 @@ jobs:
             arch: x86_64
             runner: macos-15-intel
             target: x86_64-apple-darwin
-            coverage: true
+            coverage: false
 
           - name: macOS aarch64
             os: macos
             arch: aarch64
             runner: macos-15
             target: aarch64-apple-darwin
-            coverage: true
+            coverage: false
 
           - name: Windows x86_64
             os: windows
             arch: x86_64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
-            coverage: true
+            coverage: false
 
           - name: Windows aarch64
             os: windows
