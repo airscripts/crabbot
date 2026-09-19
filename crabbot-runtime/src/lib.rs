@@ -369,9 +369,17 @@ fn staging_size(root: &Path) -> std::io::Result<u64> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)?;
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         size = size.saturating_add(if metadata.is_dir() {
-            staging_size(&path)?
+            match staging_size(&path) {
+                Ok(size) => size,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => return Err(error),
+            }
         } else {
             metadata.len()
         });
@@ -7659,6 +7667,10 @@ mod tests {
         fs::create_dir_all(root.join("nested")).unwrap();
         fs::write(root.join("file"), b"123").unwrap();
         assert_eq!(super::staging_size(&root).unwrap(), 3);
+        assert_eq!(
+            super::staging_size(&root.join("missing")).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
         assert!(super::read_bounded(&root.join("file"), 3).is_ok());
         assert!(super::read_bounded(&root.join("file"), 2).is_err());
         assert!(super::read_bounded(&root.join("missing"), 3).is_err());
