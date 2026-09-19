@@ -478,7 +478,7 @@ enum Command {
     #[command(about = "Show installation and daemon health.")]
     Status(Output),
     #[command(about = "Print the Crabbot version.")]
-    Version,
+    Version(Output),
     #[command(about = "Generate shell completion scripts.")]
     Completion {
         #[arg(value_enum, help = "Shell to generate completions for.")]
@@ -570,7 +570,7 @@ enum SessionCommand {
     #[command(about = "Cancel an active session turn.")]
     Cancel(Id),
     #[command(about = "Delete a session and reclaim its worktree.")]
-    Delete(Id),
+    Delete(SessionDelete),
 }
 
 #[derive(Debug, Subcommand)]
@@ -619,6 +619,14 @@ struct SessionModel {
     id: String,
     #[arg(help = "Model identifier.")]
     model: String,
+}
+
+#[derive(Debug, Args)]
+struct SessionDelete {
+    #[arg(help = "Session identifier.")]
+    id: String,
+    #[arg(long, help = "Confirm deletion without prompting.")]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -783,7 +791,7 @@ impl Default for ChannelConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Manifest {
     id: String,
     version: String,
@@ -931,6 +939,10 @@ pub async fn cli() -> ExitCode {
 }
 
 fn root_help_requested(args: &[String]) -> bool {
+    if args.is_empty() {
+        return true;
+    }
+
     let mut command_seen = false;
 
     for (index, argument) in args.iter().enumerate() {
@@ -1054,7 +1066,7 @@ fn command_label(command: &Command) -> &'static str {
         Command::Init => "init",
         Command::Doctor => "doctor",
         Command::Status(_) => "status",
-        Command::Version => "version",
+        Command::Version(_) => "version",
         Command::Completion { .. } => "completion",
         Command::Plugin { .. } => "plugin",
         Command::Session { .. } => "session",
@@ -1112,17 +1124,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let json = cli.json;
 
     match cli.command {
-        Command::Init => init()?,
-        Command::Doctor => doctor()?,
+        Command::Init => init(json)?,
+        Command::Doctor => doctor(json)?,
         Command::Status(output) => status_command(output.json || json).await?,
-        Command::Version => version(),
+        Command::Version(output) => version(output.json || json),
         Command::Completion { shell } => completion(shell)?,
         Command::Plugin { command } => plugin(command, json).await?,
         Command::Session { command } => session(command, json).await?,
         Command::Delivery { command } => delivery(command, json).await?,
-        Command::Service { command } => service(command.unwrap_or(ServiceCommand::Status))?,
-        Command::Export(args) => export_crabfile(args)?,
-        Command::Import(args) => import_crabfile(args)?,
+        Command::Service { command } => service(command.unwrap_or(ServiceCommand::Status), json)?,
+        Command::Export(args) => export_crabfile(args, json)?,
+        Command::Import(args) => import_crabfile(args, json)?,
         Command::External(args) => plugin_command(args).await?,
     }
 
@@ -1201,13 +1213,25 @@ struct CrabPlugin {
     capabilities: Vec<String>,
 }
 
-fn export_crabfile(args: CrabfileExport) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    export_crabfile_at(args, &home())
+fn export_crabfile(
+    args: CrabfileExport,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    export_crabfile_at_mode(args, &home(), json)
 }
 
+#[cfg(test)]
 fn export_crabfile_at(
     args: CrabfileExport,
     root: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    export_crabfile_at_mode(args, root, false)
+}
+
+fn export_crabfile_at_mode(
+    args: CrabfileExport,
+    root: &Path,
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = args.path.unwrap_or_else(|| PathBuf::from("Crabfile"));
 
@@ -1238,17 +1262,43 @@ fn export_crabfile_at(
     let file = Crabfile { version: 1, config, plugins };
     let text = toml::to_string_pretty(&file)?;
     secure(&path, text.as_bytes())?;
-    println!("Exported {}.", path.display());
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "action": "export",
+                "path": path,
+                "plugins": file.plugins.len(),
+                "status": "exported"
+            })
+        );
+    } else {
+        println!("Exported {}.", path.display());
+    }
+
     Ok(())
 }
 
-fn import_crabfile(args: CrabfileImport) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    import_crabfile_at(args, &home())
+fn import_crabfile(
+    args: CrabfileImport,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    import_crabfile_at_mode(args, &home(), json)
 }
 
+#[cfg(test)]
 fn import_crabfile_at(
     args: CrabfileImport,
     root: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    import_crabfile_at_mode(args, root, false)
+}
+
+fn import_crabfile_at_mode(
+    args: CrabfileImport,
+    root: &Path,
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = args.path.unwrap_or_else(|| PathBuf::from("Crabfile"));
 
@@ -1324,11 +1374,24 @@ fn import_crabfile_at(
         return Err(error);
     }
 
-    println!(
-        "Imported {} configuration and {} plugin entries while preserving local credentials.",
-        path.display(),
-        file.plugins.len()
-    );
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "action": "import",
+                "path": path,
+                "plugins": file.plugins.len(),
+                "status": "imported"
+            })
+        );
+    } else {
+        println!(
+            "Imported {} configuration and {} plugin entries while preserving local credentials.",
+            path.display(),
+            file.plugins.len()
+        );
+    }
+
     Ok(())
 }
 
@@ -1443,14 +1506,14 @@ async fn session(
     command: SessionCommand,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    session_at(with_session_json(command, json), &home()).await
+    session_at_json(with_session_json(command, json), &home(), json).await
 }
 
 async fn delivery(
     command: DeliveryCommand,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    delivery_at(with_delivery_json(command, json), &home()).await
+    delivery_at_json(with_delivery_json(command, json), &home(), json).await
 }
 
 fn with_session_json(command: SessionCommand, json: bool) -> SessionCommand {
@@ -1483,9 +1546,18 @@ fn with_delivery_json(command: DeliveryCommand, json: bool) -> DeliveryCommand {
     }
 }
 
+#[cfg(test)]
 async fn delivery_at(
     command: DeliveryCommand,
     root: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    delivery_at_json(command, root, false).await
+}
+
+async fn delivery_at_json(
+    command: DeliveryCommand,
+    root: &Path,
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
         DeliveryCommand::List(output) => {
@@ -1501,7 +1573,7 @@ async fn delivery_at(
                 })
             };
 
-            if output.json {
+            if output.json || json {
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else if value["items"].as_array().is_none_or(Vec::is_empty) {
                 println!("No pending deliveries.");
@@ -1529,14 +1601,34 @@ async fn delivery_at(
                 control_at("delivery.retry", serde_json::json!({"id": id, "yes": true}), root)
                     .await?
             {
-                println!("Queued delivery {} for retry.", value["id"].as_str().unwrap_or_default());
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    println!(
+                        "Queued delivery {} for retry.",
+                        value["id"].as_str().unwrap_or_default()
+                    );
+                }
+
                 return Ok(());
             }
 
             let _offline_lock = offline_lock(root)?;
             let mut store = sessions_at(root)?;
             store.retry_delivery(&args.id)?;
-            println!("Queued delivery {} for retry.", args.id);
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "action": "retry",
+                        "id": args.id,
+                        "status": "queued"
+                    }))?
+                );
+            } else {
+                println!("Queued delivery {} for retry.", args.id);
+            }
         }
 
         DeliveryCommand::Drop(args) => {
@@ -1550,23 +1642,49 @@ async fn delivery_at(
                 control_at("delivery.drop", serde_json::json!({"id": id, "yes": true}), root)
                     .await?
             {
-                println!("Dropped delivery {}.", value["id"].as_str().unwrap_or_default());
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    println!("Dropped delivery {}.", value["id"].as_str().unwrap_or_default());
+                }
+
                 return Ok(());
             }
 
             let _offline_lock = offline_lock(root)?;
             let mut store = sessions_at(root)?;
             store.drop_delivery(&args.id)?;
-            println!("Dropped delivery {}.", args.id);
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "action": "drop",
+                        "id": args.id,
+                        "status": "dropped"
+                    }))?
+                );
+            } else {
+                println!("Dropped delivery {}.", args.id);
+            }
         }
     }
 
     Ok(())
 }
 
+#[cfg(test)]
 async fn session_at(
     command: SessionCommand,
     root: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    session_at_json(command, root, false).await
+}
+
+async fn session_at_json(
+    command: SessionCommand,
+    root: &Path,
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
         SessionCommand::New(args) => {
@@ -1577,11 +1695,16 @@ async fn session_at(
                 control_at("session.new", serde_json::json!({"id": id, "model": model}), root)
                     .await?
             {
-                println!("Created session {}.", value["id"].as_str().unwrap_or_default());
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    println!("Created session {}.", value["id"].as_str().unwrap_or_default());
+                }
+
                 return Ok(());
             }
 
-            local_session(SessionCommand::New(args), root)?;
+            local_session_mode(SessionCommand::New(args), root, json)?;
         }
 
         SessionCommand::List(output) => {
@@ -1597,7 +1720,7 @@ async fn session_at(
                 })
             };
 
-            if output.json {
+            if output.json || json {
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else if value["items"].as_array().is_none_or(Vec::is_empty) {
                 println!("No sessions.");
@@ -1623,7 +1746,11 @@ async fn session_at(
                 ipc::detail(store.sessions.get(&args.id).ok_or("Session was not found.")?)
             };
 
-            println!("{}", serde_json::to_string_pretty(&value)?);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("{}", session_text(&value));
+            }
         }
 
         SessionCommand::Fork(args) => {
@@ -1637,11 +1764,16 @@ async fn session_at(
             )
             .await?
             {
-                println!("Forked session {}.", value["id"].as_str().unwrap_or_default());
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    println!("Forked session {}.", value["id"].as_str().unwrap_or_default());
+                }
+
                 return Ok(());
             }
 
-            local_session(SessionCommand::Fork(args), root)?;
+            local_session_mode(SessionCommand::Fork(args), root, json)?;
         }
 
         SessionCommand::Model(args) => {
@@ -1652,15 +1784,20 @@ async fn session_at(
                 control_at("session.model", serde_json::json!({"id": id, "model": model}), root)
                     .await?
             {
-                println!(
-                    "Session {} now uses {}.",
-                    value["id"].as_str().unwrap_or_default(),
-                    value["model"].as_str().unwrap_or_default()
-                );
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    println!(
+                        "Session {} now uses {}.",
+                        value["id"].as_str().unwrap_or_default(),
+                        value["model"].as_str().unwrap_or_default()
+                    );
+                }
+
                 return Ok(());
             }
 
-            local_session(SessionCommand::Model(args), root)?;
+            local_session_mode(SessionCommand::Model(args), root, json)?;
         }
 
         SessionCommand::Cancel(args) => {
@@ -1669,20 +1806,31 @@ async fn session_at(
             if let Some(value) =
                 control_at("session.cancel", serde_json::json!({"id": id}), root).await?
             {
-                println!("Cancelled session {}.", value["id"].as_str().unwrap_or_default());
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    println!("Cancelled session {}.", value["id"].as_str().unwrap_or_default());
+                }
+
                 return Ok(());
             }
 
-            local_session(SessionCommand::Cancel(args), root)?;
+            local_session_mode(SessionCommand::Cancel(args), root, json)?;
         }
 
         SessionCommand::Delete(args) => {
+            if !args.yes {
+                return Err("Deleting a session requires --yes.".into());
+            }
+
             let id = args.id.clone();
 
             if let Some(value) =
                 control_at("session.delete", serde_json::json!({"id": id}), root).await?
             {
-                if value["worktree"]["status"] == "pending" {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else if value["worktree"]["status"] == "pending" {
                     println!(
                         "{}",
                         sentence(format!(
@@ -1700,7 +1848,7 @@ async fn session_at(
                 return Ok(());
             }
 
-            local_session(SessionCommand::Delete(args), root)?;
+            local_session_mode(SessionCommand::Delete(args), root, json)?;
         }
     }
 
@@ -1711,14 +1859,44 @@ fn local_session(
     command: SessionCommand,
     root: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    local_session_json(command, root, false)
+}
+
+fn local_session_mode(
+    command: SessionCommand,
+    root: &Path,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if json { local_session_json(command, root, true) } else { local_session(command, root) }
+}
+
+fn local_session_json(
+    command: SessionCommand,
+    root: &Path,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::fs::create_dir_all(root)?;
     let _offline_lock = offline_lock(root)?;
     let mut store = sessions_at(root)?;
 
     match command {
         SessionCommand::New(args) => {
-            store.create(args.id.clone(), args.model)?;
-            println!("Created session {}.", args.id);
+            let id = args.id.clone();
+            let model = args.model.clone();
+            store.create(id.clone(), model.clone())?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "action": "create",
+                        "id": id,
+                        "model": model
+                    }))?
+                );
+            } else {
+                println!("Created session {}.", args.id);
+            }
         }
 
         SessionCommand::List(output) => {
@@ -1726,7 +1904,7 @@ fn local_session(
                 "items": store.sessions.values().map(ipc::summary).collect::<Vec<_>>()
             });
 
-            if output.json {
+            if output.json || json {
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else if store.sessions.is_empty() {
                 println!("No sessions.");
@@ -1739,42 +1917,147 @@ fn local_session(
 
         SessionCommand::Show(args) => {
             let session = store.sessions.get(&args.id).ok_or("Session was not found.")?;
-            println!("{}", serde_json::to_string_pretty(&ipc::detail(session))?);
+            let value = ipc::detail(session);
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("{}", session_text(&value));
+            }
         }
 
         SessionCommand::Fork(args) => {
             store.fork(&args.source, &args.target)?;
-            println!("Forked session {}.", args.target);
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "action": "fork",
+                        "id": args.target,
+                        "source": args.source
+                    }))?
+                );
+            } else {
+                println!("Forked session {}.", args.target);
+            }
         }
 
         SessionCommand::Model(args) => {
             store.set_model(&args.id, &args.model)?;
-            println!("Session {} now uses {}.", args.id, args.model);
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "action": "model",
+                        "id": args.id,
+                        "model": args.model
+                    }))?
+                );
+            } else {
+                println!("Session {} now uses {}.", args.id, args.model);
+            }
         }
 
         SessionCommand::Cancel(args) => {
             store.cancel(&args.id)?;
-            println!("Cancelled session {}.", args.id);
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "action": "cancel",
+                        "id": args.id,
+                        "status": "cancelled"
+                    }))?
+                );
+            } else {
+                println!("Cancelled session {}.", args.id);
+            }
         }
 
         SessionCommand::Delete(args) => {
-            store.remove(&args.id)?;
-
-            if let Err(error) = state::remove_worktree(&workspace_root(), &args.id) {
-                println!(
-                    "{}",
-                    sentence(format!(
-                        "Session {} was deleted, but its worktree could not be reclaimed: {}",
-                        args.id, error
-                    ))
-                );
+            if !args.yes {
+                return Err("Deleting a session requires --yes.".into());
             }
 
-            println!("Deleted session {}.", args.id);
+            store.remove(&args.id)?;
+
+            let worktree_error = state::remove_worktree(&workspace_root(), &args.id).err();
+
+            if json {
+                let mut value = serde_json::json!({
+                    "action": "delete",
+                    "id": args.id,
+                    "status": "deleted"
+                });
+
+                if let Some(error) = worktree_error {
+                    value["worktree"] = serde_json::json!({
+                        "status": "pending",
+                        "error": error.to_string()
+                    });
+                }
+
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                if let Some(error) = worktree_error {
+                    println!(
+                        "{}",
+                        sentence(format!(
+                            "Session {} was deleted, but its worktree could not be reclaimed: {}",
+                            args.id, error
+                        ))
+                    );
+                }
+
+                println!("Deleted session {}.", args.id);
+            }
         }
     }
 
     Ok(())
+}
+
+fn session_text(value: &serde_json::Value) -> String {
+    let mut lines = vec![
+        format!("Session: {}", value["id"].as_str().unwrap_or("unknown")),
+        format!("Model: {}", value["model"].as_str().unwrap_or("unknown")),
+        format!("Status: {}", value["status"].as_str().unwrap_or("unknown")),
+    ];
+
+    if let Some(workspace) = value["workspace"].as_str() {
+        lines.push(format!("Workspace: {workspace}"));
+    }
+
+    lines.push("Transcript:".into());
+    let messages = value["messages"].as_array();
+
+    if messages.is_none_or(Vec::is_empty) {
+        lines.push("  (empty)".into());
+    } else {
+        for message in messages.into_iter().flatten() {
+            let role = message["role"].as_str().unwrap_or("unknown");
+            let content = message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|item| {
+                    item["text"]
+                        .as_str()
+                        .or_else(|| item["alt"].as_str())
+                        .or_else(|| item["name"].as_str())
+                        .unwrap_or_else(|| item["kind"].as_str().unwrap_or("attachment"))
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            lines.push(format!("  {role}: {content}"));
+        }
+    }
+
+    lines.join("\n")
 }
 
 async fn control_at(
@@ -1848,10 +2131,16 @@ fn workspace_root() -> PathBuf {
     std::env::var_os("CRABBOT_ROOT").map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
-fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn init(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let root = home();
     init_at(&root)?;
-    println!("Initialized {}.", root.display());
+
+    if json {
+        println!("{}", serde_json::json!({"home": root, "initialized": true}));
+    } else {
+        println!("Initialized {}.", root.display());
+    }
+
     Ok(())
 }
 
@@ -5958,17 +6247,16 @@ fn installed_at(root: &Path) -> Vec<String> {
     ids
 }
 
-fn doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn doctor(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let root = home();
-    println!("Home: {}.", root.display());
-    println!("Config present: {}.", root.join("config.toml").exists());
-    println!("Plugins directory present: {}.", root.join("plugins").exists());
-    println!("Protocol: {}.{}.", Protocol::CURRENT.major, Protocol::CURRENT.minor);
+    let config_present = root.join("config.toml").is_file();
+    let plugins_directory_present = root.join("plugins").is_dir();
+    let mut config_valid = None;
 
-    if root.join("config.toml").is_file() {
+    if config_present {
         let config: Config = toml::from_str(&std::fs::read_to_string(root.join("config.toml"))?)?;
         config.validate().map_err(|error| format!("Config is invalid: {error}"))?;
-        println!("Config is valid.");
+        config_valid = Some(true);
     }
 
     let lock = load_lock_at(&root)?;
@@ -5984,12 +6272,46 @@ fn doctor() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    println!("Plugin integrity is valid.");
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "config": {"present": config_present, "valid": config_valid},
+                "home": root,
+                "plugin_integrity": "valid",
+                "plugins": {
+                    "directory_present": plugins_directory_present,
+                    "installed": lock.plugins.keys().collect::<Vec<_>>(),
+                },
+                "protocol": {
+                    "major": Protocol::CURRENT.major,
+                    "minor": Protocol::CURRENT.minor,
+                },
+            })
+        );
+    } else {
+        println!("Home: {}.", root.display());
+        println!("Config present: {}.", config_present);
+        println!("Plugins directory present: {}.", plugins_directory_present);
+        println!("Protocol: {}.{}.", Protocol::CURRENT.major, Protocol::CURRENT.minor);
+
+        if config_valid.is_some() {
+            println!("Config is valid.");
+        }
+
+        println!("Plugin integrity is valid.");
+    }
+
     Ok(())
 }
 
-fn service(command: ServiceCommand) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    service_at(&service_path(), command)
+fn service(
+    command: ServiceCommand,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = service_path();
+
+    if json { service_at_json(&path, command, true) } else { service_at(&path, command) }
 }
 
 const SERVICE_VARIABLES: &[&str] = &[
@@ -6151,10 +6473,27 @@ fn service_at(
     service_at_with(path, command, service_action)
 }
 
+fn service_at_json(
+    path: &Path,
+    command: ServiceCommand,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    service_at_with_mode(path, command, |path, start| service_action_with(path, start, json), json)
+}
+
 fn service_at_with(
     path: &Path,
     command: ServiceCommand,
     mut action: impl FnMut(&Path, bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    service_at_with_mode(path, command, &mut action, false)
+}
+
+fn service_at_with_mode(
+    path: &Path,
+    command: ServiceCommand,
+    mut action: impl FnMut(&Path, bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
         ServiceCommand::Install => {
@@ -6178,22 +6517,48 @@ fn service_at_with(
 
             #[cfg(not(target_os = "windows"))]
             std::fs::write(path, definition)?;
-            println!("Wrote the service definition to {}.", path.display());
-            println!("Run `crabbot service start` to activate it.");
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "action": "install",
+                        "path": path,
+                        "status": "installed",
+                    })
+                );
+            } else {
+                println!("Wrote the service definition to {}.", path.display());
+                println!("Run `crabbot service start` to activate it.");
+            }
         }
 
         ServiceCommand::Remove => {
-            if path.exists() {
+            let installed = path.exists();
+
+            if installed {
                 action(path, false)?;
             }
 
             #[cfg(target_os = "windows")]
-            if path.exists() {
+            if installed {
                 windows_service_remove()?;
             }
 
-            if path.exists() {
+            if installed {
                 std::fs::remove_file(path)?;
+            }
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "action": "remove",
+                        "path": path,
+                        "status": if installed { "removed" } else { "not installed" },
+                    })
+                );
+            } else if installed {
                 println!("Removed the service definition from {}.", path.display());
             } else {
                 println!("No service definition was found.");
@@ -6201,14 +6566,28 @@ fn service_at_with(
         }
 
         ServiceCommand::Status => {
-            println!(
-                "Service definition: {}.",
-                if path.is_file() { path.display().to_string() } else { "not installed".into() }
-            );
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "path": path,
+                        "status": if path.is_file() { "installed" } else { "not installed" },
+                    })
+                );
+            } else {
+                println!(
+                    "Service definition: {}.",
+                    if path.is_file() {
+                        path.display().to_string()
+                    } else {
+                        "not installed".into()
+                    }
+                );
+            }
         }
 
-        ServiceCommand::Start => service_action(path, true)?,
-        ServiceCommand::Stop => service_action(path, false)?,
+        ServiceCommand::Start => action(path, true)?,
+        ServiceCommand::Stop => action(path, false)?,
     }
 
     Ok(())
@@ -6324,13 +6703,26 @@ fn service_action(
     path: &Path,
     start: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    service_action_with(path, start, false)
+}
+
+fn service_action_with(
+    path: &Path,
+    start: bool,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !path.is_file() {
         return Err("Service definition is not installed.".into());
     }
 
     #[cfg(target_os = "windows")]
     if !start && !windows_service_running()? {
-        println!("Service stopped.");
+        if json {
+            println!("{}", serde_json::json!({"action": "stop", "status": "stopped"}));
+        } else {
+            println!("Service stopped.");
+        }
+
         return Ok(());
     }
 
@@ -6374,7 +6766,19 @@ fn service_action(
         return Err(format!("Service action failed: {}", sentence(detail.trim())).into());
     }
 
-    println!("Service {}.", if start { "started" } else { "stopped" });
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "action": if start { "start" } else { "stop" },
+                "status": if start { "started" } else { "stopped" },
+            })
+        );
+    } else {
+        let status = if start { "started" } else { "stopped" };
+
+        println!("Service {status}.");
+    }
 
     Ok(())
 }
@@ -6509,8 +6913,12 @@ fn xml(value: String) -> String {
         .replace('\'', "&apos;")
 }
 
-fn version() {
-    println!("{NAME} {VERSION}");
+fn version(json: bool) {
+    if json {
+        println!("{}", serde_json::json!({"name": NAME, "version": VERSION}));
+    } else {
+        println!("{NAME} {VERSION}");
+    }
 }
 
 async fn status_command(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -6540,27 +6948,69 @@ async fn status_command(json: bool) -> Result<(), Box<dyn std::error::Error + Se
     };
 
     let value = serde_json::json!({
+        "version": VERSION,
         "health": health,
         "daemon": if daemon { "running" } else { "stopped" },
-        "intelligence": if model_ready { format!("{model} ready") } else { "not configured".into() },
-        "messaging": if channel_ready { format!("{channel} ready") } else { "not configured".into() },
+        "intelligence": capability_status(&lock, "model"),
+        "messaging": capability_status(&lock, "channel"),
         "plugins": installed,
     });
 
     if json {
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
-        println!(
-            "Health: {}, Daemon: {}, Intelligence: {}, Messaging: {}, Plugins: {} installed.",
-            value["health"].as_str().unwrap_or("attention"),
-            value["daemon"].as_str().unwrap_or("stopped"),
-            value["intelligence"].as_str().unwrap_or("not configured"),
-            value["messaging"].as_str().unwrap_or("not configured"),
-            installed
-        );
+        println!("{}", status_text(&value, installed));
     }
 
     Ok(())
+}
+
+fn capability_status(lock: &Lock, capability: &str) -> serde_json::Value {
+    let plugins = lock
+        .plugins
+        .iter()
+        .filter(|(id, entry)| entry.capabilities.iter().any(|item| item == capability) && ready(id))
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "status": if plugins.is_empty() { "not configured" } else { "configured" },
+        "plugins": plugins,
+    })
+}
+
+fn capability_text(value: &serde_json::Value) -> String {
+    let status = value["status"].as_str().unwrap_or("not configured");
+    let plugins = value["plugins"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+
+    if status == "configured" && !plugins.is_empty() {
+        format!("configured ({})", plugins.join(", "))
+    } else {
+        status.into()
+    }
+}
+
+fn status_text(value: &serde_json::Value, installed: usize) -> String {
+    format!(
+        "{:<15}{}\n{:<15}{}\n{:<15}{}\n{:<15}{}\n{:<15}{}\n{:<15}{} installed",
+        "Version:",
+        value["version"].as_str().unwrap_or(VERSION),
+        "Health:",
+        value["health"].as_str().unwrap_or("attention"),
+        "Daemon:",
+        value["daemon"].as_str().unwrap_or("stopped"),
+        "Intelligence:",
+        capability_text(&value["intelligence"]),
+        "Messaging:",
+        capability_text(&value["messaging"]),
+        "Plugins:",
+        installed
+    )
 }
 
 async fn plugin_command(args: Vec<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -6805,15 +7255,43 @@ async fn plugin(
         PluginCommand::List(output) => list(output.json || json)?,
 
         PluginCommand::Install(source) => {
-            let id = source.id.clone();
-            link(source, false)?;
-            activate(&id).await?;
+            let manifest = link(source, false)?;
+            let activation = activate_at(&home(), &manifest.id).await?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "action": "install",
+                        "id": manifest.id,
+                        "version": manifest.version,
+                        "activation": if activation.is_some() { "active" } else { "deferred" }
+                    }))?
+                );
+            } else {
+                println!("Installed {} {}.", manifest.id, manifest.version);
+                print_activation(&manifest.id, activation);
+            }
         }
 
         PluginCommand::Link(source) => {
-            let id = source.id.clone();
-            link(source, true)?;
-            activate(&id).await?;
+            let manifest = link(source, true)?;
+            let activation = activate_at(&home(), &manifest.id).await?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "action": "link",
+                        "id": manifest.id,
+                        "version": manifest.version,
+                        "activation": if activation.is_some() { "active" } else { "deferred" }
+                    }))?
+                );
+            } else {
+                println!("Linked {} {}.", manifest.id, manifest.version);
+                print_activation(&manifest.id, activation);
+            }
         }
 
         PluginCommand::Update(output) => update_plugins(output.json || json).await?,
@@ -6828,10 +7306,11 @@ async fn plugin(
             }
 
             let id = name.id.clone();
-            unload(&id).await?;
+            let unloaded =
+                unload_at(&home(), &id).await?.is_some_and(|value| value["unloaded"] == true);
 
             if let Err(error) = remove(name) {
-                if let Err(reload) = activate(&id).await {
+                if let Err(reload) = activate_at(&home(), &id).await {
                     return Err(format!(
                         "Plugin removal failed: {}. Runtime restoration also failed: {}.",
                         sentence(error.to_string()),
@@ -6842,16 +7321,32 @@ async fn plugin(
 
                 return Err(error);
             }
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "action": "remove",
+                        "id": id,
+                        "status": "removed",
+                        "unloaded": unloaded
+                    }))?
+                );
+            } else {
+                if unloaded {
+                    println!("Plugin {id} was unloaded from the running daemon.");
+                }
+
+                println!("Removed {}.", id);
+            }
         }
     }
 
     Ok(())
 }
 
-async fn activate(id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = home();
-
-    match activate_at(&root, id).await? {
+fn print_activation(id: &str, value: Option<serde_json::Value>) {
+    match value {
         Some(value) => println!(
             "Plugin {} {} is active in the running daemon.",
             value["id"].as_str().unwrap_or(id),
@@ -6859,8 +7354,6 @@ async fn activate(id: &str) -> Result<(), Box<dyn std::error::Error + Send + Syn
         ),
         None => println!("Plugin {id} is installed and will load when the daemon starts."),
     }
-
-    Ok(())
 }
 
 async fn activate_at(
@@ -6868,16 +7361,6 @@ async fn activate_at(
     id: &str,
 ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
     control_at("plugin.load", serde_json::json!({"id": id}), root).await
-}
-
-async fn unload(id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = home();
-
-    if unload_at(&root, id).await?.is_some_and(|value| value["unloaded"] == true) {
-        println!("Plugin {id} was unloaded from the running daemon.");
-    }
-
-    Ok(())
 }
 
 async fn unload_at(
@@ -7287,7 +7770,10 @@ fn now() -> u64 {
         .map_or(0, |value| value.as_nanos() as u64)
 }
 
-fn link(source: Source, linked: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn link(
+    source: Source,
+    linked: bool,
+) -> Result<Manifest, Box<dyn std::error::Error + Send + Sync>> {
     link_at(source, linked, &home())
 }
 
@@ -7295,7 +7781,7 @@ fn link_at(
     source: Source,
     linked: bool,
     home_root: &Path,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Manifest, Box<dyn std::error::Error + Send + Sync>> {
     let _lock = lock_at(home_root, ".plugins.lock")?;
 
     if !valid(&source.id) {
@@ -7452,14 +7938,7 @@ fn link_at(
 
     result?;
 
-    println!(
-        "{} {} {}.",
-        if linked { "Linked" } else { "Installed" },
-        manifest.id,
-        manifest.version
-    );
-
-    Ok(())
+    Ok(manifest)
 }
 
 fn copy_binary(source: &Path, destination: &Path) -> std::io::Result<u64> {
@@ -8218,8 +8697,6 @@ fn remove_at(name: Name, home_root: &Path) -> Result<(), Box<dyn std::error::Err
         let _ = std::fs::remove_dir_all(backup);
     }
 
-    println!("Removed {}.", name.id);
-
     Ok(())
 }
 
@@ -8389,10 +8866,10 @@ mod tests {
     use super::{
         ARCHIVE_LIMIT, BANNER, Cancellation, Cli, Command, CommandSpec, CompletionShell, Config,
         CrabfileExport, CrabfileImport, DeliveryCommand, Fork, Id, Live, Manifest, Name, Output,
-        Plugins, Process, ServiceCommand, SessionCommand, SessionModel, SessionNew, Sha256, Source,
-        Stop, answer, archive, archive_root, archive_url, assistant, binary_at, canonical_source,
-        changed, channel_message_id, command_output_limited, commit_event, daemon_lock,
-        delivery_at, delivery_request, download, embedded, ensure_home, env_for,
+        Plugins, Process, ServiceCommand, SessionCommand, SessionDelete, SessionModel, SessionNew,
+        Sha256, Source, Stop, answer, archive, archive_root, archive_url, assistant, binary_at,
+        canonical_source, changed, channel_message_id, command_output_limited, commit_event,
+        daemon_lock, delivery_at, delivery_request, download, embedded, ensure_home, env_for,
         export_crabfile_at, generate_completion, import_crabfile_at, init_at, installed_at,
         isolate_at, local_session, plugin_binary, read_manifest, reclaim_worktrees, recover,
         recover_plugins, redact, resolve, restart_tool, revision, safe_archive, send_params,
@@ -8472,6 +8949,39 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn formats_status_as_aligned_lines() {
+        let value = serde_json::json!({
+            "version": super::VERSION,
+            "health": "attention",
+            "daemon": "stopped",
+            "intelligence": {
+                "status": "configured",
+                "plugins": ["codex", "gemini"]
+            },
+            "messaging": {
+                "status": "configured",
+                "plugins": ["telegram", "discord"]
+            },
+        });
+
+        assert_eq!(
+            super::status_text(&value, 0),
+            format!(
+                "Version:       {}\nHealth:        attention\nDaemon:        stopped\nIntelligence:  configured (codex, gemini)\nMessaging:     configured (telegram, discord)\nPlugins:       0 installed",
+                super::VERSION
+            )
+        );
+
+        assert_eq!(
+            super::capability_text(&serde_json::json!({
+                "status": "not configured",
+                "plugins": [],
+            })),
+            "not configured"
+        );
     }
 
     #[test]
@@ -8608,7 +9118,7 @@ mod tests {
         assert_eq!(super::command_label(&Command::Init), "init");
         assert_eq!(super::command_label(&Command::Doctor), "doctor");
         assert_eq!(super::command_label(&Command::Status(Output { json: false })), "status");
-        assert_eq!(super::command_label(&Command::Version), "version");
+        assert_eq!(super::command_label(&Command::Version(Output { json: false })), "version");
         assert_eq!(
             super::command_label(&Command::Completion { shell: CompletionShell::Bash }),
             "completion"
@@ -9170,7 +9680,8 @@ mod tests {
         super::save_lock_at(&root, &lock).unwrap();
         assert!(!super::plugin_commands(&root).contains_key("ask"));
 
-        fs::write(root.join("plugins/fake/bin/crabbot-plugin-fake"), b"plugin").unwrap();
+        let binary = root.join("plugins/fake/bin").join(super::plugin_name("fake"));
+        fs::write(binary, b"plugin").unwrap();
         let commands = super::plugin_commands(&root);
         assert_eq!(commands["ask"][0].0, "__runtime");
         assert_eq!(super::model_plugin_at(&root, Some("fake")).unwrap(), "fake");
@@ -9200,6 +9711,39 @@ mod tests {
         assert!(cli.debug);
         assert!(cli.verbose);
 
+        let cli = Cli::try_parse_from(["crabbot", "version", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Version(Output { json: true })));
+
+        let cli = Cli::try_parse_from(["crabbot", "status", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Status(Output { json: true })));
+
+        let cli = Cli::try_parse_from(["crabbot", "--json", "doctor"]).unwrap();
+        assert!(cli.json);
+
+        let cli = Cli::try_parse_from(["crabbot", "service", "status", "--json"]).unwrap();
+        assert!(cli.json);
+
+        let cli = Cli::try_parse_from(["crabbot", "plugin", "remove", "tools", "--yes", "--json"])
+            .unwrap();
+        assert!(cli.json);
+
+        let cli = Cli::try_parse_from(["crabbot", "session", "new", "main", "--json"]).unwrap();
+        assert!(cli.json);
+
+        let cli = Cli::try_parse_from(["crabbot", "session", "show", "main", "--json"]).unwrap();
+        assert!(cli.json);
+
+        let cli = Cli::try_parse_from(["crabbot", "session", "delete", "main", "--yes", "--json"])
+            .unwrap();
+        assert!(cli.json);
+
+        let cli = Cli::try_parse_from(["crabbot", "delivery", "retry", "item", "--yes", "--json"])
+            .unwrap();
+        assert!(cli.json);
+
+        let cli = Cli::try_parse_from(["crabbot", "export", "--json"]).unwrap();
+        assert!(cli.json);
+
         let help = Cli::command().render_help().to_string();
         assert!(help.contains("Initialize the Crabbot home directory and configuration."));
         assert!(help.contains("-h, --help"));
@@ -9222,6 +9766,7 @@ mod tests {
 
     #[test]
     fn root_help_detection_leaves_subcommand_help_to_clap() {
+        assert!(super::root_help_requested(&[]));
         assert!(super::root_help_requested(&["help".into()]));
         assert!(super::root_help_requested(&["--json".into(), "help".into()]));
         assert!(super::root_help_requested(&["--help".into()]));
@@ -9851,7 +10396,7 @@ mod tests {
                 verbose: false,
                 version_flag: None,
                 help: None,
-                command: Command::Version,
+                command: Command::Version(Output { json: false }),
             })
             .await,
             std::process::ExitCode::SUCCESS
@@ -9884,7 +10429,7 @@ mod tests {
     #[tokio::test]
     async fn runs_non_interactive_commands() {
         for command in [
-            Command::Version,
+            Command::Version(Output { json: true }),
             Command::Status(Output { json: true }),
             Command::Service { command: None },
             Command::Doctor,
@@ -10963,6 +11508,17 @@ fn main() {
         assert!(
             session_at(SessionCommand::Show(Id { id: "missing".into() }), &root).await.is_err()
         );
+        assert!(
+            session_at(
+                SessionCommand::Delete(SessionDelete { id: "main".into(), yes: false }),
+                &root,
+            )
+            .await
+            .is_err()
+        );
+        session_at(SessionCommand::Delete(SessionDelete { id: "main".into(), yes: true }), &root)
+            .await
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 

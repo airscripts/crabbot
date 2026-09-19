@@ -3,27 +3,29 @@
 ```text
 crabbot help
 crabbot --version
-crabbot init
-crabbot doctor
+crabbot init [--json]
+crabbot doctor [--json]
 crabbot status [--json]
-crabbot version
+crabbot version [--json]
 crabbot completion <bash|fish|powershell|zsh>
 crabbot plugin list [--json]
-crabbot plugin install <id> [source] [--revision <rev>] [--yes]
-crabbot plugin link <id> [folder] [--revision <rev>] [--yes]
+crabbot plugin install <id> [source] [--revision <rev>] [--yes] [--json]
+crabbot plugin link <id> [folder] [--revision <rev>] [--yes] [--json]
 crabbot plugin update [--json]
-crabbot plugin remove <id> [--yes]
-crabbot session new <id> [--model <name>]
+crabbot plugin remove <id> [--yes] [--json]
+crabbot session new <id> [--model <name>] [--json]
 crabbot session list [--json]
-crabbot session show <id>
-crabbot session fork <source> <target>
-crabbot session model <id> <model>
-crabbot session cancel <id>
-crabbot session delete <id>
+crabbot session show <id> [--json]
+crabbot session fork <source> <target> [--json]
+crabbot session model <id> <model> [--json]
+crabbot session cancel <id> [--json]
+crabbot session delete <id> --yes [--json]
 crabbot delivery list [--json]
-crabbot delivery retry <id> --yes
-crabbot delivery drop <id> --yes
-crabbot service [install|remove|status|start|stop]
+crabbot delivery retry <id> --yes [--json]
+crabbot delivery drop <id> --yes [--json]
+crabbot export [--path <PATH>] [--json]
+crabbot import [--path <PATH>] --yes [--force] [--json]
+crabbot service [install|remove|status|start|stop] [--json]
 crabbot <plugin-command> [arguments...]
 ```
 
@@ -31,8 +33,9 @@ crabbot <plugin-command> [arguments...]
 Native commands and currently registered plugin commands are shown in separate
 lists. The plugin list is rebuilt from the installed plugin registry, so it
 includes commands added by newly installed or linked plugins.
-`crabbot --version` and `crabbot version` print the same package version for
-scripts and automation.
+`crabbot --version` and `crabbot version` print the same package version.
+Use `crabbot version --json` when a structured `{ "name", "version" }` result
+is needed.
 
 `crabbot completion <shell>` writes a completion script to standard output.
 Supported shells are Bash, Fish, PowerShell, and Zsh. Redirect the
@@ -53,11 +56,15 @@ In PowerShell, add the generated script to the current profile:
 crabbot completion powershell >> $PROFILE
 ```
 
-The global `--json` flag selects JSON output wherever a command supports it;
-the command-level form remains available for `status`, plugin lists and
-updates, session lists, and delivery lists. `--debug` prints detailed error
+The global `--json` flag selects structured JSON output for native commands,
+including Crabfile export/import, plugin installation, linking, updating, and removal; session
+creation, forking, model changes, cancellation, and deletion; and delivery
+retry and drop operations. The command-level form remains available where the
+subcommand declares it. Completion intentionally writes its shell script
+directly to standard output instead of wrapping it in JSON. Arbitrary external
+plugin commands own their own output schema. `--debug` prints detailed error
 diagnostics. `--verbose` prints diagnostic progress, elapsed time, and nested
-error causes.
+error causes for every command.
 Help is available as `-h`, `-H`, or `--help`; version is available as `-v`,
 `-V`, or `--version`. Global flags may appear before or after the subcommand.
 Diagnostics use Rust's structured `tracing` output on stderr. Recoverable
@@ -70,9 +77,16 @@ under `<CRABBOT_HOME>/debug/` when the filesystem permits it. The report path is
 logged at info level; report creation is best effort and never replaces the
 original command error.
 
-`crabbot status` prints installation health, daemon state, intelligence setup,
-messaging setup, and the installed plugin count in one comma-separated line.
-Use `--json` for automation.
+Confirmation is explicit for unattended destructive or duplicate-prone work:
+use `--yes` for plugin replacement or removal, session deletion, delivery
+retry or drop, and Crabfile import. `--force` separately permits replacing an
+existing imported configuration. Native commands do not read stdin for these
+confirmations.
+
+`crabbot status` prints aligned installation health, daemon state, intelligence
+setup, messaging setup, version, and the installed plugin count. Use `--json`
+for automation; capability fields are objects with a `status` and `plugins`
+array.
 
 `crabbot plugin install` and `crabbot plugin link` validate and register one
 plugin at a time. When the daemon is running, it starts the new plugin
@@ -117,7 +131,8 @@ contract. Entering the `remember` command explicitly approves a suggest-mode
 memory write. `/quit` and `/exit` close the terminal client.
 
 `session list --json` returns bounded session summaries. Use `session show` for
-the transcript of one session.
+the transcript of one session; it renders a readable transcript by default and
+the bounded structured record with `--json`. Session deletion requires `--yes`.
 
 `delivery list` shows pending and uncertain outbox entries without transcript
 text. A delivery marked uncertain may already have reached the provider;

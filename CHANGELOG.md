@@ -7,6 +7,11 @@ Semantic Versioning.
 
 ### Added
 
+- Added structured JSON output for native initialization, diagnostics, version,
+  Crabfile, service, plugin, session, and delivery operations; capability status
+  now includes explicit status and plugin arrays.
+- Added explicit `--yes` confirmation for session deletion and readable human
+  output for session transcripts, while retaining structured `--json` output.
 - Added the host-managed `crabbot ask` command through the external command
   path, exposing it only when an installed model plugin can run.
 - Added runtime-enriched CLI help with separate native and plugin command lists;
