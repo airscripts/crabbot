@@ -38,7 +38,7 @@ readme = "README.md"
 publish = false
 
 [workspace.dependencies]
-base64 = "0.22"
+base64 = "0.23"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 futures-util = { version = "0.3", features = ["sink"] }
