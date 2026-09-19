@@ -21,6 +21,7 @@ use crabbot_core::{
 use rustix::{
     fd::OwnedFd,
     fs::{AtFlags, Dir, Mode, OFlags, openat, renameat, unlinkat},
+    process::{Pid, Signal, getpgid, getpgrp, kill_process, kill_process_group},
 };
 use serde_json::json;
 use tokio::{
@@ -525,6 +526,13 @@ async fn capture(
         .stderr(std::process::Stdio::piped());
     let mut child = command.spawn()?;
     let process_id = child.id();
+
+    #[cfg(unix)]
+    let process_group = process_id.and_then(child_group);
+
+    #[cfg(windows)]
+    let process_group = process_id;
+
     if let Some(input) = input {
         let mut pipe = child.stdin.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Process has no stdin.")
@@ -547,19 +555,23 @@ async fn capture(
         Ok::<_, std::io::Error>(std::process::Output { status, stdout, stderr })
     })
     .await;
+
     match result {
         Ok(Ok(output)) => {
             if group {
-                stop(&mut child, process_id, true).await;
+                stop(&mut child, process_group, true).await;
             }
             Ok(output)
         }
+
         Ok(Err(error)) => {
-            stop(&mut child, process_id, group).await;
+            stop(&mut child, process_group, group).await;
             Err(error)
         }
+
         Err(_) => {
-            stop(&mut child, process_id, group).await;
+            stop(&mut child, process_group, group).await;
+
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "Process exceeded the execution time limit.",
@@ -588,12 +600,12 @@ async fn limited<R: AsyncRead + Unpin>(mut input: R) -> std::io::Result<Vec<u8>>
 
 async fn stop(child: &mut Child, process_id: Option<u32>, group: bool) {
     #[cfg(unix)]
-    if group && let Some(id) = process_id {
-        let group = format!("-{id}");
-        let _ = Command::new("kill").args(["-TERM", &group]).status().await;
+    if group && let Some(group) = process_id.and_then(external_group) {
+        let _ = kill_process_group(group, Signal::TERM);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        kill_group(id, "-KILL");
+        kill_group(group, Signal::KILL);
     }
+
     #[cfg(windows)]
     if group && let Some(id) = process_id {
         let _ = Command::new("taskkill").args(["/PID", &id.to_string(), "/T", "/F"]).status().await;
@@ -603,9 +615,24 @@ async fn stop(child: &mut Child, process_id: Option<u32>, group: bool) {
 }
 
 #[cfg(unix)]
-fn kill_group(group: u32, signal: &str) {
-    let group_arg = format!("-{group}");
-    let _ = std::process::Command::new("kill").args([signal, &group_arg]).status();
+fn child_group(id: u32) -> Option<u32> {
+    let child = Pid::from_raw(i32::try_from(id).ok()?)?;
+    (getpgid(Some(child)).ok()? == child).then_some(id)
+}
+
+#[cfg(unix)]
+fn external_group(id: u32) -> Option<Pid> {
+    let group = Pid::from_raw(i32::try_from(id).ok()?)?;
+    (group != getpgrp()).then_some(group)
+}
+
+#[cfg(unix)]
+fn kill_group(group: Pid, signal: Signal) {
+    if group == getpgrp() {
+        return;
+    }
+
+    let _ = kill_process_group(group, signal);
 
     let Ok(output) = std::process::Command::new("ps").args(["-eo", "pid=,pgid="]).output() else {
         return;
@@ -614,16 +641,21 @@ fn kill_group(group: u32, signal: &str) {
 
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut fields = line.split_whitespace();
-        let Some(pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+
+        let Some(pid) =
+            fields.next().and_then(|value| value.parse::<i32>().ok()).and_then(Pid::from_raw)
+        else {
             continue;
         };
 
-        let Some(pgid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+        let Some(pgid) =
+            fields.next().and_then(|value| value.parse::<i32>().ok()).and_then(Pid::from_raw)
+        else {
             continue;
         };
 
-        if pgid == group && pid != current {
-            let _ = std::process::Command::new("kill").args([signal, &pid.to_string()]).status();
+        if pgid == group && pid.as_raw_pid() as u32 != current {
+            let _ = kill_process(pid, signal);
         }
     }
 }
@@ -1698,6 +1730,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1_200)).await;
         assert!(!marker.exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_cleanup_rejects_its_own_group() {
+        let group = u32::try_from(rustix::process::getpgrp().as_raw_pid()).unwrap();
+        assert!(super::external_group(group).is_none());
+        assert!(super::external_group(u32::MAX).is_none());
     }
 
     #[cfg(unix)]
