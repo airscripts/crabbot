@@ -79,8 +79,8 @@ jobs:
       - name: Report Metrics
         run: bash crabbot-scripts/metrics.sh
 
-  crates:
-    name: Crates (${{ matrix.name }})
+  crate:
+    name: Crate (${{ matrix.name }})
     runs-on: ubuntu-latest
     container: ${{ inputs.container_image || 'rust:1.89-trixie' }}
 
