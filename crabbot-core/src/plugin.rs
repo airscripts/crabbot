@@ -10,6 +10,8 @@ use std::{
     },
 };
 
+#[cfg(unix)]
+use rustix::process::{Pid, Signal, getpgid, getpgrp, kill_process, kill_process_group};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufRead, AsyncWrite, BufReader},
@@ -384,8 +386,8 @@ pub struct Process {
 impl Drop for Process {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Some(id) = self.group {
-            kill_group(id, "-KILL");
+        if let Some(group) = self.group.and_then(external_group) {
+            kill_group(group, Signal::KILL);
         }
         #[cfg(windows)]
         if let Some(id) = self.group {
@@ -458,6 +460,9 @@ impl Process {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;
+        #[cfg(unix)]
+        let group = child.id().and_then(child_group);
+        #[cfg(windows)]
         let group = child.id();
         let result = async {
             let stdout =
@@ -649,12 +654,10 @@ impl Process {
 
 async fn stop_tree(child: &mut Child, group: Option<u32>) {
     #[cfg(unix)]
-    if let Some(id) = group {
-        let group = format!("-{id}");
-        let _ = Command::new("kill").args(["-TERM", &group]).status().await;
+    if let Some(group) = group.and_then(external_group) {
+        let _ = kill_process_group(group, Signal::TERM);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = Command::new("kill").args(["-KILL", &group]).status().await;
-        kill_group(id, "-KILL");
+        kill_group(group, Signal::KILL);
     }
     #[cfg(windows)]
     if let Some(id) = group {
@@ -665,9 +668,24 @@ async fn stop_tree(child: &mut Child, group: Option<u32>) {
 }
 
 #[cfg(unix)]
-fn kill_group(group: u32, signal: &str) {
-    let group_arg = format!("-{group}");
-    let _ = std::process::Command::new("kill").args([signal, &group_arg]).status();
+fn child_group(id: u32) -> Option<u32> {
+    let child = Pid::from_raw(i32::try_from(id).ok()?)?;
+    (getpgid(Some(child)).ok()? == child).then_some(id)
+}
+
+#[cfg(unix)]
+fn external_group(id: u32) -> Option<Pid> {
+    let group = Pid::from_raw(i32::try_from(id).ok()?)?;
+    (group != getpgrp()).then_some(group)
+}
+
+#[cfg(unix)]
+fn kill_group(group: Pid, signal: Signal) {
+    if group == getpgrp() {
+        return;
+    }
+
+    let _ = kill_process_group(group, signal);
 
     let Ok(output) = std::process::Command::new("ps").args(["-eo", "pid=,pgid="]).output() else {
         return;
@@ -676,14 +694,18 @@ fn kill_group(group: u32, signal: &str) {
     let current = std::process::id();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut fields = line.split_whitespace();
-        let Some(pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+        let Some(pid) =
+            fields.next().and_then(|value| value.parse::<i32>().ok()).and_then(Pid::from_raw)
+        else {
             continue;
         };
-        let Some(pgid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+        let Some(pgid) =
+            fields.next().and_then(|value| value.parse::<i32>().ok()).and_then(Pid::from_raw)
+        else {
             continue;
         };
-        if pgid == group && pid != current {
-            let _ = std::process::Command::new("kill").args([signal, &pid.to_string()]).status();
+        if pgid == group && pid.as_raw_pid() as u32 != current {
+            let _ = kill_process(pid, signal);
         }
     }
 }
@@ -691,6 +713,8 @@ fn kill_group(group: u32, signal: &str) {
 #[cfg(test)]
 mod tests {
     use super::{Emitter, Process, serve_io, serve_io_events};
+    #[cfg(unix)]
+    use super::{external_group, getpgrp};
     use crate::{
         jsonl,
         types::{Capability, Hello, Protocol, Request, Response},
@@ -1054,6 +1078,14 @@ fn main() {
             assert!(!status.success());
             let _ = std::fs::remove_file(marker);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_cleanup_rejects_its_own_group() {
+        let group = u32::try_from(getpgrp().as_raw_pid()).unwrap();
+        assert!(external_group(group).is_none());
+        assert!(external_group(u32::MAX).is_none());
     }
 
     #[cfg(unix)]
