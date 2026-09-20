@@ -390,6 +390,72 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn recovers_each_transaction_phase_and_validates_credentials() {
+        let root = root("recovery-phases");
+        let path = root.join("state.json");
+
+        recover(std::path::Path::new("")).unwrap();
+        assert!(recover(root.join("missing").join("state.json")).is_ok());
+
+        fs::write(&path, b"current").unwrap();
+        fs::write(root.join(".state.json.tmp-prepared"), b"stale").unwrap();
+        write_transaction(&root, "prepared", "tmp-prepared", "backup-prepared");
+        recover(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"current");
+
+        let _ = fs::remove_file(&path);
+        fs::write(root.join(".backup-prepared"), b"prepared backup").unwrap();
+        write_transaction(&root, "prepared", "tmp-unused", "backup-prepared");
+        recover(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"prepared backup");
+
+        let _ = fs::remove_file(&path);
+        fs::write(root.join(".backup-installed"), b"installed backup").unwrap();
+        write_transaction(&root, "installed", "tmp-unused", "backup-installed");
+        recover(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"installed backup");
+
+        let _ = fs::remove_file(&path);
+        fs::write(root.join(".backup-backed-up"), b"backed up backup").unwrap();
+        write_transaction(&root, "backed_up", "tmp-missing", "backup-backed-up");
+        recover(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"backed up backup");
+
+        fs::write(&path, b"current").unwrap();
+        write_transaction_with_path(&root, "ignored", "prepared", "tmp", "backup");
+        fs::write(root.join(".state.json.txn-unknown"), b"not-json").unwrap();
+        recover(&path).unwrap();
+
+        credential(&path).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_transaction(root: &std::path::Path, phase: &str, temporary: &str, backup: &str) {
+        write_transaction_with_path(root, "state.json", phase, temporary, backup);
+    }
+
+    fn write_transaction_with_path(
+        root: &std::path::Path,
+        path: &str,
+        phase: &str,
+        temporary: &str,
+        backup: &str,
+    ) {
+        let journal = root.join(format!(".state.json.txn-{phase}"));
+        fs::write(
+            journal,
+            serde_json::to_vec(&Transaction {
+                path: path.into(),
+                temporary: format!(".{temporary}"),
+                backup: format!(".{backup}"),
+                phase: phase.into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_shared_credentials() {
@@ -409,6 +475,7 @@ mod tests {
 #[cfg(windows)]
 fn protect(path: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+
     use windows_sys::Win32::{
         Foundation::{ERROR_SUCCESS, LocalFree},
         Security::{
