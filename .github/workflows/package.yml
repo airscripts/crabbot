@@ -106,6 +106,7 @@ jobs:
             Copy-Item "target/$target/release/$name.exe" "$package/bin/$name.exe"
 
             if ($plugin -eq "core") {
+              Copy-Item "target/$target/release/crab.exe" "$package/bin/"
               Copy-Item "target/$target/release/crabbot-daemon.exe" "$package/bin/"
             }
 
@@ -146,8 +147,9 @@ jobs:
             [[ -d "$package/bin" ]]
 
             if [[ "$name" == crabbot-core-* ]]; then
-              [[ -x "$package/bin/crabbot" && -x "$package/bin/crabbot-daemon" ]]
+              [[ -x "$package/bin/crabbot" && -x "$package/bin/crab" && -x "$package/bin/crabbot-daemon" ]]
               "$package/bin/crabbot" version
+              "$package/bin/crab" version
               smoke="$stage/service-smoke"
               mkdir -p "$smoke/home" "$smoke/config"
 
@@ -192,6 +194,7 @@ jobs:
             CRABBOT_PREFIX="$prefix" \
             sh install.sh
           "$prefix/bin/crabbot" version
+          "$prefix/bin/crab" version
 
       - if: matrix.archive == 'zip'
         name: Validate Windows Archives
@@ -218,11 +221,13 @@ jobs:
             if (!(Test-Path "$package/bin")) { throw "Archive is missing binaries: $($archive.Name)." }
 
             if ($archive.BaseName -like "crabbot-core-*") {
-              if (!(Test-Path "$package/bin/crabbot.exe") -or !(Test-Path "$package/bin/crabbot-daemon.exe")) {
+              if (!(Test-Path "$package/bin/crabbot.exe") -or !(Test-Path "$package/bin/crab.exe") -or !(Test-Path "$package/bin/crabbot-daemon.exe")) {
                 throw "Core archive is missing an executable."
               }
               & "$package/bin/crabbot.exe" version
               if ($LASTEXITCODE -ne 0) { throw "Packaged CLI failed to start." }
+              & "$package/bin/crab.exe" version
+              if ($LASTEXITCODE -ne 0) { throw "Packaged CLI alias failed to start." }
             } else {
               if (!(Test-Path "$package/crabbot-plugin.toml")) { throw "Plugin manifest is missing." }
               $plugin = $archive.BaseName -replace "^crabbot-", "" -replace "-v.*$", ""
@@ -253,6 +258,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Packaged installer failed." }
           & "$env:LOCALAPPDATA/Crabbot/bin/crabbot.exe" version
           if ($LASTEXITCODE -ne 0) { throw "Installed CLI failed to start." }
+          & "$env:LOCALAPPDATA/Crabbot/bin/crab.exe" version
+          if ($LASTEXITCODE -ne 0) { throw "Installed CLI alias failed to start." }
 
       - name: Upload Archives
         uses: actions/upload-artifact@v7

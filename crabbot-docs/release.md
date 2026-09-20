@@ -31,8 +31,8 @@ Release scripts are intentionally explicit. They do not publish crates,
 containers, or services, and they must not receive credentials through command
 arguments.
 
-Core archives contain the `crabbot` and `crabbot-daemon` executables plus
-license files, but no plugin binaries. Every plugin has its own archive with
+Core archives contain the `crabbot`, `crab`, and `crabbot-daemon` executables
+plus license files, but no plugin binaries. Every plugin has its own archive with
 its manifest and executable under `bin/`. Plugin archives are registered one
 at a time in `plugins.lock` under
 `CRABBOT_HOME/plugins/<id>` (or the platform configuration directory). A

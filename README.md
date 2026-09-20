@@ -65,8 +65,9 @@ when that capability is needed. The base installation remains useful on its
 own for initialization, diagnostics, status, service management, and plugin
 management.
 
-The core archive ships the `crabbot` CLI and `crabbot-daemon` binaries, plus
-license files; it contains no plugin binaries. Each official plugin is a
+The core archive ships the `crabbot` CLI, its shorter `crab` alias, and the
+`crabbot-daemon` binary, plus license files; it contains no plugin binaries.
+Each official plugin is a
 separate, optional archive. The installer verifies its checksum, installs it
 under the configured Crabbot home
 (`CRABBOT_HOME/plugins/<id>` when `CRABBOT_HOME` is set), and registers it in
@@ -101,6 +102,7 @@ Ensure `~/.cargo/bin` is on `PATH`, then verify the installation:
 ```sh
 crabbot --version
 crabbot help
+crab --version
 ```
 
 `make install` is an equivalent repository-local shortcut. Re-run both

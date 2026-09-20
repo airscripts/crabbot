@@ -5,7 +5,7 @@ JOBS ?= 4
 
 help:
 	@printf '%s\n' 'Crabbot development targets:'
-	@printf '%s\n' '  install   Install the crabbot and crabbot-daemon binaries'
+	@printf '%s\n' '  install   Install the crabbot, crab, and crabbot-daemon binaries'
 	@printf '%s\n' '  hooks     Install Lefthook git hooks'
 	@printf '%s\n' '  fmt       Check Rust formatting and spacing'
 	@printf '%s\n' '  spacing   Apply Rust block spacing'

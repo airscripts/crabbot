@@ -84,6 +84,8 @@ try {
         Expand-Archive $archivePath -DestinationPath $tmp
         $file = Get-ChildItem $tmp -Recurse -File -Filter "$name.exe" | Select-Object -First 1
         if (-not $file) { Stop-Install "The archive does not contain '$name.exe'." }
+        $alias = Get-ChildItem $tmp -Recurse -File -Filter "crab.exe" | Select-Object -First 1
+        if (-not $alias) { Stop-Install "The archive does not contain 'crab.exe'." }
         $daemon = Get-ChildItem $tmp -Recurse -File -Filter "crabbot-daemon.exe" | Select-Object -First 1
         if (-not $daemon) { Stop-Install "The archive does not contain 'crabbot-daemon.exe'." }
         $dest = Join-Path $env:LOCALAPPDATA "Crabbot/bin"
@@ -91,10 +93,13 @@ try {
         $temporary = Join-Path $dest ".$name.exe.tmp"
         Copy-Item $file.FullName $temporary
         Move-Item -Force $temporary (Join-Path $dest "$name.exe")
+        $aliasTemporary = Join-Path $dest ".crab.exe.tmp"
+        Copy-Item $alias.FullName $aliasTemporary
+        Move-Item -Force $aliasTemporary (Join-Path $dest "crab.exe")
         $daemonTemporary = Join-Path $dest ".crabbot-daemon.exe.tmp"
         Copy-Item $daemon.FullName $daemonTemporary
         Move-Item -Force $daemonTemporary (Join-Path $dest "crabbot-daemon.exe")
-        Write-Install "Installed $name and crabbot-daemon in $dest."
+        Write-Install "Installed $name, crab, and crabbot-daemon in $dest."
     } else {
         if ($env:CRABBOT_HOME) {
             $config = $env:CRABBOT_HOME

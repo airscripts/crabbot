@@ -472,9 +472,9 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     #[command(about = "Initialize the Crabbot home directory and configuration.")]
-    Init,
+    Init(InitArgs),
     #[command(about = "Check configuration, plugins, credentials, and local state.")]
-    Doctor,
+    Doctor(DoctorArgs),
     #[command(about = "Show installation and daemon health.")]
     Status(Output),
     #[command(about = "Print the Crabbot version.")]
@@ -633,6 +633,18 @@ struct SessionDelete {
 struct Output {
     #[arg(long, help = "Render the result as JSON.")]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct InitArgs {
+    #[arg(long, help = "Recreate the default Crabbot configuration.")]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    #[arg(long, help = "Create missing safe local state without overwriting configuration.")]
+    fix: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1063,8 +1075,8 @@ async fn main_with(cli: Cli) -> ExitCode {
 
 fn command_label(command: &Command) -> &'static str {
     match command {
-        Command::Init => "init",
-        Command::Doctor => "doctor",
+        Command::Init(_) => "init",
+        Command::Doctor(_) => "doctor",
         Command::Status(_) => "status",
         Command::Version(_) => "version",
         Command::Completion { .. } => "completion",
@@ -1124,8 +1136,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let json = cli.json;
 
     match cli.command {
-        Command::Init => init(json)?,
-        Command::Doctor => doctor(json)?,
+        Command::Init(args) => init(args.force, json)?,
+        Command::Doctor(args) => doctor(args.fix, json)?,
         Command::Status(output) => status_command(output.json || json).await?,
         Command::Version(output) => version(output.json || json),
         Command::Completion { shell } => completion(shell)?,
@@ -1144,22 +1156,42 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 fn completion(shell: CompletionShell) -> std::io::Result<()> {
     let mut command = Cli::command();
     let mut output = std::io::BufWriter::new(std::io::stdout().lock());
+    let name = completion_name();
 
-    generate_completion(shell, &mut command, &mut output);
+    generate_completion(shell, &mut command, name, &mut output);
     output.flush()
 }
 
 fn generate_completion(
     shell: CompletionShell,
     command: &mut clap::Command,
+    name: &str,
     output: &mut dyn Write,
 ) {
     match shell {
-        CompletionShell::Bash => generate(shells::Bash, command, NAME, output),
-        CompletionShell::Fish => generate(shells::Fish, command, NAME, output),
-        CompletionShell::PowerShell => generate(shells::PowerShell, command, NAME, output),
-        CompletionShell::Zsh => generate(shells::Zsh, command, NAME, output),
+        CompletionShell::Bash => generate(shells::Bash, command, name, output),
+        CompletionShell::Fish => generate(shells::Fish, command, name, output),
+        CompletionShell::PowerShell => generate(shells::PowerShell, command, name, output),
+        CompletionShell::Zsh => generate(shells::Zsh, command, name, output),
     }
+}
+
+fn completion_name() -> &'static str {
+    completion_name_from(std::env::args_os().next().as_deref())
+}
+
+fn completion_name_from(argv0: Option<&std::ffi::OsStr>) -> &'static str {
+    let Some(value) = argv0.and_then(|value| value.to_str()) else {
+        return NAME;
+    };
+
+    let name = value.rsplit(['/', '\\']).next().unwrap_or(value);
+    let name = match name.rsplit_once('.') {
+        Some((stem, extension)) if extension.eq_ignore_ascii_case("exe") => stem,
+        _ => name,
+    };
+
+    if name.eq_ignore_ascii_case("crab") { "crab" } else { NAME }
 }
 
 fn print_help_with_plugins(root: &Path) {
@@ -2131,24 +2163,56 @@ fn workspace_root() -> PathBuf {
     std::env::var_os("CRABBOT_ROOT").map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
-fn init(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn init(force: bool, json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let root = home();
-    init_at(&root)?;
+
+    if root.exists() && !force {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "home": root,
+                    "initialized": false,
+                    "status": "already_initialized"
+                })
+            );
+        } else {
+            println!("Crabbot is already initialized at {}.", root.display());
+        }
+
+        return Ok(());
+    }
+
+    init_at_with_force(&root, force)?;
 
     if json {
-        println!("{}", serde_json::json!({"home": root, "initialized": true}));
+        println!(
+            "{}",
+            serde_json::json!({
+                "home": root,
+                "initialized": true,
+                "status": if force { "reinitialized" } else { "initialized" }
+            })
+        );
     } else {
-        println!("Initialized {}.", root.display());
+        println!("Crabbot has been initialized at {}.\nHappy crabbing!", root.display());
     }
 
     Ok(())
 }
 
 fn init_at(root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_at_with_force(root, false)
+}
+
+fn init_at_with_force(
+    root: &Path,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::fs::create_dir_all(root.join("plugins"))?;
     let path = root.join("config.toml");
 
-    if !path.exists() {
+    if force || !path.exists() {
         let config = toml::to_string_pretty(&Config::default())?;
         secure(&path, config.as_bytes())?;
     }
@@ -6247,8 +6311,41 @@ fn installed_at(root: &Path) -> Vec<String> {
     ids
 }
 
-fn doctor(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = home();
+fn doctor(fix: bool, json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    doctor_at(&home(), fix, json)
+}
+
+fn doctor_healthy(
+    config_present: bool,
+    config_valid: Option<bool>,
+    plugins_directory_present: bool,
+) -> bool {
+    config_present && config_valid == Some(true) && plugins_directory_present
+}
+
+fn doctor_at(
+    root: &Path,
+    fix: bool,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config_path = root.join("config.toml");
+    let plugins_path = root.join("plugins");
+    let config_was_present = config_path.is_file();
+    let plugins_directory_was_present = plugins_path.is_dir();
+    let mut repairs = Vec::new();
+
+    if fix {
+        init_at(root)?;
+
+        if !config_was_present && config_path.is_file() {
+            repairs.push("created_config");
+        }
+
+        if !plugins_directory_was_present && plugins_path.is_dir() {
+            repairs.push("created_plugins_directory");
+        }
+    }
+
     let config_present = root.join("config.toml").is_file();
     let plugins_directory_present = root.join("plugins").is_dir();
     let mut config_valid = None;
@@ -6259,11 +6356,11 @@ fn doctor(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config_valid = Some(true);
     }
 
-    let lock = load_lock_at(&root)?;
+    let lock = load_lock_at(root)?;
 
     for (id, entry) in &lock.plugins {
         let binary =
-            binary_at(id, &root).ok_or_else(|| format!("Plugin binary is missing: {id}."))?;
+            binary_at(id, root).ok_or_else(|| format!("Plugin binary is missing: {id}."))?;
 
         let manifest = root.join("plugins").join(id).join("crabbot-plugin.toml");
 
@@ -6272,11 +6369,23 @@ fn doctor(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    let healthy = doctor_healthy(config_present, config_valid, plugins_directory_present);
+    let health = if healthy {
+        serde_json::json!({"status": "healthy"})
+    } else {
+        serde_json::json!({
+            "status": "unhealthy",
+            "suggestion": "crabbot doctor --fix"
+        })
+    };
+
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
+        if fix {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({"repairs": repairs}))?);
+        } else {
+            let value = serde_json::json!({
                 "config": {"present": config_present, "valid": config_valid},
+                "health": health,
                 "home": root,
                 "plugin_integrity": "valid",
                 "plugins": {
@@ -6287,8 +6396,24 @@ fn doctor(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     "major": Protocol::CURRENT.major,
                     "minor": Protocol::CURRENT.minor,
                 },
-            })
-        );
+            });
+
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+    } else if fix {
+        if repairs.is_empty() {
+            println!("No repairs were needed.");
+        } else {
+            let descriptions = repairs
+                .iter()
+                .map(|repair| match *repair {
+                    "created_config" => "default config",
+                    "created_plugins_directory" => "plugins directory",
+                    _ => repair,
+                })
+                .collect::<Vec<_>>();
+            println!("Repairs applied: {}.", descriptions.join(", "));
+        }
     } else {
         println!("Home: {}.", root.display());
         println!("Config present: {}.", config_present);
@@ -6300,6 +6425,14 @@ fn doctor(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         println!("Plugin integrity is valid.");
+
+        if healthy {
+            println!("Crabbot is healthy.");
+        } else {
+            println!(
+                "Crabbot is unhealthy. Run crabbot doctor --fix to repair missing local state."
+            );
+        }
     }
 
     Ok(())
@@ -8865,10 +8998,11 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
 mod tests {
     use super::{
         ARCHIVE_LIMIT, BANNER, Cancellation, Cli, Command, CommandSpec, CompletionShell, Config,
-        CrabfileExport, CrabfileImport, DeliveryCommand, Fork, Id, Live, Manifest, Name, Output,
-        Plugins, Process, ServiceCommand, SessionCommand, SessionDelete, SessionModel, SessionNew,
-        Sha256, Source, Stop, answer, archive, archive_root, archive_url, assistant, binary_at,
-        canonical_source, changed, channel_message_id, command_output_limited, commit_event,
+        CrabfileExport, CrabfileImport, DeliveryCommand, DoctorArgs, Fork, Id, InitArgs, Live,
+        Manifest, NAME, Name, Output, Plugins, Process, ServiceCommand, SessionCommand,
+        SessionDelete, SessionModel, SessionNew, Sha256, Source, Stop, answer, archive,
+        archive_root, archive_url, assistant, binary_at, canonical_source, changed,
+        channel_message_id, command_output_limited, commit_event, completion_name_from,
         daemon_lock, delivery_at, delivery_request, download, embedded, ensure_home, env_for,
         export_crabfile_at, generate_completion, import_crabfile_at, init_at, installed_at,
         isolate_at, local_session, plugin_binary, read_manifest, reclaim_worktrees, recover,
@@ -9115,8 +9249,8 @@ mod tests {
 
         assert_eq!(super::ApprovalMode::Off, super::ApprovalMode::Off);
         assert!(super::plugin_name("memory").contains("memory"));
-        assert_eq!(super::command_label(&Command::Init), "init");
-        assert_eq!(super::command_label(&Command::Doctor), "doctor");
+        assert_eq!(super::command_label(&Command::Init(InitArgs { force: false })), "init");
+        assert_eq!(super::command_label(&Command::Doctor(DoctorArgs { fix: false })), "doctor");
         assert_eq!(super::command_label(&Command::Status(Output { json: false })), "status");
         assert_eq!(super::command_label(&Command::Version(Output { json: false })), "version");
         assert_eq!(
@@ -9720,6 +9854,9 @@ mod tests {
         let cli = Cli::try_parse_from(["crabbot", "--json", "doctor"]).unwrap();
         assert!(cli.json);
 
+        let cli = Cli::try_parse_from(["crabbot", "doctor", "--fix"]).unwrap();
+        assert!(matches!(cli.command, Command::Doctor(DoctorArgs { fix: true })));
+
         let cli = Cli::try_parse_from(["crabbot", "service", "status", "--json"]).unwrap();
         assert!(cli.json);
 
@@ -9788,12 +9925,69 @@ mod tests {
             };
 
             let mut output = Vec::new();
-            generate_completion(shell, &mut Cli::command(), &mut output);
+            generate_completion(shell, &mut Cli::command(), NAME, &mut output);
             let output = String::from_utf8(output).unwrap();
             assert!(output.contains(expected), "completion output for {name} was unexpected");
         }
 
         assert!(Cli::try_parse_from(["crabbot", "completion", "nu"]).is_err());
+
+        assert_eq!(completion_name_from(Some(std::ffi::OsStr::new("/usr/bin/crab"))), "crab");
+        assert_eq!(completion_name_from(Some(std::ffi::OsStr::new("C:\\bin\\crab.exe"))), "crab");
+        assert_eq!(completion_name_from(Some(std::ffi::OsStr::new("/usr/bin/crabbot"))), NAME);
+        assert_eq!(completion_name_from(Some(std::ffi::OsStr::new("other"))), NAME);
+
+        let cli = Cli::try_parse_from(["crabbot", "init", "--force"]).unwrap();
+        assert!(matches!(cli.command, Command::Init(InitArgs { force: true })));
+    }
+
+    #[test]
+    fn init_preserves_existing_state_without_force() {
+        let root = test_root("init-force");
+        let _ = fs::remove_dir_all(&root);
+
+        super::init_at_with_force(&root, false).unwrap();
+        fs::write(root.join("config.toml"), "update = 'auto'\n").unwrap();
+        fs::write(root.join("plugins/keep"), "plugin state").unwrap();
+
+        super::init_at_with_force(&root, false).unwrap();
+        assert_eq!(fs::read_to_string(root.join("config.toml")).unwrap(), "update = 'auto'\n");
+        assert!(root.join("plugins/keep").exists());
+
+        super::init_at_with_force(&root, true).unwrap();
+        assert!(
+            fs::read_to_string(root.join("config.toml")).unwrap().contains("update = \"prompt\"")
+        );
+        assert!(root.join("plugins/keep").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doctor_fix_creates_only_missing_safe_state() {
+        let root = test_root("doctor-fix");
+        let _ = fs::remove_dir_all(&root);
+
+        super::doctor_at(&root, false, false).unwrap();
+        assert!(!root.exists());
+
+        super::doctor_at(&root, true, false).unwrap();
+        assert!(root.join("config.toml").is_file());
+        assert!(root.join("plugins").is_dir());
+
+        fs::write(root.join("config.toml"), "update = 'auto'\n").unwrap();
+        super::doctor_at(&root, true, false).unwrap();
+        assert_eq!(fs::read_to_string(root.join("config.toml")).unwrap(), "update = 'auto'\n");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doctor_health_requires_valid_required_state() {
+        assert!(super::doctor_healthy(true, Some(true), true));
+        assert!(!super::doctor_healthy(false, None, true));
+        assert!(!super::doctor_healthy(true, Some(false), true));
+        assert!(!super::doctor_healthy(true, Some(true), false));
     }
 
     #[test]
@@ -10432,7 +10626,7 @@ mod tests {
             Command::Version(Output { json: true }),
             Command::Status(Output { json: true }),
             Command::Service { command: None },
-            Command::Doctor,
+            Command::Doctor(DoctorArgs { fix: false }),
         ] {
             let result = super::run(Cli {
                 json: false,

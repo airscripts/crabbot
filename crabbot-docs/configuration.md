@@ -183,8 +183,11 @@ crabbot plugin list
 crabbot service status
 ```
 
-If a provider is missing, install or link its plugin and run `crabbot doctor`
-again. If a channel is silent, verify its token, plugin status, `allow` list,
+`doctor` is read-only unless `--fix` is supplied. Use `crabbot doctor --fix` to
+create a missing default configuration or plugins directory; existing config
+and plugin files are not overwritten. If a provider is missing, install or
+link its plugin and run `crabbot doctor` again. If a channel is silent, verify
+its token, plugin status, `allow` list,
 mention filter, and daemon logs. If tools are unavailable, check `CRABBOT_ROOT`,
 `tools = true`, and that approval is set to `prompt` or `auto`.
 When the daemon is stopped, session commands may use the locked offline store;

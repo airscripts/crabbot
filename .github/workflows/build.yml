@@ -87,9 +87,13 @@ jobs:
       - name: Verify Native CLI on Unix
         if: runner.os != 'Windows'
         shell: bash
-        run: ./target/${{ matrix.target }}/release/crabbot version
+        run: |
+          ./target/${{ matrix.target }}/release/crabbot version
+          ./target/${{ matrix.target }}/release/crab version
 
       - name: Verify Native CLI on Windows
         if: runner.os == 'Windows'
         shell: pwsh
-        run: .\target\${{ matrix.target }}\release\crabbot.exe version
+        run: |
+          .\target\${{ matrix.target }}\release\crabbot.exe version
+          .\target\${{ matrix.target }}\release\crab.exe version

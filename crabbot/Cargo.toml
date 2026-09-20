@@ -12,6 +12,10 @@ publish = false
 name = "crabbot"
 path = "src/main.rs"
 
+[[bin]]
+name = "crab"
+path = "src/crab.rs"
+
 [dependencies]
 crabbot-runtime = { path = "../crabbot-runtime" }
 tokio.workspace = true

@@ -3,8 +3,8 @@
 ```text
 crabbot help
 crabbot --version
-crabbot init [--json]
-crabbot doctor [--json]
+crabbot init [--force] [--json]
+crabbot doctor [--fix] [--json]
 crabbot status [--json]
 crabbot version [--json]
 crabbot completion <bash|fish|powershell|zsh>
@@ -33,6 +33,8 @@ crabbot <plugin-command> [arguments...]
 Native commands and currently registered plugin commands are shown in separate
 lists. The plugin list is rebuilt from the installed plugin registry, so it
 includes commands added by newly installed or linked plugins.
+The installed `crab` executable is a shorter alias for `crabbot` and accepts
+the same commands and options.
 `crabbot --version` and `crabbot version` print the same package version.
 Use `crabbot version --json` when a structured `{ "name", "version" }` result
 is needed.
@@ -40,7 +42,9 @@ is needed.
 `crabbot completion <shell>` writes a completion script to standard output.
 Supported shells are Bash, Fish, PowerShell, and Zsh. Redirect the
 script to the shell’s normal completion directory or source it according to
-the shell’s installation conventions.
+the shell’s installation conventions. The generated command name follows the
+executable used to invoke it, so `crab completion <shell>` generates a
+completion script for `crab`.
 
 For example:
 
@@ -48,6 +52,7 @@ For example:
 crabbot completion bash > ~/.local/share/bash-completion/completions/crabbot
 crabbot completion zsh > ~/.zfunc/_crabbot
 crabbot completion fish > ~/.config/fish/completions/crabbot.fish
+crab completion bash > ~/.local/share/bash-completion/completions/crab
 ```
 
 In PowerShell, add the generated script to the current profile:
@@ -153,8 +158,17 @@ crabbot-daemon
 ```
 
 `init` creates the home directory and starter configuration without starting
-the daemon. `doctor` validates configuration, plugin manifests, protocol
-compatibility, credentials, and the local state layout. `crabbot-daemon` keeps
+the daemon. If the home directory already exists, it reports that Crabbot is
+already initialized and leaves existing state unchanged. Pass `--force` to
+recreate the default configuration while preserving installed plugins and
+runtime state. `doctor` is read-only by default and validates configuration,
+plugin manifests, protocol compatibility, credentials, and local state. Pass
+`doctor --fix` to create missing safe local state, such as the default config
+or plugins directory; it never overwrites an existing config or repairs plugin
+binaries. Plain human output ends with a health summary; unhealthy output
+suggests `crabbot doctor --fix`. `doctor --fix` reports only the repairs
+performed in both human and JSON output; regular `doctor --json` includes the
+full structured result and `health` object. `crabbot-daemon` keeps
 the daemon in the foreground so service managers and operators can observe its
 diagnostics. Use `crabbot service install` only after the foreground flow is
 healthy.
