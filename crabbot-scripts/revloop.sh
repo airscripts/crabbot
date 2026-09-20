@@ -15,6 +15,7 @@ MAX_CYCLES="${CRABBOT_REVLOOP_MAX_CYCLES:-$DEFAULT_MAX_CYCLES}"
 OUTPUT_MODE="${CRABBOT_REVLOOP_OUTPUT:-clean}"
 MODEL="${CRABBOT_REVLOOP_MODEL:-gpt-5.6-luna}"
 REASONING="${CRABBOT_REVLOOP_REASONING:-high}"
+GLOBAL_REVIEW=false
 
 print_error() {
     printf '[ERROR] %s\n' "$*" >&2
@@ -29,8 +30,12 @@ print_warn() {
 }
 
 usage() {
-    printf '%s\n' 'Usage: crabbot-scripts/revloop.sh [--clean|--verbose]'
+    printf '%s\n' \
+        'Usage: crabbot-scripts/revloop.sh [--global] [--clean|--verbose]'
     printf '%s\n' 'Default output mode: clean.'
+    printf '%s\n' \
+        'Default scope: uncommitted changes, the latest commit, or the feature branch.'
+    printf '%s\n' 'Use --global for a repository-wide audit.'
     printf '%s\n' 'Environment:'
     printf '%s\n' '  CRABBOT_CODEX_HOME=~/.codex'
     printf '%s\n' '  CRABBOT_REVLOOP_MODEL=gpt-5.6-luna'
@@ -47,6 +52,9 @@ die() {
 
 while (($# > 0)); do
     case "$1" in
+        --global)
+            GLOBAL_REVIEW=true
+            ;;
         --clean)
             OUTPUT_MODE='clean'
             ;;
@@ -108,6 +116,30 @@ fi
 
 [[ -f "$REPO_ROOT/Makefile" ]] || die "$EXIT_REPOSITORY" \
     "Repository root '$REPO_ROOT' has no Makefile."
+
+if [[ "$GLOBAL_REVIEW" == true ]]; then
+    REVIEW_SCOPE='global repository-wide audit'
+elif [[ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)" ]]; then
+    REVIEW_SCOPE='uncommitted working-tree changes (staged, unstaged, and
+untracked files)'
+else
+    CURRENT_BRANCH="$(git -C "$REPO_ROOT" branch --show-current)"
+    if [[ -n "$CURRENT_BRANCH" && "$CURRENT_BRANCH" != 'main' ]]; then
+        if git -C "$REPO_ROOT" show-ref --verify --quiet refs/heads/main; then
+            REVIEW_SCOPE="feature branch '$CURRENT_BRANCH' against main"
+            REVIEW_SCOPE+=' (main...HEAD)'
+        elif git -C "$REPO_ROOT" show-ref --verify --quiet refs/remotes/origin/main; then
+            REVIEW_SCOPE="feature branch '$CURRENT_BRANCH' against origin/main"
+            REVIEW_SCOPE+=' (origin/main...HEAD)'
+        else
+            REVIEW_SCOPE='latest commit (HEAD^..HEAD) because main is not available locally'
+        fi
+    elif [[ "$CURRENT_BRANCH" == 'main' ]]; then
+        REVIEW_SCOPE='latest commit on main (HEAD^..HEAD)'
+    else
+        REVIEW_SCOPE='latest commit on the current revision (HEAD^..HEAD)'
+    fi
+fi
 
 if [[ -z "${CRABBOT_CODEX_HOME:-}" ]]; then
     if [[ -z "${HOME:-}" ]]; then
@@ -238,12 +270,54 @@ write_orchestrator_prompt() {
     local prompt_file=$1
     local verification_file=${2:-}
     local verification_note
+    local review_scope
+    local scope_guard
 
     if [[ -n "$verification_file" ]]; then
         verification_note="$verification_file"
     else
         verification_note='None; no verification failure is currently pending.'
     fi
+
+    case "$REVIEW_SCOPE" in
+        global*)
+            review_scope='Global mode is enabled. Audit the actual repository-wide
+product code, scripts, documentation, manifests, release files, and CI. Include
+unchanged code and the current working tree when assessing reachable material
+defects.'
+            scope_guard='In global mode, report relevant pre-existing defects in
+untouched areas as well as defects introduced by current changes. Keep the audit
+bounded to repository content and exclude generated artifacts listed above.'
+            ;;
+        uncommitted*)
+            review_scope='Review the uncommitted working-tree change set as the
+primary scope. Include staged and unstaged changes, untracked source files, and
+behavior directly affected by them.'
+            scope_guard='Do not turn this review into an unrestricted audit of the
+entire repository. Do not report unrelated pre-existing defects in untouched
+areas unless the current changes introduce them, expose them, materially worsen
+them, depend on them, or make them directly relevant to the changed behavior.'
+            ;;
+        feature*)
+            review_scope="""No uncommitted files are present. Review the complete
+feature branch represented by $REVIEW_SCOPE, including its commits relative to
+main and any behavior directly affected by those changes."""
+            scope_guard='Do not turn this review into an unrestricted audit of the
+entire repository. Do not report unrelated pre-existing defects outside the
+feature branch unless the branch changes introduce them, expose them, materially
+worsen them, depend on them, or make them directly relevant.'
+            ;;
+        *)
+            review_scope="""No uncommitted files are present. Review the latest
+commit represented by $REVIEW_SCOPE and behavior directly affected by it. If no
+parent commit is available, inspect the current repository baseline as needed to
+understand that commit."""
+            scope_guard='Do not turn this review into an unrestricted audit of the
+entire repository. Do not report unrelated pre-existing defects in untouched
+areas unless the latest commit introduces them, exposes them, materially worsens
+them, depends on them, or makes them directly relevant.'
+            ;;
+    esac
 
     cat >"$prompt_file" <<EOF
 # Role
@@ -277,12 +351,7 @@ outputs. Use focused source and configuration paths instead.
 
 # Review Scope
 
-Primary review scope is the current working-tree change set and behavior
-directly affected by those changes. This checkout may be an initial scaffold
-with no tracked baseline. In that case, do not treat every untracked file as a
-request for an unrestricted whole-repository audit; focus on the runtime
-extraction, entrypoints, documentation, review script, and their adjacent
-callers, then inspect other files only when needed to validate those changes.
+$review_scope
 
 Inspect:
 
@@ -301,12 +370,7 @@ You may inspect unchanged surrounding code whenever necessary to establish
 correctness, understand contracts, or identify consequences of the current
 changes.
 
-Do not turn this review into an unrestricted audit of the entire repository.
-
-Do not report unrelated pre-existing defects in untouched areas unless the
-current changes introduce them, expose them, materially worsen them, depend on
-them, or make them directly relevant to the correctness of the changed
-behavior.
+$scope_guard
 
 # Verification Context
 
@@ -581,6 +645,14 @@ Repository: $REPO_ROOT
 
 Read the repository-root AGENTS.md and every applicable nested AGENTS.md before
 making changes.
+
+The orchestrator selected this review scope:
+
+$REVIEW_SCOPE
+
+Keep worker changes within that scope. In global mode, valid blocking findings
+may be fixed anywhere in the actual repository, subject to the repository
+instructions and the generated-artifact exclusions.
 
 The latest independent review is stored at:
 
@@ -1101,6 +1173,7 @@ print_info "Codex home: $CRABBOT_CODEX_HOME."
 print_info "Model: $MODEL."
 print_info "Reasoning: $REASONING."
 print_info "Output mode: $OUTPUT_MODE."
+print_info "Review scope: $REVIEW_SCOPE."
 print_info "Maximum cycles: $MAX_CYCLES."
 
 while (( cycle <= MAX_CYCLES )); do

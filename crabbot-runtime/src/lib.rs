@@ -611,15 +611,27 @@ enum DeliveryCommand {
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
     #[command(about = "Install the native service definition.")]
-    Install,
+    Install(ServiceInstall),
     #[command(about = "Remove the native service definition.")]
-    Remove,
+    Remove(ServiceRemove),
     #[command(about = "Show native service status.")]
     Status,
     #[command(about = "Start the native service.")]
     Start,
     #[command(about = "Stop the native service.")]
     Stop,
+}
+
+#[derive(Debug, Args)]
+struct ServiceInstall {
+    #[arg(long, help = "Replace an existing service definition.")]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct ServiceRemove {
+    #[arg(long, help = "Confirm removing the service definition.")]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -6765,7 +6777,25 @@ fn service_at_with_mode(
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
-        ServiceCommand::Install => {
+        ServiceCommand::Install(args) => {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err("Service definition cannot be a symbolic link.".into());
+                }
+
+                Ok(_) if !args.force => {
+                    return Err(format!(
+                        "Service definition already exists at {}; use --force to replace it.",
+                        path.display()
+                    )
+                    .into());
+                }
+
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+
             let executable = daemon_executable()?;
             let environment = service_environment(path)?;
 
@@ -6776,25 +6806,20 @@ fn service_at_with_mode(
             let definition = service_text(&executable, &environment);
             #[cfg(target_os = "windows")]
             {
-                windows_service_install(&executable, &environment)?;
-
-                if let Err(error) = std::fs::write(path, &definition) {
-                    let _ = windows_service_remove();
-                    return Err(error.into());
-                }
+                windows_service_install(&executable, &environment, args.force, path, &definition)?;
             }
 
             #[cfg(not(target_os = "windows"))]
-            std::fs::write(path, definition)?;
+            secure(path, definition.as_bytes())?;
 
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({
+                    serde_json::to_string_pretty(&serde_json::json!({
                         "action": "install",
                         "path": path,
                         "status": "installed",
-                    })
+                    }))?
                 );
             } else {
                 println!("Wrote the service definition to {}.", path.display());
@@ -6802,7 +6827,11 @@ fn service_at_with_mode(
             }
         }
 
-        ServiceCommand::Remove => {
+        ServiceCommand::Remove(args) => {
+            if !args.yes {
+                return Err("Removing the service requires --yes.".into());
+            }
+
             let installed = path.exists();
 
             if installed {
@@ -6821,11 +6850,11 @@ fn service_at_with_mode(
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({
+                    serde_json::to_string_pretty(&serde_json::json!({
                         "action": "remove",
                         "path": path,
                         "status": if installed { "removed" } else { "not installed" },
-                    })
+                    }))?
                 );
             } else if installed {
                 println!("Removed the service definition from {}.", path.display());
@@ -6838,10 +6867,10 @@ fn service_at_with_mode(
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({
+                    serde_json::to_string_pretty(&serde_json::json!({
                         "path": path,
                         "status": if path.is_file() { "installed" } else { "not installed" },
-                    })
+                    }))?
                 );
             } else {
                 println!(
@@ -6883,72 +6912,299 @@ fn daemon_executable() -> std::io::Result<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
+struct WindowsServiceSnapshot {
+    bin_path: String,
+    start: &'static str,
+    environment: Option<String>,
+}
+
+#[cfg(target_os = "windows")]
 fn windows_service_install(
     executable: &Path,
     environment: &[(String, String)],
+    force: bool,
+    path: &Path,
+    definition: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let executable = executable.display().to_string();
-    let output = command_output(std::process::Command::new("sc.exe").args([
-        "create",
-        "Crabbot",
-        "binPath=",
-        &executable,
-        "start=",
-        "auto",
-    ]))?;
+    let snapshot = if force { windows_service_snapshot()? } else { None };
 
-    if !output.status.success() {
-        let detail = format!(
-            "{} {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        return Err(format!("Service installation failed: {}", sentence(detail.trim())).into());
-    }
-
-    let data = environment
-        .iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join("\\0");
-
-    let output = match command_output(std::process::Command::new("reg.exe").args([
-        "add",
-        r"HKLM\SYSTEM\CurrentControlSet\Services\Crabbot",
-        "/v",
-        "Environment",
-        "/t",
-        "REG_MULTI_SZ",
-        "/d",
-        data.as_str(),
-        "/f",
-    ])) {
-        Ok(output) => output,
-
-        Err(error) => {
-            let _ =
-                command_output(std::process::Command::new("sc.exe").args(["delete", "Crabbot"]));
-            return Err(error.into());
-        }
+    let previous_definition = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
     };
 
-    if !output.status.success() {
-        let detail = format!(
-            "{} {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+    let mut created = false;
+
+    let result = (|| {
+        if snapshot.is_some() {
+            windows_service_configure(&executable, "auto")?;
+        } else {
+            windows_service_create(&executable)?;
+            created = true;
+        }
+
+        let data = environment
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("\\0");
+
+        let output = command_output(std::process::Command::new("reg.exe").args([
+            "add",
+            r"HKLM\SYSTEM\CurrentControlSet\Services\Crabbot",
+            "/v",
+            "Environment",
+            "/t",
+            "REG_MULTI_SZ",
+            "/d",
+            data.as_str(),
+            "/f",
+        ]))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "Service environment installation failed: {}",
+                windows_command_detail(&output)
+            )
+            .into());
+        }
+
+        secure(path, definition.as_bytes())?;
+
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })();
+
+    if let Err(error) = result {
+        let rollback = windows_service_rollback(
+            created,
+            snapshot.as_ref(),
+            path,
+            previous_definition.as_deref(),
         );
 
-        let _ = command_output(std::process::Command::new("sc.exe").args(["delete", "Crabbot"]));
-        return Err(format!(
-            "Service environment installation failed: {}",
-            sentence(detail.trim())
-        )
-        .into());
+        return match rollback {
+            Ok(()) => Err(error),
+
+            Err(rollback_error) => {
+                Err(format!("{error}; service rollback failed: {rollback_error}").into())
+            }
+        };
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_service_create(
+    executable: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let output = command_output(
+        std::process::Command::new("sc.exe")
+            .args(["create", "Crabbot", "binPath=", executable, "start=", "auto"]),
+    )?;
+
+    if !output.status.success() {
+        return Err(
+            format!("Service installation failed: {}", windows_command_detail(&output)).into()
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_service_configure(
+    executable: &str,
+    start: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let output = command_output(
+        std::process::Command::new("sc.exe")
+            .args(["config", "Crabbot", "binPath=", executable, "start=", start]),
+    )?;
+
+    if !output.status.success() {
+        return Err(
+            format!("Service configuration failed: {}", windows_command_detail(&output)).into()
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_service_snapshot()
+-> Result<Option<WindowsServiceSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
+    let output = command_output(std::process::Command::new("sc.exe").args(["qc", "Crabbot"]))?;
+
+    if !output.status.success() {
+        let detail = windows_command_detail(&output);
+        let lower = detail.to_ascii_lowercase();
+
+        if detail.contains("1060") || lower.contains("does not exist") {
+            return Ok(None);
+        }
+
+        return Err(format!("Service query failed: {detail}").into());
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let bin_path = windows_service_field(&text, "BINARY_PATH_NAME")
+        .ok_or("Service query did not return a binary path.")?;
+    let start_type = windows_service_field(&text, "START_TYPE")
+        .ok_or("Service query did not return a start type.")?;
+    let start = match start_type.split_whitespace().next() {
+        Some("0") => "boot",
+        Some("1") => "system",
+        Some("2") => "auto",
+        Some("3") => "demand",
+        Some("4") => "disabled",
+        _ => return Err("Service query returned an unsupported start type.".into()),
+    };
+
+    Ok(Some(WindowsServiceSnapshot {
+        bin_path,
+        start,
+        environment: windows_service_environment()?,
+    }))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_service_field(output: &str, name: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (field, value) = line.split_once(':')?;
+
+        (field.trim() == name).then(|| value.trim().to_owned())
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_service_environment() -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>
+{
+    let output = command_output(std::process::Command::new("reg.exe").args([
+        "query",
+        r"HKLM\SYSTEM\CurrentControlSet\Services\Crabbot",
+        "/v",
+        "Environment",
+    ]))?;
+
+    if !output.status.success() {
+        let detail = windows_command_detail(&output);
+        let lower = detail.to_ascii_lowercase();
+
+        if lower.contains("unable to find") || lower.contains("not found") {
+            return Ok(None);
+        }
+
+        return Err(format!("Service environment query failed: {detail}").into());
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(windows_registry_field(&text, "Environment"))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_registry_field(output: &str, name: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let line = line.trim_start();
+        let rest = line.strip_prefix(name)?;
+
+        if !rest.chars().next().is_some_and(char::is_whitespace) {
+            return None;
+        }
+
+        let rest = rest.trim_start();
+        let type_end = rest.find(char::is_whitespace)?;
+        let value = rest[type_end..].trim_start();
+
+        Some(value.to_owned())
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_service_rollback(
+    created: bool,
+    snapshot: Option<&WindowsServiceSnapshot>,
+    path: &Path,
+    previous_definition: Option<&[u8]>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut errors = Vec::new();
+
+    if let Some(snapshot) = snapshot {
+        if let Err(error) = windows_service_configure(&snapshot.bin_path, snapshot.start) {
+            errors.push(error.to_string());
+        }
+
+        let environment = match &snapshot.environment {
+            Some(value) => command_output(std::process::Command::new("reg.exe").args([
+                "add",
+                r"HKLM\SYSTEM\CurrentControlSet\Services\Crabbot",
+                "/v",
+                "Environment",
+                "/t",
+                "REG_MULTI_SZ",
+                "/d",
+                value,
+                "/f",
+            ])),
+            None => command_output(std::process::Command::new("reg.exe").args([
+                "delete",
+                r"HKLM\SYSTEM\CurrentControlSet\Services\Crabbot",
+                "/v",
+                "Environment",
+                "/f",
+            ])),
+        };
+
+        match environment {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => errors.push(format!(
+                "could not restore service environment: {}",
+                windows_command_detail(&output)
+            )),
+            Err(error) => errors.push(format!("could not restore service environment: {error}")),
+        }
+    } else if created {
+        if let Err(error) = windows_service_remove() {
+            errors.push(error.to_string());
+        }
+    }
+
+    match previous_definition {
+        Some(bytes) => {
+            if let Err(error) = secure(path, bytes) {
+                errors.push(format!("could not restore service definition: {error}"));
+            }
+        }
+
+        None => {
+            if let Err(error) = std::fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                errors.push(format!("could not restore service definition: {error}"));
+            }
+        }
+    }
+
+    if errors.is_empty() { Ok(()) } else { Err(errors.join("; ").into()) }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_command_detail(output: &std::process::Output) -> String {
+    let detail = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let detail = detail.trim();
+
+    if detail.is_empty() {
+        "the service manager returned no details".into()
+    } else {
+        sentence(detail)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -7031,17 +7287,25 @@ fn service_action_with(
     let output = command_output(std::process::Command::new(program).args(args))?;
 
     if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Service action failed: {}", sentence(detail.trim())).into());
+        let detail = format!(
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let detail = detail.trim();
+        let detail =
+            if detail.is_empty() { "the service manager returned no details" } else { detail };
+
+        return Err(format!("Service action failed: {}", sentence(detail)).into());
     }
 
     if json {
         println!(
             "{}",
-            serde_json::json!({
+            serde_json::to_string_pretty(&serde_json::json!({
                 "action": if start { "start" } else { "stop" },
                 "status": if start { "started" } else { "stopped" },
-            })
+            }))?
         );
     } else {
         let status = if start { "started" } else { "stopped" };
@@ -7184,7 +7448,11 @@ fn xml(value: String) -> String {
 
 fn version(json: bool) {
     if json {
-        println!("{}", serde_json::json!({"name": NAME, "version": VERSION}));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"name": NAME, "version": VERSION}))
+                .expect("serializing version JSON cannot fail")
+        );
     } else {
         println!("{NAME} {VERSION}");
     }
@@ -7859,11 +8127,9 @@ fn update_at(home_root: &Path, json: bool) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
-    } else if rows.is_empty() {
+    if !json && rows.is_empty() {
         println!("No plugins to update.");
-    } else {
+    } else if !json {
         for row in &rows {
             let status = row["status"].as_str().unwrap_or("unknown");
             let id = row["id"].as_str().unwrap_or("unknown");
@@ -7877,7 +8143,29 @@ fn update_at(home_root: &Path, json: bool) -> Result<(), Box<dyn std::error::Err
     }
 
     if failed {
-        return Err("One or more plugin updates failed.".into());
+        let details = rows
+            .iter()
+            .filter(|row| row["status"] == "failed")
+            .map(|row| {
+                format!(
+                    "{}: {}",
+                    row["id"].as_str().unwrap_or("unknown"),
+                    row["error"].as_str().unwrap_or("unknown error")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("One or more plugin updates failed: {details}").into());
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "items": rows,
+                "status": if rows.is_empty() { "no changes" } else { "updated" },
+            }))?
+        );
     }
 
     Ok(())
@@ -8930,6 +9218,10 @@ fn remove_at(name: Name, home_root: &Path) -> Result<(), Box<dyn std::error::Err
     let backup = plugins.join(format!(".{}.backup-remove-{}", name.id, now()));
     let had_destination = dest.exists();
 
+    if !lock.plugins.contains_key(&name.id) && !had_destination {
+        return Err(format!("Plugin {} is not installed.", name.id).into());
+    }
+
     if had_destination {
         std::fs::rename(&dest, &backup)?;
     }
@@ -9053,18 +9345,26 @@ fn list_at(root: &Path, json: bool) -> Result<(), Box<dyn std::error::Error + Se
             let entry = entry?;
             let path = entry.path();
 
-            if path.is_dir()
-                && let Some(manifest) = read_manifest(&path)
-            {
-                rows.push(manifest);
+            if !path.is_dir() || entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
             }
+
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let manifest = read_manifest_checked(&path)
+                .map_err(|error| format!("Plugin {id} is invalid: {error}."))?;
+            rows.push(manifest);
         }
     }
 
     rows.sort_by(|a, b| a.id.cmp(&b.id));
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "items": rows,
+            }))?
+        );
     } else if rows.is_empty() {
         println!("No plugins installed.");
     } else {
@@ -9073,14 +9373,14 @@ fn list_at(root: &Path, json: bool) -> Result<(), Box<dyn std::error::Error + Se
                 row.commands.iter().map(|command| command.name.as_str()).collect::<Vec<_>>();
 
             if commands.is_empty() {
-                println!("{} {} ({}).", row.id, row.version, row.capabilities.join(","));
+                println!("{} {} ({}).", row.id, row.version, row.capabilities.join(", "));
             } else {
                 println!(
                     "{} {} ({}, commands: {}).",
                     row.id,
                     row.version,
-                    row.capabilities.join(","),
-                    commands.join(",")
+                    row.capabilities.join(", "),
+                    commands.join(", ")
                 );
             }
         }
@@ -9090,10 +9390,24 @@ fn list_at(root: &Path, json: bool) -> Result<(), Box<dyn std::error::Error + Se
 }
 
 fn read_manifest(root: &Path) -> Option<Manifest> {
-    let bytes = read_bounded(&root.join("crabbot-plugin.toml"), MANIFEST_LIMIT).ok()?;
-    let manifest: Manifest = toml::from_slice(&bytes).ok()?;
-    manifest.validate().ok()?;
-    Some(manifest)
+    read_manifest_checked(root).ok()
+}
+
+fn read_manifest_checked(
+    root: &Path,
+) -> Result<Manifest, Box<dyn std::error::Error + Send + Sync>> {
+    let path = root.join("crabbot-plugin.toml");
+    let bytes = read_bounded(&path, MANIFEST_LIMIT).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("manifest not found at {}", path.display())
+        } else {
+            format!("could not read manifest at {}: {error}", path.display())
+        }
+    })?;
+    let manifest: Manifest =
+        toml::from_slice(&bytes).map_err(|error| format!("manifest parse failed: {error}"))?;
+    manifest.validate().map_err(|error| format!("manifest validation failed: {error}"))?;
+    Ok(manifest)
 }
 
 fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
@@ -9788,19 +10102,49 @@ mod tests {
     fn manages_service_definition() {
         let path = std::env::temp_dir().join(format!("crabbot-service-{}", std::process::id()));
         let _ = fs::remove_file(&path);
-        service_at(&path, ServiceCommand::Install).unwrap();
+        service_at(&path, ServiceCommand::Install(super::ServiceInstall { force: false })).unwrap();
         assert!(path.is_file());
+        assert!(
+            service_at(&path, ServiceCommand::Install(super::ServiceInstall { force: false }))
+                .is_err()
+        );
+        service_at(&path, ServiceCommand::Install(super::ServiceInstall { force: true })).unwrap();
         service_at(&path, ServiceCommand::Status).unwrap();
         let mut stopped = false;
-        service_at_with(&path, ServiceCommand::Remove, |_, start| {
-            assert!(!start);
-            stopped = true;
-            Ok(())
-        })
+        service_at_with(
+            &path,
+            ServiceCommand::Remove(super::ServiceRemove { yes: true }),
+            |_, start| {
+                assert!(!start);
+                stopped = true;
+                Ok(())
+            },
+        )
         .unwrap();
         assert!(stopped);
         assert!(!path.exists());
-        service_at(&path, ServiceCommand::Remove).unwrap();
+        service_at(&path, ServiceCommand::Remove(super::ServiceRemove { yes: true })).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_symlink_service_definition() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-service-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target");
+        let path = root.join("service");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let error =
+            service_at(&path, ServiceCommand::Install(super::ServiceInstall { force: false }))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("symbolic link"));
+        assert!(!target.exists());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -10030,6 +10374,22 @@ mod tests {
         let cli = Cli::try_parse_from(["crabbot", "service", "status", "--json"]).unwrap();
         assert!(cli.json);
 
+        let cli = Cli::try_parse_from(["crabbot", "service", "install", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Service {
+                command: Some(ServiceCommand::Install(super::ServiceInstall { force: true }))
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["crabbot", "service", "remove", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Service {
+                command: Some(ServiceCommand::Remove(super::ServiceRemove { yes: true }))
+            }
+        ));
+
         let cli = Cli::try_parse_from(["crabbot", "plugin", "remove", "tools", "--yes", "--json"])
             .unwrap();
         assert!(cli.json);
@@ -10208,6 +10568,16 @@ mod tests {
         assert_eq!(read_manifest(&root).unwrap().id, "echo");
         fs::write(root.join("crabbot-plugin.toml"), "broken = true\n").unwrap();
         assert!(read_manifest(&root).is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_list_rejects_invalid_visible_manifests() {
+        let root = test_root("plugin-list-invalid");
+        fs::create_dir_all(root.join("plugins/broken")).unwrap();
+        fs::write(root.join("plugins/broken/crabbot-plugin.toml"), "broken = true\n").unwrap();
+
+        assert!(super::list_at(&root, true).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -11019,6 +11389,7 @@ mod tests {
         assert!(super::installed_at(&root).is_empty());
         super::list_at(&root, false).unwrap();
         assert!(super::remove_at(Name { id: "missing".into(), yes: false }, &root).is_err());
+        assert!(super::remove_at(Name { id: "missing".into(), yes: true }, &root).is_err());
         assert!(
             super::plugin(
                 super::PluginCommand::Install(Source {

@@ -18,6 +18,12 @@ Semantic Versioning.
 - Added structured JSON output for native initialization, diagnostics, version,
   Crabfile, service, plugin, session, and delivery operations; capability status
   now includes explicit status and plugin arrays.
+- Hardened service installation and removal with explicit `--force` and `--yes`
+  confirmations, and made plugin inventory and delivery errors fail clearly
+  instead of being silently ignored.
+- Added adaptive `revloop` review scope: uncommitted changes by default, the
+  latest commit or feature branch when the tree is clean, and an explicit
+  `--global` mode for repository-wide audits.
 - Added clear import errors for missing confirmation, missing Crabfiles, unreadable
   files, and invalid Crabfile syntax, including parse locations.
 - Added the version `0.1` Crabfile specification and read-only

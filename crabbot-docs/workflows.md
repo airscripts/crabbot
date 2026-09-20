@@ -75,8 +75,9 @@ crabbot service start
 crabbot service status
 ```
 
-Use `crabbot service stop` before changing binaries or environment values.
-Use `crabbot service remove` to unregister the definition; pending worktree
+Use `crabbot service install --force` to replace an existing definition, and
+`crabbot service stop` before changing binaries or environment values. Use
+`crabbot service remove --yes` to unregister the definition; pending worktree
 cleanup is reported for the next daemon start.
 
 ## Session Operations

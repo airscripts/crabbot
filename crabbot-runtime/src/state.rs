@@ -1024,12 +1024,14 @@ impl Store {
     }
 
     pub fn retry_delivery(&mut self, id: &str) -> std::io::Result<()> {
-        if self
-            .outbox
-            .iter()
-            .find(|delivery| delivery.id == id)
-            .is_none_or(|delivery| delivery.status != DeliveryStatus::Uncertain)
-        {
+        let Some(delivery) = self.outbox.iter().find(|delivery| delivery.id == id) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Delivery was not found.",
+            ));
+        };
+
+        if delivery.status != DeliveryStatus::Uncertain {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Only uncertain deliveries can be retried.",
@@ -1572,6 +1574,15 @@ mod tests {
         assert_eq!(loaded.sessions["main"].messages.len(), 1);
         assert_eq!(loaded.outbox[0].text, "hello");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retrying_a_missing_delivery_reports_not_found() {
+        let mut store = Store::default();
+        let error = store.retry_delivery("missing").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "Delivery was not found.");
     }
 
     #[test]

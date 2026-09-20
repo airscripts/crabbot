@@ -26,7 +26,7 @@ crabbot delivery drop <id> --yes [--json]
 crabbot export [PATH] [--path <PATH>] [--force] [--json]
 crabbot validate [--path <PATH>] [--json]
 crabbot import [--path <PATH>] --yes [--force] [--json]
-crabbot service [install|remove|status|start|stop] [--json]
+crabbot service [install [--force]|remove --yes|status|start|stop] [--json]
 crabbot <plugin-command> [arguments...]
 ```
 
@@ -63,7 +63,8 @@ crabbot completion powershell >> $PROFILE
 ```
 
 The global `--json` flag selects structured JSON output for native commands,
-including Crabfile export, validation, and import; plugin installation, linking, updating, and removal; session
+including Crabfile export, validation, and import; plugin listing,
+installation, linking, updating, and removal; session
 creation, forking, model changes, cancellation, and deletion; and delivery
 retry and drop operations. The command-level form remains available where the
 subcommand declares it. Completion intentionally writes its shell script
@@ -83,10 +84,11 @@ logged at info level; report creation is best effort and never replaces the
 original command error.
 
 Confirmation is explicit for unattended destructive or duplicate-prone work:
-use `--yes` for plugin replacement or removal, session deletion, delivery
-retry or drop, and Crabfile import. `--force` separately permits replacing an
-existing imported configuration. Native commands do not read stdin for these
-confirmations. Import reports a missing Crabfile with its expected path and
+use `--yes` for plugin replacement or removal, session deletion, service
+removal, delivery retry or drop, and Crabfile import. `--force` separately
+permits replacing an existing imported configuration, exported Crabfile, or
+service definition. Native commands do not read stdin for these confirmations.
+Import reports a missing Crabfile with its expected path and
 validates TOML before changing local state; malformed Crabfiles include the
 line and column of the parse error. Use `--path <PATH>` to import a different
 file.
@@ -108,6 +110,10 @@ array.
 `./Crabfile` by default or the path supplied with `--path`, and reports the
 first syntax or schema error. See the [Crabfile specification](crabfile.md)
 for the supported version and keys.
+
+`crabbot plugin list --json` returns an object with an `items` array. A visible
+plugin directory with a missing or invalid manifest is reported as an error so
+the inventory cannot silently hide broken installation state.
 
 `crabbot plugin install` and `crabbot plugin link` validate and register one
 plugin at a time. When the daemon is running, it starts the new plugin
@@ -189,12 +195,13 @@ the daemon in the foreground so service managers and operators can observe its
 diagnostics. Use `crabbot service install` only after the foreground flow is
 healthy.
 
-crabbot service install writes a native service definition for the current
+`crabbot service install` writes a native service definition for the current
 platform, preserving the resolved CRABBOT_HOME and configured non-secret
 environment paths. If provider variables are present, their declared values
 are copied to a private service credential JSON file and the definition points
 to it; existing CRABBOT_CREDENTIALS and CRABBOT_KEYRING=1 configuration is also
-preserved. start and stop activate or deactivate it through systemd-user,
+preserved. An existing definition is not replaced unless `--force` is supplied.
+`remove` requires `--yes`. `start` and `stop` activate or deactivate it through systemd-user,
 launchd, or the Windows Service Controller. remove stops or unloads the service
 before deleting the definition, and status reports whether it is present.
 

@@ -194,8 +194,10 @@ allowlist; mention, owner, admin, member, topic, and thread filters are
 available for Telegram and Discord.
 
 Use `crabbot service install` followed by `crabbot service start` to activate
-the native service. `crabbot service stop` and `crabbot service remove` reverse
-those actions. See the [configuration guide](crabbot-docs/configuration.md)
+the native service. Existing definitions require
+`crabbot service install --force` to replace them. `crabbot service stop` and
+`crabbot service remove --yes` reverse those actions. See the
+[configuration guide](crabbot-docs/configuration.md)
 for the full `config.toml` reference and recovery behavior.
 
 ### Command Sandbox
@@ -313,6 +315,9 @@ Run the independent review loop:
 make revloop
 ```
 
+By default, `revloop` reviews uncommitted changes. If the working tree is clean,
+it reviews the latest commit on `main` or the complete feature branch relative
+to `main`. Use `make revloop REVLOOP_ARGS=--global` for a repository-wide audit.
 Use `make revloop REVLOOP_ARGS=--verbose` or
 `CRABBOT_REVLOOP_OUTPUT=verbose` when the full orchestrator and worker stream
 is useful during diagnosis. Each orchestrator pass performs a deep

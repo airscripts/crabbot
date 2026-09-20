@@ -56,4 +56,4 @@ workspace.
 `crabbot service install` materializes declared provider variables into a
 protected service credential file and references it from the native service
 definition. Inspect the generated definition with `crabbot service status` and
-remove it with `crabbot service remove` when rotating credentials.
+remove it with `crabbot service remove --yes` when rotating credentials.
