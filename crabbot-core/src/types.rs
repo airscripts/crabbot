@@ -72,9 +72,11 @@ impl Content {
     pub fn render(&self) -> String {
         match self {
             Self::Text { text } => text.clone(),
+
             Self::Image { alt, .. } => alt
                 .as_deref()
                 .map_or_else(|| "[Image attachment.]".into(), |alt| format!("[Image: {alt}]")),
+
             Self::File { name, .. } => format!("[File: {name}]"),
             Self::Audio { .. } => "[Audio attachment.]".into(),
         }
@@ -267,9 +269,11 @@ mod tests {
             method: "event".into(),
             params: serde_json::json!({}),
         };
+
         assert_eq!(note.id(), None);
         assert!(call.valid());
         assert!(note.valid());
+
         assert!(
             !Request::Call {
                 jsonrpc: "1.0".into(),
@@ -295,6 +299,7 @@ mod tests {
             "messages": [],
             "stream": true
         });
+
         let request: ModelRequest = serde_json::from_value(value).unwrap();
         assert_eq!(request.workspace, None);
         assert!(serde_json::to_value(request).unwrap().get("workspace").is_none());
@@ -310,9 +315,11 @@ mod tests {
             Content::Image { uri: "file://image".into(), alt: Some("diagram".into()) }.render(),
             "[Image: diagram]"
         );
+
         assert!(
             !Content::Image { uri: "file://image".into(), alt: None }.render().contains("file://")
         );
+
         assert_eq!(
             Content::File {
                 uri: "file://note".into(),
@@ -322,6 +329,7 @@ mod tests {
             .render(),
             "[File: note.txt]"
         );
+
         assert_eq!(
             Content::Audio { uri: "file://voice".into(), mime: None }.render(),
             "[Audio attachment.]"
@@ -336,6 +344,7 @@ mod tests {
             "approve": true
         }))
         .unwrap();
+
         assert!(matches!(legacy, Event::Tool { name, .. } if name == "read"));
     }
 

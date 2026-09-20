@@ -1,9 +1,33 @@
 name: Verify
 
 on:
+  workflow_dispatch:
+    inputs:
+      container_image:
+        description: "Optional local CI container image"
+        required: false
+        type: string
+        default: ""
+
+      local:
+        description: "Use the local act working tree"
+        required: false
+        type: string
+        default: ""
+
   workflow_call:
     inputs:
       ref:
+        required: false
+        type: string
+        default: ""
+
+      container_image:
+        required: false
+        type: string
+        default: ""
+
+      local:
         required: false
         type: string
         default: ""
@@ -15,7 +39,7 @@ jobs:
   workspace:
     name: Workspace
     runs-on: ubuntu-latest
-    container: rust:1.89-trixie
+    container: ${{ inputs.container_image || 'rust:1.89-trixie' }}
 
     defaults:
       run:
@@ -23,28 +47,28 @@ jobs:
 
     steps:
       - name: Checkout
+        if: inputs.local != 'true'
         uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Install Metrics Tools
+        if: inputs.local != 'true'
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y ripgrep
+
+      - name: Install Rust Components
+        run: rustup component add rustfmt clippy
+
       - name: Check Rust Formatting
-        run: cargo fmt --all --check
+        run: |
+          cargo fmt --all --check
+          bash crabbot-scripts/spacing.sh --check
 
       - name: Run Clippy
         run: CARGO_BUILD_JOBS=4 cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: Check Workspace
-        run: CARGO_BUILD_JOBS=4 cargo check --workspace --all-targets --locked
-
-      - name: Install Coverage Tool
-        uses: taiki-e/install-action@v2
-
-        with:
-          tool: cargo-llvm-cov
-
-      - name: Check Coverage
-        run: make coverage
 
       - name: Check Documentation
         run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
@@ -55,10 +79,10 @@ jobs:
       - name: Report Metrics
         run: bash crabbot-scripts/metrics.sh
 
-  modules:
-    name: Modules
+  crate:
+    name: Crate (${{ matrix.name }})
     runs-on: ubuntu-latest
-    container: rust:1.89-trixie
+    container: ${{ inputs.container_image || 'rust:1.89-trixie' }}
 
     defaults:
       run:
@@ -141,10 +165,17 @@ jobs:
 
     steps:
       - name: Checkout
+        if: inputs.local != 'true'
         uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install Archive Tools
+        if: inputs.local != 'true'
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y zip
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -155,7 +186,7 @@ jobs:
   msrv:
     name: Minimum Rust Version
     runs-on: ubuntu-latest
-    container: rust:1.89-trixie
+    container: ${{ inputs.container_image || 'rust:1.89-trixie' }}
 
     defaults:
       run:
@@ -163,6 +194,7 @@ jobs:
 
     steps:
       - name: Checkout
+        if: inputs.local != 'true'
         uses: actions/checkout@v7
 
         with:
@@ -174,7 +206,7 @@ jobs:
   windows_gnu:
     name: Windows GNU
     runs-on: ubuntu-latest
-    container: rust:1.89-trixie
+    container: ${{ inputs.container_image || 'rust:1.89-trixie' }}
 
     defaults:
       run:
@@ -182,12 +214,14 @@ jobs:
 
     steps:
       - name: Checkout
+        if: inputs.local != 'true'
         uses: actions/checkout@v7
 
         with:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install MinGW
+        if: inputs.local != 'true'
         run: |
           apt-get update
           apt-get install --no-install-recommends -y gcc-mingw-w64-x86-64

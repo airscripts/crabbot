@@ -4,6 +4,7 @@ use crabbot_core::{
     plugin::serve_with,
     types::{Capability, Hello, Protocol, Request, Response},
 };
+
 use futures_util::{Stream, StreamExt};
 use serde_json::json;
 use std::{
@@ -51,6 +52,7 @@ async fn call(
         Request::Call { id, method, params, .. } => (id, method, params),
         Request::Note { .. } => return Ok(None),
     };
+
     let token = credential()?;
     call_with(client, id, method, params, &token, &format!("https://api.telegram.org/bot{token}"))
         .await
@@ -64,21 +66,26 @@ fn credential() -> crabbot_core::Result<String> {
             return Ok(value);
         }
     }
+
     if let Some(value) = keyring("telegram") {
         return Ok(value);
     }
+
     let Some(path) = std::env::var_os("CRABBOT_CREDENTIALS") else {
         return Err(crabbot_core::Error::Denied(
             "CRABBOT_TELEGRAM_TOKEN is not configured.".into(),
         ));
     };
+
     crabbot_file::private(&path)?;
     let text = std::fs::read_to_string(path).map_err(|error| {
         crabbot_core::Error::Denied(format!("Credentials could not be read: {error}."))
     })?;
+
     let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
         crabbot_core::Error::Denied(format!("Credentials are invalid: {error}."))
     })?;
+
     value["CRABBOT_TELEGRAM_TOKEN"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
@@ -92,6 +99,7 @@ fn keyring(name: &str) -> Option<String> {
     if std::env::var("CRABBOT_KEYRING").ok().as_deref() != Some("1") {
         return None;
     }
+
     keyring::Entry::new("dev.airscripts.crabbot", name)
         .ok()?
         .get_password()
@@ -110,8 +118,10 @@ async fn call_with(
     let Some(operation) = operation(&method, &params)? else {
         return Ok(None);
     };
+
     let result = match operation {
         Operation::Info => send(client, &format!("{base}/getMe"), json!({})).await?,
+
         Operation::Poll(offset) => {
             let updates = send(
                 client,
@@ -121,48 +131,63 @@ async fn call_with(
             .await?;
             normalize(updates)
         }
+
         Operation::Send { chat, text, thread } => {
             let mut result = serde_json::Value::Null;
+
             for part in chunks(&text, 4_096) {
                 let mut body = json!({"chat_id": chat, "text": part});
+
                 if let Some(thread) = &thread {
                     body["message_thread_id"] = json!(thread.parse::<i64>().map_err(|_| {
                         crabbot_core::Error::Denied("Telegram thread ID was invalid.".into())
                     })?);
                 }
+
                 result = send(client, &format!("{base}/sendMessage"), body).await?;
             }
+
             result
         }
+
         Operation::Edit { chat, message, text, thread } => {
             let mut results = Vec::new();
+
             for (url, body) in edit_requests(base, chat, message, &text, thread.as_deref())? {
                 results.push(send(client, &url, body).await?);
             }
+
             let edited = results.remove(0);
             json!({"edited": edited, "sent": results})
         }
+
         Operation::Approval { chat, text, approve, deny, thread } => {
             let (url, body) =
                 approval_request(base, chat, &text, &approve, &deny, thread.as_deref())?;
             send(client, &url, body).await?
         }
+
         Operation::Callback { id, text } => {
             let mut body = json!({"callback_query_id": id});
+
             if let Some(text) = text {
                 body["text"] = json!(text);
             }
+
             send(client, &format!("{base}/answerCallbackQuery"), body).await?
         }
+
         Operation::Media(uri) => media(client, &uri, _token, base).await?,
     };
 
     let response = Response::ok(id, result);
+
     if serde_json::to_vec(&response)?.len().saturating_add(1) > crabbot_core::jsonl::MAX {
         return Err(crabbot_core::Error::Denied(
             "Telegram response exceeds the protocol frame limit.".into(),
         ));
     }
+
     Ok(Some(response))
 }
 
@@ -191,20 +216,26 @@ fn edit_requests(
     thread: Option<&str>,
 ) -> crabbot_core::Result<Vec<(String, serde_json::Value)>> {
     let mut parts = chunks(text, 4_096).into_iter();
+
     let first = parts
         .next()
         .filter(|part| !part.is_empty())
         .ok_or_else(|| crabbot_core::Error::Denied("edit.text is required.".into()))?;
+
     let mut requests = vec![edit_request(base, chat, message, &first)];
+
     for part in parts {
         let mut body = json!({"chat_id": chat, "text": part});
+
         if let Some(thread) = thread {
             body["message_thread_id"] = json!(thread.parse::<i64>().map_err(|_| {
                 crabbot_core::Error::Denied("Telegram thread ID was invalid.".into())
             })?);
         }
+
         requests.push((format!("{base}/sendMessage"), body));
     }
+
     Ok(requests)
 }
 
@@ -221,9 +252,11 @@ fn approval_request(
             "approval.text is empty or exceeds the Telegram limit.".into(),
         ));
     }
+
     if !callback_data(approve) || !callback_data(deny) || approve == deny {
         return Err(crabbot_core::Error::Denied("Approval callback data is invalid.".into()));
     }
+
     let mut body = json!({
         "chat_id": chat,
         "text": text,
@@ -234,11 +267,13 @@ fn approval_request(
             ]]
         }
     });
+
     if let Some(thread) = thread {
         body["message_thread_id"] = json!(thread.parse::<i64>().map_err(|_| {
             crabbot_core::Error::Denied("Telegram thread ID was invalid.".into())
         })?);
     }
+
     Ok((format!("{base}/sendMessage"), body))
 }
 
@@ -250,18 +285,23 @@ fn chunks(text: &str, limit: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut current = String::new();
     let mut units: usize = 0;
+
     for character in text.chars() {
         let width = character.len_utf16();
+
         if !current.is_empty() && units.saturating_add(width) > limit {
             chunks.push(std::mem::take(&mut current));
             units = 0;
         }
+
         current.push(character);
         units = units.saturating_add(width);
     }
+
     if !current.is_empty() || chunks.is_empty() {
         chunks.push(current);
     }
+
     chunks
 }
 
@@ -279,6 +319,7 @@ fn operation(method: &str, params: &serde_json::Value) -> crabbot_core::Result<O
                 .into(),
             thread: params["thread"].as_str().map(str::to_owned),
         })),
+
         "edit" => {
             let text = params["text"]
                 .as_str()
@@ -288,6 +329,7 @@ fn operation(method: &str, params: &serde_json::Value) -> crabbot_core::Result<O
                         "edit.text is empty or exceeds the Telegram limit.".into(),
                     )
                 })?;
+
             Ok(Some(Operation::Edit {
                 chat: params["chat"]
                     .as_i64()
@@ -299,6 +341,7 @@ fn operation(method: &str, params: &serde_json::Value) -> crabbot_core::Result<O
                 thread: params["thread"].as_str().map(str::to_owned),
             }))
         }
+
         "approval" => {
             let text = params["text"]
                 .as_str()
@@ -308,10 +351,12 @@ fn operation(method: &str, params: &serde_json::Value) -> crabbot_core::Result<O
                         "approval.text is empty or exceeds the Telegram limit.".into(),
                     )
                 })?;
+
             Ok(Some(Operation::Approval {
                 chat: params["chat"].as_i64().ok_or_else(|| {
                     crabbot_core::Error::Denied("approval.chat is required.".into())
                 })?,
+
                 text: text.into(),
                 approve: params["approve"]
                     .as_str()
@@ -328,15 +373,19 @@ fn operation(method: &str, params: &serde_json::Value) -> crabbot_core::Result<O
                 thread: params["thread"].as_str().map(str::to_owned),
             }))
         }
+
         "callback" => {
             let id = params["id"]
                 .as_str()
                 .filter(|value| !value.is_empty() && value.len() <= ID_LIMIT)
                 .ok_or_else(|| crabbot_core::Error::Denied("callback.id is required.".into()))?;
+
             let text =
                 params["text"].as_str().filter(|value| value.len() <= 200).map(str::to_owned);
+
             Ok(Some(Operation::Callback { id: id.into(), text }))
         }
+
         "media" => Ok(Some(Operation::Media(
             params["uri"]
                 .as_str()
@@ -370,31 +419,38 @@ async fn media_at(
             !value.is_empty() && value.len() <= 1024 && value.bytes().all(valid_file_id)
         })
         .ok_or_else(|| crabbot_core::Error::Denied("Telegram media URI is invalid.".into()))?;
+
     let file = send(client, &format!("{base}/getFile"), json!({"file_id": file_id})).await?;
     let path = file["file_path"]
         .as_str()
         .filter(|value| !value.is_empty() && value.len() <= 1024 && !value.contains(".."))
         .ok_or_else(|| crabbot_core::Error::Denied("Telegram media path is invalid.".into()))?;
+
     let api = base.split_once("/bot").map_or(base, |(value, _)| value);
     let response = client
         .get(format!("{api}/file/bot{token}/{path}"))
         .send()
         .await
         .map_err(|_| crabbot_core::Error::Denied("Telegram media download failed.".into()))?;
+
     let status = response.status();
     let bytes = collect(response.bytes_stream()).await?;
+
     if !status.is_success() {
         return Err(crabbot_core::Error::Denied("Telegram media download failed.".into()));
     }
+
     cleanup(root);
     std::fs::create_dir_all(root).map_err(|error| {
         crabbot_core::Error::Denied(format!("Telegram media directory failed: {error}."))
     })?;
+
     let name = format!("{file_id}.bin");
     let destination = root.join(name);
     crabbot_file::save(&destination, bytes).map_err(|error| {
         crabbot_core::Error::Denied(format!("Telegram media storage failed: {error}."))
     })?;
+
     Ok(json!({"uri": format!("file://{}", destination.display())}))
 }
 
@@ -411,6 +467,7 @@ fn media_root() -> crabbot_core::Result<PathBuf> {
         .ok_or_else(|| {
             crabbot_core::Error::Denied("CRABBOT_MEDIA or CRABBOT_HOME is required.".into())
         })?;
+
     Ok(PathBuf::from(root))
 }
 
@@ -418,20 +475,25 @@ fn cleanup(root: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
+
     let now = SystemTime::now();
+
     for entry in entries.flatten().take(256) {
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
+
         if !file_type.is_file() {
             continue;
         }
+
         let stale = entry
             .metadata()
             .and_then(|metadata| metadata.modified())
             .ok()
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age > Duration::from_secs(24 * 60 * 60));
+
         if stale {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -449,6 +511,7 @@ async fn send(
         .send()
         .await
         .map_err(|_| crabbot_core::Error::Denied("Telegram request failed.".into()))?;
+
     let status = response.status();
     let body = read(response).await?;
     let value: serde_json::Value = serde_json::from_str(&body)
@@ -468,15 +531,19 @@ where
     E: std::fmt::Display,
 {
     let mut bytes = Vec::new();
+
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             crabbot_core::Error::Denied(format!("Telegram response failed: {error}."))
         })?;
+
         if chunk.as_ref().len() > BODY_LIMIT.saturating_sub(bytes.len()) {
             return Err(crabbot_core::Error::Denied("Telegram response was too large.".into()));
         }
+
         bytes.extend_from_slice(chunk.as_ref());
     }
+
     String::from_utf8(bytes)
         .map_err(|_| crabbot_core::Error::Denied("Telegram response failed.".into()))
 }
@@ -498,6 +565,7 @@ fn response_body(
 fn normalize(value: serde_json::Value) -> serde_json::Value {
     let events =
         value.as_array().into_iter().flatten().filter_map(normalize_update).collect::<Vec<_>>();
+
     json!({"events": events})
 }
 
@@ -527,31 +595,38 @@ fn normalize_update(update: &serde_json::Value) -> Option<serde_json::Value> {
     let kind = message["chat"]["type"].as_str().unwrap_or("unknown");
     let mut content = Vec::new();
     let photo = message["photo"].as_array().and_then(|files| files.last());
+
     if let Some(text) = message["text"].as_str().filter(|text| !text.is_empty()) {
         content.push(json!({"kind": "text", "text": text}));
     }
+
     if photo.is_none()
         && let Some(caption) = message["caption"].as_str().filter(|text| !text.is_empty())
     {
         content.push(json!({"kind": "text", "text": caption}));
     }
+
     if let Some(file) = photo
         && let Some(id) = file["file_id"].as_str()
     {
         content.push(json!({"kind": "image", "uri": format!("telegram://file/{id}"), "alt": message["caption"].as_str()}));
     }
+
     if let Some(file) = message["document"]["file_id"].as_str() {
         content.push(json!({"kind": "file", "uri": format!("telegram://file/{file}"), "name": message["document"]["file_name"].as_str().unwrap_or("document"), "mime": message["document"]["mime_type"].as_str()}));
     }
+
     if let Some(file) = message["voice"]["file_id"].as_str() {
         content.push(json!({"kind": "audio", "uri": format!("telegram://file/{file}"), "mime": message["voice"]["mime_type"].as_str()}));
     }
+
     let text = message["text"].as_str().or_else(|| message["caption"].as_str());
     let role = &message["from"]["role"];
     let roles = role
         .as_array()
         .cloned()
         .unwrap_or_else(|| role.is_null().then(Vec::new).unwrap_or_else(|| vec![role.clone()]));
+
     Some(json!({
         "id": update["update_id"],
         "chat": chat,
@@ -573,6 +648,7 @@ mod tests {
         credential, keyring, media_at, media_root, normalize, operation, response_body, send,
         valid_file_id,
     };
+
     use crabbot_core::types::Request;
     use serde_json::json;
     use tokio::{
@@ -586,6 +662,7 @@ mod tests {
             {"update_id": 3, "message": {"chat": {"id": 8}, "from": {"id": 9, "role": "admin"}, "text": "hello"}},
             {"update_id": 4, "edited_message": {"chat": {"id": 8}}}
         ]));
+
         assert_eq!(result["events"].as_array().unwrap().len(), 1);
         assert_eq!(result["events"][0]["chat"], 8);
         assert_eq!(result["events"][0]["text"], "hello");
@@ -596,16 +673,19 @@ mod tests {
             "update_id": 8,
             "message": {"chat": {"id": 8, "type": "private"}, "sticker": {"file_id": "sticker"}}
         }]));
+
         assert_eq!(unsupported["events"][0]["id"], 8);
         assert!(unsupported["events"][0]["content"].as_array().unwrap().is_empty());
         let media = normalize(
             json!([{"update_id": 5, "message": {"chat": {"id": 8, "type": "private"}, "document": {"file_id": "file", "file_name": "note.txt", "mime_type": "text/plain"}}}]),
         );
+
         assert_eq!(media["events"][0]["private"], true);
         assert_eq!(media["events"][0]["content"][0]["kind"], "file");
         let photo = normalize(
             json!([{"update_id": 6, "message": {"chat": {"id": 8, "type": "group"}, "text": "hello", "caption": "look", "photo": [{"file_id": "image"}]}}]),
         );
+
         assert_eq!(photo["events"][0]["private"], false);
         assert_eq!(photo["events"][0]["content"][0]["kind"], "text");
         assert_eq!(photo["events"][0]["content"][1]["kind"], "image");
@@ -613,10 +693,12 @@ mod tests {
         let caption = normalize(
             json!([{"update_id": 9, "message": {"chat": {"id": 8, "type": "group"}, "caption": "@crabbot", "photo": [{"file_id": "image"}]}}]),
         );
+
         assert_eq!(caption["events"][0]["text"], "@crabbot");
         let topic = normalize(
             json!([{"update_id": 7, "message": {"chat": {"id": 8, "type": "supergroup"}, "message_thread_id": 4, "from": {"id": 9}, "text": "topic"}}]),
         );
+
         assert_eq!(topic["events"][0]["topic"], 4);
         let callback = normalize(json!([{
             "update_id": 10,
@@ -630,6 +712,7 @@ mod tests {
                 }
             }
         }]));
+
         assert_eq!(callback["events"][0]["kind"], "callback");
         assert_eq!(callback["events"][0]["id"], 10);
         assert_eq!(callback["events"][0]["callback_id"], "callback-1");
@@ -643,6 +726,7 @@ mod tests {
         let voice = normalize(
             json!([{"update_id": 6, "message": {"chat": {"id": 8}, "voice": {"file_id": "voice", "mime_type": "audio/ogg"}}}]),
         );
+
         assert_eq!(voice["events"][0]["content"][0]["kind"], "audio");
         assert_eq!(normalize(json!({}))["events"].as_array().unwrap().len(), 0);
         assert_eq!(
@@ -670,14 +754,17 @@ mod tests {
     #[test]
     fn reports_missing_credentials_and_media_root() {
         assert!(client().is_ok());
+
         if std::env::var_os("CRABBOT_KEYRING").is_none() {
             assert!(keyring("telegram").is_none());
         }
+
         if std::env::var_os("CRABBOT_TELEGRAM_TOKEN").is_none()
             && std::env::var_os("CRABBOT_CREDENTIALS").is_none()
         {
             assert!(credential().is_err());
         }
+
         if std::env::var_os("CRABBOT_MEDIA").is_none() && std::env::var_os("CRABBOT_HOME").is_none()
         {
             assert!(media_root().is_err());
@@ -691,6 +778,7 @@ mod tests {
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
             Err(error) => panic!("listener failed: {error}"),
         };
+
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
             for index in 0..2 {
@@ -702,6 +790,7 @@ mod tests {
                 } else {
                     b"abc".to_vec()
                 };
+
                 let header = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
@@ -710,14 +799,18 @@ mod tests {
                 stream.write_all(&body).await.unwrap();
             }
         });
+
         let root =
             std::env::temp_dir().join(format!("crabbot-telegram-media-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         let client =
             reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+
         let base = format!("http://127.0.0.1:{port}/botTOKEN");
         let value =
             media_at(&client, "telegram://file/abc_1", "TOKEN", &base, &root).await.unwrap();
+
         let path = value["uri"].as_str().unwrap().strip_prefix("file://").unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"abc");
         server.await.unwrap();
@@ -729,6 +822,7 @@ mod tests {
         let client = reqwest::Client::new();
         let root = std::env::temp_dir()
             .join(format!("crabbot-telegram-media-invalid-{}", std::process::id()));
+
         assert!(
             media_at(&client, "file://outside", "TOKEN", "http://127.0.0.1:1", &root)
                 .await
@@ -740,6 +834,7 @@ mod tests {
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
             Err(error) => panic!("listener failed: {error}"),
         };
+
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
             for body in [
@@ -757,6 +852,7 @@ mod tests {
                 stream.write_all(&body).await.unwrap();
             }
         });
+
         let base = format!("http://127.0.0.1:{port}/botTOKEN");
         assert!(media_at(&client, "telegram://file/abc", "TOKEN", &base, &root).await.is_err());
         assert!(media_at(&client, "telegram://file/abc", "TOKEN", &base, &root).await.is_err());
@@ -768,6 +864,7 @@ mod tests {
     fn cleans_only_old_files() {
         let root =
             std::env::temp_dir().join(format!("crabbot-telegram-cleanup-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("nested")).unwrap();
         std::fs::write(root.join("fresh"), "ok").unwrap();
@@ -806,6 +903,7 @@ mod tests {
         assert!(matches!(
             operation("send", &json!({"chat": 8, "text": "hello", "thread": "4"})).unwrap(),
             Some(Operation::Send { chat: 8, text, thread: Some(thread) })
+
                 if text == "hello" && thread == "4"
         ));
         assert!(matches!(
@@ -821,11 +919,13 @@ mod tests {
             )
             .unwrap(),
             Some(Operation::Approval { chat: 8, text, approve, deny, thread: None })
+
                 if text == "Approve write?" && approve == "allow" && deny == "deny"
         ));
         assert!(matches!(
             operation("callback", &json!({"id": "callback-1", "text": "Denied."})).unwrap(),
             Some(Operation::Callback { id, text: Some(text) })
+
                 if id == "callback-1" && text == "Denied."
         ));
         assert!(
@@ -854,6 +954,7 @@ mod tests {
         let requests =
             super::edit_requests("https://telegram.test/bot", 8, 12, &"x".repeat(4_097), Some("4"))
                 .unwrap();
+
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].1["text"].as_str().unwrap().len(), 4_096);
         assert!(requests[0].1["message_thread_id"].is_null());
@@ -884,6 +985,7 @@ mod tests {
             Some("4"),
         )
         .unwrap();
+
         assert_eq!(url, "https://telegram.test/bot/sendMessage");
         assert_eq!(body["chat_id"], 8);
         assert_eq!(body["message_thread_id"], 4);
@@ -976,6 +1078,7 @@ mod tests {
         assert!(send(&client, "http://127.0.0.1:1", json!({})).await.is_err());
         let note =
             Request::Note { jsonrpc: "2.0".into(), method: "poll".into(), params: json!({}) };
+
         assert!(call(&client, note).await.unwrap().is_none());
         let request = Request::Call {
             jsonrpc: "2.0".into(),
@@ -983,6 +1086,7 @@ mod tests {
             method: "info".into(),
             params: json!({}),
         };
+
         assert!(call(&client, request).await.is_err());
     }
 

@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 base64.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 crabbot-core = { path = "../crabbot-core" }
 crabbot-file = { path = "../crabbot-libs/file" }
 getrandom.workspace = true

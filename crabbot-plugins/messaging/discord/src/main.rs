@@ -1,20 +1,25 @@
 #![forbid(unsafe_code)]
 
+use crabbot_core::types::{Content, Request, Response};
+#[cfg(not(test))]
 use crabbot_core::{
     plugin::serve_with,
-    types::{Capability, Content, Hello, Protocol, Request, Response},
+    types::{Capability, Hello, Protocol},
 };
+
 use crabbot_file::{load as load_file, save as save_file};
 use futures_util::{SinkExt, Stream, StreamExt};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde_json::{Value, json};
+#[cfg(not(test))]
+use std::sync::Arc;
 use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
     time::SystemTime,
 };
+
 use tokio::{
     net::TcpStream,
     sync::Mutex as AsyncMutex,
@@ -83,12 +88,14 @@ impl Default for GatewayState {
 }
 
 #[tokio::main]
+#[cfg(not(test))]
 async fn main() -> crabbot_core::Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|error| crabbot_core::Error::Denied(format!("Discord client failed: {error}.")))?;
+
     let gateway = Arc::new(AsyncMutex::new(GatewayState::default()));
 
     serve_with(
@@ -114,6 +121,7 @@ async fn call(
     request: Request,
 ) -> crabbot_core::Result<Option<Response>> {
     let gateway = AsyncMutex::new(GatewayState::default());
+
     call_state(client, &gateway, request).await
 }
 
@@ -126,6 +134,7 @@ async fn call_state(
         Request::Call { id, method, params, .. } => (id, method, params),
         Request::Note { .. } => return Ok(None),
     };
+
     let token = credential()?;
     call_with_state(client, gateway, id, method, params, &token, "https://discord.com/api/v10")
         .await
@@ -139,19 +148,24 @@ fn credential() -> crabbot_core::Result<String> {
             return Ok(value);
         }
     }
+
     if let Some(value) = keyring("discord") {
         return Ok(value);
     }
+
     let Some(path) = std::env::var_os("CRABBOT_CREDENTIALS") else {
         return Err(crabbot_core::Error::Denied("CRABBOT_DISCORD_TOKEN is not configured.".into()));
     };
+
     crabbot_file::private(&path)?;
     let text = std::fs::read_to_string(path).map_err(|error| {
         crabbot_core::Error::Denied(format!("Credentials could not be read: {error}."))
     })?;
+
     let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
         crabbot_core::Error::Denied(format!("Credentials are invalid: {error}."))
     })?;
+
     value["CRABBOT_DISCORD_TOKEN"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
@@ -165,6 +179,7 @@ fn keyring(name: &str) -> Option<String> {
     if std::env::var("CRABBOT_KEYRING").ok().as_deref() != Some("1") {
         return None;
     }
+
     keyring::Entry::new("dev.airscripts.crabbot", name)
         .ok()?
         .get_password()
@@ -197,10 +212,12 @@ async fn call_with_state(
     let Some(operation) = operation(&method, &params)? else {
         return Ok(None);
     };
+
     let result = match operation {
         Operation::Send { channel, text, content } => {
             send_content(client, &channel, &text, &content, token, base).await?
         }
+
         Operation::Approval { channel, text, approve, deny } => {
             let body = approval_request(&text, &approve, &deny)?;
             message(
@@ -212,28 +229,36 @@ async fn call_with_state(
             )
             .await?
         }
+
         Operation::Edit { channel, message_id, text } => {
             let mut results = Vec::new();
+
             for (method, url, body) in edit_requests(base, &channel, &message_id, &text)? {
                 results.push(message(client, method, url, token, body).await?);
             }
+
             let edited = results.remove(0);
             json!({"edited": edited, "sent": results})
         }
+
         Operation::Poll(timeout) => gateway(gateway_state, token, timeout, base).await?,
         Operation::Ack(sequence) => acknowledge(gateway_state, sequence).await?,
+
         Operation::Callback { id, text } => {
             callback(client, gateway_state, &id, &text, base).await?
         }
+
         Operation::Media(uri) => media(client, gateway_state, &uri, token).await?,
     };
 
     let response = Response::ok(id, result);
+
     if serde_json::to_vec(&response)?.len().saturating_add(1) > crabbot_core::jsonl::MAX {
         return Err(crabbot_core::Error::Denied(
             "Discord response exceeds the protocol frame limit.".into(),
         ));
     }
+
     Ok(Some(response))
 }
 
@@ -248,15 +273,19 @@ where
     E: std::fmt::Display,
 {
     let mut bytes = Vec::new();
+
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             crabbot_core::Error::Denied(format!("Discord response failed: {error}."))
         })?;
+
         if chunk.as_ref().len() > BODY_LIMIT.saturating_sub(bytes.len()) {
             return Err(crabbot_core::Error::Denied("Discord response was too large.".into()));
         }
+
         bytes.extend_from_slice(chunk.as_ref());
     }
+
     String::from_utf8(bytes)
         .map_err(|_| crabbot_core::Error::Denied("Discord response failed.".into()))
 }
@@ -279,15 +308,19 @@ fn operation(method: &str, params: &serde_json::Value) -> crabbot_core::Result<O
                 .filter(|value| snowflake(value))
                 .ok_or_else(|| crabbot_core::Error::Denied("send.channel is invalid.".into()))?
                 .into();
+
             let text: String = params["text"].as_str().unwrap_or_default().into();
             let content = parse_content(&params["content"])?;
+
             if text.is_empty() && content.is_empty() {
                 return Err(crabbot_core::Error::Denied(
                     "send.text or send.content is required.".into(),
                 ));
             }
+
             Ok(Some(Operation::Send { channel, text, content }))
         }
+
         "edit" => Ok(Some(Operation::Edit {
             channel: params["channel"]
                 .as_str()
@@ -309,6 +342,7 @@ fn operation(method: &str, params: &serde_json::Value) -> crabbot_core::Result<O
                 })?
                 .into(),
         })),
+
         "approval" => Ok(Some(Operation::Approval {
             channel: params["channel"]
                 .as_str()
@@ -335,6 +369,7 @@ fn operation(method: &str, params: &serde_json::Value) -> crabbot_core::Result<O
                 .ok_or_else(|| crabbot_core::Error::Denied("approval.deny is invalid.".into()))?
                 .into(),
         })),
+
         "callback" => Ok(Some(Operation::Callback {
             id: params["id"]
                 .as_str()
@@ -347,6 +382,7 @@ fn operation(method: &str, params: &serde_json::Value) -> crabbot_core::Result<O
                 .unwrap_or_default()
                 .into(),
         })),
+
         "poll" => Ok(Some(Operation::Poll(params["timeout"].as_u64().unwrap_or(25)))),
         "ack" => Ok(Some(Operation::Ack(
             params["sequence"]
@@ -367,9 +403,11 @@ fn parse_content(value: &serde_json::Value) -> crabbot_core::Result<Vec<Content>
     let Some(items) = value.as_array() else {
         return Ok(Vec::new());
     };
+
     if items.len() > 8 {
         return Err(crabbot_core::Error::Denied("send.content has too many items.".into()));
     }
+
     items
         .iter()
         .cloned()
@@ -390,10 +428,12 @@ async fn send_content(
     base: &str,
 ) -> crabbot_core::Result<Value> {
     let mut result = Value::Null;
+
     for part in chunks(text, 2_000) {
         if part.is_empty() {
             continue;
         }
+
         result = message(
             client,
             reqwest::Method::POST,
@@ -403,6 +443,7 @@ async fn send_content(
         )
         .await?;
     }
+
     for item in content {
         match item {
             Content::Text { text } => {
@@ -419,6 +460,7 @@ async fn send_content(
                     }
                 }
             }
+
             Content::Image { uri, alt } => {
                 result = upload(
                     client,
@@ -431,19 +473,23 @@ async fn send_content(
                 )
                 .await?;
             }
+
             Content::File { uri, name, mime } => {
                 result = upload(client, channel, uri, name, "", token, base).await?;
                 let _ = mime;
             }
+
             Content::Audio { uri, mime } => {
                 result = upload(client, channel, uri, "audio", "", token, base).await?;
                 let _ = mime;
             }
         }
     }
+
     if result.is_null() {
         return Err(crabbot_core::Error::Denied("send.text or send.content is required.".into()));
     }
+
     Ok(result)
 }
 
@@ -460,9 +506,11 @@ async fn upload(
     let bytes = fs::read(&path).map_err(|error| {
         crabbot_core::Error::Denied(format!("Discord attachment could not be read: {error}."))
     })?;
+
     if bytes.len() > MEDIA_LIMIT {
         return Err(crabbot_core::Error::Denied("Discord attachment is too large.".into()));
     }
+
     let filename = safe_name(name).unwrap_or_else(|| "attachment.bin".into());
     let part = reqwest::multipart::Part::bytes(bytes).file_name(filename);
     let payload = json!({"content": caption});
@@ -477,11 +525,13 @@ async fn upload(
         .send()
         .await
         .map_err(|error| crabbot_core::Error::Denied(format!("Discord upload failed: {error}.")))?;
+
     let status = response.status();
     let body = read(response).await?;
     let body = serde_json::from_str(&body).map_err(|error| {
         crabbot_core::Error::Denied(format!("Discord response failed: {error}."))
     })?;
+
     response_body(status, body)
 }
 
@@ -496,6 +546,7 @@ async fn media(
         .filter(|value| snowflake(value))
         .ok_or_else(|| crabbot_core::Error::Denied("Discord media URI is invalid.".into()))?
         .to_owned();
+
     let attachment = {
         let mut state = gateway.lock().await;
         state.attachments.retain(|_, value| value.expires > Instant::now());
@@ -503,32 +554,40 @@ async fn media(
             crabbot_core::Error::Denied("Discord attachment is no longer available.".into())
         })?
     };
+
     if !discord_media_url(&attachment.url) {
         return Err(crabbot_core::Error::Denied("Discord attachment URL is not allowed.".into()));
     }
+
     if attachment.size.is_some_and(|size| size > MEDIA_LIMIT) {
         return Err(crabbot_core::Error::Denied("Discord attachment is too large.".into()));
     }
+
     let response = client
         .get(&attachment.url)
         .header(AUTHORIZATION, format!("Bot {token}"))
         .send()
         .await
         .map_err(|error| crabbot_core::Error::Denied(format!("Discord media failed: {error}.")))?;
+
     let status = response.status();
     let bytes = collect(response.bytes_stream()).await?;
+
     if !status.is_success() || bytes.len() > MEDIA_LIMIT {
         return Err(crabbot_core::Error::Denied("Discord media download failed.".into()));
     }
+
     let root = media_root()?;
     cleanup(&root);
     fs::create_dir_all(&root).map_err(|error| {
         crabbot_core::Error::Denied(format!("Discord media directory failed: {error}."))
     })?;
+
     let destination = root.join(format!("{id}.bin"));
     crabbot_file::save(&destination, bytes).map_err(|error| {
         crabbot_core::Error::Denied(format!("Discord media storage failed: {error}."))
     })?;
+
     Ok(json!({
         "uri": format!("file://{}", destination.display()),
         "name": attachment.name,
@@ -541,16 +600,20 @@ fn local_media(uri: &str) -> crabbot_core::Result<PathBuf> {
         .strip_prefix("file://")
         .map(PathBuf::from)
         .ok_or_else(|| crabbot_core::Error::Denied("Discord attachment URI is invalid.".into()))?;
+
     let root = media_root()?;
     let root = fs::canonicalize(root)
         .map_err(|_| crabbot_core::Error::Denied("Discord media root is unavailable.".into()))?;
+
     let path = fs::canonicalize(path)
         .map_err(|_| crabbot_core::Error::Denied("Discord attachment is unavailable.".into()))?;
+
     if !path.starts_with(root) {
         return Err(crabbot_core::Error::Denied(
             "Discord attachment leaves the media root.".into(),
         ));
     }
+
     Ok(path)
 }
 
@@ -570,7 +633,9 @@ fn cleanup(root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
+
     let cutoff = SystemTime::now().checked_sub(ATTACHMENT_TTL).unwrap_or(SystemTime::UNIX_EPOCH);
+
     for entry in entries.flatten().take(ATTACHMENTS) {
         if entry.file_type().is_ok_and(|value| value.is_file())
             && entry.metadata().and_then(|value| value.modified()).is_ok_and(|value| value < cutoff)
@@ -584,17 +649,21 @@ fn discord_media_url(value: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(value) else {
         return false;
     };
+
     if url.scheme() != "https" {
         return false;
     }
+
     matches!(url.host_str(), Some("cdn.discordapp.com" | "media.discordapp.net"))
 }
 
 fn safe_name(value: &str) -> Option<String> {
     let value = Path::new(value).file_name()?.to_str()?;
+
     if value.is_empty() || value.len() > 255 || value == "." || value == ".." {
         return None;
     }
+
     Some(value.into())
 }
 
@@ -612,6 +681,7 @@ fn approval_request(text: &str, approve: &str, deny: &str) -> crabbot_core::Resu
     if approve == deny || !custom_id(approve) || !custom_id(deny) {
         return Err(crabbot_core::Error::Denied("Approval callback data is invalid.".into()));
     }
+
     Ok(json!({
         "content": text,
         "components": [{
@@ -638,6 +708,7 @@ async fn callback(
             crabbot_core::Error::Denied("Discord interaction is missing or expired.".into())
         })?
     };
+
     let response = client
         .post(format!("{base}/interactions/{id}/{token}/callback"))
         .json(&json!({
@@ -649,11 +720,13 @@ async fn callback(
         .map_err(|_| {
             crabbot_core::Error::Denied("Discord interaction acknowledgement failed.".into())
         })?;
+
     if !response.status().is_success() {
         return Err(crabbot_core::Error::Denied(
             "Discord interaction acknowledgement was rejected.".into(),
         ));
     }
+
     Ok(json!({"acknowledged": true}))
 }
 
@@ -681,6 +754,7 @@ fn edit_requests(
         .next()
         .filter(|part| !part.is_empty())
         .ok_or_else(|| crabbot_core::Error::Denied("edit.text is required.".into()))?;
+
     let mut requests = vec![edit_request(base, channel, message_id, &first)];
     requests.extend(parts.map(|part| {
         (
@@ -689,6 +763,7 @@ fn edit_requests(
             json!({"content": part}),
         )
     }));
+
     Ok(requests)
 }
 
@@ -713,6 +788,7 @@ async fn message(
         .map_err(|error| {
             crabbot_core::Error::Denied(format!("Discord request failed: {error}."))
         })?;
+
     let status = response.status();
     let body = read(response).await?;
     let body: Value = serde_json::from_str(&body).map_err(|error| {
@@ -730,15 +806,18 @@ async fn gateway(
 ) -> crabbot_core::Result<serde_json::Value> {
     let url = std::env::var("CRABBOT_DISCORD_GATEWAY_URL").unwrap_or_else(|_| gateway_url(base));
     let mut state = gateway_state.lock().await;
+
     if state.pending_sequence.is_some() {
         return Err(crabbot_core::Error::Denied(
             "Discord Gateway event is awaiting host acknowledgement.".into(),
         ));
     }
+
     if state.socket.is_none() {
         let (mut socket, _) = connect_async(&url).await.map_err(|error| {
             crabbot_core::Error::Denied(format!("Discord Gateway failed: {error}."))
         })?;
+
         let hello = timeout(Duration::from_secs(10), socket.next())
             .await
             .map_err(|_| crabbot_core::Error::Denied("Discord Gateway hello timed out.".into()))?
@@ -748,6 +827,7 @@ async fn gateway(
             .map_err(|error| {
                 crabbot_core::Error::Denied(format!("Discord Gateway read failed: {error}."))
             })?;
+
         state.interval = Duration::from_millis(heartbeat(&hello)?);
         let payload = state.session_id.as_deref().map_or_else(
             || json!({
@@ -758,11 +838,14 @@ async fn gateway(
                     "properties": {"os": "linux", "browser": "crabbot", "device": "crabbot"}
                 }
             }),
+
             |session_id| json!({"op": 6, "d": {"token": token, "session_id": session_id, "seq": state.sequence}}),
         );
+
         socket.send(Message::Text(payload.to_string().into())).await.map_err(|error| {
             crabbot_core::Error::Denied(format!("Discord Gateway identify failed: {error}."))
         })?;
+
         state.next_heartbeat = Instant::now() + state.interval;
         state.socket = Some(socket);
     }
@@ -789,13 +872,17 @@ async fn gateway(
                         .map_err(|error| crabbot_core::Error::Denied(format!("Discord Gateway heartbeat failed: {error}.")))?;
                     next_heartbeat = Instant::now() + interval;
                 }
+
                 message = socket.next() => {
                     let Some(message) = message else { closed = true; break; };
+
                     let message = message.map_err(|error| crabbot_core::Error::Denied(format!("Discord Gateway read failed: {error}.")))?;
                     let Some(value) = message.into_text().ok().and_then(|text| serde_json::from_str::<serde_json::Value>(text.as_ref()).ok()) else { continue; };
+
                     if value["t"] == "MESSAGE_CREATE" {
                         remember_attachments(&value["d"], &mut attachments);
                     }
+
                     match prepare_gateway_value(
                         &value,
                         &mut sequence,
@@ -818,9 +905,11 @@ async fn gateway(
                                         expires: Instant::now() + Duration::from_secs(300),
                                     },
                                 );
+
                                 if let Some(values) = event.as_object_mut() {
                                     values.remove("callback_token");
                                 }
+
                                 while interactions.len() > 128 {
                                     let Some(oldest) = interactions
                                         .iter()
@@ -829,52 +918,66 @@ async fn gateway(
                                     else {
                                         break;
                                     };
+
                                     interactions.remove(&oldest);
                                 }
                             }
+
                             events.push(event);
                             break;
                         }
+
                         Action::Event(None) | Action::Ignore => {}
+
                         Action::Heartbeat(data) => {
                             socket.send(Message::Text(json!({"op": 1, "d": sequence.or(data.as_u64())}).to_string().into())).await
                                 .map_err(|error| crabbot_core::Error::Denied(format!("Discord Gateway heartbeat failed: {error}.")))?;
                             next_heartbeat = Instant::now() + interval;
                         }
+
                         Action::Reconnect => return Err(crabbot_core::Error::Denied("Discord Gateway requested reconnect.".into())),
+
                         Action::Reject { resumable } => {
                             if !resumable {
                                 session_id = None;
                                 save_cursor(committed_sequence, None)?;
                             }
+
                             return Err(crabbot_core::Error::Denied("Discord Gateway rejected the session.".into()));
                         }
                     }
                 }
             }
         }
+
         Ok::<(), crabbot_core::Error>(())
     })
     .await;
+
     if let Ok(Err(error)) = result {
         state.socket = None;
         return Err(error);
     }
+
     if events.is_empty() {
         state.sequence = sequence;
     }
+
     state.pending_sequence = pending_sequence;
     state.interactions = interactions;
     state.attachments = attachments;
     state.session_id = session_id;
     state.next_heartbeat = next_heartbeat;
+
     if closed {
         state.socket = None;
     }
+
     if let Err(error) = save_cursor(state.sequence, state.session_id.as_deref()) {
         state.socket = None;
         return Err(error);
     }
+
     Ok(json!({"events": events}))
 }
 
@@ -883,11 +986,13 @@ async fn acknowledge(
     sequence: u64,
 ) -> crabbot_core::Result<serde_json::Value> {
     let mut state = gateway_state.lock().await;
+
     if state.pending_sequence != Some(sequence) {
         return Err(crabbot_core::Error::Denied(
             "Discord Gateway acknowledgement is stale.".into(),
         ));
     }
+
     state.sequence = Some(sequence);
     state.pending_sequence = None;
     save_cursor(state.sequence, state.session_id.as_deref())?;
@@ -902,9 +1007,11 @@ fn stage_event(
     let Some(mut event) = event else {
         return Ok(None);
     };
+
     let Some(sequence) = sequence else {
         return Err(crabbot_core::Error::Denied("Discord Gateway message had no sequence.".into()));
     };
+
     event["gateway_sequence"] = json!(sequence);
     *pending = Some(sequence);
     Ok(Some(event))
@@ -920,10 +1027,12 @@ fn prepare_gateway_value(
     if let Some(value) = value["s"].as_u64() {
         *sequence = Some(value);
     }
+
     if value["t"] == "READY" {
         *session_id = value["d"]["session_id"].as_str().map(str::to_owned);
         save_cursor(committed_sequence, session_id.as_deref())?;
     }
+
     match action(value) {
         Action::Event(event) => Ok(Action::Event(stage_event(event, *sequence, pending)?)),
         action => Ok(action),
@@ -938,6 +1047,7 @@ fn load_cursor() -> (Option<u64>, Option<String>) {
     let Some(path) = cursor_path() else {
         return (None, None);
     };
+
     load_cursor_at(&path)
 }
 
@@ -945,12 +1055,15 @@ fn load_cursor_at(path: &Path) -> (Option<u64>, Option<String>) {
     let Ok(Some(bytes)) = load_file(path, 4 * 1024) else {
         return (None, None);
     };
+
     let Ok(value) = serde_json::from_slice::<Cursor>(&bytes) else {
         return (None, None);
     };
+
     if value.version != 1 {
         return (None, None);
     }
+
     (value.sequence, value.session_id)
 }
 
@@ -958,6 +1071,7 @@ fn save_cursor(sequence: Option<u64>, session_id: Option<&str>) -> crabbot_core:
     let Some(path) = cursor_path() else {
         return Ok(());
     };
+
     save_cursor_at(&path, sequence, session_id)
 }
 
@@ -978,13 +1092,16 @@ fn heartbeat(value: &Message) -> crabbot_core::Result<u64> {
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
         .ok_or_else(|| crabbot_core::Error::Denied("Discord Gateway hello was invalid.".into()))?;
+
     if value["op"].as_u64() != Some(10) {
         return Err(crabbot_core::Error::Denied("Discord Gateway hello was invalid.".into()));
     }
+
     let interval =
         value["d"]["heartbeat_interval"].as_u64().filter(|interval| *interval > 0).ok_or_else(
             || crabbot_core::Error::Denied("Discord Gateway heartbeat was invalid.".into()),
         )?;
+
     Ok(interval)
 }
 
@@ -999,27 +1116,34 @@ fn gateway_url(base: &str) -> String {
     if base == "https://discord.com/api/v10" {
         return "wss://gateway.discord.gg/?v=10&encoding=json".into();
     }
+
     if let Some(host) = base.strip_prefix("https://") {
         return format!("wss://{host}");
     }
+
     if let Some(host) = base.strip_prefix("http://") {
         return format!("ws://{host}");
     }
+
     base.into()
 }
 
 fn chunks(text: &str, limit: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut current = String::new();
+
     for character in text.chars() {
         current.push(character);
+
         if current.chars().count() == limit {
             chunks.push(std::mem::take(&mut current));
         }
     }
+
     if !current.is_empty() || chunks.is_empty() {
         chunks.push(current);
     }
+
     chunks
 }
 
@@ -1027,18 +1151,22 @@ fn normalize(value: &serde_json::Value) -> Option<serde_json::Value> {
     if value["author"]["bot"].as_bool() == Some(true) {
         return None;
     }
+
     let id = value["id"].as_str()?;
     let channel = value["channel_id"].as_str()?;
     let text = value["content"].as_str().unwrap_or_default();
     let mut content = Vec::new();
+
     if !text.is_empty() {
         content.push(json!({"kind": "text", "text": text}));
     }
+
     if let Some(attachments) = value["attachments"].as_array() {
         for attachment in attachments {
             let Some(id) = attachment["id"].as_str().filter(|value| snowflake(value)) else {
                 continue;
             };
+
             let uri = format!("discord://attachment/{id}");
             let mime = attachment["content_type"].as_str();
             let voice = attachment["flags"].as_u64().is_some_and(|flags| flags & (1 << 13) != 0);
@@ -1049,6 +1177,7 @@ fn normalize(value: &serde_json::Value) -> Option<serde_json::Value> {
             } else {
                 "file"
             };
+
             if kind == "image" {
                 content.push(
                     json!({"kind": kind, "uri": uri, "alt": attachment["description"].as_str()}),
@@ -1060,14 +1189,17 @@ fn normalize(value: &serde_json::Value) -> Option<serde_json::Value> {
             }
         }
     }
+
     if content.is_empty() {
         return None;
     }
+
     let thread = value["thread_id"]
         .as_str()
         .or_else(|| value["thread"]["id"].as_str())
         .or_else(|| matches!(value["channel_type"].as_u64(), Some(10..=12)).then_some(channel))
         .or_else(|| matches!(value["type"].as_u64(), Some(11 | 12)).then(|| channel));
+
     Some(json!({
         "id": id,
         "chat": channel,
@@ -1086,28 +1218,35 @@ fn remember_attachments(value: &Value, attachments: &mut BTreeMap<String, Attach
     let Some(values) = value["attachments"].as_array() else {
         return;
     };
+
     let expires = Instant::now() + ATTACHMENT_TTL;
+
     for value in values {
         let Some(id) = value["id"].as_str().filter(|value| snowflake(value)) else {
             continue;
         };
+
         let Some(url) = value["url"].as_str().filter(|value| discord_media_url(value)) else {
             continue;
         };
+
         let name = value["filename"]
             .as_str()
             .and_then(safe_name)
             .unwrap_or_else(|| "attachment.bin".into());
+
         let mime = value["content_type"].as_str().map(str::to_owned);
         let size = value["size"].as_u64().and_then(|value| usize::try_from(value).ok());
         attachments.insert(id.into(), Attachment { url: url.into(), name, mime, size, expires });
     }
+
     while attachments.len() > ATTACHMENTS {
         let Some(oldest) =
             attachments.iter().min_by_key(|(_, value)| value.expires).map(|(id, _)| id.clone())
         else {
             break;
         };
+
         attachments.remove(&oldest);
     }
 }
@@ -1116,22 +1255,29 @@ fn normalize_interaction(value: &Value) -> Option<Value> {
     if value["type"].as_u64() != Some(3) {
         return None;
     }
+
     let id = value["id"].as_str()?;
     let channel = value["channel_id"].as_str()?;
+
     if !snowflake(id) || !snowflake(channel) {
         return None;
     }
+
     let data = value["data"]["custom_id"].as_str()?;
+
     if !custom_id(data) {
         return None;
     }
+
     let token = value["token"].as_str()?;
+
     if token.is_empty()
         || token.len() > 512
         || !token.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._~-".contains(&byte))
     {
         return None;
     }
+
     let sender = value["member"]["user"]["id"].as_str().or_else(|| value["user"]["id"].as_str())?;
     let roles = value["member"]["roles"].as_array().cloned().unwrap_or_default();
     Some(json!({
@@ -1162,9 +1308,11 @@ enum Action {
 fn action(value: &Value) -> Action {
     match value["op"].as_u64() {
         Some(0) if value["t"] == "MESSAGE_CREATE" => Action::Event(normalize(&value["d"])),
+
         Some(0) if value["t"] == "INTERACTION_CREATE" => {
             Action::Event(normalize_interaction(&value["d"]))
         }
+
         Some(1) => Action::Heartbeat(value["d"].clone()),
         Some(7) => Action::Reconnect,
         Some(9) => Action::Reject { resumable: value["d"].as_bool().unwrap_or(false) },
@@ -1182,6 +1330,7 @@ fn response_body(
             body["message"].as_str().unwrap_or("unknown error")
         )));
     }
+
     Ok(body)
 }
 
@@ -1189,11 +1338,12 @@ fn response_body(
 mod tests {
     use super::{
         Action, BODY_LIMIT, GatewayState, Operation, acknowledge, action, approval_request, call,
-        call_with, chunks, collect, custom_id, discord_media_url, edit_request, edit_requests,
-        gateway_url, heartbeat, intents, load_cursor_at, local_media, media_root, normalize,
-        normalize_interaction, operation, prepare_gateway_value, remember_attachments,
+        call_with, chunks, cleanup, collect, custom_id, discord_media_url, edit_request,
+        edit_requests, gateway_url, heartbeat, intents, load_cursor_at, local_media, media_root,
+        normalize, normalize_interaction, operation, prepare_gateway_value, remember_attachments,
         response_body, safe_name, save_cursor_at, snowflake, stage_event,
     };
+
     use crabbot_core::types::Request;
     use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
@@ -1203,6 +1353,7 @@ mod tests {
         sync::Mutex as AsyncMutex,
         time::{Duration, Instant},
     };
+
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::{WebSocketStream, accept_async};
 
@@ -1218,12 +1369,15 @@ mod tests {
     fn parses_provider_responses() {
         assert_eq!(response_body(reqwest::StatusCode::OK, json!({"id": "1"})).unwrap()["id"], "1");
         assert!(response_body(reqwest::StatusCode::UNAUTHORIZED, json!({"message":"no"})).is_err());
+        assert!(super::credential().is_err());
+        assert!(super::keyring("discord").is_none());
     }
 
     #[test]
     fn normalizes_gateway_messages() {
         let message =
             json!({"id":"1","channel_id":"2","content":"hello","author":{"id":"3","bot":false}});
+
         assert_eq!(normalize(&message).unwrap()["chat"], "2");
         let attachment = json!({"id":"1","channel_id":"2","content":"","attachments":[{"id":"4","url":"https://cdn.discordapp.com/a.png","content_type":"image/png","filename":"a.png"}],"author":{"id":"3","bot":false}});
         assert_eq!(normalize(&attachment).unwrap()["content"][0]["kind"], "image");
@@ -1286,12 +1440,14 @@ mod tests {
         assert!(matches!(
             operation("send", &json!({"channel": "1", "text": "hello"})).unwrap(),
             Some(Operation::Send { channel, text, content })
+
                 if channel == "1" && text == "hello" && content.is_empty()
         ));
         assert!(matches!(
             operation("edit", &json!({"channel": "1", "message": "2", "text": "hello"}))
                 .unwrap(),
             Some(Operation::Edit { channel, message_id, text })
+
                 if channel == "1" && message_id == "2" && text == "hello"
         ));
         assert!(matches!(
@@ -1301,6 +1457,7 @@ mod tests {
             )
             .unwrap(),
             Some(Operation::Approval { channel, text, approve, deny })
+
                 if channel == "1" && text == "Approve write?" && approve == "allow" && deny == "deny"
         ));
         assert!(matches!(
@@ -1351,6 +1508,7 @@ mod tests {
             "member": {"user": {"id": "40"}, "roles": ["50"]}
         }))
         .unwrap();
+
         assert_eq!(event["kind"], "callback");
         assert_eq!(event["id"], "10");
         assert_eq!(event["chat"], "20");
@@ -1381,6 +1539,7 @@ mod tests {
 
         let requests =
             edit_requests("https://discord.test/api/v10", "1", "2", &"x".repeat(2_001)).unwrap();
+
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].0, reqwest::Method::PATCH);
         assert_eq!(requests[0].2["content"].as_str().unwrap().len(), 2_000);
@@ -1397,6 +1556,9 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
+
+        assert_eq!(load_cursor_at(&path), (None, None));
+        std::fs::write(&path, "{}").unwrap();
         assert_eq!(load_cursor_at(&path), (None, None));
         save_cursor_at(&path, Some(7), Some("session")).unwrap();
         assert_eq!(load_cursor_at(&path), (Some(7), Some("session".into())));
@@ -1417,6 +1579,7 @@ mod tests {
             interactions: Default::default(),
             attachments: Default::default(),
         });
+
         assert_eq!(acknowledge(&state, 7).await.unwrap()["acknowledged"], true);
         assert!(acknowledge(&state, 7).await.is_err());
     }
@@ -1450,6 +1613,7 @@ mod tests {
             "s": 2,
             "d": {"id": "1", "channel_id": "2", "content": "hi", "author": {"id": "3"}}
         });
+
         assert!(matches!(
             prepare_gateway_value(&message, &mut sequence, &mut session_id, None, &mut pending)
                 .unwrap(),
@@ -1462,6 +1626,7 @@ mod tests {
     fn validates_gateway_hello() {
         let message =
             Message::Text(json!({"op":10,"d":{"heartbeat_interval":45000}}).to_string().into());
+
         assert_eq!(heartbeat(&message).unwrap(), 45000);
         let bad = Message::Text(json!({"op":0,"d":{}}).to_string().into());
         assert!(heartbeat(&bad).is_err());
@@ -1516,6 +1681,7 @@ mod tests {
         );
         let note =
             Request::Note { jsonrpc: "2.0".into(), method: "send".into(), params: json!({}) };
+
         assert!(call(&client, note).await.unwrap().is_none());
     }
 
@@ -1524,6 +1690,7 @@ mod tests {
         let Some(listener) = loopback_listener().await else {
             return;
         };
+
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -1549,9 +1716,11 @@ mod tests {
                 .await
                 .unwrap();
         });
+
         let state = AsyncMutex::new(GatewayState::default());
         let events =
             super::gateway(&state, "token", 2, &format!("http://{address}")).await.unwrap();
+
         assert_eq!(events["events"][0]["text"], "hello");
         assert_eq!(events["events"][0]["gateway_sequence"], 1);
         assert_eq!(acknowledge(&state, 1).await.unwrap()["acknowledged"], true);
@@ -1563,6 +1732,7 @@ mod tests {
         let Some(listener) = loopback_listener().await else {
             return;
         };
+
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             for _ in 0..3 {
@@ -1578,6 +1748,7 @@ mod tests {
                 stream.write_all(body).await.unwrap();
             }
         });
+
         let client = reqwest::Client::new();
         let base = format!("http://{address}");
         let sent = call_with(
@@ -1591,6 +1762,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+
         assert_eq!(sent.result.unwrap()["ok"], true);
         let edited = call_with(
             &client,
@@ -1603,6 +1775,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+
         assert_eq!(edited.result.unwrap()["edited"]["ok"], true);
         let approval = call_with(
             &client,
@@ -1615,6 +1788,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+
         assert_eq!(approval.result.unwrap()["ok"], true);
         server.await.unwrap();
     }
@@ -1624,6 +1798,7 @@ mod tests {
         let Some(listener) = loopback_listener().await else {
             return;
         };
+
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -1636,6 +1811,7 @@ mod tests {
                 .await
                 .unwrap();
         });
+
         let state = AsyncMutex::new(GatewayState {
             socket: None,
             interval: Duration::from_secs(45),
@@ -1654,6 +1830,7 @@ mod tests {
             .collect(),
             attachments: Default::default(),
         });
+
         let value = super::callback(
             &reqwest::Client::new(),
             &state,
@@ -1663,6 +1840,7 @@ mod tests {
         )
         .await
         .unwrap();
+
         assert_eq!(value["acknowledged"], true);
         assert!(
             super::callback(
@@ -1703,6 +1881,10 @@ mod tests {
 
     #[test]
     fn validates_media_metadata_and_identifiers() {
+        assert!(super::parse_content(&json!({})).unwrap().is_empty());
+        assert!(super::parse_content(&json!([{"kind": "unknown"}])).is_err());
+        let too_many = (0..9).map(|_| json!({"kind": "text", "text": "x"})).collect::<Vec<_>>();
+        assert!(super::parse_content(&json!(too_many)).is_err());
         assert!(discord_media_url("https://cdn.discordapp.com/files/a.png"));
         assert!(discord_media_url("https://media.discordapp.net/files/a.png"));
         assert!(!discord_media_url("http://cdn.discordapp.com/files/a.png"));
@@ -1718,6 +1900,7 @@ mod tests {
         assert!(!custom_id("not valid"));
 
         let mut attachments = std::collections::BTreeMap::new();
+        remember_attachments(&json!({}), &mut attachments);
         remember_attachments(
             &json!({
                 "attachments": [
@@ -1731,6 +1914,20 @@ mod tests {
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments["1"].name, "a.txt");
 
+        let many = (0..257)
+            .map(|id| {
+                json!({
+                    "id": (id + 10).to_string(),
+                    "url": "https://cdn.discordapp.com/a.txt",
+                    "filename": "a.txt"
+                })
+            })
+            .collect::<Vec<_>>();
+
+        remember_attachments(&json!({"attachments": many}), &mut attachments);
+        assert_eq!(attachments.len(), 256);
+        cleanup(std::path::Path::new("/path/that/does/not/exist"));
+
         let content = json!([{"kind":"text","text":"hello"}]);
         assert!(matches!(
             operation("send", &json!({"channel":"1", "content": content})).unwrap(),
@@ -1743,6 +1940,7 @@ mod tests {
         );
         let too_many =
             serde_json::Value::Array((0..9).map(|_| json!({"kind":"text","text":"x"})).collect());
+
         assert!(operation("send", &json!({"channel":"1", "content": too_many})).is_err());
         assert!(media_root().is_err());
         assert!(local_media("outside").is_err());
@@ -1758,6 +1956,7 @@ mod tests {
             "data": {"custom_id": "approve"},
             "user": {"id": "40"}
         });
+
         assert!(normalize_interaction(&invalid_token).is_none());
 
         let path = std::env::temp_dir().join(format!(
@@ -1765,6 +1964,7 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
+
         std::fs::write(&path, json!({"version": 2, "sequence": 4}).to_string()).unwrap();
         assert_eq!(load_cursor_at(&path), (None, None));
         let _ = std::fs::remove_file(path);

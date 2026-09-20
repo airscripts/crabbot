@@ -2,6 +2,7 @@ use crate::{
     Error, Result,
     types::{Content, Event, Message, Role},
 };
+
 use serde_json::Value;
 
 const LIMIT: usize = 256;
@@ -19,16 +20,20 @@ pub fn turn<M: Model>(model: &mut M, messages: &[Message], steps: usize) -> Resu
     if steps == 0 {
         return Err(Error::Limit("steps must be greater than zero".into()));
     }
+
     let events = model.reply(messages)?;
     let mut text = String::new();
+
     for event in events.into_iter().take(steps) {
         match event {
             Event::Text { text: part } => text.push_str(&part),
             Event::Done { text: done } => text = done,
             Event::Error { message } => return Err(Error::Denied(message)),
+
             Event::Tool { .. } => {}
         }
     }
+
     Ok(Message {
         id: "reply".into(),
         session: messages.first().map_or_else(|| "session".into(), |m| m.session.clone()),
@@ -49,17 +54,21 @@ pub fn run<M: Model, T: Tool>(
     }
 
     let mut history = messages.to_vec();
+
     let mut used = 0_usize;
+
     for step in 0..steps {
         let events = model.reply(&history)?;
         let mut text = String::new();
         let mut calls = Vec::new();
         let mut called = false;
+
         for event in events {
             match event {
                 Event::Text { text: part } => text.push_str(&part),
                 Event::Done { text: done } => text = done,
                 Event::Error { message } => return Err(Error::Denied(message)),
+
                 Event::Tool { name, args } => {
                     calls.push((name, args));
                     called = true;
@@ -73,9 +82,11 @@ pub fn run<M: Model, T: Tool>(
                 .map(|(name, args)| format!("[Tool call {name}]: {args}"))
                 .collect::<Vec<_>>()
                 .join("\n");
+
             if !text.is_empty() {
                 text.push('\n');
             }
+
             text.push_str(&marker);
             history.push(Message {
                 id: format!("assistant-tool-{step}-{}", history.len()),
@@ -84,6 +95,7 @@ pub fn run<M: Model, T: Tool>(
                 sender: None,
                 content: vec![Content::Text { text: text.clone() }],
             });
+
             if history.len() > LIMIT {
                 history.drain(..history.len() - LIMIT);
             }
@@ -91,9 +103,11 @@ pub fn run<M: Model, T: Tool>(
 
         for (name, args) in calls {
             used = used.saturating_add(1);
+
             if used > CALLS {
                 return Err(Error::Limit("tool-call limit exceeded".into()));
             }
+
             // Model output never grants approval; hosts must apply policy before invoking tools.
             let result = tools.call(&name, &args, false)?;
             history.push(Message {
@@ -103,6 +117,7 @@ pub fn run<M: Model, T: Tool>(
                 sender: Some(name),
                 content: vec![Content::Text { text: result }],
             });
+
             if history.len() > LIMIT {
                 history.drain(..history.len() - LIMIT);
             }
@@ -118,6 +133,7 @@ pub fn run<M: Model, T: Tool>(
             });
         }
     }
+
     Err(Error::Limit("tool steps exhausted".into()))
 }
 
@@ -151,6 +167,7 @@ mod tests {
             if messages.iter().any(|message| message.role == Role::Tool) {
                 return Ok(vec![Event::Done { text: "finished".into() }]);
             }
+
             self.count += 1;
             Ok(vec![Event::Tool { name: "read".into(), args: serde_json::json!({"path": "note"}) }])
         }
@@ -205,6 +222,7 @@ mod tests {
             sender: None,
             content: vec![Content::Text { text: "hi".into() }],
         };
+
         let reply = turn(&mut Echo, &[input], 4).unwrap();
         assert_eq!(reply.content, vec![Content::Text { text: "done".into() }]);
     }
@@ -218,6 +236,7 @@ mod tests {
             sender: None,
             content: vec![Content::Text { text: "hi".into() }],
         };
+
         assert!(turn(&mut Echo, std::slice::from_ref(&input), 0).is_err());
         assert!(turn(&mut Failure, std::slice::from_ref(&input), 1).is_err());
 
@@ -247,6 +266,7 @@ mod tests {
             sender: None,
             content: vec![Content::Text { text: "hi".into() }],
         };
+
         let mut model = Calls { count: 0 };
         let reply = run(&mut model, &mut Read, std::slice::from_ref(&input), 2).unwrap();
         assert_eq!(reply.content, vec![Content::Text { text: "finished".into() }]);
@@ -254,9 +274,11 @@ mod tests {
         assert!(run(&mut Calls { count: 0 }, &mut Read, &[], 0).is_err());
         assert!(run(&mut Calls { count: 0 }, &mut Read, &[], 1).is_err());
         assert!(run(&mut Mixed, &mut Read, std::slice::from_ref(&input), 1).is_err());
+
         assert!(
             run(&mut Calls { count: 0 }, &mut BrokenTool, std::slice::from_ref(&input), 1).is_err()
         );
+
         assert!(run(&mut Flood, &mut Read, &[], 257).is_err());
     }
 }

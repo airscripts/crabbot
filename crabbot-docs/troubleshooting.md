@@ -11,6 +11,13 @@ crabbot doctor
 Confirm that the daemon and CLI use the same `CRABBOT_HOME`. If a plugin is
 missing, build or install it, then run `crabbot doctor` again.
 
+`crabbot doctor` does not change local state by default. If the home directory,
+default configuration, or plugins directory is missing, use
+`crabbot doctor --fix` to create those safe defaults without overwriting an
+existing configuration. Invalid configuration and plugin integrity failures
+require manual correction or plugin reinstall/update. Use `crabbot init
+--force` only when intentionally recreating the default configuration.
+
 ## No Channel Replies
 
 Check the channel token, plugin status, and configured `allow` list. For group

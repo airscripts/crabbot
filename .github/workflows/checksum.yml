@@ -11,8 +11,8 @@ permissions:
   contents: read
 
 jobs:
-  checksum:
-    name: Generate Checksums
+  generate:
+    name: Generate
     runs-on: ubuntu-latest
     container: rust:1.89-trixie
 

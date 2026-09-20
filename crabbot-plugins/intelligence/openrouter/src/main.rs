@@ -7,6 +7,7 @@ use crabbot_core::{
         Role,
     },
 };
+
 use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -24,6 +25,7 @@ async fn main() -> crabbot_core::Result<()> {
         .map_err(|error| {
             crabbot_core::Error::Denied(format!("OpenRouter client failed: {error}."))
         })?;
+
     serve_events(
         Hello {
             protocol: Protocol::CURRENT,
@@ -49,9 +51,11 @@ async fn generate(
         Request::Call { id, method, params, .. } => (id, method, params),
         Request::Note { .. } => return Ok(None),
     };
+
     if method != "generate" {
         return Ok(None);
     }
+
     let input: ModelRequest = serde_json::from_value(params)?;
     let key = credential()?;
     let model = if input.model.trim().is_empty() || input.model == "default" {
@@ -61,8 +65,10 @@ async fn generate(
     } else {
         input.model.clone()
     };
+
     let base = base_url()?;
     let request = ModelRequest { model, ..input };
+
     if request.stream {
         stream(client, id, request, &key, &base, &mut emitter).await
     } else {
@@ -73,14 +79,18 @@ async fn generate(
 fn base_url() -> crabbot_core::Result<String> {
     let value = std::env::var("CRABBOT_OPENROUTER_BASE_URL")
         .unwrap_or_else(|_| "https://openrouter.ai/api/v1".into());
+
     let url = reqwest::Url::parse(&value)
         .map_err(|_| crabbot_core::Error::Denied("OpenRouter base URL is invalid.".into()))?;
+
     let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+
     if url.scheme() != "https" && !local {
         return Err(crabbot_core::Error::Denied(
             "OpenRouter base URL must use HTTPS outside loopback.".into(),
         ));
     }
+
     Ok(value.trim_end_matches('/').into())
 }
 
@@ -106,6 +116,7 @@ async fn complete(
         .map_err(|error| {
             crabbot_core::Error::Denied(format!("OpenRouter request failed: {error}."))
         })?;
+
     let status = response.status();
     let body = collect(response.bytes_stream()).await?;
     response_body(id, status, serde_json::from_slice(&body)?)
@@ -134,17 +145,20 @@ async fn stream(
         .map_err(|error| {
             crabbot_core::Error::Denied(format!("OpenRouter stream failed: {error}."))
         })?;
+
     if !response.status().is_success() {
         return Err(crabbot_core::Error::Denied(format!(
             "OpenRouter stream was rejected with {}.",
             response.status()
         )));
     }
+
     stream_body(id, response.bytes_stream(), emitter).await
 }
 
 fn headers() -> crabbot_core::Result<reqwest::header::HeaderMap> {
     let mut headers = reqwest::header::HeaderMap::new();
+
     if let Some(value) =
         std::env::var("CRABBOT_OPENROUTER_REFERER").ok().filter(|value| !value.is_empty())
     {
@@ -155,6 +169,7 @@ fn headers() -> crabbot_core::Result<reqwest::header::HeaderMap> {
             })?,
         );
     }
+
     if let Some(value) =
         std::env::var("CRABBOT_OPENROUTER_TITLE").ok().filter(|value| !value.is_empty())
     {
@@ -165,6 +180,7 @@ fn headers() -> crabbot_core::Result<reqwest::header::HeaderMap> {
                 .map_err(|_| crabbot_core::Error::Denied("OpenRouter title is invalid.".into()))?,
         );
     }
+
     Ok(headers)
 }
 
@@ -175,17 +191,21 @@ where
     E: std::fmt::Display,
 {
     let mut bytes = Vec::new();
+
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             crabbot_core::Error::Denied(format!("OpenRouter response failed: {error}."))
         })?;
+
         if chunk.as_ref().len() > BODY_LIMIT.saturating_sub(bytes.len()) {
             return Err(crabbot_core::Error::Denied(
                 "OpenRouter response exceeded the frame budget.".into(),
             ));
         }
+
         bytes.extend_from_slice(chunk.as_ref());
     }
+
     Ok(bytes)
 }
 
@@ -193,22 +213,28 @@ fn messages(input: &ModelRequest) -> crabbot_core::Result<Vec<Value>> {
     input.messages.iter().map(|message| {
         let role = match message.role { Role::System => "system", Role::User => "user", Role::Assistant => "assistant", Role::Tool => "user" };
         let mut parts = Vec::new();
+
         if message.role == Role::Tool {
             parts.push(json!({"type":"text","text":"[Tool result]"}));
         }
+
         for item in &message.content {
             match item {
                 Content::Text { text } => parts.push(json!({"type":"text","text":text})),
+
                 Content::Image { uri, .. } if message.role != Role::System => {
                     parts.push(json!({"type":"image_url","image_url":{"url":image(uri)?}}));
                 }
+
                 Content::Image { alt, .. } => parts.push(json!({"type":"text","text":alt.as_deref().unwrap_or("[Image attachment.]")})),
                 item => parts.push(json!({"type":"text","text":item.render()})),
             }
         }
+
         let content = if parts.iter().all(|part| part["type"] == "text") {
             Value::String(parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n"))
         } else { Value::Array(parts) };
+
         Ok(json!({"role":role,"content":content}))
     }).collect()
 }
@@ -242,41 +268,53 @@ where
     let mut pending = String::new();
     let mut calls = BTreeMap::<usize, (String, String)>::new();
     let mut bytes: usize = 0;
+
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             crabbot_core::Error::Denied(format!("OpenRouter stream failed: {error}."))
         })?;
+
         bytes = bytes.saturating_add(chunk.as_ref().len());
+
         if bytes > BODY_LIMIT {
             return Err(crabbot_core::Error::Denied(
                 "OpenRouter stream exceeded the frame budget.".into(),
             ));
         }
+
         buffer.extend_from_slice(chunk.as_ref());
+
         while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
             let line = buffer.drain(..=end).collect::<Vec<_>>();
+
             if stream_line(&line, &mut text, &mut pending, &mut calls)? {
                 break;
             }
+
             if pending.len() >= 128 {
                 emit(&mut pending, emitter).await?;
             }
         }
+
         if !pending.is_empty() {
             emit(&mut pending, emitter).await?;
         }
     }
+
     if !buffer.is_empty() {
         stream_line(&buffer, &mut text, &mut pending, &mut calls)?;
     }
+
     emit(&mut pending, emitter).await?;
     let events = calls
         .into_values()
         .map(|(name, args)| {
             let args = if args.is_empty() { json!({}) } else { serde_json::from_str(&args)? };
+
             Ok(Event::Tool { name, args })
         })
         .collect::<crabbot_core::Result<Vec<_>>>()?;
+
     response(
         id,
         serde_json::to_value(ModelReply {
@@ -297,17 +335,23 @@ fn stream_line(
 ) -> crabbot_core::Result<bool> {
     let line = std::str::from_utf8(line)
         .map_err(|_| crabbot_core::Error::Denied("OpenRouter stream was not UTF-8.".into()))?;
+
     let Some(data) = line.trim().strip_prefix("data:") else { return Ok(false) };
+
     let data = data.trim();
+
     if data == "[DONE]" {
         return Ok(true);
     }
+
     let value: Value = serde_json::from_str(data)?;
     let delta = &value["choices"][0]["delta"];
+
     if let Some(value) = delta["content"].as_str() {
         text.push_str(value);
         pending.push_str(value);
     }
+
     if let Some(values) = delta["tool_calls"].as_array() {
         for value in values {
             let index = value["index"]
@@ -319,15 +363,19 @@ fn stream_line(
                         "OpenRouter stream exceeded the tool-call limit.".into(),
                     )
                 })?;
+
             let entry = calls.entry(index).or_insert_with(|| (String::new(), String::new()));
+
             if let Some(value) = value["function"]["name"].as_str() {
                 entry.0.push_str(value);
             }
+
             if let Some(value) = value["function"]["arguments"].as_str() {
                 entry.1.push_str(value);
             }
         }
     }
+
     Ok(false)
 }
 
@@ -335,6 +383,7 @@ async fn emit(pending: &mut String, emitter: &mut Emitter) -> crabbot_core::Resu
     if !pending.is_empty() {
         emitter.event(json!({"kind":"text","text":std::mem::take(pending)})).await?;
     }
+
     Ok(())
 }
 
@@ -349,9 +398,11 @@ fn response_body(
             body["error"]["message"].as_str().unwrap_or("request failed")
         )));
     }
+
     let choice = body["choices"].as_array().and_then(|values| values.first()).ok_or_else(|| {
         crabbot_core::Error::Denied("OpenRouter response contained no choices.".into())
     })?;
+
     let text = choice["message"]["content"].as_str().unwrap_or_default().to_owned();
     let events: Vec<Event> = choice["message"]["tool_calls"]
         .as_array()
@@ -369,11 +420,13 @@ fn response_body(
                 .collect()
         })
         .unwrap_or_default();
+
     if text.is_empty() && events.is_empty() {
         return Err(crabbot_core::Error::Denied(
             "OpenRouter response contained no text or tools.".into(),
         ));
     }
+
     response(
         id,
         serde_json::to_value(ModelReply {
@@ -388,11 +441,13 @@ fn response_body(
 
 fn response(id: u64, result: Value) -> crabbot_core::Result<Option<Response>> {
     let response = Response::ok(id, result);
+
     if serde_json::to_vec(&response)?.len().saturating_add(1) > crabbot_core::jsonl::MAX {
         return Err(crabbot_core::Error::Denied(
             "OpenRouter response exceeds the protocol frame limit.".into(),
         ));
     }
+
     Ok(Some(response))
 }
 
@@ -402,15 +457,18 @@ fn credential() -> crabbot_core::Result<String> {
     {
         return Ok(value);
     }
+
     Err(crabbot_core::Error::Denied("CRABBOT_OPENROUTER_KEY is not configured.".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_LIMIT, collect, image, messages, response_body, stream_body, stream_line, tools,
+        BODY_LIMIT, base_url, collect, credential, generate, headers, image, messages, response,
+        response_body, stream_body, stream_line, tools,
     };
-    use crabbot_core::types::{Content, Message, ModelRequest, Role, ToolSpec};
+
+    use crabbot_core::types::{Content, Message, ModelRequest, Request, Role, ToolSpec};
     use futures_util::stream;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -472,7 +530,50 @@ mod tests {
             sender: None,
             content: vec![Content::Text { text: "result".into() }],
         });
+
         assert_eq!(messages(&tool).unwrap().last().unwrap()["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn ignores_notes_and_unknown_calls_without_provider_access() {
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let emitter = crabbot_core::plugin::Emitter::new(output);
+        assert!(
+            generate(
+                &reqwest::Client::new(),
+                Request::Note { jsonrpc: "2.0".into(), method: "note".into(), params: json!({}) },
+                emitter,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let emitter = crabbot_core::plugin::Emitter::new(output);
+        assert!(
+            generate(&reqwest::Client::new(), Request::call(1, "other", json!({})), emitter,)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let emitter = crabbot_core::plugin::Emitter::new(output);
+        assert!(
+            generate(&reqwest::Client::new(), Request::call(1, "generate", json!({})), emitter,)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validates_provider_configuration_and_protocol_size() {
+        assert!(base_url().is_ok());
+        assert!(credential().is_err());
+        assert!(headers().is_ok());
+        assert!(response(1, json!({"ok": true})).unwrap().is_some());
+        assert!(response_body(1, reqwest::StatusCode::OK, json!({"choices": []})).is_err());
     }
 
     #[test]
@@ -482,6 +583,7 @@ mod tests {
             reqwest::StatusCode::OK,
             json!({"choices":[{"message":{"content":"done","tool_calls":[{"function":{"name":"read","arguments":"{\"path\":\"note\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":3}}),
         ).unwrap().unwrap();
+
         assert_eq!(response.result.as_ref().unwrap()["text"], "done");
         assert_eq!(response.result.as_ref().unwrap()["events"][0]["name"], "read");
         assert!(response_body(1, reqwest::StatusCode::UNAUTHORIZED, json!({})).is_err());
@@ -499,6 +601,7 @@ mod tests {
             ),
             Ok(b"data: [DONE]\n".to_vec()),
         ]);
+
         let (output, mut events) = tokio::sync::mpsc::channel(4);
         let mut emitter = crabbot_core::plugin::Emitter::new(output);
         let response = stream_body(2, chunks, &mut emitter).await.unwrap().unwrap();
@@ -524,6 +627,22 @@ mod tests {
         .is_ok());
         assert_eq!(calls[&0].0, "read");
         assert!(stream_line(b"invalid", &mut text, &mut pending, &mut calls).is_ok());
+        assert!(stream_line(&[0xff], &mut text, &mut pending, &mut calls).is_err());
+        assert!(stream_line(b"data: {", &mut text, &mut pending, &mut calls).is_err());
+        assert!(
+            stream_line(
+                br#"data: {"choices":[{"delta":{"tool_calls":[{"index":16}]}}]}"#,
+                &mut text,
+                &mut pending,
+                &mut calls,
+            )
+            .is_err()
+        );
+
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let mut emitter = crabbot_core::plugin::Emitter::new(output);
+        let chunks = stream::iter(vec![Ok::<_, std::io::Error>(b"data: nope\n".to_vec())]);
+        assert!(stream_body(2, chunks, &mut emitter).await.is_err());
     }
 
     #[tokio::test]
@@ -531,6 +650,7 @@ mod tests {
         let Some(listener) = loopback_listener().await else {
             return;
         };
+
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -544,6 +664,7 @@ mod tests {
             stream.write_all(header.as_bytes()).await.unwrap();
             stream.write_all(body).await.unwrap();
         });
+
         let result = super::complete(
             &reqwest::Client::new(),
             1,
@@ -554,6 +675,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+
         assert_eq!(result.result.unwrap()["text"], "done");
         server.await.unwrap();
     }
@@ -563,6 +685,7 @@ mod tests {
         let Some(listener) = loopback_listener().await else {
             return;
         };
+
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -577,6 +700,7 @@ mod tests {
             stream.write_all(header.as_bytes()).await.unwrap();
             stream.write_all(body).await.unwrap();
         });
+
         let (output, mut events) = tokio::sync::mpsc::channel(4);
         let mut emitter = crabbot_core::plugin::Emitter::new(output);
         let mut input = model();
@@ -592,6 +716,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+
         assert_eq!(response.result.unwrap()["text"], "ok");
         assert_eq!(events.recv().await.unwrap()["params"]["event"]["text"], "ok");
         server.await.unwrap();

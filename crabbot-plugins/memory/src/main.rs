@@ -10,6 +10,7 @@ use crabbot_core::{
     plugin::serve_with,
     types::{Capability, Hello, Protocol, Request, Response},
 };
+
 use crabbot_file::{load as load_file, save as save_file};
 use serde_json::json;
 
@@ -75,6 +76,7 @@ fn call_at(
         Request::Call { id, method, params, .. } => (id, method, params),
         Request::Note { .. } => return Ok(None),
     };
+
     let mut state =
         items.lock().map_err(|_| crabbot_core::Error::Denied("Memory lock is poisoned.".into()))?;
 
@@ -86,36 +88,47 @@ fn call_at(
             let value = params["value"]
                 .as_str()
                 .ok_or_else(|| crabbot_core::Error::Denied("remember.value is required.".into()))?;
+
             if key.trim().is_empty() {
                 return Err(crabbot_core::Error::Denied("remember.key cannot be empty.".into()));
             }
+
             if key.contains('\0') {
                 return Err(crabbot_core::Error::Denied("remember.key cannot contain NUL.".into()));
             }
+
             if key.len() > VALUE_LIMIT || value.len() > VALUE_LIMIT {
                 return Err(crabbot_core::Error::Denied(
                     "Memory keys and values must be smaller than 256 KiB.".into(),
                 ));
             }
+
             let mode = params["mode"].as_str().unwrap_or("suggest");
+
             if mode == "off" {
                 return Err(crabbot_core::Error::Denied("Memory is disabled.".into()));
             }
+
             if !matches!(mode, "suggest" | "auto") {
                 return Err(crabbot_core::Error::Denied("Memory mode is invalid.".into()));
             }
+
             if mode == "suggest" && params["approved"] != true {
                 return Err(crabbot_core::Error::Denied("Memory approval is required.".into()));
             }
+
             let scope = params["scope"].as_str().unwrap_or("global");
+
             if scope.trim().is_empty() {
                 return Err(crabbot_core::Error::Denied("remember.scope cannot be empty.".into()));
             }
+
             if scope.contains('\0') {
                 return Err(crabbot_core::Error::Denied(
                     "remember.scope cannot contain NUL.".into(),
                 ));
             }
+
             let at = now();
             let previous = state.clone();
             let storage = storage(scope, key);
@@ -130,6 +143,7 @@ fn call_at(
                     updated: at,
                 },
             );
+
             if state.items.len() > LIMIT {
                 let excess = state.items.len() - LIMIT;
                 let mut keys = state
@@ -139,26 +153,32 @@ fn call_at(
                     .collect::<Vec<_>>();
                 keys.sort_by_key(|(_, updated)| *updated);
                 let keys = keys.into_iter().take(excess).map(|(key, _)| key).collect::<Vec<_>>();
+
                 for key in keys {
                     state.items.remove(&key);
                 }
             }
+
             state.audit.push(Audit {
                 action: "remember".into(),
                 key: key.into(),
                 scope: scope.into(),
                 at,
             });
+
             if state.audit.len() > LIMIT {
                 let excess = state.audit.len() - LIMIT;
                 state.audit.drain(..excess);
             }
+
             if let Err(error) = persist_at(location, &state) {
                 *state = previous;
                 return Err(error);
             }
+
             json!({"ok": true, "scope": scope, "mode": mode})
         }
+
         "list" => {
             let scope = params["scope"].as_str();
             json!({
@@ -170,6 +190,7 @@ fn call_at(
                     .collect::<Vec<_>>()
             })
         }
+
         "audit" => {
             let key = params["key"].as_str();
             json!({
@@ -181,20 +202,25 @@ fn call_at(
                     .collect::<Vec<_>>()
             })
         }
+
         "forget" => {
             let key = params["key"]
                 .as_str()
                 .ok_or_else(|| crabbot_core::Error::Denied("forget.key is required.".into()))?;
             let scope = params["scope"].as_str().unwrap_or("global");
+
             if key.contains('\0') {
                 return Err(crabbot_core::Error::Denied("forget.key cannot contain NUL.".into()));
             }
+
             if scope.contains('\0') {
                 return Err(crabbot_core::Error::Denied("forget.scope cannot contain NUL.".into()));
             }
+
             let previous = state.clone();
             let storage = storage(scope, key);
             let deleted = state.items.contains_key(&storage);
+
             if deleted && let Some(entry) = state.items.remove(&storage) {
                 state.audit.push(Audit {
                     action: "forget".into(),
@@ -202,21 +228,26 @@ fn call_at(
                     scope: entry.scope,
                     at: now(),
                 });
+
                 if state.audit.len() > LIMIT {
                     let excess = state.audit.len() - LIMIT;
                     state.audit.drain(..excess);
                 }
             }
+
             if let Err(error) = persist_at(location, &state) {
                 *state = previous;
                 return Err(error);
             }
+
             json!({"deleted": deleted})
         }
+
         _ => return Ok(None),
     };
 
     let response = Response::ok(id, result);
+
     if serde_json::to_vec(&response)?.len().saturating_add(1 + FRAME_HEADROOM)
         > crabbot_core::jsonl::MAX
     {
@@ -224,6 +255,7 @@ fn call_at(
             "Memory response exceeds the protocol frame limit.".into(),
         ));
     }
+
     Ok(Some(response))
 }
 
@@ -235,14 +267,17 @@ fn load_at(path: Option<&std::path::Path>) -> Arc<Mutex<State>> {
     let Some(path) = path else {
         return Arc::new(Mutex::new(State::default()));
     };
+
     let bytes = match load_file(path, BYTE_LIMIT as u64) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Arc::new(Mutex::new(State::default())),
+
         Err(_) => {
             quarantine(path);
             return Arc::new(Mutex::new(State::default()));
         }
     };
+
     let state = String::from_utf8(bytes).ok().and_then(|text| {
         serde_json::from_str::<State>(&text).ok().or_else(|| {
             serde_json::from_str::<BTreeMap<String, String>>(&text).ok().map(|items| State {
@@ -259,24 +294,30 @@ fn load_at(path: Option<&std::path::Path>) -> Arc<Mutex<State>> {
             })
         })
     });
+
     if state.is_none() {
         quarantine(path);
     }
+
     let mut state = state.unwrap_or_default();
+
     for (storage, entry) in &mut state.items {
         if entry.key.is_empty() {
             entry.key = storage.split_once('\0').map_or(storage.as_str(), |(_, key)| key).into();
         }
     }
+
     if state.items.len() > LIMIT {
         let excess = state.items.len() - LIMIT;
         let mut values = state.items.into_iter().collect::<Vec<_>>();
         values.sort_by_key(|(_, entry)| entry.updated);
         state.items = values.into_iter().skip(excess).collect();
     }
+
     if state.audit.len() > LIMIT {
         state.audit.drain(..state.audit.len() - LIMIT);
     }
+
     Arc::new(Mutex::new(state))
 }
 
@@ -292,11 +333,13 @@ fn quarantine(path: &Path) {
     if !path.is_file() {
         return;
     }
+
     let target = path.with_file_name(format!(
         ".{}.corrupt-{}",
         path.file_name().and_then(|value| value.to_str()).unwrap_or("memory"),
         nonce()
     ));
+
     let _ = std::fs::rename(path, target);
 }
 
@@ -304,13 +347,17 @@ fn persist_at(path: Option<&std::path::Path>, state: &State) -> crabbot_core::Re
     let Some(path) = path else {
         return Ok(());
     };
+
     if path.parent().is_some_and(|parent| !parent.is_dir()) {
         return Err(crabbot_core::Error::Denied("Memory state directory is unavailable.".into()));
     }
+
     let text = serde_json::to_vec_pretty(state)?;
+
     if text.len() > BYTE_LIMIT {
         return Err(crabbot_core::Error::Denied("Memory state exceeds the size limit.".into()));
     }
+
     save_file(path, text).map_err(Into::into)
 }
 
@@ -332,6 +379,7 @@ mod tests {
         BYTE_LIMIT, Entry, LIMIT, State, VALUE_LIMIT, call, call_at, load, load_at, path,
         persist_at, storage,
     };
+
     use crabbot_core::types::Request;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -349,6 +397,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+
         assert_eq!(put.result.unwrap()["ok"], true);
 
         let list = call(&items, Request::call(2, "list", json!({}))).unwrap().unwrap();
@@ -356,10 +405,12 @@ mod tests {
 
         let audit =
             call(&items, Request::call(3, "audit", json!({"key": "name"}))).unwrap().unwrap();
+
         assert_eq!(audit.result.unwrap()["items"][0]["action"], "remember");
 
         let forget =
             call(&items, Request::call(4, "forget", json!({"key": "name"}))).unwrap().unwrap();
+
         assert_eq!(forget.result.unwrap()["deleted"], true);
     }
 
@@ -367,6 +418,7 @@ mod tests {
     fn memory_rejects_missing_values() {
         let error =
             call(&items(), Request::call(1, "remember", json!({"key": "name"}))).unwrap_err();
+
         assert!(error.to_string().contains("remember.value"));
     }
 
@@ -385,6 +437,7 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(
             call(
                 &items,
@@ -396,6 +449,7 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(call(
             &items,
             Request::call(
@@ -415,9 +469,11 @@ mod tests {
         assert!(call(&items, Request::call(3, "unknown", json!({}))).unwrap().is_none());
         let note =
             Request::Note { jsonrpc: "2.0".into(), method: "list".into(), params: json!({}) };
+
         assert!(call(&items, note).unwrap().is_none());
         let forgotten =
             call(&items, Request::call(4, "forget", json!({"key": "missing"}))).unwrap().unwrap();
+
         assert_eq!(forgotten.result.unwrap()["deleted"], false);
     }
 
@@ -436,16 +492,19 @@ mod tests {
                 updated: 0,
             },
         );
+
         persist_at(Some(&path), &state).unwrap();
         assert_eq!(
             load_at(Some(&path)).lock().unwrap().items[&storage("global", "key")].value,
             "value"
         );
+
         std::fs::write(&path, r#"{"legacy":"value"}"#).unwrap();
         assert_eq!(
             load_at(Some(&path)).lock().unwrap().items[&storage("global", "legacy")].scope,
             "global"
         );
+
         std::fs::write(&path, "broken").unwrap();
         assert!(load_at(Some(&path)).lock().unwrap().items.is_empty());
         std::fs::File::create(&path).unwrap().set_len(BYTE_LIMIT as u64 + 1).unwrap();
@@ -472,6 +531,7 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(
             call(
                 &items,
@@ -483,9 +543,11 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(
             call(&items, Request::call(1, "remember", json!({"key": "x", "value": "y"}))).is_err()
         );
+
         assert!(
             call(
                 &items,
@@ -493,6 +555,7 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(
             call(
                 &items,
@@ -504,6 +567,7 @@ mod tests {
             )
             .is_err()
         );
+
         let remembered = call(
             &items,
             Request::call(
@@ -514,6 +578,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+
         assert_eq!(remembered.result.unwrap()["scope"], "room");
         assert_eq!(
             call(&items, Request::call(5, "list", json!({"scope": "other"})))
@@ -526,6 +591,7 @@ mod tests {
                 .len(),
             0
         );
+
         assert_eq!(
             call(&items, Request::call(6, "forget", json!({"key": "x", "scope": "other"})))
                 .unwrap()
@@ -534,6 +600,7 @@ mod tests {
                 .unwrap()["deleted"],
             false
         );
+
         assert!(
             call(&items, Request::call(7, "forget", json!({"key": "bad\u{0000}key"})),).is_err()
         );
@@ -542,6 +609,7 @@ mod tests {
     #[test]
     fn bounds_memory_history_and_items() {
         let items = items();
+
         for index in 0..=LIMIT {
             call(
                 &items,
@@ -553,6 +621,7 @@ mod tests {
             )
             .unwrap();
         }
+
         let state = items.lock().unwrap();
         assert_eq!(state.items.len(), LIMIT);
         assert_eq!(state.audit.len(), LIMIT);
@@ -560,7 +629,9 @@ mod tests {
 
         let path =
             std::env::temp_dir().join(format!("crabbot-memory-bound-{}.json", std::process::id()));
+
         let mut state = State::default();
+
         for index in 0..=LIMIT {
             state.items.insert(
                 storage("global", &format!("key-{index}")),
@@ -572,6 +643,7 @@ mod tests {
                     updated: 0,
                 },
             );
+
             state.audit.push(super::Audit {
                 action: "remember".into(),
                 key: format!("key-{index}"),
@@ -579,6 +651,7 @@ mod tests {
                 at: index as u64,
             });
         }
+
         std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
         #[cfg(unix)]
         {
@@ -588,7 +661,9 @@ mod tests {
             permissions.set_mode(0o600);
             std::fs::set_permissions(&path, permissions).unwrap();
         }
+
         let loaded = load_at(Some(&path)).lock().unwrap().clone();
+
         assert_eq!(loaded.items.len(), LIMIT);
         assert_eq!(loaded.audit.len(), LIMIT);
         let _ = std::fs::remove_file(path);
@@ -599,6 +674,7 @@ mod tests {
         let items = items();
         {
             let mut state = items.lock().unwrap();
+
             for index in 0..LIMIT {
                 state.audit.push(super::Audit {
                     action: "remember".into(),
@@ -607,6 +683,7 @@ mod tests {
                     at: index as u64,
                 });
             }
+
             state.items.insert(
                 storage("global", "last"),
                 Entry {
@@ -618,7 +695,9 @@ mod tests {
                 },
             );
         }
+
         call(&items, Request::call(1, "forget", json!({"key": "last"}))).unwrap();
+
         let state = items.lock().unwrap();
         assert_eq!(state.audit.len(), LIMIT);
         assert_eq!(state.audit.last().unwrap().action, "forget");
@@ -628,6 +707,7 @@ mod tests {
     fn restores_memory_when_forget_persistence_fails() {
         let root =
             std::env::temp_dir().join(format!("crabbot-memory-forget-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let blocker = root.join("blocker");
@@ -638,6 +718,7 @@ mod tests {
             Request::call(1, "remember", json!({"key": "x", "value": "y", "mode": "auto"})),
         )
         .unwrap();
+
         assert!(
             call_at(
                 &state,
@@ -646,6 +727,7 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(state.lock().unwrap().items.contains_key(&storage("global", "x")));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -654,6 +736,7 @@ mod tests {
     fn restores_memory_when_persistence_fails() {
         let root =
             std::env::temp_dir().join(format!("crabbot-memory-blocker-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let blocker = root.join("blocker");
@@ -667,6 +750,7 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(state.lock().unwrap().items.is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -678,6 +762,7 @@ mod tests {
 
         let path =
             std::env::temp_dir().join(format!("crabbot-memory-shared-{}.json", std::process::id()));
+
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, r#"{"items":{},"audit":[]}"#).unwrap();
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();

@@ -5,6 +5,7 @@ use crabbot_core::{
     plugin::Emitter,
     types::{Content, Message, ModelReply, ModelRequest, Response, Role, ToolSpec},
 };
+
 use serde_json::{Value, json};
 use tokio::{
     io::BufReader,
@@ -30,9 +31,11 @@ async fn command_with(
 ) -> crabbot_core::Result<String> {
     let name = params["name"].as_str().unwrap_or_default();
     let args = params["args"].as_array().cloned().unwrap_or_default();
+
     if name != "codex" {
         return Err(denied("Unknown Codex command."));
     }
+
     let command = args.first().and_then(Value::as_str).unwrap_or_default();
     let mut server = Server::start_with(binary, home).await?;
     server.initialize().await?;
@@ -44,20 +47,25 @@ async fn command_with(
                 Some("--device") => true,
                 Some(_) => return Err(denied("Use crabbot codex login [--device].")),
             };
+
             login(&mut server, device, emitter).await
         }
+
         "status" if args.len() == 1 => {
             let result = server.call("account/read", json!({})).await?;
+
             if result["account"].is_null() {
                 Ok("Codex is not signed in.".into())
             } else {
                 Ok("Codex is signed in.".into())
             }
         }
+
         "logout" if args.len() == 1 => {
             server.call("account/logout", json!({})).await?;
             Ok("Codex signed out.".into())
         }
+
         _ => Err(denied("Use crabbot codex login [--device], status, or logout.")),
     }
 }
@@ -68,10 +76,12 @@ async fn login(
     emitter: &mut Emitter,
 ) -> crabbot_core::Result<String> {
     let kind = if device { "chatgptDeviceCode" } else { "chatgpt" };
+
     let result = server.call("account/login/start", json!({"type": kind})).await?;
     let login_id = result["loginId"]
         .as_str()
         .ok_or_else(|| denied("Codex did not return a login identifier."))?;
+
     let instructions = if device {
         let url = result["verificationUrl"]
             .as_str()
@@ -86,35 +96,46 @@ async fn login(
             .ok_or_else(|| denied("Codex did not return a sign-in URL."))?;
         format!("Open this URL to sign in to Codex: {url}\n")
     };
+
     emitter.event(json!({"kind": "text", "text": instructions})).await?;
 
     let deadline = Instant::now() + LOGIN_TIMEOUT;
     let mut notices = 0_usize;
+
     loop {
         let value = timeout_at(deadline, jsonl::read::<Value>(&mut server.input, jsonl::MAX))
             .await
             .map_err(|_| denied("Codex sign-in timed out."))??
             .ok_or_else(|| denied("Codex app-server closed during sign-in."))?;
+
         if !valid_rpc(&value) {
             return Err(denied("Codex app-server returned an invalid JSON-RPC message."));
         }
+
         notices = notices.saturating_add(1);
+
         if notices > 4096 {
             return Err(denied("Codex sent too many messages during sign-in."));
         }
+
         if value["method"] != "account/login/completed" {
             if value.get("id").is_some() && value.get("method").is_some() {
                 return Err(denied("Codex app-server sent an unsupported sign-in request."));
             }
+
             continue;
         }
+
         let params = &value["params"];
+
         if params["loginId"].as_str().is_some_and(|id| id != login_id) {
             continue;
         }
+
         if params["success"] == true {
             return Ok("Codex sign-in completed.".into());
         }
+
         return Err(denied("Codex sign-in failed."));
     }
 }
@@ -137,6 +158,7 @@ async fn generate_with(
     let mut server = Server::start_with(binary, home).await?;
     server.initialize().await?;
     let account = server.call("account/read", json!({})).await?;
+
     if account["account"].is_null() {
         return Err(denied("Codex is not signed in. Run crabbot codex login first."));
     }
@@ -167,14 +189,17 @@ async fn generate_with(
                         "computer_use": false,
                         "view_image": false
                     },
+
                     "mcp_servers": {}
                 }
             }),
         )
         .await?;
+
     let thread_id = thread["thread"]["id"]
         .as_str()
         .ok_or_else(|| denied("Codex did not return a thread identifier."))?;
+
     let input_items = prompt(&input.messages)?;
     let started = server
         .call(
@@ -189,13 +214,16 @@ async fn generate_with(
             }),
         )
         .await?;
+
     let turn_id = started["turn"]["id"]
         .as_str()
         .or_else(|| started["turnId"].as_str())
         .ok_or_else(|| denied("Codex did not return a turn identifier."))?;
+
     let text = timeout(TURN_TIMEOUT, server.turn(thread_id, turn_id, &allowed, &mut emitter))
         .await
         .map_err(|_| denied("Codex exceeded the turn time limit."))??;
+
     let response = Response::ok(
         id,
         serde_json::to_value(ModelReply {
@@ -206,9 +234,11 @@ async fn generate_with(
             events: Vec::new(),
         })?,
     );
+
     if serde_json::to_vec(&response)?.len().saturating_add(1) > jsonl::MAX {
         return Err(denied("Codex response exceeded the protocol frame limit."));
     }
+
     Ok(Some(response))
 }
 
@@ -216,6 +246,7 @@ fn dynamic_tools(tools: &[ToolSpec]) -> crabbot_core::Result<Vec<Value>> {
     if tools.len() > TOOLS {
         return Err(denied("Crabbot supplied too many tools to Codex."));
     }
+
     let mut names = std::collections::BTreeSet::new();
     tools
         .iter()
@@ -223,6 +254,7 @@ fn dynamic_tools(tools: &[ToolSpec]) -> crabbot_core::Result<Vec<Value>> {
             if tool.name.trim().is_empty() || !names.insert(tool.name.as_str()) {
                 return Err(denied("Crabbot supplied invalid or duplicate tool names."));
             }
+
             Ok(json!({
                 "type": "function",
                 "name": tool.name,
@@ -235,33 +267,41 @@ fn dynamic_tools(tools: &[ToolSpec]) -> crabbot_core::Result<Vec<Value>> {
 
 fn prompt(messages: &[Message]) -> crabbot_core::Result<Vec<Value>> {
     let mut output = Vec::new();
+
     for message in messages {
         if message.role == Role::System {
             continue;
         }
+
         let tag = match message.role {
             Role::System => continue,
             Role::User => "\n<User>\n",
             Role::Assistant => "\n<Assistant>\n",
             Role::Tool => "\n<Tool Result>\n",
         };
+
         output.push(json!({"type": "text", "text": tag}));
+
         for content in &message.content {
             match content {
                 Content::Text { text } => {
                     output.push(json!({"type": "text", "text": format!("{text}\n")}));
                 }
+
                 Content::Image { uri, alt } => {
                     let url = codex_image_url(uri)?;
                     output.push(json!({"type": "image", "url": url}));
+
                     if let Some(alt) = alt {
                         output.push(json!({"type": "text", "text": alt}));
                     }
                 }
+
                 Content::File { name, .. } => output.push(json!({
                     "type": "text",
                     "text": format!("[File attachment: {name}]\n")
                 })),
+
                 Content::Audio { .. } => output.push(json!({
                     "type": "text",
                     "text": "[Audio attachment omitted.]\n"
@@ -269,9 +309,11 @@ fn prompt(messages: &[Message]) -> crabbot_core::Result<Vec<Value>> {
             }
         }
     }
+
     if output.is_empty() {
         return Err(denied("Codex input is empty."));
     }
+
     if serde_json::to_vec(&output)
         .map_err(|_| denied("Codex input could not be serialized."))?
         .len()
@@ -279,6 +321,7 @@ fn prompt(messages: &[Message]) -> crabbot_core::Result<Vec<Value>> {
     {
         return Err(denied("Codex input exceeded the request limit."));
     }
+
     Ok(output)
 }
 
@@ -288,6 +331,7 @@ fn codex_image_url(uri: &str) -> crabbot_core::Result<&str> {
     else {
         return Err(denied("Codex requires images as inline data URLs."));
     };
+
     if !matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp")
         || encoded.is_empty()
         || !encoded
@@ -296,22 +340,26 @@ fn codex_image_url(uri: &str) -> crabbot_core::Result<&str> {
     {
         return Err(denied("Codex received an invalid image data URL."));
     }
+
     Ok(uri)
 }
 
 fn instructions(messages: &[Message]) -> crabbot_core::Result<String> {
     let mut output = String::new();
+
     for message in messages.iter().filter(|message| message.role == Role::System) {
         for content in &message.content {
             if let Content::Text { text } = content {
                 if text.len() > BODY.saturating_sub(output.len()) {
                     return Err(denied("Codex instructions exceeded the request limit."));
                 }
+
                 output.push_str(text);
                 output.push('\n');
             }
         }
     }
+
     Ok(output)
 }
 
@@ -333,25 +381,32 @@ impl Server {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         command.env_clear();
+
         for name in ["PATH", "TEMP", "TMP", "TMPDIR"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
             }
         }
+
         if let Some(path) = home {
             command.env("CODEX_HOME", &path);
+
             if let Some(home) = path.parent().map(PathBuf::from) {
                 command.env("HOME", &home);
                 command.env("USERPROFILE", home);
             }
         }
+
         let mut child = command
             .spawn()
             .map_err(|error| denied(&format!("Codex app-server could not start: {error}.")))?;
+
         let output =
             child.stdin.take().ok_or_else(|| denied("Codex app-server input is unavailable."))?;
+
         let stdout =
             child.stdout.take().ok_or_else(|| denied("Codex app-server output is unavailable."))?;
+
         Ok(Self { child, input: BufReader::new(stdout), output, next: 1 })
     }
 
@@ -377,27 +432,35 @@ impl Server {
         jsonl::write(&mut self.output, &request).await?;
         timeout(RPC_TIMEOUT, async {
             let mut notices = 0_usize;
+
             loop {
                 let value = jsonl::read::<Value>(&mut self.input, jsonl::MAX)
                     .await?
                     .ok_or_else(|| denied("Codex app-server closed its output."))?;
+
                 if !valid_rpc(&value) {
                     return Err(denied("Codex app-server returned an invalid JSON-RPC message."));
                 }
+
                 if value["id"].as_u64() != Some(id) {
                     notices = notices.saturating_add(1);
+
                     if notices > 4096 {
                         return Err(denied("Codex sent too many messages before a response."));
                     }
+
                     if value.get("id").is_some() && value.get("method").is_some() {
                         self.reply_error(value["id"].clone(), -32601, "Unsupported Codex request.")
                             .await?;
                     }
+
                     continue;
                 }
+
                 if value.get("error").is_some_and(|error| !error.is_null()) {
                     return Err(denied("Codex app-server rejected a request."));
                 }
+
                 return value
                     .get("result")
                     .cloned()
@@ -434,27 +497,35 @@ impl Server {
                         .map_err(|_| denied("Codex exceeded the turn time limit."))??
                         .ok_or_else(|| denied("Codex app-server closed during a turn."))?
                 }
+
                 _ = ticker.tick(), if !pending.is_empty() => {
                     emit(&mut pending, emitter).await?;
                     continue;
                 }
             };
+
             if !valid_rpc(&value) {
                 return Err(denied("Codex app-server returned an invalid JSON-RPC message."));
             }
+
             notices = notices.saturating_add(1);
+
             if notices > 4096 {
                 return Err(denied("Codex sent too many turn events."));
             }
+
             if value.get("method").is_none() {
                 continue;
             }
+
             if value["method"] == "item/agentMessage/delta" {
                 if value["params"]["threadId"] != thread || value["params"]["turnId"] != turn {
                     continue;
                 }
+
                 if let Some(delta) = value["params"]["delta"].as_str() {
                     append(delta, &mut text, &mut pending)?;
+
                     if pending.len() >= 128 {
                         emit(&mut pending, emitter).await?;
                     }
@@ -463,20 +534,26 @@ impl Server {
                 if value["params"]["threadId"] != thread {
                     continue;
                 }
+
                 let result = &value["params"]["turn"];
+
                 if result["id"] != turn || result["status"] != "completed" {
                     return Err(denied("Codex turn did not complete successfully."));
                 }
+
                 if let Some(final_text) = final_text(result) {
                     text = final_text;
                 }
+
                 emit(&mut pending, emitter).await?;
                 return Ok(text);
             } else if value.get("id").is_some() {
                 calls = calls.saturating_add(1);
+
                 if calls > TOOLS {
                     return Err(denied("Codex exceeded the tool-call limit."));
                 }
+
                 self.tool(&value, thread, turn, allowed, emitter).await?;
             } else if value["method"] == "error" {
                 return Err(denied("Codex app-server reported an error."));
@@ -493,24 +570,29 @@ impl Server {
         emitter: &mut Emitter,
     ) -> crabbot_core::Result<()> {
         let id = request["id"].clone();
+
         if request["method"] != "item/tool/call" {
             self.reply_error(id, -32601, "Unsupported Codex request.").await?;
             return Ok(());
         }
+
         if let Some(message) = tool_denial(request, thread, turn, allowed) {
             self.reply_error(id, -32602, message).await?;
             return Ok(());
         }
+
         let params = &request["params"];
         let name = params["tool"].as_str().unwrap_or_default();
         let response =
             emitter.call("host/tool", json!({"name": name, "args": params["arguments"]})).await?;
+
         let (success, output) = if let Some(error) = response.error {
             (false, error.message)
         } else {
             let value = response.result.unwrap_or(Value::Null);
             (true, value["text"].as_str().unwrap_or_default().to_owned())
         };
+
         let mut reply = json!({
             "id": id,
             "result": {
@@ -518,11 +600,13 @@ impl Server {
                 "contentItems": [{"type": "inputText", "text": output}]
             }
         });
+
         if serde_json::to_vec(&reply)?.len().saturating_add(1) > jsonl::MAX {
             reply["result"]["contentItems"][0]["text"] =
                 "Tool output exceeded the Codex protocol limit.".into();
             reply["result"]["success"] = false.into();
         }
+
         jsonl::write(&mut self.output, &reply).await
     }
 
@@ -559,18 +643,23 @@ fn tool_denial(
     allowed: &BTreeSet<String>,
 ) -> Option<&'static str> {
     let params = &request["params"];
+
     if params["threadId"] != thread || params["turnId"] != turn {
         return Some("The tool request does not match the active turn.");
     }
+
     let Some(name) = params["tool"].as_str() else {
         return Some("A tool name is required.");
     };
+
     if !allowed.contains(name) {
         return Some("The requested tool was not declared by Crabbot.");
     }
+
     if !params["arguments"].is_object() {
         return Some("Tool arguments must be an object.");
     }
+
     None
 }
 
@@ -578,6 +667,7 @@ fn append(part: &str, text: &mut String, pending: &mut String) -> crabbot_core::
     if part.len() > BODY.saturating_sub(text.len()) {
         return Err(denied("Codex response exceeded the response limit."));
     }
+
     text.push_str(part);
     pending.push_str(part);
     Ok(())
@@ -587,6 +677,7 @@ async fn emit(pending: &mut String, emitter: &mut Emitter) -> crabbot_core::Resu
     if !pending.is_empty() {
         emitter.event(json!({"kind": "text", "text": std::mem::take(pending)})).await?;
     }
+
     Ok(())
 }
 
@@ -601,9 +692,11 @@ async fn check_version(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+
     if let Some(path) = home {
         command.env("CODEX_HOME", path);
     }
+
     let output = timeout(Duration::from_secs(3), executable_output(&mut command))
         .await
         .map_err(|_| denied("Codex version check timed out."))?
@@ -612,12 +705,15 @@ async fn check_version(
                 "Codex CLI could not be started ({error}). Install Codex CLI and ensure `codex` is on PATH, or set CRABBOT_CODEX_BINARY."
             ))
         })?;
+
     let version = String::from_utf8_lossy(&output.stdout);
+
     if !version_reported(output.status.success(), &version) {
         return Err(denied(
             "Codex CLI could not report its version. Reinstall it using the official setup guide or set CRABBOT_CODEX_BINARY.",
         ));
     }
+
     Ok(())
 }
 
@@ -627,9 +723,11 @@ async fn executable_output(command: &mut Command) -> std::io::Result<std::proces
             Err(error) if attempt < 2 && executable_busy(&error) => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+
             result => return result,
         }
     }
+
     unreachable!()
 }
 
@@ -638,6 +736,7 @@ fn executable_busy(error: &std::io::Error) -> bool {
     {
         error.raw_os_error() == Some(26)
     }
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = error;
@@ -675,12 +774,15 @@ fn workspace(value: Option<&str>) -> crabbot_core::Result<PathBuf> {
         .or_else(|| std::env::var_os("CRABBOT_ROOT").map(PathBuf::from))
         .or_else(|| std::env::current_dir().ok())
         .ok_or_else(|| denied("A Crabbot workspace is required for Codex."))?;
+
     let path = path
         .canonicalize()
         .map_err(|_| denied("The configured Codex workspace is unavailable."))?;
+
     if !path.is_dir() {
         return Err(denied("The configured Codex workspace is not a directory."));
     }
+
     Ok(path)
 }
 
@@ -690,6 +792,7 @@ mod tests {
         Server, check_version, command_with, dynamic_tools, final_text, generate_with,
         instructions, prompt, tool_denial, valid_rpc, version_reported, workspace,
     };
+
     use crabbot_core::types::{Content, Message, ModelRequest, Role, ToolSpec};
     use serde_json::json;
     use tokio::sync::mpsc;
@@ -718,6 +821,7 @@ mod tests {
             description: Some("Read a file".into()),
             schema: json!({"type": "object"}),
         }];
+
         let value = dynamic_tools(&tools).unwrap();
         assert_eq!(value[0]["name"], "read");
         assert_eq!(value[0]["inputSchema"]["type"], "object");
@@ -751,6 +855,7 @@ mod tests {
                 }],
             },
         ];
+
         let prompt = prompt(&messages).unwrap();
         assert!(instructions(&messages).unwrap().contains("Rules"));
         assert_eq!(prompt[1], json!({"type": "image", "url": "data:image/png;base64,aW1hZ2U="}));
@@ -767,6 +872,7 @@ mod tests {
                 {"type": "agentMessage", "text": "Final."}
             ]
         });
+
         assert_eq!(final_text(&turn).as_deref(), Some("Final."));
         assert_eq!(final_text(&json!({"items": []})), None);
     }
@@ -797,6 +903,7 @@ mod tests {
     async fn explains_the_codex_install_requirement() {
         let path =
             std::env::temp_dir().join(format!("crabbot-codex-missing-{}", std::process::id()));
+
         let error = check_version(path.as_os_str(), None).await.unwrap_err().to_string();
 
         assert!(error.contains("Install Codex CLI"));
@@ -814,6 +921,7 @@ mod tests {
                 "arguments": {"path": "README.md"}
             }
         });
+
         assert_eq!(tool_denial(&request, "thread-1", "turn-1", &allowed), None);
 
         let mut other = request.clone();
@@ -856,6 +964,7 @@ mod tests {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let path =
             std::env::temp_dir().join(format!("crabbot-codex-{}-{nonce}", std::process::id()));
+
         let script = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
     printf '%s\n' 'codex-cli 99.0.0'
@@ -873,14 +982,17 @@ while IFS= read -r line; do
     esac
 done
 "#;
+
         write_binary(&path, script).unwrap();
 
         let mut server = Server::start_with(path.as_os_str().to_owned(), None).await.unwrap();
         server.initialize().await.unwrap();
         let thread =
             server.call("thread/start", json!({"cwd": ".", "ephemeral": true})).await.unwrap();
+
         let turn =
             server.call("turn/start", json!({"threadId": thread["thread"]["id"]})).await.unwrap();
+
         let (output, mut events) = mpsc::channel(8);
         let mut emitter = crate::Emitter::new(output);
         let text = server
@@ -908,8 +1020,10 @@ done
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let binary = std::env::temp_dir()
             .join(format!("crabbot-codex-generate-{}-{nonce}", std::process::id()));
+
         let root = std::env::temp_dir()
             .join(format!("crabbot-codex-workspace-{}-{nonce}", std::process::id()));
+
         let script = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
     printf '%s\n' 'codex-cli 99.0.0'
@@ -945,6 +1059,7 @@ done
                     sender: None,
                     content: vec![Content::Text { text: "Hello".into() }],
                 }],
+
                 stream: true,
                 tools: vec![ToolSpec {
                     name: "read".into(),
@@ -963,6 +1078,7 @@ done
         assert_eq!(response.id, 9);
         let reply: crabbot_core::types::ModelReply =
             serde_json::from_value(response.result.unwrap()).unwrap();
+
         assert_eq!(reply.text, "Hello");
         assert_eq!(events.try_recv().unwrap()["params"]["event"]["text"], "Hello");
         let _ = std::fs::remove_file(binary);
@@ -977,14 +1093,18 @@ done
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let path = std::env::temp_dir()
             .join(format!("crabbot-codex-login-{}-{nonce}", std::process::id()));
+
         let script = r#"#!/bin/sh
+
 if [ "$1" = "--version" ]; then
     printf '%s\n' 'codex-cli 99.0.0'
     exit 0
 fi
+
 while IFS= read -r line; do
     case "$line" in
         *initialize*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+
         *account/login/start*)
             printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"type":"chatgptDeviceCode","loginId":"login-1","verificationUrl":"https://example.test/device","userCode":"ABCD-EFGH"}}'
             printf '%s\n' '{"jsonrpc":"2.0","method":"account/login/completed","params":{"loginId":"login-1","success":true}}'

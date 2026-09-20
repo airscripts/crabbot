@@ -60,13 +60,16 @@ impl Gate {
     pub fn issue(&mut self, target: Target) -> io::Result<Challenge> {
         let now = now()?;
         let target_size = serde_json::to_vec(&target).map_err(io::Error::other)?.len();
+
         if target_size > TARGET_LIMIT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Approval request exceeds the size limit.",
             ));
         }
+
         self.pending.retain(|_, pending| pending.expires > now);
+
         if self.pending.len() >= LIMIT {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Approval capacity is full."));
         }
@@ -106,8 +109,10 @@ impl Gate {
         if !authorized {
             return None;
         }
+
         let (id, action, provided_signature) = decode(token)?;
         let pending = self.pending.get(id)?;
+
         if pending.expires <= now
             || pending.target.channel != channel
             || pending.target.chat != chat
@@ -115,7 +120,9 @@ impl Gate {
         {
             return None;
         }
+
         let expected = signature(&self.key, id, pending, action).ok()?;
+
         if !bool::from(expected.ct_eq(&provided_signature)) {
             return None;
         }
@@ -154,11 +161,14 @@ impl Gate {
         if id.len() != ID_BYTES * 2 || id.bytes().any(|byte| !byte.is_ascii_hexdigit()) {
             return None;
         }
+
         let now = now().ok()?;
+
         if self.pending.get(id)?.expires <= now {
             self.pending.remove(id);
             return None;
         }
+
         self.pending.remove(id)?.answer.send(approved).ok()?;
         Some(approved)
     }
@@ -192,32 +202,40 @@ fn decode(value: &str) -> Option<(&str, u8, [u8; MAC_BYTES])> {
     if value.len() != ID_BYTES * 2 + 1 + MAC_BYTES * 2 + 2 || !value.is_ascii() {
         return None;
     }
+
     let id = value.get(..ID_BYTES * 2)?;
     let middle = value.get(ID_BYTES * 2..)?.strip_prefix('.')?;
     let (signature, action) = middle.split_once('.')?;
+
     if id.bytes().any(|byte| !byte.is_ascii_hexdigit())
         || signature.len() != MAC_BYTES * 2
         || signature.bytes().any(|byte| !byte.is_ascii_hexdigit())
     {
         return None;
     }
+
     let action = match action {
         "a" => b'a',
         "d" => b'd',
         _ => return None,
     };
+
     let mut bytes = [0_u8; MAC_BYTES];
+
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&signature[index * 2..index * 2 + 2], 16).ok()?;
     }
+
     Some((id, action, bytes))
 }
 
 fn hex(bytes: &[u8]) -> String {
     let mut value = String::with_capacity(bytes.len() * 2);
+
     for byte in bytes {
         value.push_str(&format!("{byte:02x}"));
     }
+
     value
 }
 
@@ -353,6 +371,7 @@ mod tests {
         for challenge in challenges {
             gate.cancel(&challenge.approve);
         }
+
         assert!(gate.pending.is_empty());
     }
 }

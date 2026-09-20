@@ -27,6 +27,18 @@ crabbot plugin link telegram --yes
 crabbot doctor
 ```
 
+Before opening a pull request, check Rust formatting and repository block
+spacing with `make fmt`. Apply both formatters with:
+
+```sh
+cargo fmt --all
+make spacing
+make fmt
+```
+
+The spacing formatter is idempotent and preserves the contents of Rust raw
+strings. Keep its inserted blank lines between adjacent multiline statements.
+
 Build only the plugins you plan to use. After changing a linked plugin, rebuild
 its package and run `crabbot plugin link <id> --yes`; the host health-checks the
 staged executable and loads it into a running daemon without a restart.
@@ -47,6 +59,13 @@ On a Linux host with Docker or Podman available, run
 `crabbot-scripts/sandbox.sh target/debug/crabbot-plugin-tools` to verify the
 networkless, read-only-root tools sandbox against a local image. The script
 uses only an image already present on the host and does not pull one.
+
+Use `make ci` for new or changed GitHub Actions workflows and for debugging
+workflow behavior that depends on action ordering, inputs, runners, or
+artifacts. It runs `crabbot-ci/ci.sh`, which performs the local preflight and
+then exercises the important Actions flow through `act`. For ordinary source
+changes, use `make verify`, `make test`, and `make build` without the container
+workflow.
 
 ## Background Service
 

@@ -31,7 +31,9 @@ locking your data into a hosted service.
 
 When working on the repository, read `AGENTS.md`, the nearest scoped guidance,
 and the relevant local documentation before making changes. Treat the
-repository’s implementation and documentation as the source of truth.
+repository’s implementation and documentation as the source of truth. For
+Rust changes, run `cargo fmt --all`, `make spacing`, and `make fmt` before
+testing; keep the spacing formatter’s blank lines between multiline statements.
 
 ## Installation
 
@@ -63,8 +65,9 @@ when that capability is needed. The base installation remains useful on its
 own for initialization, diagnostics, status, service management, and plugin
 management.
 
-The core archive ships the `crabbot` CLI and `crabbot-daemon` binaries, plus
-license files; it contains no plugin binaries. Each official plugin is a
+The core archive ships the `crabbot` CLI, its shorter `crab` alias, and the
+`crabbot-daemon` binary, plus license files; it contains no plugin binaries.
+Each official plugin is a
 separate, optional archive. The installer verifies its checksum, installs it
 under the configured Crabbot home
 (`CRABBOT_HOME/plugins/<id>` when `CRABBOT_HOME` is set), and registers it in
@@ -99,6 +102,7 @@ Ensure `~/.cargo/bin` is on `PATH`, then verify the installation:
 ```sh
 crabbot --version
 crabbot help
+crab --version
 ```
 
 `make install` is an equivalent repository-local shortcut. Re-run both
@@ -276,11 +280,27 @@ make verify
 ```
 
 The workflow checks formatting, Clippy, locked compilation, tests, coverage,
-builds, and metrics. Workspace line coverage must remain at or above 80%:
+builds, and metrics. Core and host package line coverage must remain at or above
+80%:
 
 ```sh
 make coverage
 ```
+
+`make fmt` checks both `cargo fmt` and the repository spacing formatter. Use
+`cargo fmt --all` followed by `make spacing` to apply formatting, then rerun
+`make fmt` to confirm the result. The spacing formatter is idempotent and
+preserves Rust raw-string contents.
+
+Use `make ci` only when adding or changing GitHub Actions workflows, or when
+debugging the workflow’s own ordering, inputs, runners, or action behavior. It
+uses `crabbot-ci/ci.sh` and `act` after a local preflight. For normal code
+changes, `make verify`, `make test`, and `make build` are enough.
+
+Generate shell completion scripts with `crabbot completion SHELL`. The command
+supports `bash`, `fish`, `powershell`, and `zsh`; write the output to
+the shell’s completion directory or source it according to that shell’s normal
+installation procedure.
 
 See [AGENTS.md](AGENTS.md) for repository boundaries and conventions,
 [ROADMAP.md](ROADMAP.md) for planned work, and the
@@ -290,11 +310,12 @@ boundaries.
 Run the independent review loop:
 
 ```sh
-./crabbot-scripts/revloop.sh
+make revloop
 ```
 
-Use `CRABBOT_REVLOOP_OUTPUT=verbose` when the full orchestrator and worker
-stream is useful during diagnosis. Each orchestrator pass performs a deep
+Use `make revloop REVLOOP_ARGS=--verbose` or
+`CRABBOT_REVLOOP_OUTPUT=verbose` when the full orchestrator and worker stream
+is useful during diagnosis. Each orchestrator pass performs a deep
 review and records every distinct material finding it identifies. Blocking
 findings still control worker cycles and the bounded
 `CRABBOT_REVLOOP_MAX_CYCLES` convergence limit; non-blocking findings remain

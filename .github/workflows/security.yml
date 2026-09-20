@@ -3,6 +3,12 @@ name: Security
 on:
   workflow_call:
   workflow_dispatch:
+    inputs:
+      local:
+        description: "Use the local act working tree"
+        required: false
+        type: string
+        default: ""
   schedule:
     - cron: "23 4 * * 1"
 
@@ -13,10 +19,10 @@ jobs:
   dependencies:
     name: Dependencies
     runs-on: ubuntu-latest
-    container: rust:1.89-trixie
 
     steps:
       - name: Checkout
+        if: inputs.local != 'true'
         uses: actions/checkout@v7
 
       - name: Audit Rust Dependencies
@@ -27,3 +33,6 @@ jobs:
 
       - name: Check Dependency Policy
         uses: EmbarkStudios/cargo-deny-action@v2
+
+        with:
+          rust-version: "1.89.0"

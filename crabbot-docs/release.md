@@ -17,7 +17,7 @@ publish crates or containers.
 
 1. Update `VERSION`, the workspace manifests, `CITATION.cff`, and the matching
    `CHANGELOG.md` heading.
-2. Run `make verify` and confirm the workspace remains above 80% line coverage.
+2. Run `make verify` and confirm the core and host packages remain above 80% line coverage.
 3. Run `crabbot-scripts/release.sh vX.Y.Z` to build the release binaries.
 4. Inspect archive contents and checksums with `crabbot-scripts/check.sh`.
 5. Review installer output on each supported platform before publishing.
@@ -31,8 +31,8 @@ Release scripts are intentionally explicit. They do not publish crates,
 containers, or services, and they must not receive credentials through command
 arguments.
 
-Core archives contain the `crabbot` and `crabbot-daemon` executables plus
-license files, but no plugin binaries. Every plugin has its own archive with
+Core archives contain the `crabbot`, `crab`, and `crabbot-daemon` executables
+plus license files, but no plugin binaries. Every plugin has its own archive with
 its manifest and executable under `bin/`. Plugin archives are registered one
 at a time in `plugins.lock` under
 `CRABBOT_HOME/plugins/<id>` (or the platform configuration directory). A

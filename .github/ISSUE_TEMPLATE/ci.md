@@ -1,5 +1,5 @@
 ---
-name: CI
+name: Continuous Integration
 about: Continuous Integration to the rescue!
 title: ""
 labels: ci

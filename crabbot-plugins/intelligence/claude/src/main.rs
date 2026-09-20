@@ -6,6 +6,7 @@ use crabbot_core::{
         Capability, Content, Event, Hello, ModelReply, ModelRequest, Protocol, Request, Response,
     },
 };
+
 use futures_util::{Stream, StreamExt};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -22,6 +23,7 @@ async fn main() -> crabbot_core::Result<()> {
         .map_err(|error| {
             crabbot_core::Error::Denied(format!("Anthropic client failed: {error}."))
         })?;
+
     serve_events(
         Hello {
             protocol: Protocol::CURRENT,
@@ -47,9 +49,11 @@ async fn generate(
         Request::Call { id, method, params, .. } => (id, method, params),
         Request::Note { .. } => return Ok(None),
     };
+
     if method != "generate" {
         return Ok(None);
     }
+
     let input: ModelRequest = serde_json::from_value(params)?;
     let primary = std::env::var("CRABBOT_CLAUDE_KEY").ok();
     let key = key(primary.as_deref())
@@ -59,8 +63,10 @@ async fn generate(
             })
         })
         .or_else(|_| file_key())?;
+
     let base = std::env::var("CRABBOT_CLAUDE_BASE_URL")
         .unwrap_or_else(|_| "https://api.anthropic.com".into());
+
     generate_at(client, id, input, &key, &base, &mut emitter).await
 }
 
@@ -92,13 +98,16 @@ fn file_key() -> crabbot_core::Result<String> {
     let Some(path) = std::env::var_os("CRABBOT_CREDENTIALS") else {
         return Err(crabbot_core::Error::Denied("CRABBOT_CLAUDE_KEY is not configured.".into()));
     };
+
     crabbot_file::private(&path)?;
     let text = std::fs::read_to_string(path).map_err(|error| {
         crabbot_core::Error::Denied(format!("Credentials could not be read: {error}."))
     })?;
+
     let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
         crabbot_core::Error::Denied(format!("Credentials are invalid: {error}."))
     })?;
+
     key(value["CRABBOT_CLAUDE_KEY"].as_str())
 }
 
@@ -106,6 +115,7 @@ fn keyring(name: &str) -> Option<String> {
     if std::env::var("CRABBOT_KEYRING").ok().as_deref() != Some("1") {
         return None;
     }
+
     keyring::Entry::new("dev.airscripts.crabbot", name)
         .ok()?
         .get_password()
@@ -142,12 +152,15 @@ async fn stream_request(
         .map_err(|error| {
             crabbot_core::Error::Denied(format!("Anthropic stream failed: {error}."))
         })?;
+
     let status = response.status();
+
     if !status.is_success() {
         return Err(crabbot_core::Error::Denied(format!(
             "Anthropic stream was rejected with {status}."
         )));
     }
+
     live_stream(id, response.bytes_stream(), emitter).await
 }
 
@@ -169,16 +182,21 @@ async fn request(
         .await
         .map_err(|error| {
             let kind = if stream { "stream" } else { "request" };
+
             crabbot_core::Error::Denied(format!("Anthropic {kind} failed: {error}."))
         })?;
+
     let status = response.status();
     let body = read(response, "Anthropic").await?;
+
     if stream {
         return stream_body(id, status, &body);
     }
+
     let body: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
         crabbot_core::Error::Denied(format!("Anthropic response failed: {error}."))
     })?;
+
     response_body(id, status, body)
 }
 
@@ -198,11 +216,13 @@ where
         let chunk = chunk.map_err(|error| {
             crabbot_core::Error::Denied(format!("{provider} response failed: {error}."))
         })?;
+
         if chunk.as_ref().len() > BODY_LIMIT.saturating_sub(bytes.len()) {
             return Err(crabbot_core::Error::Denied(format!(
                 "{provider} response exceeded the {BODY_LIMIT}-byte limit."
             )));
         }
+
         bytes.extend_from_slice(chunk.as_ref());
     }
 
@@ -241,32 +261,41 @@ where
         tokio::select! {
             chunk = stream.next() => {
                 let Some(chunk) = chunk else { break };
+
                 let chunk = chunk.map_err(|error| {
                     crabbot_core::Error::Denied(format!("Anthropic stream failed: {error}."))
                 })?;
+
                 if chunk.as_ref().len() > BODY_LIMIT.saturating_sub(bytes) {
                     return Err(crabbot_core::Error::Denied(format!(
                         "Anthropic stream exceeded the {BODY_LIMIT}-byte limit."
                     )));
                 }
+
                 bytes = bytes.saturating_add(chunk.as_ref().len());
                 buffered.extend_from_slice(chunk.as_ref());
+
                 while let Some(end) = buffered.iter().position(|byte| *byte == b'\n') {
                     let line = buffered.drain(..=end).collect::<Vec<_>>();
+
                     if anthropic_line(&line, &mut text, &mut pending, &mut tools, &mut stop)? {
                         break;
                     }
+
                     if pending.len() >= 128 {
                         emit(&mut pending, emitter).await?;
                     }
                 }
             }
+
             _ = ticker.tick(), if !pending.is_empty() => emit(&mut pending, emitter).await?,
         }
     }
+
     if !buffered.is_empty() {
         anthropic_line(&buffered, &mut text, &mut pending, &mut tools, &mut stop)?;
     }
+
     emit(&mut pending, emitter).await?;
 
     let events = tools
@@ -277,6 +306,7 @@ where
                     "Anthropic stream returned a tool call without a name.".into(),
                 ));
             }
+
             let args = if tool.arguments.is_empty() {
                 tool.input
             } else {
@@ -286,6 +316,7 @@ where
                     ))
                 })?
             };
+
             Ok(Event::Tool { name: tool.name, args })
         })
         .collect::<crabbot_core::Result<Vec<_>>>()?;
@@ -306,16 +337,20 @@ fn anthropic_line(
     let line = std::str::from_utf8(line).map_err(|error| {
         crabbot_core::Error::Denied(format!("Anthropic stream was not UTF-8: {error}."))
     })?;
+
     let Some(data) = line.trim().strip_prefix("data:") else {
         return Ok(false);
     };
+
     let value: serde_json::Value = serde_json::from_str(data.trim())?;
+
     match value["type"].as_str().unwrap_or_default() {
         "error" => {
             return Err(crabbot_core::Error::Denied(
                 "Anthropic stream returned an error event.".into(),
             ));
         }
+
         "content_block_start" => {
             if value["content_block"]["type"] == "tool_use" {
                 let index = tool_index(&value["index"])?;
@@ -324,28 +359,35 @@ fn anthropic_line(
                 tool.input = value["content_block"]["input"].clone();
             }
         }
+
         "content_block_delta" => {
             if let Some(part) = value["delta"]["text"].as_str() {
                 append_text(part, text, pending)?;
             }
+
             if let Some(part) = value["delta"]["partial_json"].as_str() {
                 let index = tool_index(&value["index"])?;
                 let tool = tools.entry(index).or_default();
+
                 if part.len() > BODY_LIMIT.saturating_sub(tool.arguments.len()) {
                     return Err(crabbot_core::Error::Limit(
                         "Anthropic tool arguments exceeded the response limit.".into(),
                     ));
                 }
+
                 tool.arguments.push_str(part);
             }
         }
+
         "message_delta" => {
             if let Some(reason) = value["delta"]["stop_reason"].as_str() {
                 *stop = reason.into();
             }
         }
+
         _ => {}
     }
+
     Ok(false)
 }
 
@@ -365,6 +407,7 @@ fn append_text(part: &str, text: &mut String, pending: &mut String) -> crabbot_c
             "Anthropic stream exceeded the response limit.".into(),
         ));
     }
+
     text.push_str(part);
     pending.push_str(part);
     Ok(())
@@ -374,14 +417,17 @@ async fn emit(pending: &mut String, emitter: &mut Emitter) -> crabbot_core::Resu
     if !pending.is_empty() {
         emitter.event(json!({"kind": "text", "text": std::mem::take(pending)})).await?;
     }
+
     Ok(())
 }
 
 fn messages(input: &ModelRequest) -> crabbot_core::Result<(String, Vec<serde_json::Value>)> {
     let mut system = Vec::new();
     let mut messages = Vec::new();
+
     for message in &input.messages {
         let mut blocks = Vec::new();
+
         for content in &message.content {
             match content {
                 Content::Text { text } => blocks.push(json!({"type": "text", "text": text})),
@@ -389,35 +435,43 @@ fn messages(input: &ModelRequest) -> crabbot_core::Result<(String, Vec<serde_jso
                     if message.role != crabbot_core::types::Role::System =>
                 {
                     blocks.push(image_block(uri)?);
+
                     if let Some(alt) = alt {
                         blocks.push(json!({"type": "text", "text": alt}));
                     }
                 }
+
                 Content::Image { alt, .. } => blocks.push(json!({
                     "type": "text",
                     "text": alt.as_deref().unwrap_or("[Image attachment.]"),
                 })),
+
                 content => blocks.push(json!({"type": "text", "text": content.render()})),
             }
         }
+
         let has_image = blocks.iter().any(|block| block["type"] == "image");
         let text =
             blocks.iter().filter_map(|block| block["text"].as_str()).collect::<Vec<_>>().join("\n");
+
         match message.role {
             crabbot_core::types::Role::System => system.push(text),
             crabbot_core::types::Role::User => messages.push(json!({
                 "role": "user",
                 "content": if has_image { json!(blocks) } else { json!(text) }
             })),
+
             crabbot_core::types::Role::Assistant => messages.push(json!({
                 "role": "assistant",
                 "content": if has_image { json!(blocks) } else { json!(text) }
             })),
+
             crabbot_core::types::Role::Tool => {
                 let prefix = format!(
                     "[Tool result{}]",
                     message.sender.as_deref().map_or(String::new(), |name| format!(" from {name}"))
                 );
+
                 let content = if has_image {
                     let mut tool_blocks = vec![json!({"type": "text", "text": prefix})];
                     tool_blocks.extend(blocks);
@@ -425,10 +479,12 @@ fn messages(input: &ModelRequest) -> crabbot_core::Result<(String, Vec<serde_jso
                 } else {
                     json!(format!("{prefix}\n{text}"))
                 };
+
                 messages.push(json!({"role": "user", "content": content}));
             }
         }
     }
+
     Ok((system.join("\n"), messages))
 }
 
@@ -439,6 +495,7 @@ fn image_block(uri: &str) -> crabbot_core::Result<serde_json::Value> {
             "source": {"type": "url", "url": uri}
         }));
     }
+
     let Some((mime, data)) =
         uri.strip_prefix("data:").and_then(|value| value.split_once(";base64,"))
     else {
@@ -446,6 +503,7 @@ fn image_block(uri: &str) -> crabbot_core::Result<serde_json::Value> {
             "Anthropic received an unsupported image reference.".into(),
         ));
     };
+
     if !matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp")
         || data.is_empty()
         || !data
@@ -456,6 +514,7 @@ fn image_block(uri: &str) -> crabbot_core::Result<serde_json::Value> {
             "Anthropic received an invalid image data URL.".into(),
         ));
     }
+
     Ok(json!({
         "type": "image",
         "source": {"type": "base64", "media_type": mime, "data": data}
@@ -486,20 +545,26 @@ fn stream_body(
             "Anthropic stream was rejected with {status}."
         )));
     }
+
     let mut text = String::new();
     let mut stop = "stream".to_string();
+
     for line in body.lines() {
         let Some(value) = line.trim().strip_prefix("data:") else {
             continue;
         };
+
         let value: serde_json::Value = serde_json::from_str(value.trim())?;
+
         if let Some(part) = value["delta"]["text"].as_str() {
             text.push_str(part);
         }
+
         if let Some(reason) = value["delta"]["stop_reason"].as_str() {
             stop = reason.into();
         }
     }
+
     response(
         id,
         serde_json::to_value(ModelReply {
@@ -523,9 +588,11 @@ fn response_body(
             body["error"]["message"].as_str().unwrap_or("request failed")
         )));
     }
+
     let blocks = body["content"].as_array().ok_or_else(|| {
         crabbot_core::Error::Denied("Anthropic response contained no content.".into())
     })?;
+
     let text = blocks.iter().filter_map(|content| content["text"].as_str()).collect::<String>();
     let events = blocks
         .iter()
@@ -537,11 +604,13 @@ fn response_body(
             })
         })
         .collect::<Vec<_>>();
+
     if text.is_empty() && events.is_empty() {
         return Err(crabbot_core::Error::Denied(
             "Anthropic response contained no text or tools.".into(),
         ));
     }
+
     response(
         id,
         serde_json::to_value(ModelReply {
@@ -556,20 +625,24 @@ fn response_body(
 
 fn response(id: u64, result: serde_json::Value) -> crabbot_core::Result<Option<Response>> {
     let response = Response::ok(id, result);
+
     if serde_json::to_vec(&response)?.len().saturating_add(1) > crabbot_core::jsonl::MAX {
         return Err(crabbot_core::Error::Denied(
             "Anthropic response exceeds the protocol frame limit.".into(),
         ));
     }
+
     Ok(Some(response))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_LIMIT, Emitter, collect, generate, generate_at, generate_request, key, live_stream,
-        messages, response_body, stream_body, tools,
+        BODY_LIMIT, Emitter, anthropic_line, append_text, collect, generate, generate_at,
+        generate_request, image_block, key, keyring, live_stream, messages, response,
+        response_body, stream_body, tool_index, tools,
     };
+
     use crabbot_core::types::{Content, Message, ModelRequest, Request, Role, ToolSpec};
     use serde_json::json;
 
@@ -640,6 +713,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+
         assert_eq!(tool.result.unwrap()["events"][0]["name"], "read");
     }
 
@@ -692,6 +766,10 @@ mod tests {
             .content
             .push(Content::Image { uri: "file:///private/image.png".into(), alt: None });
         assert!(messages(&input).is_err());
+        assert!(image_block("https://example.com/image.png").is_ok());
+        assert!(image_block("data:image/bmp;base64,abc").is_err());
+        assert!(image_block("data:image/png;base64,").is_err());
+        assert!(image_block("data:image/png;base64,not ok").is_err());
     }
 
     #[test]
@@ -699,6 +777,74 @@ mod tests {
         assert_eq!(key(Some("primary")).unwrap(), "primary");
         assert!(key(Some(" ")).is_err());
         assert!(key(None).is_err());
+        assert!(keyring("claude").is_none());
+        assert!(tool_index(&json!(16)).is_err());
+        let mut text = String::new();
+        let mut pending = String::new();
+        assert!(append_text(&"x".repeat(BODY_LIMIT + 1), &mut text, &mut pending).is_err());
+    }
+
+    #[test]
+    fn covers_stream_line_error_and_tool_limit_paths() {
+        let mut text = String::new();
+        let mut pending = String::new();
+        let mut tools = std::collections::BTreeMap::new();
+        let mut stop = String::new();
+        assert!(anthropic_line(&[0xff], &mut text, &mut pending, &mut tools, &mut stop).is_err());
+
+        assert!(
+            anthropic_line(
+                br#"data: {"type":"error"}"#,
+                &mut text,
+                &mut pending,
+                &mut tools,
+                &mut stop,
+            )
+            .is_err()
+        );
+
+        assert!(
+            anthropic_line(
+                br#"data: {"type":"content_block_delta","index":16,"delta":{"partial_json":"{}"}}"#,
+                &mut text,
+                &mut pending,
+                &mut tools,
+                &mut stop,
+            )
+            .is_err()
+        );
+
+        assert!(
+            anthropic_line(
+                br#"data: {"type":"message_delta","delta":{"stop_reason":"stop"}}"#,
+                &mut text,
+                &mut pending,
+                &mut tools,
+                &mut stop,
+            )
+            .is_ok()
+        );
+
+        assert_eq!(stop, "stop");
+    }
+
+    #[tokio::test]
+    async fn covers_tool_defaults_and_frame_bounds() {
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let mut emitter = Emitter::new(output);
+
+        let result = live_stream(
+            1,
+            futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+                br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","input":{}}}
+"#.to_vec(),
+            )]),
+            &mut emitter,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(response(1, json!({"large": "x".repeat(crabbot_core::jsonl::MAX)})).is_err());
     }
 
     #[tokio::test]
@@ -722,6 +868,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+
         let reply = result.result.unwrap();
         assert_eq!(reply["text"], "hello");
         assert_eq!(reply["stop"], "end_turn");
@@ -740,6 +887,7 @@ mod tests {
         );
         let note =
             Request::Note { jsonrpc: "2.0".into(), method: "generate".into(), params: json!({}) };
+
         assert!(generate(&client, note, test_emitter()).await.unwrap().is_none());
         assert!(
             generate_request(&client, 1, model(), "secret", "http://127.0.0.1:1").await.is_err()
@@ -775,6 +923,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+
         assert_eq!(result.result.unwrap()["text"], "hello");
     }
 
@@ -790,6 +939,7 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Ready.\"}}\n",
             "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n",
         );
+
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(body.as_bytes().to_vec())]);
         let response = live_stream(5, chunks, &mut emitter).await.unwrap().unwrap();
 
@@ -798,9 +948,11 @@ mod tests {
         assert_eq!(response.result.as_ref().unwrap()["events"][0]["args"]["path"], "README.md");
         let event: crabbot_core::types::Request =
             serde_json::from_value(events.try_recv().unwrap()).unwrap();
+
         assert!(matches!(
             event,
             crabbot_core::types::Request::Note { params, .. }
+
                 if params["event"]["text"] == "Ready."
         ));
     }

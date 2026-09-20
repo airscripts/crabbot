@@ -2,7 +2,30 @@ name: Agentskill
 
 on:
   workflow_call:
+    inputs:
+      container_image:
+        required: false
+        type: string
+        default: ""
+
+      local:
+        required: false
+        type: string
+        default: ""
+
   workflow_dispatch:
+    inputs:
+      container_image:
+        description: "Optional local CI container image"
+        required: false
+        type: string
+        default: ""
+
+      local:
+        description: "Use the local act working tree"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -11,7 +34,7 @@ jobs:
   validate:
     name: Validate
     runs-on: ubuntu-latest
-    container: rust:1.89-trixie
+    container: ${{ inputs.container_image || 'rust:1.89-trixie' }}
 
     defaults:
       run:
@@ -19,6 +42,7 @@ jobs:
 
     steps:
       - name: Checkout
+        if: inputs.local != 'true'
         uses: actions/checkout@v7
 
       - name: Install Agentskill
@@ -28,7 +52,12 @@ jobs:
 
         run: |
           set -euo pipefail
-          target="x86_64-unknown-linux-gnu"
+          case "$(uname -m)" in
+            aarch64|arm64) target="aarch64-unknown-linux-gnu" ;;
+            x86_64|amd64) target="x86_64-unknown-linux-gnu" ;;
+            *) printf 'Unsupported architecture: %s\n' "$(uname -m)" >&2; exit 1 ;;
+          esac
+
           package="agentskill-${AGENTSKILL_VERSION}-${target}"
           archive="${package}.tar.gz"
           work="${RUNNER_TEMP}/agentskill"
@@ -37,6 +66,7 @@ jobs:
           curl --fail --silent --show-error --location \
             "https://github.com/airscripts/agentskill/releases/download/${AGENTSKILL_VERSION}/${archive}" \
             --output "${work}/${archive}"
+
           curl --fail --silent --show-error --location \
             "https://github.com/airscripts/agentskill/releases/download/${AGENTSKILL_VERSION}/SHA256SUMS" \
             --output "${work}/SHA256SUMS"

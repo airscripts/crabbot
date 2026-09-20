@@ -7,6 +7,7 @@ use crabbot_core::{
     plugin::serve_with,
     types::{Capability, Hello, Protocol, Request, Response},
 };
+
 use futures_util::{Stream, StreamExt};
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -58,13 +59,16 @@ async fn call(client: &Client, request: Request) -> crabbot_core::Result<Option<
             "transport": ["stdio", "http"],
             "methods": ["tools/list", "tools/call", "resources/list", "prompts/list"]
         }),
+
         _ => return Ok(None),
     };
 
     let response = Response::ok(id, result);
+
     if serde_json::to_vec(&response)?.len().saturating_add(1) > crabbot_core::jsonl::MAX {
         return Err(denied("MCP response exceeds the protocol frame limit"));
     }
+
     Ok(Some(response))
 }
 
@@ -72,10 +76,12 @@ async fn stdio(params: &Value) -> crabbot_core::Result<Value> {
     if params["approved"] != true {
         return Err(denied("stdio.approved must be true"));
     }
+
     let command = params["command"]
         .as_str()
         .filter(|command| !command.trim().is_empty())
         .ok_or_else(|| denied("stdio.command is required"))?;
+
     let args = match params["args"].as_array() {
         Some(args) => args
             .iter()
@@ -84,6 +90,7 @@ async fn stdio(params: &Value) -> crabbot_core::Result<Value> {
             .ok_or_else(|| denied("stdio.args must contain strings"))?,
         None => Vec::new(),
     };
+
     let payload =
         params.get("request").cloned().ok_or_else(|| denied("stdio.request is required"))?;
 
@@ -94,6 +101,7 @@ async fn stdio(params: &Value) -> crabbot_core::Result<Value> {
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|error| denied(format!("MCP process failed to start: {error}")))?;
+
     let result = timeout(DEADLINE, async {
         let mut input = child.stdin.take().ok_or_else(|| denied("MCP process has no stdin"))?;
         let output = child.stdout.take().ok_or_else(|| denied("MCP process has no stdout"))?;
@@ -115,8 +123,10 @@ async fn stdio(params: &Value) -> crabbot_core::Result<Value> {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
             }
+
             Ok(response)
         }
+
         Err(error) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -130,20 +140,26 @@ async fn http(client: &Client, params: &Value) -> crabbot_core::Result<Value> {
         .as_str()
         .filter(|url| safe_url(url))
         .ok_or_else(|| denied("http.url must use HTTPS or loopback HTTP"))?;
+
     let payload =
         params.get("request").cloned().ok_or_else(|| denied("http.request is required"))?;
+
     let mut request = client.post(url).json(&payload);
+
     if let Some(token) = params["token"].as_str().filter(|token| !token.trim().is_empty()) {
         request = request.bearer_auth(token);
     }
+
     let response = timeout(DEADLINE, request.send())
         .await
         .map_err(|_| denied("MCP HTTP request timed out"))?
         .map_err(|error| denied(format!("MCP HTTP request failed: {error}")))?;
+
     let status = response.status();
     let body = read(response).await?;
     let value = serde_json::from_str::<Value>(&body)
         .map_err(|error| denied(format!("MCP HTTP response failed: {error}")))?;
+
     response_body(status, value)
 }
 
@@ -158,13 +174,17 @@ where
     E: std::fmt::Display,
 {
     let mut bytes = Vec::new();
+
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| denied(format!("MCP HTTP response failed: {error}")))?;
+
         if chunk.as_ref().len() > BODY_LIMIT.saturating_sub(bytes.len()) {
             return Err(denied("MCP HTTP response was too large"));
         }
+
         bytes.extend_from_slice(chunk.as_ref());
     }
+
     String::from_utf8(bytes).map_err(|_| denied("MCP HTTP response was not UTF-8"))
 }
 
@@ -175,13 +195,16 @@ fn safe_url(value: &str) -> bool {
             .and_then(|value| value.split(['/', '?', '#']).next())
             .is_some_and(|authority| !authority.is_empty() && !authority.contains('@'));
     }
+
     let Some(authority) =
         value.strip_prefix("http://").and_then(|value| value.split(['/', '?', '#']).next())
     else {
         return false;
     };
+
     let host = if authority.starts_with('[') {
         let Some(end) = authority.find(']') else { return false };
+
         if authority[end + 1..].is_empty()
             || authority[end + 1..].strip_prefix(':').is_some_and(|port| {
                 !port.is_empty() && port.chars().all(|value| value.is_ascii_digit())
@@ -196,6 +219,7 @@ fn safe_url(value: &str) -> bool {
             if port.chars().all(|value| value.is_ascii_digit()) { host } else { "" }
         })
     };
+
     matches!(host, "127.0.0.1" | "localhost" | "[::1]")
 }
 
@@ -203,6 +227,7 @@ fn response_body(status: reqwest::StatusCode, value: Value) -> crabbot_core::Res
     if !status.is_success() {
         return Err(denied(format!("MCP HTTP request was rejected with {status}")));
     }
+
     Ok(value)
 }
 
@@ -264,9 +289,11 @@ mod tests {
         assert!(call(&client, Request::call(5, "unknown", json!({}))).await.unwrap().is_none());
         let note =
             Request::Note { jsonrpc: "2.0".into(), method: "describe".into(), params: json!({}) };
+
         assert!(call(&client, note).await.unwrap().is_none());
         let description =
             call(&client, Request::call(6, "describe", json!({}))).await.unwrap().unwrap();
+
         assert_eq!(description.result.unwrap()["transport"][0], "stdio");
     }
 
@@ -281,6 +308,7 @@ mod tests {
         }))
         .await
         .unwrap();
+
         assert_eq!(value["method"], "initialize");
         let value = stdio(&json!({
             "approved": true,
@@ -289,6 +317,7 @@ mod tests {
         }))
         .await
         .unwrap();
+
         assert_eq!(value["method"], "ping");
         assert!(
             stdio(&json!({

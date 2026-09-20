@@ -79,6 +79,10 @@ for plugin in "${plugins[@]}"; do
     [[ "$binary" == *.exe ]] && destination+='.exe'
     cp "$binary" "$destination"
     if [[ "$plugin" == core ]]; then
+        cli_alias="$release/crab"
+        [[ -f "$cli_alias" ]] || cli_alias="$release/crab.exe"
+        [[ -f "$cli_alias" ]] || die "Built binary 'crab' was not found for '$target'."
+        cp "$cli_alias" "$package_dir/bin/"
         daemon="$release/crabbot-daemon"
         [[ -f "$daemon" ]] || daemon="$release/crabbot-daemon.exe"
         [[ -f "$daemon" ]] || die "Built binary 'crabbot-daemon' was not found for '$target'."

@@ -25,6 +25,7 @@ struct Transaction {
 
 pub fn load(path: impl AsRef<Path>, limit: u64) -> io::Result<Option<Vec<u8>>> {
     let path = path.as_ref();
+
     match recover(path) {
         Ok(()) => {}
         Err(error)
@@ -32,40 +33,48 @@ pub fn load(path: impl AsRef<Path>, limit: u64) -> io::Result<Option<Vec<u8>>> {
         {
             return Ok(None);
         }
+
         Err(error) => return Err(error),
     }
+
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+
     if metadata.file_type().is_symlink() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "State file cannot be a symbolic link.",
         ));
     }
+
     if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "State path must be a regular file.",
         ));
     }
+
     if metadata.len() > limit {
         return Err(io::Error::new(
             io::ErrorKind::FileTooLarge,
             "State file exceeds the size limit.",
         ));
     }
+
     check(path)?;
     fs::read(path).map(Some)
 }
 
 pub fn save(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> io::Result<()> {
     let path = path.as_ref();
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+
     reject_link(path)?;
     let nonce = nonce();
     let temporary = path.with_file_name(format!(".{}.tmp-{}", name(path), nonce));
@@ -88,6 +97,7 @@ pub fn save(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> io::Result<()>
             backup: name(&backup),
             phase: "prepared".into(),
         };
+
         write_journal(&journal, &transaction)?;
 
         if matches!(fs::symlink_metadata(path), Ok(metadata) if metadata.is_file()) {
@@ -95,6 +105,7 @@ pub fn save(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> io::Result<()>
             transaction.phase = "backed_up".into();
             write_journal(&journal, &transaction)?;
         }
+
         fs::rename(&temporary, path)?;
         private(path)?;
         transaction.phase = "installed".into();
@@ -106,6 +117,7 @@ pub fn save(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> io::Result<()>
         if let Some(parent) = path.parent() {
             File::open(parent)?.sync_all()?;
         }
+
         Ok::<(), io::Error>(())
     })();
 
@@ -113,6 +125,7 @@ pub fn save(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> io::Result<()>
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
+
     Ok(())
 }
 
@@ -121,30 +134,38 @@ pub fn recover(path: impl AsRef<Path>) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
+
     let prefix = format!(".{}.txn-", name(path));
     let entries = match fs::read_dir(parent) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
+
     for entry in entries {
         let entry = entry?;
         let journal = entry.path();
+
         if !entry.file_name().to_string_lossy().starts_with(&prefix) {
             continue;
         }
+
         let transaction: Transaction = match serde_json::from_slice(&fs::read(&journal)?) {
             Ok(transaction) => transaction,
+
             Err(_) => {
                 let _ = fs::remove_file(journal);
                 continue;
             }
         };
+
         if transaction.path != name(path) {
             continue;
         }
+
         let temporary = parent.join(&transaction.temporary);
         let backup = parent.join(&transaction.backup);
+
         match transaction.phase.as_str() {
             "backed_up" if !regular(path) => {
                 if regular(&temporary) {
@@ -153,24 +174,31 @@ pub fn recover(path: impl AsRef<Path>) -> io::Result<()> {
                     fs::rename(&backup, path)?;
                 }
             }
+
             "prepared" if regular(path) => {
                 let _ = fs::remove_file(&temporary);
             }
+
             "prepared" if !regular(path) && regular(&backup) => {
                 fs::rename(&backup, path)?;
             }
+
             "installed" if !regular(path) && regular(&backup) => {
                 fs::rename(&backup, path)?;
             }
+
             _ => {}
         }
+
         if regular(path) {
             private(path)?;
         }
+
         let _ = fs::remove_file(temporary);
         let _ = fs::remove_file(backup);
         let _ = fs::remove_file(journal);
     }
+
     Ok(())
 }
 
@@ -185,20 +213,24 @@ pub fn private(path: impl AsRef<Path>) -> io::Result<()> {
         permissions.set_mode(0o600);
         fs::set_permissions(path, permissions)?;
     }
+
     #[cfg(windows)]
     protect(path)?;
+
     Ok(())
 }
 
 pub fn credential(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref();
     check(path)?;
+
     if metadata(path)?.len() > CREDENTIAL_LIMIT {
         return Err(io::Error::new(
             io::ErrorKind::FileTooLarge,
             "Credential file exceeds the size limit.",
         ));
     }
+
     Ok(())
 }
 
@@ -211,6 +243,7 @@ pub fn check(path: impl AsRef<Path>) -> io::Result<()> {
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "State file must be private."));
     }
+
     #[cfg(windows)]
     protect(path)?;
     Ok(())
@@ -218,18 +251,21 @@ pub fn check(path: impl AsRef<Path>) -> io::Result<()> {
 
 fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
     let metadata = fs::symlink_metadata(path)?;
+
     if metadata.file_type().is_symlink() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "State file cannot be a symbolic link.",
         ));
     }
+
     if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "State path must be a regular file.",
         ));
     }
+
     Ok(metadata)
 }
 
@@ -272,6 +308,7 @@ fn nonce() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{Transaction, check, credential, load, private, recover, save};
+
     use std::fs;
 
     fn root(name: &str) -> std::path::PathBuf {
@@ -334,6 +371,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+
         recover(&path).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"temporary");
 
@@ -350,6 +388,72 @@ mod tests {
         fs::create_dir(root.join("directory")).unwrap();
         assert!(load(root.join("directory"), 16).is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovers_each_transaction_phase_and_validates_credentials() {
+        let root = root("recovery-phases");
+        let path = root.join("state.json");
+
+        recover(std::path::Path::new("")).unwrap();
+        assert!(recover(root.join("missing").join("state.json")).is_ok());
+
+        fs::write(&path, b"current").unwrap();
+        fs::write(root.join(".state.json.tmp-prepared"), b"stale").unwrap();
+        write_transaction(&root, "prepared", "tmp-prepared", "backup-prepared");
+        recover(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"current");
+
+        let _ = fs::remove_file(&path);
+        fs::write(root.join(".backup-prepared"), b"prepared backup").unwrap();
+        write_transaction(&root, "prepared", "tmp-unused", "backup-prepared");
+        recover(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"prepared backup");
+
+        let _ = fs::remove_file(&path);
+        fs::write(root.join(".backup-installed"), b"installed backup").unwrap();
+        write_transaction(&root, "installed", "tmp-unused", "backup-installed");
+        recover(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"installed backup");
+
+        let _ = fs::remove_file(&path);
+        fs::write(root.join(".backup-backed-up"), b"backed up backup").unwrap();
+        write_transaction(&root, "backed_up", "tmp-missing", "backup-backed-up");
+        recover(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"backed up backup");
+
+        fs::write(&path, b"current").unwrap();
+        write_transaction_with_path(&root, "ignored", "prepared", "tmp", "backup");
+        fs::write(root.join(".state.json.txn-unknown"), b"not-json").unwrap();
+        recover(&path).unwrap();
+
+        credential(&path).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_transaction(root: &std::path::Path, phase: &str, temporary: &str, backup: &str) {
+        write_transaction_with_path(root, "state.json", phase, temporary, backup);
+    }
+
+    fn write_transaction_with_path(
+        root: &std::path::Path,
+        path: &str,
+        phase: &str,
+        temporary: &str,
+        backup: &str,
+    ) {
+        let journal = root.join(format!(".state.json.txn-{phase}"));
+        fs::write(
+            journal,
+            serde_json::to_vec(&Transaction {
+                path: path.into(),
+                temporary: format!(".{temporary}"),
+                backup: format!(".{backup}"),
+                phase: phase.into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
     }
 
     #[cfg(unix)]
@@ -371,6 +475,7 @@ mod tests {
 #[cfg(windows)]
 fn protect(path: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+
     use windows_sys::Win32::{
         Foundation::{ERROR_SUCCESS, LocalFree},
         Security::{
@@ -394,18 +499,23 @@ fn protect(path: &Path) -> io::Result<()> {
             &mut length,
         )
     };
+
     if converted == 0 {
         return Err(io::Error::last_os_error());
     }
+
     let mut present = 0;
     let mut defaulted = 0;
     let mut dacl = std::ptr::null_mut();
     let result =
         unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) };
+
     if result == 0 {
         unsafe { LocalFree(descriptor.cast()) };
+
         return Err(io::Error::last_os_error());
     }
+
     let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
     wide.push(0);
     let result = unsafe {
@@ -419,9 +529,12 @@ fn protect(path: &Path) -> io::Result<()> {
             std::ptr::null_mut(),
         )
     };
+
     unsafe { LocalFree(descriptor.cast()) };
+
     if result != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(result as i32));
     }
+
     Ok(())
 }

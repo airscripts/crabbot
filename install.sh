@@ -119,14 +119,18 @@ if [ "$plugin" = core ]; then
     tar -xzf "$tmp/$archive_name" -C "$tmp"
     binary=$(find "$tmp" -type f -name "$name" -print -quit)
     [ -n "$binary" ] || die "Archive does not contain '$name'."
+    cli_alias=$(find "$tmp" -type f -name crab -print -quit)
+    [ -n "$cli_alias" ] || die "Archive does not contain 'crab'."
     daemon=$(find "$tmp" -type f -name "crabbot-daemon" -print -quit)
     [ -n "$daemon" ] || die "Archive does not contain 'crabbot-daemon'."
     mkdir -p "$prefix/bin"
     install -m 0755 "$binary" "$prefix/bin/.$name.tmp.$$"
     mv -f "$prefix/bin/.$name.tmp.$$" "$prefix/bin/$name"
+    install -m 0755 "$cli_alias" "$prefix/bin/.crab.tmp.$$"
+    mv -f "$prefix/bin/.crab.tmp.$$" "$prefix/bin/crab"
     install -m 0755 "$daemon" "$prefix/bin/.crabbot-daemon.tmp.$$"
     mv -f "$prefix/bin/.crabbot-daemon.tmp.$$" "$prefix/bin/crabbot-daemon"
-    info "Installed $name and crabbot-daemon in $prefix/bin."
+    info "Installed $name, crab, and crabbot-daemon in $prefix/bin."
 else
     if [ -n "${CRABBOT_HOME:-}" ]; then
         config=$CRABBOT_HOME

@@ -9,6 +9,7 @@ use crabbot_core::{
     jsonl,
     types::{Capability, Content, IpcRequest, IpcResponse, Message, Request, Role},
 };
+
 use serde_json::{Value, json};
 use tokio::{
     io::BufReader,
@@ -16,6 +17,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{Duration, timeout},
 };
+
 use tracing::warn;
 
 use super::{Cancellation, Stop, state::Store};
@@ -53,12 +55,14 @@ pub async fn serve(listener: TcpListener, state: Arc<State>) -> io::Result<()> {
     loop {
         tokio::select! {
             _ = state.stop.notified() => return Ok(()),
+
             result = listener.accept() => {
                 let (stream, _) = result?;
                 let Ok(slot) = Arc::clone(&state.slots).try_acquire_owned() else {
                     warn!("IPC client limit reached; connection rejected.");
                     continue;
                 };
+
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     if let Err(error) = handle(stream, state, slot).await {
@@ -76,6 +80,7 @@ async fn handle(
     _slot: OwnedSemaphorePermit,
 ) -> io::Result<()> {
     let (input, output) = stream.into_split();
+
     let mut input = BufReader::new(input);
     let mut output = output;
 
@@ -83,14 +88,17 @@ async fn handle(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "IPC authentication timed out."))?
         .map_err(to_io)?;
+
     let Some(request) = request else {
         return Ok(());
     };
+
     if !request.valid() || request.token != state.token {
         warn!(method = %super::diagnostic(&request.method), "Rejected unauthorized IPC request.");
         jsonl::write(&mut output, &IpcResponse::fail(request.id, 401, "Unauthorized."))
             .await
             .map_err(to_io)?;
+
         return Ok(());
     }
 
@@ -105,6 +113,7 @@ async fn handle(
         _ => dispatch(&request, &state)
             .unwrap_or_else(|error| IpcResponse::fail(request.id, -32000, error.to_string())),
     };
+
     jsonl::write(&mut output, &response).await.map_err(to_io)
 }
 
@@ -113,10 +122,13 @@ async fn approval_list(request: &IpcRequest, state: &State) -> IpcResponse {
         Ok(items) => items,
         Err(error) => return IpcResponse::fail(request.id, -32000, error.to_string()),
     };
+
     let result = json!({"items": items});
+
     if serde_json::to_vec(&result).map_or(true, |value| value.len() >= FRAME) {
         return IpcResponse::fail(request.id, -32000, "Approval list exceeds the IPC frame limit.");
     }
+
     IpcResponse::ok(request.id, result)
 }
 
@@ -124,13 +136,16 @@ async fn approval_resolve(request: &IpcRequest, state: &State) -> IpcResponse {
     let Some(id) = request.params["id"].as_str() else {
         return IpcResponse::fail(request.id, -32602, "approval.resolve.id is required.");
     };
+
     let Some(approved) = request.params["approved"].as_bool() else {
         return IpcResponse::fail(request.id, -32602, "approval.resolve.approved is required.");
     };
+
     match state.pending.lock().await.resolve_local(id, approved) {
         Some(approved) => {
             IpcResponse::ok(request.id, json!({"resolved": true, "approved": approved}))
         }
+
         None => IpcResponse::fail(
             request.id,
             -32004,
@@ -143,18 +158,23 @@ async fn capability_call(request: &IpcRequest, state: &State) -> IpcResponse {
     let Some(service) = request.params["service"].as_str() else {
         return IpcResponse::fail(request.id, -32602, "capability.call.service is required.");
     };
+
     let Some(method) = request.params["method"].as_str() else {
         return IpcResponse::fail(request.id, -32602, "capability.call.method is required.");
     };
+
     let Some(params) = request.params.get("params") else {
         return IpcResponse::fail(request.id, -32602, "capability.call.params is required.");
     };
+
     if serde_json::to_vec(params).map_or(true, |value| value.len() > DETAIL_LIMIT) {
         return IpcResponse::fail(request.id, -32602, "Capability request exceeds its size limit.");
     }
+
     let (capability, allowed) = match service {
         "timer" => (Capability::Timer, ["add", "list", "remove"].as_slice()),
         "memory" => (Capability::Memory, ["audit", "forget", "list", "remember"].as_slice()),
+
         _ => {
             return IpcResponse::fail(
                 request.id,
@@ -163,6 +183,7 @@ async fn capability_call(request: &IpcRequest, state: &State) -> IpcResponse {
             );
         }
     };
+
     if !allowed.contains(&method) {
         return IpcResponse::fail(
             request.id,
@@ -170,6 +191,7 @@ async fn capability_call(request: &IpcRequest, state: &State) -> IpcResponse {
             "Capability method is not available to the TUI.",
         );
     }
+
     let Some((_, plugin)) = state.plugins.find(capability).await else {
         return IpcResponse::fail(
             request.id,
@@ -177,18 +199,23 @@ async fn capability_call(request: &IpcRequest, state: &State) -> IpcResponse {
             "The requested capability plugin is not loaded.",
         );
     };
+
     let result = match plugin.call(Request::call(request.id, method, params.clone())).await {
         Ok(response) => {
             if let Some(error) = response.error {
                 return IpcResponse::fail(request.id, error.code, error.message);
             }
+
             let Some(result) = response.result else {
                 return IpcResponse::fail(request.id, -32000, "Capability returned no result.");
             };
+
             result
         }
+
         Err(error) => return IpcResponse::fail(request.id, -32000, error.to_string()),
     };
+
     if serde_json::to_vec(&result).map_or(true, |value| value.len().saturating_add(1024) > FRAME) {
         return IpcResponse::fail(
             request.id,
@@ -196,6 +223,7 @@ async fn capability_call(request: &IpcRequest, state: &State) -> IpcResponse {
             "Capability response exceeds the IPC frame limit.",
         );
     }
+
     IpcResponse::ok(request.id, result)
 }
 
@@ -203,22 +231,28 @@ async fn cancel(request: &IpcRequest, state: &State) -> IpcResponse {
     let Some(id) = request.params["id"].as_str() else {
         return IpcResponse::fail(request.id, -32602, "session.cancel.id is required.");
     };
+
     let token = {
         let mut sessions = match state.sessions.lock() {
             Ok(sessions) => sessions,
             Err(error) => return IpcResponse::fail(request.id, -32000, lock(error).to_string()),
         };
+
         let active = sessions.sessions.get(id).is_some_and(|session| session.inflight.is_some());
+
         if let Err(error) = sessions.cancel(id) {
             return IpcResponse::fail(request.id, -32000, error.to_string());
         }
+
         if active {
             let mut cancels = match state.cancels.lock() {
                 Ok(cancels) => cancels,
+
                 Err(error) => {
                     return IpcResponse::fail(request.id, -32000, lock(error).to_string());
                 }
             };
+
             Some(Arc::clone(
                 cancels.entry(id.into()).or_insert_with(|| Arc::new(Cancellation::new())),
             ))
@@ -226,8 +260,10 @@ async fn cancel(request: &IpcRequest, state: &State) -> IpcResponse {
             None
         }
     };
+
     if let Some(token) = token {
         token.request();
+
         if timeout(CANCEL_WAIT, token.wait()).await.is_err() {
             return IpcResponse::fail(
                 request.id,
@@ -235,17 +271,20 @@ async fn cancel(request: &IpcRequest, state: &State) -> IpcResponse {
                 "Cancellation was requested but the active turn did not acknowledge it.",
             );
         }
+
         match state.cancels.lock() {
             Ok(mut cancels) => {
                 if cancels.get(id).is_some_and(|current| Arc::ptr_eq(current, &token)) {
                     cancels.remove(id);
                 }
             }
+
             Err(error) => return IpcResponse::fail(request.id, -32000, lock(error).to_string()),
         }
     } else if let Ok(mut cancels) = state.cancels.lock() {
         cancels.remove(id);
     }
+
     IpcResponse::ok(request.id, json!({"id": id, "status": "cancelled"}))
 }
 
@@ -253,19 +292,23 @@ async fn load(request: &IpcRequest, state: &State) -> IpcResponse {
     let Some(id) = request.params["id"].as_str() else {
         return IpcResponse::fail(request.id, -32602, "plugin.load.id is required.");
     };
+
     let capability = if id == state.channel {
         if !super::ready(id) {
             return IpcResponse::fail(request.id, -32000, "Channel credentials are not ready.");
         }
+
         Some(Capability::Channel)
     } else if id == state.model {
         if !super::ready(id) {
             return IpcResponse::fail(request.id, -32000, "Model credentials are not ready.");
         }
+
         Some(Capability::Model)
     } else {
         None
     };
+
     match super::load_plugin(&state.home, id, capability, false, &state.config, &state.plugins)
         .await
     {
@@ -281,6 +324,7 @@ async fn unload(request: &IpcRequest, state: &State) -> IpcResponse {
     let Some(id) = request.params["id"].as_str() else {
         return IpcResponse::fail(request.id, -32602, "plugin.unload.id is required.");
     };
+
     match super::unload_plugin(id, &state.plugins).await {
         Ok(unloaded) => IpcResponse::ok(request.id, json!({"id": id, "unloaded": unloaded})),
         Err(error) => IpcResponse::fail(request.id, -32000, error.to_string()),
@@ -302,15 +346,19 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
                 "approval": state.approval_mode.as_str(),
             })
         }
+
         "plugin.list" => json!({"items": plugins(&state.home)}),
+
         "session.list" => {
             let sessions = state.sessions.lock().map_err(lock)?;
             json!({"items": sessions.sessions.values().map(summary).collect::<Vec<_>>()})
         }
+
         "delivery.list" => {
             let sessions = state.sessions.lock().map_err(lock)?;
             json!({"items": sessions.outbox.iter().map(delivery).collect::<Vec<_>>()})
         }
+
         "delivery.retry" => {
             if request.params["yes"] != Value::Bool(true) {
                 return Ok(IpcResponse::fail(
@@ -319,6 +367,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
                     "Delivery retry requires confirmation.",
                 ));
             }
+
             let id = request.params["id"]
                 .as_str()
                 .ok_or_else(|| invalid("delivery.retry.id is required."))?;
@@ -326,6 +375,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             sessions.retry_delivery(id)?;
             json!({"id": id, "status": "pending"})
         }
+
         "delivery.drop" => {
             if request.params["yes"] != Value::Bool(true) {
                 return Ok(IpcResponse::fail(
@@ -334,6 +384,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
                     "Delivery drop requires confirmation.",
                 ));
             }
+
             let id = request.params["id"]
                 .as_str()
                 .ok_or_else(|| invalid("delivery.drop.id is required."))?;
@@ -341,6 +392,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             sessions.drop_delivery(id)?;
             json!({"id": id, "status": "dropped"})
         }
+
         "session.get" => {
             let id = request.params["id"]
                 .as_str()
@@ -350,6 +402,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
                 sessions.sessions.get(id).ok_or_else(|| not_found("Session was not found."))?;
             detail(session)
         }
+
         "session.ensure" => {
             let id = request.params["id"]
                 .as_str()
@@ -359,6 +412,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             sessions.ensure(id, model)?;
             json!({"id": id})
         }
+
         "session.new" => {
             let id = request.params["id"]
                 .as_str()
@@ -368,30 +422,37 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             sessions.create(id, model)?;
             json!({"id": id})
         }
+
         "session.append" => {
             let id = request.params["id"]
                 .as_str()
                 .ok_or_else(|| invalid("session.append.id is required."))?;
             let message: Message = serde_json::from_value(request.params["message"].clone())
                 .map_err(|error| invalid(&format!("session.append.message is invalid: {error}")))?;
+
             if message.session != id
                 || !matches!(&message.role, Role::User | Role::Assistant)
                 || message.content.is_empty()
                 || message.content.iter().any(|content| {
                     !matches!(content, Content::Text { text } if text.len() <= DETAIL_LIMIT)
                 })
+
             {
                 return Err(invalid("session.append.message is outside the supported bounds."));
             }
+
             let mut sessions = state.sessions.lock().map_err(lock)?;
             let session =
                 sessions.sessions.get(id).ok_or_else(|| not_found("Session was not found."))?;
+
             if session.inflight.is_some() || session.status == "working" {
                 return Err(invalid("Session is already working."));
             }
+
             sessions.append(id, message)?;
             json!({"id": id, "saved": true})
         }
+
         "session.clear" => {
             let id = request.params["id"]
                 .as_str()
@@ -399,12 +460,15 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             let mut sessions = state.sessions.lock().map_err(lock)?;
             let session =
                 sessions.sessions.get(id).ok_or_else(|| not_found("Session was not found."))?;
+
             if session.inflight.is_some() || session.status == "working" {
                 return Err(invalid("A working session cannot be cleared."));
             }
+
             sessions.clear_history(id)?;
             json!({"id": id, "cleared": true})
         }
+
         "session.fork" => {
             let source = request.params["source"]
                 .as_str()
@@ -416,6 +480,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             sessions.fork(source, target)?;
             json!({"id": target})
         }
+
         "session.delete" => {
             let id = request.params["id"]
                 .as_str()
@@ -429,9 +494,11 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
                     "error": super::sentence(error.to_string()),
                 }),
             };
+
             state.cancels.lock().map_err(lock)?.remove(id);
             json!({"id": id, "worktree": worktree})
         }
+
         "session.model" => {
             let id = request.params["id"]
                 .as_str()
@@ -443,31 +510,39 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             sessions.set_model(id, model)?;
             json!({"id": id, "model": model})
         }
+
         "session.workspace" => {
             let id = request.params["id"]
                 .as_str()
                 .ok_or_else(|| invalid("session.workspace.id is required."))?;
             let workspace = match &request.params["workspace"] {
                 Value::Null => None,
+
                 Value::String(path) if !path.trim().is_empty() && path.len() <= 4096 => {
                     let path = Path::new(path)
                         .canonicalize()
                         .map_err(|_| invalid("Workspace directory is unavailable."))?;
+
                     if !path.is_dir() {
                         return Err(invalid("Workspace must be a directory."));
                     }
+
                     Some(path.to_string_lossy().into_owned())
                 }
+
                 _ => return Err(invalid("session.workspace.workspace is invalid.")),
             };
+
             let mut sessions = state.sessions.lock().map_err(lock)?;
             sessions.set_workspace(id, workspace.as_deref())?;
             json!({"id": id, "workspace": workspace})
         }
+
         "shutdown" => {
             state.stop.signal();
             json!({"ok": true})
         }
+
         _ => return Ok(IpcResponse::fail(request.id, -32601, "Method not found.")),
     };
 
@@ -477,6 +552,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
 pub(crate) fn summary(session: &super::state::Session) -> Value {
     let short =
         |value: Option<&String>| value.map(|value| super::clip(value.clone(), SUMMARY_LIMIT));
+
     json!({
         "id": super::clip(session.id.clone(), SUMMARY_LIMIT),
         "model": super::clip(session.model.clone(), SUMMARY_LIMIT),
@@ -510,9 +586,11 @@ pub(crate) fn delivery(item: &super::state::Delivery) -> Value {
 pub(crate) fn detail(session: &super::state::Session) -> Value {
     let mut messages = Vec::new();
     let mut truncated = false;
+
     for item in session.messages.iter().rev() {
         let item = message_value(item);
         messages.push(item);
+
         if serde_json::to_vec(&messages)
             .map_or(true, |bytes| bytes.len().saturating_add(DETAIL_LIMIT) > FRAME)
         {
@@ -521,6 +599,7 @@ pub(crate) fn detail(session: &super::state::Session) -> Value {
             break;
         }
     }
+
     messages.reverse();
     let mut value = summary(session);
     value["messages"] = Value::Array(messages);
@@ -537,6 +616,7 @@ fn message_value(message: &Message) -> Value {
         Role::Assistant => "assistant",
         Role::Tool => "tool",
     };
+
     let content = message
         .content
         .iter()
@@ -545,17 +625,20 @@ fn message_value(message: &Message) -> Value {
                 "kind": "text",
                 "text": super::clip(text.clone(), DETAIL_LIMIT),
             }),
+
             Content::Image { uri, alt } => json!({
                 "kind": "image",
                 "uri": super::clip(uri.clone(), DETAIL_LIMIT),
                 "alt": alt.as_ref().map(|value| super::clip(value.clone(), DETAIL_LIMIT)),
             }),
+
             Content::File { uri, name, mime } => json!({
                 "kind": "file",
                 "uri": super::clip(uri.clone(), DETAIL_LIMIT),
                 "name": super::clip(name.clone(), DETAIL_LIMIT),
                 "mime": mime.as_ref().map(|value| super::clip(value.clone(), DETAIL_LIMIT)),
             }),
+
             Content::Audio { uri, mime } => json!({
                 "kind": "audio",
                 "uri": super::clip(uri.clone(), DETAIL_LIMIT),
@@ -563,6 +646,7 @@ fn message_value(message: &Message) -> Value {
             }),
         })
         .collect::<Vec<_>>();
+
     json!({
         "id": super::clip(message.id.clone(), SUMMARY_LIMIT),
         "session": super::clip(message.session.clone(), SUMMARY_LIMIT),
@@ -583,6 +667,7 @@ pub async fn call(
         .trim()
         .parse::<u16>()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
     let stream = TcpStream::connect(("127.0.0.1", port)).await?;
     let (input, output) = stream.into_split();
     let mut input = BufReader::new(input);
@@ -592,9 +677,11 @@ pub async fn call(
         jsonl::read(&mut input, FRAME).await.map_err(to_io)?.ok_or_else(|| {
             io::Error::new(io::ErrorKind::UnexpectedEof, "IPC closed before response.")
         })?;
+
     if !valid(&response) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "IPC response was invalid."));
     }
+
     match (response.result, response.error) {
         (Some(value), _) => Ok(value),
         (_, Some(error)) => Err(io::Error::new(io::ErrorKind::PermissionDenied, error.message)),
@@ -614,18 +701,23 @@ fn plugins(home: &std::path::Path) -> Vec<Value> {
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let file_type = entry.file_type().ok()?;
+
             if !file_type.is_dir() {
                 return None;
             }
+
             let id = entry.file_name().into_string().ok()?;
+
             if id.is_empty() || id.len() > SUMMARY_LIMIT || !id.bytes().all(valid_plugin_byte) {
                 return None;
             }
+
             let binary = if cfg!(windows) {
                 format!("crabbot-plugin-{id}.exe")
             } else {
                 format!("crabbot-plugin-{id}")
             };
+
             let health = entry.path().join("bin").join(binary).is_file();
             Some(json!({
                 "id": id,
@@ -635,6 +727,7 @@ fn plugins(home: &std::path::Path) -> Vec<Value> {
         })
         .take(256)
         .collect::<Vec<_>>();
+
     items.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
     items
 }
@@ -666,16 +759,19 @@ mod tests {
         FRAME, State, active, approval_list, approval_resolve, cancel as cancel_request,
         capability_call, dispatch, load, plugins, unload,
     };
+
     use crabbot_core::{
         jsonl,
         types::{Content, IpcRequest, IpcResponse, Message, Role},
     };
+
     use serde_json::json;
     use std::{
         collections::BTreeMap,
         path::PathBuf,
         sync::{Arc, Mutex},
     };
+
     use tokio::{
         io::BufReader,
         net::{TcpListener, TcpStream},
@@ -688,21 +784,27 @@ mod tests {
     }
 
     fn state_at(label: &str) -> State {
-        let path = PathBuf::from(format!(
-            "/tmp/crabbot-ipc-test-{}-{}-{}.json",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test"),
-            label
-        ));
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .chars()
+            .map(|value| if value.is_ascii_alphanumeric() { value } else { '_' })
+            .collect::<String>();
+
+        let path = std::env::temp_dir()
+            .join(format!("crabbot-ipc-test-{}-{thread}-{label}.json", std::process::id()));
+
         let _ = std::fs::remove_file(&path);
+        let temp = std::env::temp_dir();
+
         State {
             token: "secret".into(),
             sessions: Arc::new(Mutex::new(Store::load(path).unwrap())),
             stop: Arc::new(Stop::new()),
             slots: Arc::new(Semaphore::new(super::CLIENTS)),
             cancels: Arc::new(Mutex::new(BTreeMap::new())),
-            root: PathBuf::from("/tmp"),
-            home: PathBuf::from(format!("/tmp/crabbot-ipc-home-{}-{}", std::process::id(), label)),
+            root: temp.clone(),
+            home: temp.join(format!("crabbot-ipc-home-{}-{thread}-{label}", std::process::id())),
             approval_mode: "off".into(),
             pending: Arc::new(tokio::sync::Mutex::new(crate::approval::Gate::new().unwrap())),
             plugins: crate::Plugins::default(),
@@ -719,7 +821,9 @@ mod tests {
 
         let state = state_at("capability-call");
         let binary = PathBuf::from(format!("/tmp/crabbot-ipc-capability-{}", std::process::id()));
-        let script = r#"while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); case "$line" in *'"method":"hello"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol":{"major":0,"minor":1},"id":"timer","version":"0.1.0","capabilities":["timer"]}}' ;; *'"method":"list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"items":[{"id":7,"text":"reminder"}]}}' ;; *'"method":"shutdown"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}'; exit 0 ;; esac; done"#;
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); case "$line" in *'"method":"hello"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol":{"major":0,"minor":1},"id":"timer","version":"0.1.0","capabilities":["timer"]}}' ;; *'"method":"list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"items":[{"id":7,"text":"reminder"}]}}' ;; *'"method":"shutdown"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}'; exit 0 ;; esac; done"#;
+
         std::fs::write(&binary, script).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let process = crabbot_core::plugin::Process::start(&binary).await.unwrap();
@@ -735,6 +839,7 @@ mod tests {
             &state,
         )
         .await;
+
         assert_eq!(response.result.unwrap()["items"][0]["id"], 7);
 
         let denied = capability_call(
@@ -747,6 +852,7 @@ mod tests {
             &state,
         )
         .await;
+
         assert_eq!(denied.error.unwrap().code, -32602);
 
         let bad_service = capability_call(
@@ -759,11 +865,13 @@ mod tests {
             &state,
         )
         .await;
+
         assert_eq!(bad_service.error.unwrap().code, -32602);
 
         if let Some(plugin) = state.plugins.remove("timer").await {
             plugin.stop().await.unwrap();
         }
+
         let _ = std::fs::remove_file(binary);
     }
 
@@ -783,11 +891,13 @@ mod tests {
             "id = 'tools'\nversion = '0.1.0'\nprotocol = { major = 0, minor = 1 }\ncapabilities = ['tool']\n",
         )
         .unwrap();
+
         std::fs::write(
             &binary,
             "#!/bin/sh\nwhile IFS= read -r line; do case \"$line\" in *hello*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol\":{\"major\":0,\"minor\":1},\"id\":\"tools\",\"version\":\"0.1.0\",\"capabilities\":[\"tool\"]}}' ;; *shutdown*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}'; exit 0 ;; esac; done\n",
         )
         .unwrap();
+
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let entry = crate::Entry {
             source: "test".into(),
@@ -803,6 +913,7 @@ mod tests {
             linked: false,
             commands: Vec::new(),
         };
+
         crate::save_lock_at(
             &state.home,
             &crate::Lock { plugins: BTreeMap::from([("tools".into(), entry)]) },
@@ -840,6 +951,7 @@ mod tests {
         let new =
             dispatch(&IpcRequest::call(1, "secret", "session.new", json!({"id": "one"})), &state)
                 .unwrap();
+
         assert_eq!(new.result.unwrap()["id"], "one");
         let ensured = dispatch(
             &IpcRequest::call(
@@ -851,6 +963,7 @@ mod tests {
             &state,
         )
         .unwrap();
+
         assert_eq!(ensured.result.unwrap()["id"], "terminal");
         let ensured = dispatch(
             &IpcRequest::call(
@@ -862,6 +975,7 @@ mod tests {
             &state,
         )
         .unwrap();
+
         assert_eq!(ensured.result.unwrap()["id"], "terminal");
         let message = Message {
             id: "terminal-user-1".into(),
@@ -870,6 +984,7 @@ mod tests {
             sender: Some("tui".into()),
             content: vec![Content::Text { text: "hello".into() }],
         };
+
         state.sessions.lock().unwrap().set_status("terminal", "cancelled").unwrap();
         let appended = dispatch(
             &IpcRequest::call(
@@ -881,6 +996,7 @@ mod tests {
             &state,
         )
         .unwrap();
+
         assert_eq!(appended.result.unwrap()["saved"], true);
         let terminal = dispatch(
             &IpcRequest::call(24, "secret", "session.get", json!({"id": "terminal"})),
@@ -889,6 +1005,7 @@ mod tests {
         .unwrap()
         .result
         .unwrap();
+
         assert_eq!(terminal["messages"][0]["content"][0]["text"], "hello");
         assert_eq!(terminal["status"], "idle");
         let invalid_message = Message {
@@ -898,6 +1015,7 @@ mod tests {
             sender: None,
             content: vec![Content::Text { text: "untrusted".into() }],
         };
+
         assert!(
             dispatch(
                 &IpcRequest::call(
@@ -910,6 +1028,7 @@ mod tests {
             )
             .is_err()
         );
+
         state.sessions.lock().unwrap().set_status("terminal", "working").unwrap();
         assert!(
             dispatch(
@@ -918,12 +1037,14 @@ mod tests {
             )
             .is_err()
         );
+
         state.sessions.lock().unwrap().set_status("terminal", "idle").unwrap();
         let cleared = dispatch(
             &IpcRequest::call(27, "secret", "session.clear", json!({"id": "terminal"})),
             &state,
         )
         .unwrap();
+
         assert_eq!(cleared.result.unwrap()["cleared"], true);
         let terminal = dispatch(
             &IpcRequest::call(28, "secret", "session.get", json!({"id": "terminal"})),
@@ -932,13 +1053,16 @@ mod tests {
         .unwrap()
         .result
         .unwrap();
+
         assert!(terminal["messages"].as_array().unwrap().is_empty());
         let list =
             dispatch(&IpcRequest::call(2, "secret", "session.list", json!({})), &state).unwrap();
+
         assert_eq!(list.result.unwrap()["items"][0]["id"], "one");
         let get =
             dispatch(&IpcRequest::call(3, "secret", "session.get", json!({"id": "one"})), &state)
                 .unwrap();
+
         assert_eq!(get.result.unwrap()["model"], "gpt-4o-mini");
         let model = dispatch(
             &IpcRequest::call(
@@ -950,6 +1074,7 @@ mod tests {
             &state,
         )
         .unwrap();
+
         assert_eq!(model.result.unwrap()["model"], "test-model");
         let fork = dispatch(
             &IpcRequest::call(
@@ -961,6 +1086,7 @@ mod tests {
             &state,
         )
         .unwrap();
+
         assert_eq!(fork.result.unwrap()["id"], "copy");
         state.sessions.lock().unwrap().set_status("one", "working").unwrap();
         assert!(
@@ -970,18 +1096,21 @@ mod tests {
             )
             .is_err()
         );
+
         state.sessions.lock().unwrap().set_status("one", "idle").unwrap();
         let cancelled = cancel_request(
             &IpcRequest::call(6, "secret", "session.cancel", json!({"id": "copy"})),
             &state,
         )
         .await;
+
         assert_eq!(cancelled.result.unwrap()["status"], "cancelled");
         let deleted = dispatch(
             &IpcRequest::call(6, "secret", "session.delete", json!({"id": "copy"})),
             &state,
         )
         .unwrap();
+
         assert_eq!(deleted.result.unwrap()["id"], "copy");
         assert_eq!(
             dispatch(&IpcRequest::call(7, "secret", "unknown", json!({})), &state)
@@ -991,9 +1120,11 @@ mod tests {
                 .code,
             -32601
         );
+
         assert!(
             dispatch(&IpcRequest::call(8, "secret", "session.get", json!({})), &state).is_err()
         );
+
         assert!(
             dispatch(
                 &IpcRequest::call(9, "secret", "session.get", json!({"id": "missing"})),
@@ -1001,9 +1132,11 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(
             dispatch(&IpcRequest::call(10, "secret", "session.new", json!({})), &state).is_err()
         );
+
         assert!(
             dispatch(
                 &IpcRequest::call(11, "secret", "session.new", json!({"id": "bad_id"})),
@@ -1011,10 +1144,12 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(
             dispatch(&IpcRequest::call(12, "secret", "session.new", json!({"id": "one"})), &state)
                 .is_err()
         );
+
         assert!(
             dispatch(
                 &IpcRequest::call(
@@ -1027,6 +1162,7 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(
             cancel_request(
                 &IpcRequest::call(14, "secret", "session.cancel", json!({"id": "missing"})),
@@ -1036,6 +1172,7 @@ mod tests {
             .error
             .is_some()
         );
+
         assert!(
             dispatch(
                 &IpcRequest::call(16, "secret", "session.fork", json!({"target": "new"})),
@@ -1043,6 +1180,7 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(
             dispatch(
                 &IpcRequest::call(17, "secret", "session.fork", json!({"source": "one"})),
@@ -1050,15 +1188,18 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(
             cancel_request(&IpcRequest::call(18, "secret", "session.cancel", json!({})), &state,)
                 .await
                 .error
                 .is_some()
         );
+
         assert!(
             dispatch(&IpcRequest::call(19, "secret", "session.model", json!({})), &state,).is_err()
         );
+
         assert!(
             dispatch(
                 &IpcRequest::call(20, "secret", "session.model", json!({"id": "one"})),
@@ -1066,6 +1207,7 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(
             dispatch(
                 &IpcRequest::call(
@@ -1078,15 +1220,16 @@ mod tests {
             )
             .is_err()
         );
+
         let shutdown =
             dispatch(&IpcRequest::call(15, "secret", "shutdown", json!({})), &state).unwrap();
+
         assert_eq!(shutdown.result.unwrap()["ok"], true);
-        let _ = std::fs::remove_file(format!("/tmp/crabbot-ipc-test-{}.json", std::process::id()));
     }
 
     #[test]
     fn lists_safe_plugins_only() {
-        let root = PathBuf::from(format!("/tmp/crabbot-ipc-plugins-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("crabbot-ipc-plugins-{}", std::process::id()));
         let plugin_root = root.join("plugins");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&plugin_root).unwrap();
@@ -1101,6 +1244,7 @@ mod tests {
                 json!({"id": "telegram-1", "status": "installed", "health": "missing"}),
             ]
         );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1126,11 +1270,13 @@ mod tests {
                 "hello",
             )
             .unwrap();
+
         store.uncertain("delivery", "timeout").unwrap();
         drop(store);
 
         let list =
             dispatch(&IpcRequest::call(1, "secret", "delivery.list", json!({})), &state).unwrap();
+
         assert_eq!(list.result.unwrap()["items"][0]["status"], "uncertain");
         assert!(
             dispatch(
@@ -1141,6 +1287,7 @@ mod tests {
             .error
             .is_some()
         );
+
         dispatch(
             &IpcRequest::call(
                 3,
@@ -1151,18 +1298,23 @@ mod tests {
             &state,
         )
         .unwrap();
+
         dispatch(
             &IpcRequest::call(4, "secret", "delivery.drop", json!({"id": "delivery", "yes": true})),
             &state,
         )
         .unwrap();
+
         assert!(state.sessions.lock().unwrap().outbox.is_empty());
     }
 
     #[test]
     fn stores_only_canonical_session_workspaces() {
         let state = state_at("workspace");
-        let root = PathBuf::from(format!("/tmp/crabbot-ipc-workspace-{}", std::process::id()));
+
+        let root =
+            std::env::temp_dir().join(format!("crabbot-ipc-workspace-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         dispatch(&IpcRequest::call(1, "secret", "session.new", json!({"id": "one"})), &state)
@@ -1180,6 +1332,7 @@ mod tests {
         .unwrap()
         .result
         .unwrap();
+
         assert_eq!(
             selected["workspace"],
             std::fs::canonicalize(&root).unwrap().display().to_string()
@@ -1190,6 +1343,7 @@ mod tests {
                 .unwrap()
                 .result
                 .unwrap();
+
         assert_eq!(session["workspace"], selected["workspace"]);
 
         assert!(
@@ -1217,6 +1371,7 @@ mod tests {
         .unwrap()
         .result
         .unwrap();
+
         assert!(reset["workspace"].is_null());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1245,16 +1400,19 @@ mod tests {
         let cancel_state = Arc::clone(&state);
         let cancel_request =
             tokio::spawn(async move { cancel_request(&request, &cancel_state).await });
+
         let token = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if let Some(token) = state.cancels.lock().unwrap().get("active").cloned() {
                     break token;
                 }
+
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
+
         tokio::time::timeout(Duration::from_secs(1), token.cancelled()).await.unwrap();
         assert!(!cancel_request.is_finished());
         token.acknowledge();
@@ -1279,6 +1437,7 @@ mod tests {
                 args: json!({"path": "note.txt", "text": "approved"}),
             })
             .unwrap();
+
         let request = IpcRequest::call(1, "secret", "approval.list", json!({}));
         let listed = approval_list(&request, &state).await;
         let listed = listed.result.unwrap();
@@ -1287,6 +1446,7 @@ mod tests {
 
         let request =
             IpcRequest::call(2, "secret", "approval.resolve", json!({"id": id, "approved": true}));
+
         let resolved = approval_resolve(&request, &state).await;
         assert_eq!(resolved.result.unwrap()["approved"], true);
         assert!(challenge.answer.await.unwrap());
@@ -1300,12 +1460,14 @@ mod tests {
             &state,
         )
         .await;
+
         assert!(missing_id.error.unwrap().message.contains(".id is required"));
         let missing_action = approval_resolve(
             &IpcRequest::call(1, "secret", "approval.resolve", json!({"id": "bad"})),
             &state,
         )
         .await;
+
         assert!(missing_action.error.unwrap().message.contains(".approved is required"));
         let expired = approval_resolve(
             &IpcRequest::call(
@@ -1317,6 +1479,7 @@ mod tests {
             &state,
         )
         .await;
+
         assert_eq!(expired.error.unwrap().code, -32004);
     }
 
@@ -1326,6 +1489,7 @@ mod tests {
         {
             let mut sessions = state.sessions.lock().unwrap();
             sessions.create("large", "model").unwrap();
+
             for index in 0..100 {
                 sessions.sessions.get_mut("large").unwrap().messages.push(Message {
                     id: index.to_string(),
@@ -1336,19 +1500,18 @@ mod tests {
                 });
             }
         }
+
         let response =
             dispatch(&IpcRequest::call(1, "secret", "session.list", json!({})), &state).unwrap();
+
         let encoded = serde_json::to_vec(&response).unwrap();
         assert!(encoded.len().saturating_add(1) <= FRAME);
         assert!(response.result.unwrap()["items"][0]["messages"].is_null());
         let detail =
             dispatch(&IpcRequest::call(2, "secret", "session.get", json!({"id": "large"})), &state)
                 .unwrap();
+
         assert!(serde_json::to_vec(&detail).unwrap().len().saturating_add(1) <= FRAME);
-        let _ = std::fs::remove_file(format!(
-            "/tmp/crabbot-ipc-test-{}-large.json",
-            std::process::id()
-        ));
     }
 
     #[test]
@@ -1371,12 +1534,14 @@ mod tests {
             channel: "telegram".into(),
             model: "codex".into(),
         };
+
         state.sessions.lock().unwrap().create("copy", "model").unwrap();
         let response = dispatch(
             &IpcRequest::call(1, "secret", "session.delete", json!({"id": "copy"})),
             &state,
         )
         .unwrap();
+
         let result = response.result.unwrap();
         assert_eq!(result["worktree"]["status"], "pending");
         assert!(result["worktree"]["error"].as_str().is_some());
@@ -1393,6 +1558,7 @@ mod tests {
             super::to_io(crabbot_core::Error::Denied("no".into())).kind(),
             std::io::ErrorKind::InvalidData
         );
+
         assert_eq!(super::invalid("bad").kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(super::not_found("missing").kind(), std::io::ErrorKind::NotFound);
         assert_eq!(super::token().unwrap().len(), 64);
@@ -1410,6 +1576,7 @@ mod tests {
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
             Err(error) => panic!("listener failed: {error}"),
         };
+
         let port = listener.local_addr().unwrap().port();
         std::fs::write(root.join("ipc.token"), "secret").unwrap();
         std::fs::write(root.join("ipc.port"), port.to_string()).unwrap();
@@ -1428,6 +1595,7 @@ mod tests {
             channel: "telegram".into(),
             model: "codex".into(),
         });
+
         let task_state = Arc::clone(&state);
         let task = tokio::spawn(async move { super::serve(listener, task_state).await });
 

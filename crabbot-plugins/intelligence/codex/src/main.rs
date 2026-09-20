@@ -7,6 +7,7 @@ use crabbot_core::{
         Request, Response,
     },
 };
+
 use futures_util::{Stream, StreamExt};
 use serde_json::json;
 use std::{collections::BTreeMap, time::Duration};
@@ -22,6 +23,7 @@ async fn main() -> crabbot_core::Result<()> {
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|error| crabbot_core::Error::Denied(format!("OpenAI client failed: {error}.")))?;
+
     serve_events(
         Hello {
             protocol: Protocol::CURRENT,
@@ -51,19 +53,24 @@ async fn generate(
         Request::Call { id, method, params, .. } => (id, method, params),
         Request::Note { .. } => return Ok(None),
     };
+
     if method == "command" {
         let text = codex::command(&params, emitter).await?;
         return Ok(Some(Response::ok(id, json!({"text": text}))));
     }
+
     if method != "generate" {
         return Ok(None);
     }
+
     let input: ModelRequest = serde_json::from_value(params)?;
     let Some(key) = credential()? else {
         return codex::generate(id, input, emitter).await;
     };
+
     let base = std::env::var("CRABBOT_CODEX_BASE_URL")
         .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+
     generate_at(client, id, input, &key, &base, emitter).await
 }
 
@@ -99,11 +106,13 @@ async fn generate_request(
         .map_err(|error| {
             crabbot_core::Error::Denied(format!("OpenAI request failed: {error}."))
         })?;
+
     let status = response.status();
     let body = read(response, "OpenAI").await?;
     let body: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
         crabbot_core::Error::Denied(format!("OpenAI response failed: {error}."))
     })?;
+
     response_body(id, status, body)
 }
 
@@ -123,12 +132,15 @@ async fn stream_request(
         .send()
         .await
         .map_err(|error| crabbot_core::Error::Denied(format!("OpenAI stream failed: {error}.")))?;
+
     let status = response.status();
+
     if !status.is_success() {
         return Err(crabbot_core::Error::Denied(format!(
             "OpenAI stream was rejected with {status}."
         )));
     }
+
     stream_body(id, status, response.bytes_stream(), emitter).await
 }
 
@@ -148,11 +160,13 @@ where
         let chunk = chunk.map_err(|error| {
             crabbot_core::Error::Denied(format!("{provider} response failed: {error}."))
         })?;
+
         if chunk.as_ref().len() > BODY_LIMIT.saturating_sub(bytes.len()) {
             return Err(crabbot_core::Error::Denied(format!(
                 "{provider} response exceeded the {BODY_LIMIT}-byte limit."
             )));
         }
+
         bytes.extend_from_slice(chunk.as_ref());
     }
 
@@ -172,7 +186,9 @@ fn messages(input: &ModelRequest) -> crabbot_core::Result<Vec<serde_json::Value>
                 crabbot_core::types::Role::Assistant => "assistant",
                 crabbot_core::types::Role::Tool => "user",
             };
+
             let mut parts = Vec::new();
+
             if message.role == crabbot_core::types::Role::Tool {
                 parts.push(json!({
                     "type": "text",
@@ -182,10 +198,12 @@ fn messages(input: &ModelRequest) -> crabbot_core::Result<Vec<serde_json::Value>
                     )
                 }));
             }
+
             for content in &message.content {
                 match content {
                     Content::Text { text } => parts.push(json!({"type": "text", "text": text})),
                     Content::Image { uri, .. }
+
                         if message.role != crabbot_core::types::Role::System =>
                     {
                         parts.push(json!({
@@ -193,13 +211,16 @@ fn messages(input: &ModelRequest) -> crabbot_core::Result<Vec<serde_json::Value>
                             "image_url": {"url": image_url(uri)?, "detail": "auto"}
                         }));
                     }
+
                     Content::Image { alt, .. } => parts.push(json!({
                         "type": "text",
                         "text": alt.as_deref().unwrap_or("[Image attachment.]"),
                     })),
+
                     content => parts.push(json!({"type": "text", "text": content.render()})),
                 }
             }
+
             let content = if parts.iter().all(|part| part["type"] == "text") {
                 serde_json::Value::String(
                     parts
@@ -211,6 +232,7 @@ fn messages(input: &ModelRequest) -> crabbot_core::Result<Vec<serde_json::Value>
             } else {
                 serde_json::Value::Array(parts)
             };
+
             Ok(json!({"role": role, "content": content}))
         })
         .collect()
@@ -220,6 +242,7 @@ fn image_url(uri: &str) -> crabbot_core::Result<&str> {
     if uri.starts_with("https://") {
         return Ok(uri);
     }
+
     let Some((mime, encoded)) =
         uri.strip_prefix("data:").and_then(|value| value.split_once(";base64,"))
     else {
@@ -227,6 +250,7 @@ fn image_url(uri: &str) -> crabbot_core::Result<&str> {
             "OpenAI received an unsupported image reference.".into(),
         ));
     };
+
     if !matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp")
         || encoded.is_empty()
         || !encoded
@@ -237,6 +261,7 @@ fn image_url(uri: &str) -> crabbot_core::Result<&str> {
             "OpenAI received an invalid image data URL.".into(),
         ));
     }
+
     Ok(uri)
 }
 
@@ -279,6 +304,7 @@ where
             "OpenAI stream was rejected with {status}."
         )));
     }
+
     let mut buffered = Vec::new();
     let mut bytes = 0_usize;
     let mut text = String::new();
@@ -292,36 +318,46 @@ where
         tokio::select! {
             chunk = stream.next() => {
                 let Some(chunk) = chunk else { break };
+
                 let chunk = chunk.map_err(|error| {
                     crabbot_core::Error::Denied(format!("OpenAI stream failed: {error}."))
                 })?;
+
                 if chunk.as_ref().len() > BODY_LIMIT.saturating_sub(bytes) {
                     return Err(crabbot_core::Error::Denied(format!(
                         "OpenAI stream exceeded the {BODY_LIMIT}-byte limit."
                     )));
                 }
+
                 bytes = bytes.saturating_add(chunk.as_ref().len());
                 buffered.extend_from_slice(chunk.as_ref());
+
                 while let Some(end) = buffered.iter().position(|byte| *byte == b'\n') {
                     let line = buffered.drain(..=end).collect::<Vec<_>>();
+
                     if stream_line(&line, &mut text, &mut pending, &mut tools)? {
                         done = true;
                         break;
                     }
+
                     if pending.len() >= 128 {
                         emit(&mut pending, emitter).await?;
                     }
                 }
+
                 if done {
                     break;
                 }
             }
+
             _ = ticker.tick(), if !pending.is_empty() => emit(&mut pending, emitter).await?,
         }
     }
+
     if !buffered.is_empty() {
         stream_line(&buffered, &mut text, &mut pending, &mut tools)?;
     }
+
     emit(&mut pending, emitter).await?;
 
     let events = tools
@@ -332,6 +368,7 @@ where
                     "OpenAI stream returned a tool call without a name.".into(),
                 ));
             }
+
             let args = if tool.arguments.is_empty() {
                 json!({})
             } else {
@@ -341,6 +378,7 @@ where
                     ))
                 })?
             };
+
             Ok(Event::Tool { name: tool.name, args })
         })
         .collect::<crabbot_core::Result<Vec<_>>>()?;
@@ -366,19 +404,25 @@ fn stream_line(
     let line = std::str::from_utf8(line).map_err(|error| {
         crabbot_core::Error::Denied(format!("OpenAI stream was not UTF-8: {error}."))
     })?;
+
     let Some(data) = line.trim().strip_prefix("data:") else {
         return Ok(false);
     };
+
     let data = data.trim();
+
     if data == "[DONE]" {
         return Ok(true);
     }
+
     let value: serde_json::Value = serde_json::from_str(data)?;
     let delta = &value["choices"][0]["delta"];
+
     if let Some(part) = delta["content"].as_str() {
         text.push_str(part);
         pending.push_str(part);
     }
+
     if let Some(calls) = delta["tool_calls"].as_array() {
         for call in calls {
             let index = call["index"]
@@ -390,15 +434,19 @@ fn stream_line(
                         "OpenAI stream exceeded the tool-call limit.".into(),
                     )
                 })?;
+
             let tool = tools.entry(index).or_default();
+
             if let Some(name) = call["function"]["name"].as_str() {
                 tool.name.push_str(name);
             }
+
             if let Some(arguments) = call["function"]["arguments"].as_str() {
                 tool.arguments.push_str(arguments);
             }
         }
     }
+
     Ok(false)
 }
 
@@ -406,6 +454,7 @@ async fn emit(pending: &mut String, emitter: &mut Emitter) -> crabbot_core::Resu
     if !pending.is_empty() {
         emitter.event(json!({"kind": "text", "text": std::mem::take(pending)})).await?;
     }
+
     Ok(())
 }
 
@@ -420,10 +469,12 @@ fn response_body(
             body["error"]["message"].as_str().unwrap_or("request failed")
         )));
     }
+
     let choice =
         body["choices"].as_array().and_then(|choices| choices.first()).ok_or_else(|| {
             crabbot_core::Error::Denied("OpenAI response contained no choices.".into())
         })?;
+
     let text = choice["message"]["content"].as_str().unwrap_or_default().to_string();
     let events = choice["message"]["tool_calls"]
         .as_array()
@@ -441,11 +492,13 @@ fn response_body(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+
     if text.is_empty() && events.is_empty() {
         return Err(crabbot_core::Error::Denied(
             "OpenAI response contained no text or tools.".into(),
         ));
     }
+
     let usage = &body["usage"];
     response(
         id,
@@ -461,11 +514,13 @@ fn response_body(
 
 fn response(id: u64, result: serde_json::Value) -> crabbot_core::Result<Option<Response>> {
     let response = Response::ok(id, result);
+
     if serde_json::to_vec(&response)?.len().saturating_add(1) > crabbot_core::jsonl::MAX {
         return Err(crabbot_core::Error::Denied(
             "OpenAI response exceeds the protocol frame limit.".into(),
         ));
     }
+
     Ok(Some(response))
 }
 
@@ -484,6 +539,7 @@ fn credential() -> crabbot_core::Result<Option<String>> {
         && path.is_file()
     {
         crabbot_file::private(&path)?;
+
         if let Some(key) = credential_file(&path)? {
             return Ok(Some(key));
         }
@@ -496,6 +552,7 @@ fn keyring(name: &str) -> Option<String> {
     if std::env::var("CRABBOT_KEYRING").ok().as_deref() != Some("1") {
         return None;
     }
+
     keyring::Entry::new("dev.airscripts.crabbot", name)
         .ok()?
         .get_password()
@@ -507,15 +564,19 @@ fn credential_file(path: &std::path::Path) -> crabbot_core::Result<Option<String
     if !path.is_file() {
         return Ok(None);
     }
+
     if crabbot_file::private(path).is_err() {
         return Ok(None);
     }
+
     let text = std::fs::read_to_string(path).map_err(|error| {
         crabbot_core::Error::Denied(format!("Credentials could not be read: {error}."))
     })?;
+
     let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
         crabbot_core::Error::Denied(format!("Credentials are invalid: {error}."))
     })?;
+
     Ok(value["CRABBOT_CODEX_KEY"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
@@ -529,9 +590,10 @@ fn credentials_path() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_LIMIT, Emitter, collect, credential_file, generate, generate_at, generate_request,
-        messages, response_body, stream_body,
+        BODY_LIMIT, Emitter, collect, credential, credential_file, credentials_path, generate,
+        generate_at, generate_request, keyring, messages, response_body, stream_body,
     };
+
     use crabbot_core::types::{Content, ModelRequest, Request, Role, ToolSpec};
     use serde_json::json;
 
@@ -589,6 +651,7 @@ mod tests {
 
         let path =
             std::env::temp_dir().join(format!("crabbot-codex-auth-{}.json", std::process::id()));
+
         std::fs::write(&path, r#"{"CRABBOT_CODEX_KEY":"key"}"#).unwrap();
         #[cfg(unix)]
         {
@@ -596,6 +659,7 @@ mod tests {
             permissions.set_mode(0o600);
             std::fs::set_permissions(&path, permissions).unwrap();
         }
+
         assert_eq!(credential_file(&path).unwrap(), Some("key".into()));
         std::fs::write(&path, r#"{"access_token":"secret"}"#).unwrap();
         assert_eq!(credential_file(&path).unwrap(), None);
@@ -612,8 +676,16 @@ mod tests {
             assert_eq!(credential_file(&path).unwrap(), Some("key".into()));
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
+
         assert_eq!(credential_file(&path.with_file_name("missing-auth.json")).unwrap(), None);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn checks_optional_credential_sources_without_fallbacks() {
+        assert!(keyring("codex").is_none());
+        assert!(credentials_path().is_none());
+        assert!(credential().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -658,8 +730,10 @@ mod tests {
                 }
             ])
         );
+
         input.messages[1].content[2] =
             Content::Image { uri: "file:///private/image.png".into(), alt: None };
+
         assert!(messages(&input).is_err());
     }
 
@@ -672,6 +746,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+
         assert_eq!(result.result.unwrap()["text"], "done");
     }
 
@@ -688,6 +763,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+
         assert_eq!(result.result.unwrap()["events"][0]["name"], "read");
     }
 
@@ -698,29 +774,35 @@ mod tests {
             response_body(1, reqwest::StatusCode::UNAUTHORIZED, json!({"error":{"message":"no"}}))
                 .is_err()
         );
+
         assert!(response_body(1, reqwest::StatusCode::OK, json!({})).is_err());
         assert!(
             generate_request(&client, 1, model(), "secret", "http://127.0.0.1:1/v1").await.is_err()
         );
+
         assert!(
             generate(&client, Request::call(1, "unknown", json!({})), quiet_emitter().0)
                 .await
                 .unwrap()
                 .is_none()
         );
+
         let note =
             Request::Note { jsonrpc: "2.0".into(), method: "generate".into(), params: json!({}) };
+
         assert!(generate(&client, note, quiet_emitter().0).await.unwrap().is_none());
         assert!(
             generate(&client, Request::call(1, "generate", json!({})), quiet_emitter().0)
                 .await
                 .is_err()
         );
+
         assert!(
             generate_at(&client, 1, model(), "secret", "http://127.0.0.1:1/v1", quiet_emitter().0,)
                 .await
                 .is_err()
         );
+
         let mut stream = model();
         stream.stream = true;
         assert!(
@@ -728,6 +810,7 @@ mod tests {
                 .await
                 .is_err()
         );
+
         let mut stream = model();
         stream.stream = true;
         stream.tools.push(ToolSpec {
@@ -735,16 +818,19 @@ mod tests {
             description: None,
             schema: json!({"type": "object"}),
         });
+
         assert!(
             generate_at(&client, 1, stream, "secret", "http://127.0.0.1:1/v1", quiet_emitter().0,)
                 .await
                 .is_err()
         );
+
         assert!(response_body(1, reqwest::StatusCode::OK, json!({"choices":[]})).is_err());
         assert!(
             response_body(1, reqwest::StatusCode::OK, json!({"choices":[{"message":{}}]}),)
                 .is_err()
         );
+
         assert!(
             response_body(
                 1,
@@ -767,8 +853,10 @@ mod tests {
             ),
             Ok(b"data: [DONE]\n".to_vec()),
         ]);
+
         let result =
             stream_body(2, reqwest::StatusCode::OK, chunks, &mut emitter).await.unwrap().unwrap();
+
         assert_eq!(result.result.unwrap()["text"], "ok");
         assert_eq!(events.recv().await.unwrap()["params"]["event"]["text"], "ok");
 
@@ -777,6 +865,7 @@ mod tests {
         assert!(
             stream_body(2, reqwest::StatusCode::BAD_REQUEST, chunks, &mut emitter).await.is_err()
         );
+
         let (mut emitter, _) = quiet_emitter();
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(b"data: nope\n".to_vec())]);
         assert!(stream_body(2, reqwest::StatusCode::OK, chunks, &mut emitter).await.is_err());
@@ -791,16 +880,20 @@ mod tests {
             "index": 0,
             "function": {"name": "read", "arguments": "{\"path\":"}
         }]}}]});
+
         let second = json!({"choices": [{"delta": {"tool_calls": [{
             "index": 0,
             "function": {"arguments": "\"note\"}"}
         }]}}]});
+
         let chunks = stream::iter(vec![
             Ok::<_, std::io::Error>(format!("data: {first}\n").into_bytes()),
             Ok(format!("data: {second}\ndata: [DONE]\n").into_bytes()),
         ]);
+
         let result =
             stream_body(3, reqwest::StatusCode::OK, chunks, &mut emitter).await.unwrap().unwrap();
+
         assert_eq!(result.result.unwrap()["events"][0]["name"], "read");
     }
 }

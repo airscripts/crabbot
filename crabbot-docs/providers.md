@@ -70,5 +70,5 @@ policy have been reviewed.
 Use `crabbot plugin list` and `crabbot doctor` to inspect installed providers.
 The daemon reports a missing or incompatible capability instead of silently
 substituting another provider. Select a model for a session with
-`crabbot session model <id> <model>` or for a one-shot request with
-`crabbot ask --plugin <id> --model <model> <prompt...>`.
+`crabbot session model <id> <model>`. When a model plugin is installed, use
+`crabbot ask --plugin <id> --model <model> <prompt...>` for a one-shot request.

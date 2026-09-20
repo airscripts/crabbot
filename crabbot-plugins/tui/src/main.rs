@@ -8,6 +8,7 @@ use crabbot_core::{
         Protocol, Request, Response, Role,
     },
 };
+
 use serde_json::Value;
 use std::future::Future;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -38,9 +39,11 @@ async fn call(request: Request) -> crabbot_core::Result<Option<Response>> {
     let Request::Call { id, method, params, .. } = request else {
         return Ok(None);
     };
+
     if method != "command" || params["name"] != "tui" {
         return Ok(None);
     }
+
     run().await?;
     Ok(Some(Response::ok(
         id,
@@ -52,6 +55,7 @@ async fn call(request: Request) -> crabbot_core::Result<Option<Response>> {
 
 async fn run() -> crabbot_core::Result<()> {
     let input = terminal("r")?;
+
     let output = terminal("w")?;
     let plugin = std::env::var("CRABBOT_MODEL_PLUGIN").unwrap_or_else(|_| "codex".into());
     let model = std::env::var("CRABBOT_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
@@ -86,6 +90,7 @@ where
     let mut session = String::from("tui");
     let (selected_model, mut messages, mut workspace) =
         ensure_session(&home, &session, &model, host).await?;
+
     model = selected_model;
     output.write_all(b"Crabbot terminal. Type /help for commands.\n> ").await?;
     output.flush().await?;
@@ -95,16 +100,20 @@ where
     } else {
         format!("crabbot-plugin-{plugin}")
     };
+
     let path = std::path::PathBuf::from(&home).join("plugins").join(&plugin).join("bin").join(name);
     let mut process = Process::start(path).await?;
     let mut sequence = 0_u64;
     let result = async {
         let mut lines = input.lines();
+
         while let Some(line) = lines.next_line().await? {
             let line = line.trim();
+
             if line == "/quit" || line == "/exit" {
                 break;
             }
+
             if line == "/help" {
                 output
                     .write_all(
@@ -114,6 +123,7 @@ where
                 output.flush().await?;
                 continue;
             }
+
             if line == "/timer" || line.starts_with("/timer ") {
                 let command = line.strip_prefix("/timer").unwrap_or_default().trim();
                 let mut parts = command.splitn(3, ' ');
@@ -124,6 +134,7 @@ where
                             .await
                             .map(|value| format_timers(&value))
                     }
+
                     "add" => match (parts.next(), parts.next()) {
                         (Some(delay), Some(text)) => match delay.parse::<u64>() {
                             Ok(delay) if (1..=31_536_000).contains(&delay) && !text.trim().is_empty() => {
@@ -138,10 +149,13 @@ where
                                 .await
                                 .map(|_| format!("Timer {id} was scheduled.\n> "))
                             }
+
                             _ => Ok("Timer delay must be between 1 and 31536000 seconds, with a reminder text.\n> ".into()),
                         },
+
                         _ => Ok("Usage: /timer add <seconds> <text>.\n> ".into()),
                     },
+
                     "remove" => match parts.next().and_then(|id| id.parse::<u64>().ok()) {
                         Some(id) if parts.next().is_none() => capability(
                             home.clone(),
@@ -158,17 +172,22 @@ where
                                 format!("Timer {id} was not found.\n> ")
                             }
                         }),
+
                         _ => Ok("Usage: /timer remove <id>.\n> ".into()),
                     },
+
                     _ => Ok("Usage: /timer <list|add|remove>.\n> ".into()),
                 };
+
                 let text = result.unwrap_or_else(|error| {
                     format!("Timer action failed: {}.\n> ", sentence(error.to_string()))
                 });
+
                 output.write_all(text.as_bytes()).await?;
                 output.flush().await?;
                 continue;
             }
+
             if line == "/memory" || line.starts_with("/memory ") {
                 let command = line.strip_prefix("/memory").unwrap_or_default().trim();
                 let result = if command == "list" {
@@ -195,11 +214,13 @@ where
                                     "mode": "suggest",
                                     "approved": true
                                 }),
+
                                 host,
                             )
                             .await
                             .map(|_| "Memory saved for this session.\n> ".into())
                         }
+
                         _ => Ok("Usage: /memory remember <key>=<value>.\n> ".into()),
                     }
                 } else if let Some(key) = command.strip_prefix("forget ") {
@@ -225,19 +246,23 @@ where
                 } else {
                     Ok("Usage: /memory <list|remember|forget>.\n> ".into())
                 };
+
                 let text = result.unwrap_or_else(|error| {
                     format!("Memory action failed: {}.\n> ", sentence(error.to_string()))
                 });
+
                 output.write_all(text.as_bytes()).await?;
                 output.flush().await?;
                 continue;
             }
+
             if line == "/plugins" {
                 if let Ok(value) = host(home.clone(), "plugin.list".into(), serde_json::json!({})).await {
                     output.write_all(format_plugins(&value).as_bytes()).await?;
                     output.flush().await?;
                     continue;
                 }
+
                 let path = std::path::PathBuf::from(&home).join("plugins");
                 let mut names = std::fs::read_dir(path)
                     .ok()
@@ -258,19 +283,23 @@ where
                 } else {
                     format!("Installed plugins: {}.\n> ", names.join(", "))
                 };
+
                 output.write_all(text.as_bytes()).await?;
                 output.flush().await?;
                 continue;
             }
+
             if line == "/status" {
                 let text = match host(home.clone(), "status".into(), serde_json::json!({})).await {
                     Ok(value) => format_status(&value),
                     Err(error) => format!("Daemon status unavailable: {}.\n> ", sentence(error.to_string())),
                 };
+
                 output.write_all(text.as_bytes()).await?;
                 output.flush().await?;
                 continue;
             }
+
             if line == "/approval" {
                 let text = match host(home.clone(), "status".into(), serde_json::json!({})).await {
                     Ok(value) => format_approval(&value),
@@ -279,10 +308,12 @@ where
                         sentence(error.to_string())
                     ),
                 };
+
                 output.write_all(text.as_bytes()).await?;
                 output.flush().await?;
                 continue;
             }
+
             if line == "/approvals" {
                 let text = match host(home.clone(), "approval.list".into(), serde_json::json!({})).await {
                     Ok(value) => format_approvals(&value),
@@ -291,36 +322,43 @@ where
                         sentence(error.to_string())
                     ),
                 };
+
                 output.write_all(text.as_bytes()).await?;
                 output.flush().await?;
                 continue;
             }
+
             if line == "/approve" || line == "/deny" {
                 output.write_all(b"Usage: /approve <id> or /deny <id>.\n> ").await?;
                 output.flush().await?;
                 continue;
             }
+
             if let Some(id) = line.strip_prefix("/approve ") {
                 let text = approval_action(&home, id, true, host).await;
                 output.write_all(format!("{text}\n> ").as_bytes()).await?;
                 output.flush().await?;
                 continue;
             }
+
             if let Some(id) = line.strip_prefix("/deny ") {
                 let text = approval_action(&home, id, false, host).await;
                 output.write_all(format!("{text}\n> ").as_bytes()).await?;
                 output.flush().await?;
                 continue;
             }
+
             if line == "/sessions" {
                 let text = match host(home.clone(), "session.list".into(), serde_json::json!({})).await {
                     Ok(value) => format_sessions(&value),
                     Err(error) => format!("Session list unavailable: {}.\n> ", sentence(error.to_string())),
                 };
+
                 output.write_all(text.as_bytes()).await?;
                 output.flush().await?;
                 continue;
             }
+
             if line == "/deliveries" {
                 let text = match host(home.clone(), "delivery.list".into(), serde_json::json!({})).await {
                     Ok(value) => format_deliveries(&value),
@@ -329,22 +367,26 @@ where
                         sentence(error.to_string())
                     ),
                 };
+
                 output.write_all(text.as_bytes()).await?;
                 output.flush().await?;
                 continue;
             }
+
             if let Some(id) = line.strip_prefix("/retry ") {
                 let text = delivery_action(&home, "delivery.retry", id, host).await;
                 output.write_all(format!("{text}\n> ").as_bytes()).await?;
                 output.flush().await?;
                 continue;
             }
+
             if let Some(id) = line.strip_prefix("/drop ") {
                 let text = delivery_action(&home, "delivery.drop", id, host).await;
                 output.write_all(format!("{text}\n> ").as_bytes()).await?;
                 output.flush().await?;
                 continue;
             }
+
             if line == "/workspace" {
                 let default_workspace = std::env::var("CRABBOT_ROOT").ok();
                 let active = workspace
@@ -357,12 +399,15 @@ where
                 output.flush().await?;
                 continue;
             }
+
             if let Some(value) = line.strip_prefix("/workspace ") {
                 let value = value.trim();
+
                 if value.is_empty() {
                     output.write_all(b"Workspace path cannot be empty.\n> ").await?;
                 } else {
                     let selected = (value != "reset").then_some(value);
+
                     match host(
                         home.clone(),
                         "session.workspace".into(),
@@ -381,6 +426,7 @@ where
                                 .write_all(format!("Workspace: {active}.\n> ").as_bytes())
                                 .await?;
                         }
+
                         Err(error) => {
                             output
                                 .write_all(
@@ -391,9 +437,11 @@ where
                         }
                     }
                 }
+
                 output.flush().await?;
                 continue;
             }
+
             if line == "/clear" {
                 host(home.clone(), "session.clear".into(), serde_json::json!({"id": session}))
                     .await?;
@@ -402,13 +450,16 @@ where
                 output.flush().await?;
                 continue;
             }
+
             if line == "/model" {
                 output.write_all(b"Model cannot be empty.\n> ").await?;
                 output.flush().await?;
                 continue;
             }
+
             if let Some(value) = line.strip_prefix("/model ") {
                 let value = value.trim();
+
                 if value.is_empty() {
                     output.write_all(b"Model cannot be empty.\n> ").await?;
                 } else {
@@ -421,11 +472,14 @@ where
                     model = value.to_owned();
                     output.write_all(format!("Using model {model}.\n> ").as_bytes()).await?;
                 }
+
                 output.flush().await?;
                 continue;
             }
+
             if let Some(value) = line.strip_prefix("/session ") {
                 let value = value.trim();
+
                 if !valid_session(value) {
                     output.write_all(b"Session ID is invalid.\n> ").await?;
                 } else {
@@ -439,6 +493,7 @@ where
                                 .write_all(format!("Using session {session}.\n> ").as_bytes())
                                 .await?;
                         }
+
                         Err(error) => {
                             output
                                 .write_all(
@@ -449,11 +504,14 @@ where
                         }
                     }
                 }
+
                 output.flush().await?;
                 continue;
             }
+
             if let Some(value) = line.strip_prefix("/new ") {
                 let value = value.trim();
+
                 if !valid_session(value) {
                     output.write_all(b"Session ID is invalid.\n> ").await?;
                 } else {
@@ -475,6 +533,7 @@ where
                                 .write_all(format!("Created session {session}.\n> ").as_bytes())
                                 .await?;
                         }
+
                         Err(error) => {
                             output
                                 .write_all(
@@ -485,14 +544,17 @@ where
                         }
                     }
                 }
+
                 output.flush().await?;
                 continue;
             }
+
             if line.is_empty() {
                 output.write_all(b"> ").await?;
                 output.flush().await?;
                 continue;
             }
+
             sequence = sequence.saturating_add(1);
             let user = Message {
                 id: message_id("user", sequence),
@@ -501,6 +563,7 @@ where
                 sender: Some("tui".into()),
                 content: vec![Content::Text { text: line.into() }],
             };
+
             if let Err(error) = host(
                 home.clone(),
                 "session.append".into(),
@@ -516,6 +579,7 @@ where
                 output.flush().await?;
                 continue;
             }
+
             messages.push(user);
             let (sender, mut events) = mpsc::channel(32);
             let request = Request::call(
@@ -537,11 +601,13 @@ where
                     })
                 }
             });
+
             tokio::pin!(call);
             let mut streamed = String::new();
             let response = loop {
                 tokio::select! {
                     result = &mut call => break result?,
+
                     event = events.recv() => {
                         if let Some(text) = event.and_then(stream_text) {
                             streamed.push_str(&text);
@@ -551,18 +617,22 @@ where
                     }
                 }
             };
+
             while let Ok(event) = events.try_recv() {
                 if let Some(text) = stream_text(event) {
                     streamed.push_str(&text);
                     output.write_all(text.as_bytes()).await?;
                 }
             }
+
             if let Some(error) = response.error {
                 return Err(crabbot_core::Error::Denied(error.message));
             }
+
             let value = response.result.ok_or_else(|| {
                 crabbot_core::Error::Denied("The intelligence plugin returned no result.".into())
             })?;
+
             let reply: crabbot_core::types::ModelReply = serde_json::from_value(value)?;
             let assistant = Message {
                 id: message_id("assistant", sequence),
@@ -571,6 +641,7 @@ where
                 sender: None,
                 content: vec![Content::Text { text: reply.text.clone() }],
             };
+
             let saved = host(
                 home.clone(),
                 "session.append".into(),
@@ -578,6 +649,7 @@ where
             )
             .await;
             messages.push(assistant);
+
             if streamed.is_empty() {
                 output.write_all(reply.text.as_bytes()).await?;
             } else if let Some(rest) = reply.text.strip_prefix(&streamed) {
@@ -586,6 +658,7 @@ where
                 output.write_all(b"\n").await?;
                 output.write_all(reply.text.as_bytes()).await?;
             }
+
             if let Err(error) = saved {
                 output
                     .write_all(
@@ -593,12 +666,15 @@ where
                     )
                     .await?;
             }
+
             output.write_all(b"\n> ").await?;
             output.flush().await?;
         }
+
         Ok::<(), crabbot_core::Error>(())
     }
     .await;
+
     let stopped = process.stop().await;
     result?;
     stopped
@@ -629,14 +705,17 @@ where
     F: Future<Output = crabbot_core::Result<Value>>,
 {
     let value = host(home.into(), "session.get".into(), serde_json::json!({"id": id})).await?;
+
     if value["status"] == "working" || value["inflight"] == true {
         return Err(crabbot_core::Error::Denied("Session is already working.".into()));
     }
+
     let model = value["model"]
         .as_str()
         .filter(|model| !model.trim().is_empty())
         .ok_or_else(|| crabbot_core::Error::Denied("Session has no model configured.".into()))?
         .to_owned();
+
     let messages = serde_json::from_value(value["messages"].clone())?;
     let workspace = value["workspace"].as_str().map(str::to_owned);
     Ok((model, messages, workspace))
@@ -676,6 +755,7 @@ fn format_timers(value: &Value) -> String {
     let Some(items) = value["items"].as_array() else {
         return "Timers: none.\n> ".into();
     };
+
     let items = items
         .iter()
         .take(100)
@@ -686,6 +766,7 @@ fn format_timers(value: &Value) -> String {
             Some(format!("{id} (due {due}): {}", short(text)))
         })
         .collect::<Vec<_>>();
+
     if items.is_empty() {
         "Timers: none.\n> ".into()
     } else {
@@ -697,6 +778,7 @@ fn format_memories(value: &Value) -> String {
     let Some(items) = value["items"].as_array() else {
         return "Memories: none.\n> ".into();
     };
+
     let items = items
         .iter()
         .take(100)
@@ -706,6 +788,7 @@ fn format_memories(value: &Value) -> String {
             Some(format!("{} = {}", short(key), short(value)))
         })
         .collect::<Vec<_>>();
+
     if items.is_empty() {
         "Memories: none.\n> ".into()
     } else {
@@ -716,9 +799,11 @@ fn format_memories(value: &Value) -> String {
 fn short(value: &str) -> String {
     let mut chars = value.chars();
     let mut short = chars.by_ref().take(120).collect::<String>();
+
     if chars.next().is_some() {
         short.push('…');
     }
+
     short
 }
 
@@ -733,6 +818,7 @@ fn message_id(role: &str, sequence: u64) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
+
     format!("tui-{role}-{now}-{sequence}")
 }
 
@@ -740,21 +826,26 @@ fn stream_text(request: Request) -> Option<String> {
     let Request::Note { method, params, .. } = request else {
         return None;
     };
+
     if method != "event" || params["event"]["kind"] != "text" {
         return None;
     }
+
     params["event"]["text"].as_str().map(str::to_owned)
 }
 
 fn terminal(mode: &str) -> crabbot_core::Result<std::fs::File> {
     let path =
         if cfg!(windows) { if mode == "r" { "CONIN$" } else { "CONOUT$" } } else { "/dev/tty" };
+
     let mut options = std::fs::OpenOptions::new();
+
     if mode == "r" {
         options.read(true);
     } else {
         options.write(true);
     }
+
     options.open(path).map_err(crabbot_core::Error::from)
 }
 
@@ -767,6 +858,7 @@ async fn control(home: &str, method: &str, params: Value) -> crabbot_core::Resul
         .map_err(|error| {
             crabbot_core::Error::Denied(format!("The daemon port is invalid: {error}."))
         })?;
+
     let exchange = async {
         let stream = TcpStream::connect(("127.0.0.1", port)).await?;
         let (input, output) = stream.into_split();
@@ -779,17 +871,20 @@ async fn control(home: &str, method: &str, params: Value) -> crabbot_core::Resul
             jsonl::read(&mut input, jsonl::MAX).await?.ok_or_else(|| {
                 crabbot_core::Error::Denied("The daemon closed the IPC connection.".into())
             })?;
+
         if !response.valid() || response.id != 1 {
             return Err(crabbot_core::Error::Denied(
                 "The daemon returned an invalid response.".into(),
             ));
         }
+
         match (response.result, response.error) {
             (Some(value), _) => Ok(value),
             (_, Some(error)) => Err(crabbot_core::Error::Denied(error.message)),
             _ => Err(crabbot_core::Error::Denied("The daemon returned an empty response.".into())),
         }
     };
+
     timeout(Duration::from_secs(5), exchange)
         .await
         .map_err(|_| crabbot_core::Error::Denied("The daemon did not respond in time.".into()))?
@@ -801,6 +896,7 @@ where
     F: Future<Output = crabbot_core::Result<Value>>,
 {
     let id = id.trim();
+
     if id.is_empty()
         || !id.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
@@ -808,6 +904,7 @@ where
     {
         return "Delivery ID is invalid.".into();
     }
+
     match host(home.into(), method.into(), serde_json::json!({"id": id, "yes": true})).await {
         Ok(value) => format!("Delivery {}.", value["status"].as_str().unwrap_or("updated")),
         Err(error) => format!("Delivery update unavailable: {}.", sentence(error.to_string())),
@@ -829,9 +926,11 @@ fn format_approvals(value: &Value) -> String {
     let Some(items) = value["items"].as_array() else {
         return "Pending approvals: none.\n> ".into();
     };
+
     if items.is_empty() {
         return "Pending approvals: none.\n> ".into();
     }
+
     let rows = items
         .iter()
         .filter_map(|item| {
@@ -843,15 +942,18 @@ fn format_approvals(value: &Value) -> String {
             Some(format!("{id}: {tool} for {session} — {args}"))
         })
         .collect::<Vec<_>>();
+
     if rows.is_empty() {
         return "Pending approvals: none.\n> ".into();
     }
+
     format!("Pending approvals:\n{}\nUse /approve <id> or /deny <id>.\n> ", rows.join("\n"))
 }
 
 fn preview(value: &str, limit: usize) -> String {
     let mut chars = value.chars();
     let output = chars.by_ref().take(limit).collect::<String>();
+
     if chars.next().is_some() { format!("{output}…") } else { output }
 }
 
@@ -861,9 +963,11 @@ where
     F: Future<Output = crabbot_core::Result<Value>>,
 {
     let id = id.trim();
+
     if id.len() != 24 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return "Approval ID is invalid.".into();
     }
+
     match host(
         home.into(),
         "approval.resolve".into(),
@@ -874,6 +978,7 @@ where
         Ok(value) if value["resolved"] == true => {
             if approved { "Approval accepted." } else { "Approval denied." }.into()
         }
+
         Ok(_) => "Approval is no longer pending.".into(),
         Err(error) => format!("Approval action failed: {}.", sentence(error.to_string())),
     }
@@ -883,9 +988,11 @@ fn format_sessions(value: &Value) -> String {
     let Some(items) = value["items"].as_array() else {
         return "Sessions: none.\n> ".into();
     };
+
     if items.is_empty() {
         return "Sessions: none.\n> ".into();
     }
+
     let names = items
         .iter()
         .filter_map(|item| {
@@ -894,6 +1001,7 @@ fn format_sessions(value: &Value) -> String {
             Some(format!("{id} ({status})"))
         })
         .collect::<Vec<_>>();
+
     if names.is_empty() {
         "Sessions: none.\n> ".into()
     } else {
@@ -905,6 +1013,7 @@ fn format_plugins(value: &Value) -> String {
     let Some(items) = value["items"].as_array() else {
         return "Installed plugins: none.\n> ".into();
     };
+
     let names = items
         .iter()
         .filter_map(|item| {
@@ -916,6 +1025,7 @@ fn format_plugins(value: &Value) -> String {
             )
         })
         .collect::<Vec<String>>();
+
     if names.is_empty() {
         "Installed plugins: none.\n> ".into()
     } else {
@@ -927,6 +1037,7 @@ fn format_deliveries(value: &Value) -> String {
     let Some(items) = value["items"].as_array() else {
         return "Deliveries: none.\n> ".into();
     };
+
     let names = items
         .iter()
         .filter_map(|item| {
@@ -935,6 +1046,7 @@ fn format_deliveries(value: &Value) -> String {
             Some(format!("{id} ({status})"))
         })
         .collect::<Vec<_>>();
+
     if names.is_empty() {
         "Deliveries: none.\n> ".into()
     } else {
@@ -944,10 +1056,13 @@ fn format_deliveries(value: &Value) -> String {
 
 fn sentence(value: String) -> String {
     let value = value.trim().trim_end_matches('.');
+
     if value.is_empty() {
         return "Unknown error".into();
     }
+
     let mut chars = value.chars();
+
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => "Unknown error".into(),
@@ -995,6 +1110,7 @@ mod tests {
                 }
             }]
         });
+
         assert_eq!(
             super::format_approvals(&value),
             "Pending approvals:\n0123456789abcdef01234567: write for telegram-7 — {\"path\":\"note.txt\"}\nUse /approve <id> or /deny <id>.\n> "
@@ -1008,6 +1124,7 @@ mod tests {
         let text = super::format_sessions(&serde_json::json!({
             "items": [{"id": "one", "status": "idle"}]
         }));
+
         assert_eq!(text, "Sessions: one (idle).\n> ");
 
         assert_eq!(
@@ -1081,19 +1198,23 @@ mod tests {
                 "inflight": false,
                 "messages": []
             })),
+
             "capability.call" => match (params["service"].as_str(), params["method"].as_str()) {
                 (Some("timer"), Some("list")) => Ok(json!({
                     "items": [{"id": 7, "due": 42, "text": "call back"}]
                 })),
+
                 (Some("timer"), Some("add")) => Ok(json!({"id": params["params"]["id"]})),
                 (Some("timer"), Some("remove")) => Ok(json!({"deleted": true})),
                 (Some("memory"), Some("list")) => Ok(json!({
                     "items": [{"key": "drink", "value": "tea"}]
                 })),
+
                 (Some("memory"), Some("remember")) => Ok(json!({"ok": true})),
                 (Some("memory"), Some("forget")) => Ok(json!({"deleted": true})),
                 _ => Err(crabbot_core::Error::Denied("Method not found.".into())),
             },
+
             "approval.list" => Ok(json!({
                 "items": [{
                     "id": "0123456789abcdef01234567",
@@ -1104,11 +1225,13 @@ mod tests {
                     }
                 }]
             })),
+
             "approval.resolve" => Ok(json!({"resolved": true, "approved": params["approved"]})),
             "session.workspace" => Ok(json!({
                 "id": params["id"],
                 "workspace": params["workspace"]
             })),
+
             "session.ensure" | "session.new" | "session.append" | "session.clear"
             | "session.model" => Ok(json!({"id": params["id"]})),
             _ => Err(crabbot_core::Error::Denied("Method not found.".into())),
@@ -1122,6 +1245,7 @@ mod tests {
             method: "event".into(),
             params: serde_json::json!({"event": {"kind": "text", "text": "part"}}),
         };
+
         assert_eq!(super::stream_text(event), Some("part".into()));
         assert!(
             super::stream_text(crabbot_core::types::Request::call(
@@ -1145,7 +1269,8 @@ mod tests {
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
         fs::write(
             &binary,
-            r#"while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc":"2.0","method":"event","params":{"event":{"kind":"text","text":"Reply"}}}'; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"text":"Reply","stop":"stop","events":[]}}' ;; *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"codex","version":"0.1.0","capabilities":["model"]}}' ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;; esac; done"#,
+            r#"#!/bin/sh
+while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc":"2.0","method":"event","params":{"event":{"kind":"text","text":"Reply"}}}'; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"text":"Reply","stop":"stop","events":[]}}' ;; *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"codex","version":"0.1.0","capabilities":["model"]}}' ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;; esac; done"#,
         )
         .unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1169,6 +1294,7 @@ mod tests {
             "base".into(),
             mock_control,
         );
+
         tokio::time::timeout(std::time::Duration::from_secs(10), run).await.unwrap().unwrap();
         let text = fs::read_to_string(&output_path).unwrap();
         assert_eq!(text.matches("Reply").count(), 1);

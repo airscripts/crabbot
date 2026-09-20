@@ -78,9 +78,11 @@ Brand positioning:
   credentials, protected-file fallback, and systemd-user, launchd-agent, and
   Windows Service support.
 - CLI commands include init, doctor, status, version, plugin
-  install/link/list/update/remove, session, delivery, service, ask, export,
-  import, and plugin-registered commands such as `code`, `codex`, and `tui`.
-  Human output is default; JSON and noninteractive confirmation are explicit.
+  install/link/list/update/remove, session, delivery, service, export, and
+  import. The host-managed `ask` command appears when an installed model
+  plugin can run; other optional commands are registered by plugins such as
+  `code`, `codex`, and `tui`. Human output is default; JSON and noninteractive
+  confirmation are explicit.
 - TUI supports chat, sessions, model/workspace switching, approvals, timers,
   memory, plugin health, and streamed activity.
 - Sessions support new, resume, fork, cancel, and model switching. One turn
@@ -136,8 +138,8 @@ Brand positioning:
 - CI covers verification, builds, tests, security, Agentskill, release
   preparation, packaging, and checksums.
 - Stable and MSRV builds, all-target compilation, doctests, Clippy, formatting,
-  dependency audits, documentation validation, and at least 80% workspace line
-  coverage are release requirements.
+  dependency audits, documentation validation, and at least 80% core and host
+  package line coverage are release requirements.
 - Releases provide separate core and plugin archives for Linux, macOS, and
   Windows on x86_64 and ARM64, with checksums and provenance.
 - Unix and PowerShell installers support core and one-line plugin installation.

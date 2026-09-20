@@ -7,6 +7,23 @@ Semantic Versioning.
 
 ### Added
 
+- Added safe, repeatable `crabbot init` behavior with explicit `--force`
+  reinitialization and a friendly first-run completion message.
+- Added conservative `crabbot doctor --fix` repairs for missing default local
+  state without overwriting configuration or plugin files.
+- Added human and structured health summaries to `crabbot doctor` output.
+- Added pretty-printed JSON diagnostics for all `crabbot doctor` modes.
+- Added the shorter `crab` executable alias for the `crabbot` CLI.
+- Added executable-aware shell completions for both `crabbot` and `crab`.
+- Added structured JSON output for native initialization, diagnostics, version,
+  Crabfile, service, plugin, session, and delivery operations; capability status
+  now includes explicit status and plugin arrays.
+- Added explicit `--yes` confirmation for session deletion and readable human
+  output for session transcripts, while retaining structured `--json` output.
+- Added the host-managed `crabbot ask` command through the external command
+  path, exposing it only when an installed model plugin can run.
+- Added runtime-enriched CLI help with separate native and plugin command lists;
+  unknown external commands now display that help.
 - Added descriptive CLI command help, global JSON and diagnostic modes, and
   `-h`/`-H`/`--help`, `--verbose`, and `-v`/`-V`/`--version` options.
 - Added structured `tracing` diagnostics for CLI and daemon failures.

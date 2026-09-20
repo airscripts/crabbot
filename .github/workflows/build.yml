@@ -1,14 +1,27 @@
 name: Build
 
 on:
+  workflow_dispatch:
+    inputs:
+      local:
+        description: "Use the local act working tree"
+        required: false
+        type: string
+        default: ""
+
   workflow_call:
+    inputs:
+      local:
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    name: Modules
+  agent:
+    name: Agent (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
 
@@ -55,9 +68,11 @@ jobs:
 
     steps:
       - name: Checkout
+        if: inputs.local != 'true'
         uses: actions/checkout@v7
 
       - name: Install Rust Toolchain
+        if: inputs.local != 'true'
         uses: dtolnay/rust-toolchain@1.89
 
         with:
@@ -72,9 +87,13 @@ jobs:
       - name: Verify Native CLI on Unix
         if: runner.os != 'Windows'
         shell: bash
-        run: ./target/${{ matrix.target }}/release/crabbot version
+        run: |
+          ./target/${{ matrix.target }}/release/crabbot version
+          ./target/${{ matrix.target }}/release/crab version
 
       - name: Verify Native CLI on Windows
         if: runner.os == 'Windows'
         shell: pwsh
-        run: .\target\${{ matrix.target }}\release\crabbot.exe version
+        run: |
+          .\target\${{ matrix.target }}\release\crabbot.exe version
+          .\target\${{ matrix.target }}\release\crab.exe version
