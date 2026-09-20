@@ -1,4 +1,4 @@
-# whisper
+# Whisper
 
 Install the released plugin with:
 

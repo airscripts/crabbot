@@ -1,4 +1,4 @@
-# ollama
+# Ollama
 
 Install the released plugin with:
 

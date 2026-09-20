@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -278,6 +278,19 @@ fn sentence(value: impl Into<String>) -> String {
     value
 }
 
+fn toml_position(input: &str, offset: usize) -> (usize, usize) {
+    let bytes = input.as_bytes();
+    let offset = offset.min(bytes.len());
+    let line = bytes[..offset].iter().filter(|byte| **byte == b'\n').count() + 1;
+    let column = bytes[..offset]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(offset, |position| offset.saturating_sub(position + 1))
+        + 1;
+
+    (line, column)
+}
+
 fn diagnostic(value: impl AsRef<str>) -> String {
     redact_diagnostic(value)
 }
@@ -510,6 +523,8 @@ enum Command {
 
     #[command(about = "Export the local configuration and plugin lock.")]
     Export(CrabfileExport),
+    #[command(about = "Validate a Crabfile without changing local state.")]
+    Validate(CrabfileValidate),
     #[command(about = "Import a configuration and plugin lock.")]
     Import(CrabfileImport),
     #[command(external_subcommand, hide = true)]
@@ -527,7 +542,17 @@ enum CompletionShell {
 
 #[derive(Debug, Args)]
 struct CrabfileExport {
-    #[arg(long, value_name = "PATH", help = "Write the Crabfile to PATH.")]
+    #[arg(value_name = "PATH", help = "Write the Crabfile to PATH or a directory.")]
+    destination: Option<PathBuf>,
+    #[arg(long, value_name = "PATH", help = "Write the Crabfile to PATH or a directory.")]
+    path: Option<PathBuf>,
+    #[arg(long, help = "Overwrite an existing Crabfile.")]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct CrabfileValidate {
+    #[arg(long, value_name = "PATH", help = "Read the Crabfile from PATH.")]
     path: Option<PathBuf>,
 }
 
@@ -709,6 +734,7 @@ struct Ask {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Config {
     update: String,
     shell: bool,
@@ -764,6 +790,7 @@ impl ApprovalMode {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ChannelConfig {
     #[serde(default)]
     allow: Vec<String>,
@@ -1029,13 +1056,15 @@ async fn main_with(cli: Cli) -> ExitCode {
                 debug.then(|| write_debug_report(command, error.as_ref(), started.elapsed()));
 
             if json {
+                let message = diagnostic(sentence(error.to_string()));
                 eprintln!(
                     "{}",
-                    serde_json::json!({"error": diagnostic(sentence(error.to_string()))})
+                    serde_json::to_string_pretty(&serde_json::json!({"error": message}))
+                        .expect("serializing a JSON error cannot fail")
                 );
             } else {
                 let message = sentence(error.to_string());
-                error!(error = %diagnostic(&message), "Command failed.");
+                eprintln!("Error: {}", diagnostic(&message));
 
                 if debug {
                     debug!(
@@ -1085,6 +1114,7 @@ fn command_label(command: &Command) -> &'static str {
         Command::Delivery { .. } => "delivery",
         Command::Service { .. } => "service",
         Command::Export(_) => "export",
+        Command::Validate(_) => "validate",
         Command::Import(_) => "import",
         Command::External(_) => "external",
     }
@@ -1146,6 +1176,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Delivery { command } => delivery(command, json).await?,
         Command::Service { command } => service(command.unwrap_or(ServiceCommand::Status), json)?,
         Command::Export(args) => export_crabfile(args, json)?,
+        Command::Validate(args) => validate_crabfile(args, json)?,
         Command::Import(args) => import_crabfile(args, json)?,
         Command::External(args) => plugin_command(args).await?,
     }
@@ -1230,13 +1261,15 @@ fn help_text_with_plugins(root: &Path) -> String {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Crabfile {
-    version: u8,
+    version: String,
     config: Config,
     plugins: Vec<CrabPlugin>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct CrabPlugin {
     id: String,
     source: String,
@@ -1244,6 +1277,42 @@ struct CrabPlugin {
     version: String,
     capabilities: Vec<String>,
 }
+
+impl Crabfile {
+    fn validate(&self) -> Result<(), String> {
+        if self.version != CRABFILE_VERSION {
+            return Err(format!(
+                "unsupported version {} (expected {})",
+                self.version, CRABFILE_VERSION
+            ));
+        }
+
+        self.config.validate().map_err(|error| format!("configuration: {error}"))?;
+
+        let mut ids = BTreeSet::new();
+
+        for plugin in &self.plugins {
+            if !valid(&plugin.id) {
+                return Err(format!(
+                    "plugin {} has an invalid ID; use lowercase letters, digits, or hyphens",
+                    plugin.id
+                ));
+            }
+
+            if plugin.source.trim().is_empty() {
+                return Err(format!("plugin {} has an empty source", plugin.id));
+            }
+
+            if !ids.insert(&plugin.id) {
+                return Err(format!("plugin {} is listed more than once", plugin.id));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+const CRABFILE_VERSION: &str = "0.1";
 
 fn export_crabfile(
     args: CrabfileExport,
@@ -1265,10 +1334,14 @@ fn export_crabfile_at_mode(
     root: &Path,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let path = args.path.unwrap_or_else(|| PathBuf::from("Crabfile"));
+    let path = crabfile_output_path(args.destination, args.path)?;
 
-    if path.exists() {
-        return Err(format!("{} already exists; choose another path.", path.display()).into());
+    if path.exists() && !args.force {
+        return Err(format!(
+            "Crabfile already exists at {}; use --force to overwrite it.",
+            path.display()
+        )
+        .into());
     }
 
     let config = if root.join("config.toml").is_file() {
@@ -1291,7 +1364,7 @@ fn export_crabfile_at_mode(
         .collect::<Vec<_>>();
 
     plugins.sort_by(|left, right| left.id.cmp(&right.id));
-    let file = Crabfile { version: 1, config, plugins };
+    let file = Crabfile { version: CRABFILE_VERSION.into(), config, plugins };
     let text = toml::to_string_pretty(&file)?;
     secure(&path, text.as_bytes())?;
 
@@ -1319,6 +1392,31 @@ fn import_crabfile(
     import_crabfile_at_mode(args, &home(), json)
 }
 
+fn validate_crabfile(
+    args: CrabfileValidate,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = args.path.unwrap_or_else(default_crabfile_path);
+    let file = read_crabfile(&path)?;
+    validate_crabfile_spec(&file, &path)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": path,
+                "plugins": file.plugins.len(),
+                "status": "valid",
+                "version": file.version,
+            }))?
+        );
+    } else {
+        println!("Crabfile at {} is valid.", path.display());
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 fn import_crabfile_at(
     args: CrabfileImport,
@@ -1332,27 +1430,14 @@ fn import_crabfile_at_mode(
     root: &Path,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let path = args.path.unwrap_or_else(|| PathBuf::from("Crabfile"));
+    let path = args.path.unwrap_or_else(default_crabfile_path);
 
     if !args.yes {
-        return Err("Import requires --yes.".into());
+        return Err("Import requires confirmation; re-run with --yes.".into());
     }
 
-    let file: Crabfile = toml::from_str(&std::fs::read_to_string(&path)?)?;
-
-    if file.version != 1 {
-        return Err("Unsupported Crabfile version.".into());
-    }
-
-    file.config.validate().map_err(|error| format!("Invalid Crabfile configuration: {error}"))?;
-
-    for plugin in &file.plugins {
-        if !valid(&plugin.id) || plugin.source.trim().is_empty() {
-            return Err(
-                format!("Crabfile plugin {} has an invalid source or ID.", plugin.id).into()
-            );
-        }
-    }
+    let file = read_crabfile(&path)?;
+    validate_crabfile_spec(&file, &path)?;
 
     let destination = root.join("config.toml");
 
@@ -1425,6 +1510,56 @@ fn import_crabfile_at_mode(
     }
 
     Ok(())
+}
+
+fn read_crabfile(path: &Path) -> Result<Crabfile, Box<dyn std::error::Error + Send + Sync>> {
+    let source = std::fs::read_to_string(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "Crabfile not found at {}. Use --path <PATH> to choose a Crabfile.",
+                path.display()
+            )
+        } else {
+            format!("Could not read Crabfile at {}: {error}.", path.display())
+        }
+    })?;
+
+    toml::from_str(&source).map_err(|error: toml::de::Error| {
+        let location = error.span().map(|span| toml_position(&source, span.start));
+        let location = location
+            .map_or_else(String::new, |(line, column)| format!(" at line {line}, column {column}"));
+
+        format!("Crabfile at {} is invalid{}: {}.", path.display(), location, error.message())
+            .into()
+    })
+}
+
+fn validate_crabfile_spec(
+    file: &Crabfile,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    file.validate()
+        .map_err(|error| format!("Crabfile at {} is invalid: {error}", path.display()).into())
+}
+
+fn default_crabfile_path() -> PathBuf {
+    PathBuf::from("./Crabfile")
+}
+
+fn crabfile_output_path(
+    destination: Option<PathBuf>,
+    path: Option<PathBuf>,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let path = match (destination, path) {
+        (Some(_), Some(_)) => {
+            return Err("Choose either a positional export path or --path, not both.".into());
+        }
+
+        (Some(path), None) | (None, Some(path)) => path,
+        (None, None) => default_crabfile_path(),
+    };
+
+    Ok(if path.is_dir() { path.join("Crabfile") } else { path })
 }
 
 async fn ask_at(ask: Ask, root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -2632,6 +2767,7 @@ fn native_command(name: &str) -> bool {
             | "service"
             | "ask"
             | "export"
+            | "validate"
             | "import"
     )
 }
@@ -8997,18 +9133,19 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ARCHIVE_LIMIT, BANNER, Cancellation, Cli, Command, CommandSpec, CompletionShell, Config,
-        CrabfileExport, CrabfileImport, DeliveryCommand, DoctorArgs, Fork, Id, InitArgs, Live,
-        Manifest, NAME, Name, Output, Plugins, Process, ServiceCommand, SessionCommand,
-        SessionDelete, SessionModel, SessionNew, Sha256, Source, Stop, answer, archive,
-        archive_root, archive_url, assistant, binary_at, canonical_source, changed,
-        channel_message_id, command_output_limited, commit_event, completion_name_from,
-        daemon_lock, delivery_at, delivery_request, download, embedded, ensure_home, env_for,
-        export_crabfile_at, generate_completion, import_crabfile_at, init_at, installed_at,
-        isolate_at, local_session, plugin_binary, read_manifest, reclaim_worktrees, recover,
-        recover_plugins, redact, resolve, restart_tool, revision, safe_archive, send_params,
-        service_at, service_at_with, service_environment_from, service_path_value, service_text,
-        session_at, stream_fits, tool, update_at, validate_archive, verify_archive,
+        ARCHIVE_LIMIT, BANNER, CRABFILE_VERSION, Cancellation, Cli, Command, CommandSpec,
+        CompletionShell, Config, CrabPlugin, Crabfile, CrabfileExport, CrabfileImport,
+        CrabfileValidate, DeliveryCommand, DoctorArgs, Fork, Id, InitArgs, Live, Manifest, NAME,
+        Name, Output, Plugins, Process, ServiceCommand, SessionCommand, SessionDelete,
+        SessionModel, SessionNew, Sha256, Source, Stop, answer, archive, archive_root, archive_url,
+        assistant, binary_at, canonical_source, changed, channel_message_id,
+        command_output_limited, commit_event, completion_name_from, crabfile_output_path,
+        daemon_lock, default_crabfile_path, delivery_at, delivery_request, download, embedded,
+        ensure_home, env_for, export_crabfile_at, generate_completion, import_crabfile_at, init_at,
+        installed_at, isolate_at, local_session, plugin_binary, read_manifest, reclaim_worktrees,
+        recover, recover_plugins, redact, resolve, restart_tool, revision, safe_archive,
+        send_params, service_at, service_at_with, service_environment_from, service_path_value,
+        service_text, session_at, stream_fits, tool, update_at, validate_archive, verify_archive,
         write_debug_report_at,
     };
 
@@ -9187,6 +9324,28 @@ mod tests {
     }
 
     #[test]
+    fn crabfile_validation_reports_the_first_error() {
+        let mut file =
+            Crabfile { version: "0.2".into(), config: Config::default(), plugins: vec![] };
+        assert_eq!(file.validate().unwrap_err(), "unsupported version 0.2 (expected 0.1)");
+
+        file.version = CRABFILE_VERSION.into();
+        file.config.update = "invalid".into();
+        assert!(file.validate().unwrap_err().starts_with("configuration:"));
+
+        file.config = Config::default();
+        file.plugins.push(CrabPlugin {
+            id: "Bad ID".into(),
+            source: "local".into(),
+            revision: String::new(),
+            version: "0.1.0".into(),
+            capabilities: vec![],
+        });
+
+        assert!(file.validate().unwrap_err().contains("invalid ID"));
+    }
+
+    #[test]
     fn covers_runtime_helpers() {
         assert_eq!(super::sentence("hello"), "Hello.");
         assert_eq!(super::sentence("Already!"), "Already!");
@@ -9232,6 +9391,7 @@ mod tests {
             "service",
             "ask",
             "export",
+            "validate",
             "import",
         ] {
             assert!(super::native_command(name));
@@ -9285,8 +9445,17 @@ mod tests {
         );
 
         assert_eq!(
-            super::command_label(&Command::Export(super::CrabfileExport { path: None })),
+            super::command_label(&Command::Export(super::CrabfileExport {
+                destination: None,
+                path: None,
+                force: false,
+            })),
             "export"
+        );
+
+        assert_eq!(
+            super::command_label(&Command::Validate(super::CrabfileValidate { path: None })),
+            "validate"
         );
 
         assert_eq!(
@@ -9349,6 +9518,7 @@ mod tests {
         assert!(!config.shell);
         assert_eq!(config.approval, "off");
         assert_eq!(config.channels["telegram"].allow, vec!["123"]);
+        assert!(toml::from_str::<Config>("unknown = true\n").is_err());
     }
 
     #[test]
@@ -9880,6 +10050,32 @@ mod tests {
 
         let cli = Cli::try_parse_from(["crabbot", "export", "--json"]).unwrap();
         assert!(cli.json);
+
+        let cli = Cli::try_parse_from(["crabbot", "export", "."]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Export(CrabfileExport { destination: Some(path), path: None, force: false })
+                if path == Path::new(".")
+        ));
+
+        let cli = Cli::try_parse_from(["crabbot", "export", "--force"]).unwrap();
+        assert!(matches!(cli.command, Command::Export(CrabfileExport { force: true, .. })));
+
+        let cli =
+            Cli::try_parse_from(["crabbot", "validate", "--path", "Crabfile", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(
+            matches!(cli.command, Command::Validate(CrabfileValidate { path: Some(path) }) if path == Path::new("Crabfile"))
+        );
+
+        assert_eq!(default_crabfile_path(), Path::new("./Crabfile"));
+        assert_eq!(
+            crabfile_output_path(None, Some(PathBuf::from("."))).unwrap(),
+            Path::new("./Crabfile")
+        );
+        assert!(
+            crabfile_output_path(Some(PathBuf::from("one")), Some(PathBuf::from("two"))).is_err()
+        );
 
         let help = Cli::command().render_help().to_string();
         assert!(help.contains("Initialize the Crabbot home directory and configuration."));
@@ -10894,19 +11090,63 @@ mod tests {
             .unwrap();
 
         let crabfile = root.join("Crabfile");
-        export_crabfile_at(CrabfileExport { path: Some(crabfile.clone()) }, &root).unwrap();
+        export_crabfile_at(
+            CrabfileExport { destination: None, path: Some(crabfile.clone()), force: false },
+            &root,
+        )
+        .unwrap();
 
         assert!(
-            export_crabfile_at(CrabfileExport { path: Some(crabfile.clone()) }, &root).is_err()
-        );
-
-        assert!(
-            import_crabfile_at(
-                CrabfileImport { path: Some(crabfile), yes: false, force: false },
-                &root
+            export_crabfile_at(
+                CrabfileExport { destination: None, path: Some(crabfile.clone()), force: false },
+                &root,
             )
             .is_err()
         );
+
+        export_crabfile_at(
+            CrabfileExport { destination: None, path: Some(crabfile.clone()), force: true },
+            &root,
+        )
+        .unwrap();
+
+        let export_dir = root.join("export");
+        fs::create_dir_all(&export_dir).unwrap();
+        export_crabfile_at(
+            CrabfileExport { destination: Some(export_dir.clone()), path: None, force: false },
+            &root,
+        )
+        .unwrap();
+        assert!(export_dir.join("Crabfile").is_file());
+
+        let error = import_crabfile_at(
+            CrabfileImport { path: Some(crabfile.clone()), yes: false, force: false },
+            &root,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("requires confirmation"));
+
+        let missing = root.join("missing-crabfile");
+        let error = import_crabfile_at(
+            CrabfileImport { path: Some(missing.clone()), yes: true, force: false },
+            &root,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Crabfile not found"));
+        assert!(error.contains(&missing.display().to_string()));
+
+        let invalid = root.join("invalid-crabfile");
+        fs::write(&invalid, "version = [\n").unwrap();
+        let error = import_crabfile_at(
+            CrabfileImport { path: Some(invalid.clone()), yes: true, force: false },
+            &root,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Crabfile at"));
+        assert!(error.contains("is invalid at line 1, column"));
 
         import_crabfile_at(
             CrabfileImport { path: Some(root.join("Crabfile")), yes: true, force: true },

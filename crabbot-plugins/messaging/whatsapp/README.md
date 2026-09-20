@@ -1,4 +1,4 @@
-# whatsapp
+# WhatsApp
 
 This channel is optional and is distributed separately from the
 core release package.

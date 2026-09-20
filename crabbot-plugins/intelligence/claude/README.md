@@ -1,4 +1,4 @@
-# claude
+# Claude
 
 Install the released plugin with:
 

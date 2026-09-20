@@ -1,4 +1,4 @@
-# tui
+# TUI
 
 Install the released plugin with:
 

@@ -1,4 +1,4 @@
-# codex
+# Codex
 
 Install the released plugin with:
 

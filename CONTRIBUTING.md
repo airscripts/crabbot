@@ -41,6 +41,9 @@ The spacing formatter is idempotent and understands Rust raw strings, so it
 does not alter their contents. Keep the resulting blank lines in the source;
 do not remove them as cosmetic noise.
 
+Use Title Case for section titles in Markdown files, including new or edited
+documentation headings.
+
 For the complete non-release CI pipeline, install Docker and
 [act](https://github.com/nektos/act), then run:
 

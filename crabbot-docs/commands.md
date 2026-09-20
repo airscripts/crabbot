@@ -23,7 +23,8 @@ crabbot session delete <id> --yes [--json]
 crabbot delivery list [--json]
 crabbot delivery retry <id> --yes [--json]
 crabbot delivery drop <id> --yes [--json]
-crabbot export [--path <PATH>] [--json]
+crabbot export [PATH] [--path <PATH>] [--force] [--json]
+crabbot validate [--path <PATH>] [--json]
 crabbot import [--path <PATH>] --yes [--force] [--json]
 crabbot service [install|remove|status|start|stop] [--json]
 crabbot <plugin-command> [arguments...]
@@ -62,7 +63,7 @@ crabbot completion powershell >> $PROFILE
 ```
 
 The global `--json` flag selects structured JSON output for native commands,
-including Crabfile export/import, plugin installation, linking, updating, and removal; session
+including Crabfile export, validation, and import; plugin installation, linking, updating, and removal; session
 creation, forking, model changes, cancellation, and deletion; and delivery
 retry and drop operations. The command-level form remains available where the
 subcommand declares it. Completion intentionally writes its shell script
@@ -72,11 +73,10 @@ diagnostics. `--verbose` prints diagnostic progress, elapsed time, and nested
 error causes for every command.
 Help is available as `-h`, `-H`, or `--help`; version is available as `-v`,
 `-V`, or `--version`. Global flags may appear before or after the subcommand.
-Diagnostics use Rust's structured `tracing` output on stderr. Recoverable
-degradations are warnings visible by default, normal failures are emitted at
-error level, `--verbose` enables informational timing and cause events, and
-`--debug` enables debug representations as well. JSON mode suppresses
-human-readable logging so stderr remains safe for automation.
+Command failures are printed as concise `Error: ...` messages on stderr.
+`--verbose` enables informational timing and cause events, and `--debug` also
+enables debug representations and a redacted private report. JSON mode emits
+the error as a pretty-printed `{"error":"..."}` object.
 When `--debug` handles a failure, Crabbot also makes a redacted, private report
 under `<CRABBOT_HOME>/debug/` when the filesystem permits it. The report path is
 logged at info level; report creation is best effort and never replaces the
@@ -86,12 +86,28 @@ Confirmation is explicit for unattended destructive or duplicate-prone work:
 use `--yes` for plugin replacement or removal, session deletion, delivery
 retry or drop, and Crabfile import. `--force` separately permits replacing an
 existing imported configuration. Native commands do not read stdin for these
-confirmations.
+confirmations. Import reports a missing Crabfile with its expected path and
+validates TOML before changing local state; malformed Crabfiles include the
+line and column of the parse error. Use `--path <PATH>` to import a different
+file.
+
+`crabbot export` writes `./Crabfile` by default. Pass a positional directory,
+such as `crabbot export .`, or `--path <PATH>` to choose an output location;
+an existing directory receives a `Crabfile` file, while a new path is treated
+as the exact output filename. Exporting with no local config or plugin lock
+uses the default config and an empty plugin list. If the output Crabfile is
+already present, export stops without changing it; pass `--force` to overwrite
+that file.
 
 `crabbot status` prints aligned installation health, daemon state, intelligence
 setup, messaging setup, version, and the installed plugin count. Use `--json`
 for automation; capability fields are objects with a `status` and `plugins`
 array.
+
+`crabbot validate` checks a Crabfile without changing local state. It uses
+`./Crabfile` by default or the path supplied with `--path`, and reports the
+first syntax or schema error. See the [Crabfile specification](crabfile.md)
+for the supported version and keys.
 
 `crabbot plugin install` and `crabbot plugin link` validate and register one
 plugin at a time. When the daemon is running, it starts the new plugin

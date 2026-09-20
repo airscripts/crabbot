@@ -1,4 +1,4 @@
-# crabbot-daemon
+# Crabbot Daemon
 
 `crabbot-daemon` is the thin foreground entrypoint for Crabbot’s runtime. The
 runtime owns plugin supervision, channel bridges, authenticated IPC, leases,

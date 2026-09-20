@@ -1,12 +1,12 @@
 # Security Policy
 
-## Supported versions
+## Supported Versions
 
 | Version | Supported |
 | --- | --- |
 | Current release line | yes |
 
-## Report a vulnerability
+## Report A Vulnerability
 
 Email [francesco@airscript.it](mailto:francesco@airscript.it) with the affected
 version, platform, reproduction steps, impact, and suggested mitigation. Do

@@ -1,4 +1,4 @@
-# mcp
+# MCP
 
 Install the released plugin with:
 

@@ -1,4 +1,4 @@
-# tools
+# Tools
 
 Install the released plugin with:
 

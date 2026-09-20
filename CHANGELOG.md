@@ -18,6 +18,13 @@ Semantic Versioning.
 - Added structured JSON output for native initialization, diagnostics, version,
   Crabfile, service, plugin, session, and delivery operations; capability status
   now includes explicit status and plugin arrays.
+- Added clear import errors for missing confirmation, missing Crabfiles, unreadable
+  files, and invalid Crabfile syntax, including parse locations.
+- Added the version `0.1` Crabfile specification and read-only
+  `crabbot validate` command sharing validation rules with import.
+- `crabbot export` now defaults to `./Crabfile` and accepts a positional or
+  `--path` directory destination, while requiring `--force` to overwrite an
+  existing output.
 - Added explicit `--yes` confirmation for session deletion and readable human
   output for session transcripts, while retaining structured `--json` output.
 - Added the host-managed `crabbot ask` command through the external command

@@ -1,4 +1,4 @@
-# memory
+# Memory
 
 Install the released plugin with:
 

@@ -1,4 +1,4 @@
-# timer
+# Timer
 
 Install the released plugin with:
 

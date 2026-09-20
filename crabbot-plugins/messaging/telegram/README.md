@@ -1,4 +1,4 @@
-# telegram
+# Telegram
 
 Install the released plugin with:
 

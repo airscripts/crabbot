@@ -1,4 +1,4 @@
-# openrouter
+# OpenRouter
 
 This provider is optional and is distributed separately from the
 core release package.

@@ -1,0 +1,9 @@
+version = "0.1"
+plugins = []
+
+[config]
+update = "prompt"
+shell = false
+approval = "off"
+
+[config.channels]

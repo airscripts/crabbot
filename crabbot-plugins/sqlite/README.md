@@ -1,4 +1,4 @@
-# sqlite
+# SQLite
 
 Install the released plugin with:
 

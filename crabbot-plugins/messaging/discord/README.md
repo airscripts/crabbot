@@ -1,4 +1,4 @@
-# discord
+# Discord
 
 Install the released plugin with:
 
