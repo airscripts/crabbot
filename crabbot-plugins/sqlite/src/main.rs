@@ -430,6 +430,7 @@ mod tests {
         migrate(&db).unwrap();
         let page_size: i64 = db.query_row("PRAGMA page_size;", [], |row| row.get(0)).unwrap();
         let max_pages: i64 = db.query_row("PRAGMA max_page_count;", [], |row| row.get(0)).unwrap();
+
         assert!(max_pages.saturating_mul(page_size) <= DB_LIMIT);
     }
 
@@ -443,6 +444,7 @@ mod tests {
         assert_eq!(put.result.unwrap()["ok"], true);
 
         let get = store(&db, Request::call(2, "get", json!({"key": "answer"}))).unwrap().unwrap();
+
         assert_eq!(get.result.unwrap()["value"], 42);
 
         let deleted =
@@ -466,6 +468,7 @@ mod tests {
 
         assert!(store(&db, Request::call(2, "unknown", json!({}))).unwrap().is_none());
         let note = Request::Note { jsonrpc: "2.0".into(), method: "get".into(), params: json!({}) };
+
         assert!(store(&db, note).unwrap().is_none());
     }
 
@@ -545,13 +548,17 @@ mod tests {
 
         assert_eq!(first.result.unwrap()["id"], second.result.unwrap()["id"]);
         let listed = store(&db, Request::call(7, "outbox", json!({"limit": 10}))).unwrap().unwrap();
+
         assert_eq!(listed.result.as_ref().unwrap()["items"].as_array().unwrap().len(), 1);
         let id = listed.result.as_ref().unwrap()["items"][0]["id"].clone();
         let retried = store(&db, Request::call(8, "retry", json!({"id": id}))).unwrap().unwrap();
+
         assert_eq!(retried.result.unwrap()["retried"], true);
         let retried = store(&db, Request::call(9, "outbox", json!({}))).unwrap().unwrap();
+
         assert_eq!(retried.result.unwrap()["items"][0]["attempts"], 1);
         let acked = store(&db, Request::call(10, "ack", json!({"id": id}))).unwrap().unwrap();
+
         assert_eq!(acked.result.unwrap()["acked"], true);
         let seen =
             store(&db, Request::call(11, "seen", json!({"key": "event-1"}))).unwrap().unwrap();
@@ -587,6 +594,7 @@ mod tests {
 
         assert_eq!(missing.result.unwrap()["released"], false);
         let unacked = store(&db, Request::call(4, "ack", json!({"id": 42}))).unwrap().unwrap();
+
         assert_eq!(unacked.result.unwrap()["acked"], false);
     }
 
@@ -612,6 +620,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, b"").unwrap();
         private(&path).unwrap();
+
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_file(path);
     }

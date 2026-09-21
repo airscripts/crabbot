@@ -142,6 +142,7 @@ async fn stream_request(
     emitter: &mut Emitter,
 ) -> crabbot_core::Result<Option<Response>> {
     let (system, messages) = messages(&input)?;
+
     let response = client
         .post(format!("{base}/v1/messages"))
         .header("x-api-key", key)
@@ -700,11 +701,13 @@ mod tests {
     #[test]
     fn parses_success_and_failure_responses() {
         let result = response_body(3, reqwest::StatusCode::OK, json!({"content":[{"text":"done"}],"stop_reason":"end","usage":{"input_tokens":2,"output_tokens":4}})).unwrap().unwrap();
+
         assert_eq!(result.result.unwrap()["text"], "done");
         assert!(
             response_body(3, reqwest::StatusCode::BAD_REQUEST, json!({"error":{"message":"no"}}))
                 .is_err()
         );
+
         assert!(response_body(3, reqwest::StatusCode::OK, json!({})).is_err());
         let tool = response_body(
             3,
@@ -720,6 +723,7 @@ mod tests {
     #[test]
     fn builds_messages_and_system_prompt() {
         let (system, messages) = messages(&model()).unwrap();
+
         assert_eq!(system, "rules");
         assert_eq!(messages[0], json!({"role": "user", "content": "hello"}));
         assert_eq!(messages[1], json!({"role": "assistant", "content": "prior"}));
@@ -741,6 +745,7 @@ mod tests {
                 ]
             })
         );
+
         assert_eq!(tools(&model())[0]["name"], "read");
     }
 
@@ -751,6 +756,7 @@ mod tests {
             .content
             .push(Content::Image { uri: "data:image/jpeg;base64,aW1hZ2U=".into(), alt: None });
         let (_, values) = messages(&input).unwrap();
+
         assert_eq!(
             values[0]["content"],
             json!([
@@ -781,6 +787,7 @@ mod tests {
         assert!(tool_index(&json!(16)).is_err());
         let mut text = String::new();
         let mut pending = String::new();
+
         assert!(append_text(&"x".repeat(BODY_LIMIT + 1), &mut text, &mut pending).is_err());
     }
 
@@ -790,6 +797,7 @@ mod tests {
         let mut pending = String::new();
         let mut tools = std::collections::BTreeMap::new();
         let mut stop = String::new();
+
         assert!(anthropic_line(&[0xff], &mut text, &mut pending, &mut tools, &mut stop).is_err());
 
         assert!(
@@ -852,10 +860,13 @@ mod tests {
         use futures_util::stream;
 
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(b"ok".to_vec())]);
+
         assert_eq!(collect(chunks, "Anthropic").await.unwrap(), "ok");
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(vec![0xff])]);
+
         assert!(collect(chunks, "Anthropic").await.is_err());
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(vec![b'x'; BODY_LIMIT + 1])]);
+
         assert!(collect(chunks, "Anthropic").await.is_err());
     }
 
@@ -870,6 +881,7 @@ mod tests {
         .unwrap();
 
         let reply = result.result.unwrap();
+
         assert_eq!(reply["text"], "hello");
         assert_eq!(reply["stop"], "end_turn");
         assert!(stream_body(4, reqwest::StatusCode::BAD_REQUEST, "").is_err());
@@ -879,6 +891,7 @@ mod tests {
     #[tokio::test]
     async fn validates_requests_and_network_failures() {
         let client = reqwest::Client::new();
+
         assert!(
             generate(&client, Request::call(1, "unknown", json!({})), test_emitter())
                 .await
@@ -893,6 +906,7 @@ mod tests {
             generate_request(&client, 1, model(), "secret", "http://127.0.0.1:1").await.is_err()
         );
         let mut emitter = test_emitter();
+
         assert!(
             generate_at(&client, 1, model(), "secret", "http://127.0.0.1:1", &mut emitter)
                 .await
@@ -900,16 +914,19 @@ mod tests {
         );
         let mut stream = model();
         stream.stream = true;
+
         assert!(
             generate_at(&client, 1, stream, "secret", "http://127.0.0.1:1", &mut emitter)
                 .await
                 .is_err()
         );
+
         assert!(
             generate(&client, Request::call(1, "generate", json!({})), test_emitter())
                 .await
                 .is_err()
         );
+
         assert!(response_body(3, reqwest::StatusCode::OK, json!({"content":[]})).is_err());
         assert!(response_body(3, reqwest::StatusCode::BAD_REQUEST, json!({})).is_err());
     }

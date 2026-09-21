@@ -474,6 +474,7 @@ fn validate_zone(value: &str) -> crabbot_core::Result<()> {
 
 fn next(cron: &str, zone: &str, after: u64) -> crabbot_core::Result<u64> {
     validate_cron(cron)?;
+
     let zone = timezone(zone)?;
     let start = after.saturating_add(60 - after % 60);
 
@@ -554,6 +555,7 @@ mod tests {
         assert_eq!(added.result.unwrap()["id"], 4);
 
         let listed = call(&tasks, Request::call(2, "list", json!({}))).await.unwrap().unwrap();
+
         assert_eq!(listed.result.unwrap()["items"][0]["text"], "check");
 
         let due =
@@ -575,6 +577,7 @@ mod tests {
     #[tokio::test]
     async fn timer_validates_requests_and_missing_tasks() {
         let tasks = tasks();
+
         assert!(call(&tasks, Request::call(1, "add", json!({"text": "check"}))).await.is_err());
         assert!(
             call(
@@ -584,12 +587,14 @@ mod tests {
             .await
             .is_err()
         );
+
         assert!(call(&tasks, Request::call(2, "add", json!({"id": 4}))).await.is_err());
         assert!(
             call(&tasks, Request::call(3, "add", json!({"id": 4, "text": "check", "cron": "bad"})))
                 .await
                 .is_err()
         );
+
         assert!(
             call(
                 &tasks,
@@ -598,6 +603,7 @@ mod tests {
             .await
             .is_err()
         );
+
         let cron = call(
             &tasks,
             Request::call(5, "add", json!({"id": 5, "text": "check", "cron": "* * * * *"})),
@@ -615,6 +621,7 @@ mod tests {
             .await
             .is_err()
         );
+
         assert!(
             call(
                 &tasks,
@@ -627,6 +634,7 @@ mod tests {
             .await
             .is_err()
         );
+
         assert!(call(&tasks, Request::call(5, "remove", json!({}))).await.is_err());
         let removed =
             call(&tasks, Request::call(6, "remove", json!({"id": 4}))).await.unwrap().unwrap();
@@ -649,6 +657,7 @@ mod tests {
         let blocker = root.join("blocker");
         std::fs::write(&blocker, "file").unwrap();
         let tasks = tasks();
+
         assert!(
             call_at(
                 &tasks,
@@ -658,6 +667,7 @@ mod tests {
             .await
             .is_err()
         );
+
         assert!(tasks.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -678,11 +688,15 @@ mod tests {
                 zone: "UTC".into(),
             },
         );
+
         persist_at(Some(&path), &tasks).unwrap();
+
         assert_eq!(load_at(Some(&path)).lock().unwrap()[&1].text, "check");
         std::fs::write(&path, "broken").unwrap();
+
         assert!(load_at(Some(&path)).lock().unwrap().is_empty());
         std::fs::File::create(&path).unwrap().set_len(BYTE_LIMIT as u64 + 1).unwrap();
+
         assert!(load_at(Some(&path)).lock().unwrap().is_empty());
         assert!(persist_at(Some(&path.with_file_name("missing-dir/item")), &tasks).is_err());
         let _ = std::fs::remove_file(path);
@@ -691,6 +705,7 @@ mod tests {
     #[test]
     fn handles_disabled_persistence() {
         let _ = path();
+
         assert!(load_at(None).lock().unwrap().is_empty());
         persist_at(None, &tasks()).unwrap();
     }
@@ -699,6 +714,7 @@ mod tests {
     fn schedules_cron_in_named_zone() {
         let after = 1_700_000_000;
         let due = next("*/15 * * * *", "Europe/Rome", after).unwrap();
+
         assert!(due > after);
         assert_eq!(due % 60, 0);
     }
@@ -739,9 +755,11 @@ mod tests {
         )
         .await
         .unwrap();
+
         call(&tasks, Request::call(2, "add", json!({"id": 2, "text": "once", "delay": 0})))
             .await
             .unwrap();
+
         let due =
             call(&tasks, Request::call(3, "due", json!({"at": u64::MAX}))).await.unwrap().unwrap();
 
@@ -773,6 +791,7 @@ mod tests {
         }
 
         assert!(call(&tasks, Request::call(1, "due", json!({"at": u64::MAX}))).await.is_err());
+
         assert_eq!(tasks.lock().unwrap().len(), 33);
     }
 
@@ -789,6 +808,7 @@ mod tests {
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o644);
         std::fs::set_permissions(&path, permissions).unwrap();
+
         assert!(load_at(Some(&path)).lock().unwrap().is_empty());
         let _ = std::fs::remove_file(path);
     }

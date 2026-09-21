@@ -9,6 +9,8 @@ Semantic Versioning.
 
 - Added safe, repeatable `crabbot init` behavior with explicit `--force`
   reinitialization and a friendly first-run completion message.
+- Added crash-safe Signal inbound acknowledgement and bounded attachment
+  caching with expiration and aggregate-size limits.
 - Added conservative `crabbot doctor --fix` repairs for missing default local
   state without overwriting configuration or plugin files.
 - Added human and structured health summaries to `crabbot doctor` output.
@@ -24,6 +26,14 @@ Semantic Versioning.
 - Added adaptive `revloop` review scope: uncommitted changes by default, the
   latest commit or feature branch when the tree is clean, and an explicit
   `--global` mode for repository-wide audits.
+- Hardened `revloop` convergence with explicit verification short-circuiting, a
+  three-pass clean stability check for every scope, a 50-cycle default limit,
+  60-minute Codex invocation limits, and non-blocking environment warnings,
+  automatic repository spacing before verification, and unambiguous release
+  smoke-test binary selection; verification phases now have configurable
+  timeouts with one retry and a separately logged worker recovery pass after
+  two timeouts; repeated focused failures now preserve diagnostics and continue
+  autonomously instead of stopping for manual repair.
 - Added clear import errors for missing confirmation, missing Crabfiles, unreadable
   files, and invalid Crabfile syntax, including parse locations.
 - Added the version `0.1` Crabfile specification and read-only

@@ -1585,6 +1585,7 @@ fn model_plugin_at(root: &Path, requested: Option<&str>) -> Result<String, Plugi
     let lock = load_lock_at(root)?;
     let configured =
         requested.map(str::to_owned).or_else(|| std::env::var("CRABBOT_MODEL_PLUGIN").ok());
+
     let plugin = configured.or_else(|| {
         lock.plugins
             .iter()
@@ -1654,6 +1655,7 @@ async fn model_at(
     config
         .validate()
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
+
     let mut process = launch(root, path, &plugin, Some(Capability::Model), false, &config).await?;
     let result = async {
         let workspace = std::env::var_os("CRABBOT_ROOT").map(PathBuf::from);
@@ -2393,6 +2395,7 @@ async fn serve_inner(
     config
         .validate()
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
+
     updates(root, &config.update)?;
 
     let loaded = state::Store::load(root.join("sessions.json"))?;
@@ -2515,6 +2518,7 @@ fn offline_lock(root: &Path) -> std::io::Result<DaemonLock> {
 
 fn lock_at(root: &Path, name: &str) -> std::io::Result<DaemonLock> {
     std::fs::create_dir_all(root)?;
+
     let path = root.join(name);
 
     match std::fs::symlink_metadata(&path) {
@@ -2565,6 +2569,7 @@ fn lock_at(root: &Path, name: &str) -> std::io::Result<DaemonLock> {
 
 fn recover_plugins(root: &Path) -> std::io::Result<()> {
     let _plugins_lock = lock_at(root, ".plugins.lock")?;
+
     let lock = load_lock_at(root).map_err(std::io::Error::other)?;
     let plugins = root.join("plugins");
     let Ok(entries) = std::fs::read_dir(&plugins) else {
@@ -2599,6 +2604,7 @@ fn recover_plugins(root: &Path) -> std::io::Result<()> {
 
 fn reclaim_worktrees(root: &Path, store: &state::Store) {
     let directory = root.join(".crabbot/worktrees");
+
     let Ok(entries) = std::fs::read_dir(&directory) else {
         return;
     };
@@ -2713,6 +2719,7 @@ pub(crate) async fn load_plugin(
     }
 
     let _loading = plugins.loading.lock().await;
+
     let path = binary_at(id, root).ok_or_else(|| format!("Plugin binary was not found: {id}."))?;
     let process = launch(root, path, id, capability, force, config).await?;
     let hello = process.hello.clone();
@@ -2948,48 +2955,66 @@ fn secret(name: &str) -> Option<String> {
 }
 
 fn ready(id: &str) -> bool {
+    let credentials = std::env::var_os("CRABBOT_CREDENTIALS").map(PathBuf::from);
+    ready_at(id, credentials.as_deref())
+}
+
+fn ready_at(id: &str, credentials: Option<&Path>) -> bool {
     match id {
         "telegram" => {
             env_nonempty("CRABBOT_TELEGRAM_TOKEN")
                 || keyring_ready("telegram")
-                || file_credential(&["CRABBOT_TELEGRAM_TOKEN"])
+                || file_credential_at(credentials, &["CRABBOT_TELEGRAM_TOKEN"])
         }
 
         "discord" => {
             env_nonempty("CRABBOT_DISCORD_TOKEN")
                 || keyring_ready("discord")
-                || file_credential(&["CRABBOT_DISCORD_TOKEN"])
+                || file_credential_at(credentials, &["CRABBOT_DISCORD_TOKEN"])
         }
 
         "codex" => {
             env_nonempty("CRABBOT_CODEX_KEY")
                 || keyring_ready("codex")
-                || file_credential(&["CRABBOT_CODEX_KEY"])
+                || file_credential_at(credentials, &["CRABBOT_CODEX_KEY"])
                 || codex_auth()
         }
 
         "claude" => {
             env_nonempty("CRABBOT_CLAUDE_KEY")
                 || keyring_ready("claude")
-                || file_credential(&["CRABBOT_CLAUDE_KEY"])
+                || file_credential_at(credentials, &["CRABBOT_CLAUDE_KEY"])
         }
 
         "ollama" => true,
 
         "openrouter" => {
-            env_nonempty("CRABBOT_OPENROUTER_KEY") || file_credential(&["CRABBOT_OPENROUTER_KEY"])
+            env_nonempty("CRABBOT_OPENROUTER_KEY")
+                || file_credential_at(credentials, &["CRABBOT_OPENROUTER_KEY"])
         }
 
-        "gemini" => env_nonempty("CRABBOT_GEMINI_KEY") || file_credential(&["CRABBOT_GEMINI_KEY"]),
-        "signal" => env_nonempty("CRABBOT_SIGNAL_ACCOUNT"),
-        "slack" => env_nonempty("CRABBOT_SLACK_BOT_TOKEN"),
+        "gemini" => {
+            env_nonempty("CRABBOT_GEMINI_KEY")
+                || file_credential_at(credentials, &["CRABBOT_GEMINI_KEY"])
+        }
+
+        "signal" => {
+            env_nonempty("CRABBOT_SIGNAL_ACCOUNT")
+                || file_credential_at(credentials, &["CRABBOT_SIGNAL_ACCOUNT"])
+        }
+
+        "slack" => {
+            env_nonempty("CRABBOT_SLACK_BOT_TOKEN")
+                || file_credential_at(credentials, &["CRABBOT_SLACK_BOT_TOKEN"])
+        }
 
         "whatsapp" => {
-            (env_nonempty("CRABBOT_WHATSAPP_TOKEN") || file_credential(&["CRABBOT_WHATSAPP_TOKEN"]))
+            (env_nonempty("CRABBOT_WHATSAPP_TOKEN")
+                || file_credential_at(credentials, &["CRABBOT_WHATSAPP_TOKEN"]))
                 && (env_nonempty("CRABBOT_WHATSAPP_APP_SECRET")
-                    || file_credential(&["CRABBOT_WHATSAPP_APP_SECRET"]))
+                    || file_credential_at(credentials, &["CRABBOT_WHATSAPP_APP_SECRET"]))
                 && (env_nonempty("CRABBOT_WHATSAPP_VERIFY")
-                    || file_credential(&["CRABBOT_WHATSAPP_VERIFY"]))
+                    || file_credential_at(credentials, &["CRABBOT_WHATSAPP_VERIFY"]))
                 && env_nonempty("CRABBOT_WHATSAPP_PHONE")
                 && env_nonempty("CRABBOT_WHATSAPP_GRAPH_URL")
         }
@@ -3094,12 +3119,12 @@ fn keyring_ready(name: &str) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
-fn file_credential(names: &[&str]) -> bool {
-    let Some(path) = std::env::var_os("CRABBOT_CREDENTIALS") else {
+fn file_credential_at(path: Option<&Path>, names: &[&str]) -> bool {
+    let Some(path) = path else {
         return false;
     };
 
-    credential(&path, names)
+    credential(path, names)
 }
 
 fn credential(path: impl AsRef<Path>, names: &[&str]) -> bool {
@@ -3728,9 +3753,7 @@ async fn bridge_with_media(
                             if !existing {
                                 history.push(message.clone());
 
-                                if history.len() > state::LIMIT {
-                                    history.drain(..history.len() - state::LIMIT);
-                                }
+                                state::compact_messages(&mut history);
                             }
 
                             (history, session.model.clone())
@@ -4286,7 +4309,7 @@ async fn transcribe_media(
     media_root: &Path,
     call: &mut u64,
 ) -> Vec<Content> {
-    if !matches!(channel_id, "telegram" | "discord" | "whatsapp") {
+    if !matches!(channel_id, "telegram" | "discord" | "whatsapp" | "signal" | "slack") {
         return content;
     }
 
@@ -4352,7 +4375,7 @@ async fn transcribe_media(
 }
 
 fn expand_media_files(channel_id: &str, content: Vec<Content>, media_root: &Path) -> Vec<Content> {
-    if !matches!(channel_id, "telegram" | "discord" | "whatsapp") {
+    if !matches!(channel_id, "telegram" | "discord" | "whatsapp" | "signal" | "slack") {
         return content;
     }
 
@@ -4700,10 +4723,22 @@ fn event_id(value: &serde_json::Value) -> Option<String> {
 }
 
 fn session_id(channel: &str, chat: &str, thread: Option<&str>) -> String {
-    thread.map_or_else(
+    let raw = thread.map_or_else(
         || format!("{channel}-{chat}"),
         |thread| format!("{channel}-{chat}-thread-{thread}"),
-    )
+    );
+
+    if valid(&raw) {
+        return raw;
+    }
+
+    let mut key = Sha256::new();
+    key.update(channel.as_bytes());
+    key.update([0]);
+    key.update(chat.as_bytes());
+    key.update([0]);
+    key.update(thread.unwrap_or_default().as_bytes());
+    format!("{channel}-x{:x}", key.finalize())
 }
 
 fn context(session: &str) -> Option<Message> {
@@ -5000,6 +5035,24 @@ fn send_params(
     Ok(value)
 }
 
+fn send_request(
+    channel: &str,
+    call: u64,
+    delivery: &str,
+    chat: &str,
+    private: bool,
+    text: &str,
+    thread: Option<&str>,
+) -> Result<Request, Box<dyn std::error::Error + Send + Sync>> {
+    let mut params = send_params(channel, delivery, chat, text, thread)?;
+
+    if channel == "signal" {
+        params["private"] = serde_json::Value::Bool(private);
+    }
+
+    Ok(Request::call(call, "send", params))
+}
+
 fn delivery_request(
     channel: &str,
     call: u64,
@@ -5019,17 +5072,15 @@ fn delivery_request(
             )?,
         ))
     } else {
-        Ok(Request::call(
+        send_request(
+            channel,
             call,
-            "send",
-            send_params(
-                channel,
-                &delivery.id,
-                &delivery.chat,
-                &delivery.text,
-                delivery.thread.as_deref(),
-            )?,
-        ))
+            &delivery.id,
+            &delivery.chat,
+            delivery.private,
+            &delivery.text,
+            delivery.thread.as_deref(),
+        )
     }
 }
 
@@ -5672,6 +5723,13 @@ async fn flush_stream(
             edit_params(channel_id, delivery_id, chat, message_id, &output.display, thread)?,
         )
     } else {
+        let private = sessions
+            .lock()
+            .map_err(|_| "Session lock is poisoned.")?
+            .sessions
+            .get(session)
+            .ok_or("Session was not found.")?
+            .private;
         sessions.lock().map_err(|_| "Session lock is poisoned.")?.start_stream(
             session,
             delivery_id,
@@ -5680,11 +5738,7 @@ async fn flush_stream(
             thread.map(str::to_owned),
             output.display.clone(),
         )?;
-        Request::call(
-            *call,
-            "send",
-            send_params(channel_id, delivery_id, chat, &output.display, thread)?,
-        )
+        send_request(channel_id, *call, delivery_id, chat, private, &output.display, thread)?
     };
 
     let response = channel.call(request).await;
@@ -6079,16 +6133,9 @@ fn model_request(
             .rposition(|message| message.role == Role::User)
             .or_else(|| history.iter().rposition(|message| message.role != Role::System));
 
-        let Some(index) = history
-            .iter()
-            .enumerate()
-            .find(|(index, message)| message.role != Role::System && Some(*index) != required)
-            .map(|(index, _)| index)
-        else {
+        if !state::remove_oldest_message_group(&mut history, required) {
             return Err("Model context exceeds the protocol frame limit.".into());
-        };
-
-        history.remove(index);
+        }
     }
 }
 
@@ -6098,7 +6145,11 @@ fn assistant(reply: &ModelReply) -> String {
     for event in &reply.events {
         match event {
             Event::Text { text: delta } | Event::Done { text: delta } => {
-                text.push_str(&clip(delta.clone(), TEXT_LIMIT.saturating_sub(text.len())));
+                let remaining = TEXT_LIMIT.saturating_sub(text.len());
+
+                if remaining > 0 {
+                    text.push_str(&clip(delta.clone(), remaining));
+                }
             }
 
             Event::Tool { name, args } => {
@@ -6109,14 +6160,14 @@ fn assistant(reply: &ModelReply) -> String {
                 text.push_str("[Tool call ");
                 text.push_str(name);
                 text.push_str("]: ");
-                text.push_str(&clip(args.to_string(), META_LIMIT));
+                text.push_str(&args.to_string());
             }
 
             Event::Error { .. } => {}
         }
     }
 
-    clip(text, TEXT_LIMIT)
+    text
 }
 
 fn stream_event(note: Request) -> Option<Event> {
@@ -6725,6 +6776,7 @@ fn service_environment_from(
 
     if direct {
         let path = service_credentials_path(path);
+
         secure(&path, serde_json::to_vec_pretty(&credentials)?)?;
         values.push(("CRABBOT_CREDENTIALS".into(), service_path_value(path)?));
     } else if let Some(path) = configured {
@@ -6792,6 +6844,7 @@ fn service_at_with_mode(
                 }
 
                 Ok(_) => {}
+
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
@@ -6927,6 +6980,7 @@ fn windows_service_install(
     definition: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let executable = executable.display().to_string();
+
     let snapshot = if force { windows_service_snapshot()? } else { None };
 
     let previous_definition = match std::fs::read(path) {
@@ -7718,6 +7772,7 @@ async fn agent_request(
 
     match method.as_str() {
         "host/model" => {
+            selected_workspace(&params, &workspace)?;
             let mut model = model.lock().await;
             let Some(provider) = model.as_mut() else {
                 return Ok(Response::fail(id, -32000, "No intelligence provider is available."));
@@ -7732,6 +7787,7 @@ async fn agent_request(
                 return Ok(Response::fail(id, -32000, "The tools plugin is not installed."));
             };
 
+            let workspace = selected_workspace(&params, &workspace)?;
             let Some(name) = params["name"].as_str() else {
                 return Ok(Response::fail(id, -32602, "A tool name is required."));
             };
@@ -7765,6 +7821,33 @@ async fn agent_request(
 
         _ => Ok(Response::fail(id, -32601, "Agent host method not found.")),
     }
+}
+
+fn selected_workspace(
+    params: &serde_json::Value,
+    configured: &Path,
+) -> std::result::Result<PathBuf, crabbot_core::Error> {
+    let Some(value) = params["workspace"].as_str() else {
+        return Ok(configured.to_owned());
+    };
+
+    let workspace = std::fs::canonicalize(value).map_err(|error| {
+        crabbot_core::Error::Denied(format!("The selected workspace is unavailable: {error}."))
+    })?;
+
+    if !workspace.is_dir() {
+        return Err(crabbot_core::Error::Denied(
+            "The selected workspace is not a directory.".into(),
+        ));
+    }
+
+    if !workspace.starts_with(configured) {
+        return Err(crabbot_core::Error::Denied(
+            "The selected workspace leaves the configured root.".into(),
+        ));
+    }
+
+    Ok(workspace)
 }
 
 fn prompt_code_approval(name: &str, args: &serde_json::Value) -> bool {
@@ -9458,9 +9541,9 @@ mod tests {
         ensure_home, env_for, export_crabfile_at, generate_completion, import_crabfile_at, init_at,
         installed_at, isolate_at, local_session, plugin_binary, read_manifest, reclaim_worktrees,
         recover, recover_plugins, redact, resolve, restart_tool, revision, safe_archive,
-        send_params, service_at, service_at_with, service_environment_from, service_path_value,
-        service_text, session_at, stream_fits, tool, update_at, validate_archive, verify_archive,
-        write_debug_report_at,
+        send_params, send_request, service_at, service_at_with, service_environment_from,
+        service_path_value, service_text, session_at, stream_fits, tool, update_at,
+        validate_archive, verify_archive, write_debug_report_at,
     };
 
     use base64::Engine;
@@ -9525,6 +9608,7 @@ mod tests {
         );
         let path = write_debug_report_at(&root, "ask", &error, Duration::from_millis(12)).unwrap();
         let text = fs::read_to_string(&path).unwrap();
+
         assert!(text.contains("command: ask"));
         assert!(text.contains("elapsed_ms: 12"));
         assert!(!text.contains("secret"));
@@ -9532,6 +9616,7 @@ mod tests {
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         #[cfg(unix)]
+
         assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = fs::remove_dir_all(root);
     }
@@ -9574,6 +9659,7 @@ mod tests {
         let root = test_root("lock");
         let first = daemon_lock(&root).unwrap();
         drop(first);
+
         assert!(daemon_lock(&root).is_ok());
     }
 
@@ -9592,6 +9678,7 @@ mod tests {
             Some(&root),
             5,
         );
+
         assert_eq!(output.unwrap_err().kind(), std::io::ErrorKind::FileTooLarge);
         let _ = fs::remove_dir_all(root);
     }
@@ -9612,6 +9699,7 @@ mod tests {
     #[test]
     fn default_is_safe() {
         let config = Config::default();
+
         assert_eq!(config.update, "prompt");
         assert!(!config.shell);
         assert_eq!(config.approval, "off");
@@ -9645,6 +9733,7 @@ mod tests {
 
         file.version = CRABFILE_VERSION.into();
         file.config.update = "invalid".into();
+
         assert!(file.validate().unwrap_err().starts_with("configuration:"));
 
         file.config = Config::default();
@@ -9718,6 +9807,7 @@ mod tests {
 
         for approval in ["off", "prompt", "auto"] {
             let config = Config { approval: approval.into(), ..Config::default() };
+
             assert_eq!(config.approval_mode().enabled(), approval != "off");
         }
 
@@ -9784,18 +9874,21 @@ mod tests {
         assert_eq!(super::command_label(&Command::External(vec!["custom".into()])), "external");
 
         let session = SessionCommand::List(Output { json: false });
+
         assert!(matches!(
             super::with_session_json(session, true),
             SessionCommand::List(Output { json: true })
         ));
 
         let delivery = super::DeliveryCommand::List(Output { json: false });
+
         assert!(matches!(
             super::with_delivery_json(delivery, true),
             super::DeliveryCommand::List(Output { json: true })
         ));
 
         let command = super::git_command();
+
         assert_eq!(command.get_program(), "git");
 
         assert!(
@@ -9812,11 +9905,13 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("nested")).unwrap();
         fs::write(root.join("file"), b"123").unwrap();
+
         assert_eq!(super::staging_size(&root).unwrap(), 3);
         assert_eq!(
             super::staging_size(&root.join("missing")).unwrap_err().kind(),
             std::io::ErrorKind::NotFound
         );
+
         assert!(super::read_bounded(&root.join("file"), 3).is_ok());
         assert!(super::read_bounded(&root.join("file"), 2).is_err());
         assert!(super::read_bounded(&root.join("missing"), 3).is_err());
@@ -9850,27 +9945,36 @@ mod tests {
         assert!(manifest.validate().is_ok());
         let mut invalid = manifest;
         invalid.id = "Tools".into();
+
         assert!(invalid.validate().is_err());
         invalid.id = "tools".into();
         invalid.version.clear();
+
         assert!(invalid.validate().is_err());
         invalid.version = "0.1.0".into();
         invalid.protocol = Protocol { major: 9, minor: 0 };
+
         assert!(invalid.validate().is_err());
         invalid.protocol = Protocol::CURRENT;
         invalid.capabilities = vec!["tool".into(), "tool".into()];
+
         assert!(invalid.validate().is_err());
         invalid.capabilities = vec!["unknown".into()];
+
         assert!(invalid.validate().is_err());
         invalid.capabilities = vec!["tool".into()];
         invalid.permissions = vec!["unknown".into()];
+
         assert!(invalid.validate().is_err());
         invalid.permissions.clear();
         invalid.secrets = vec!["bad-name".into()];
+
         assert!(invalid.validate().is_err());
         invalid.secrets = vec!["OPENAI_API_KEY".into()];
+
         assert!(invalid.validate().is_err());
         invalid.secrets = vec!["CRABBOT_TOOLS_KEY".into(), "CRABBOT_TOOLS_KEY".into()];
+
         assert!(invalid.validate().is_err());
 
         let values = env_for(
@@ -9886,6 +9990,7 @@ mod tests {
             &Config::default(),
             Path::new("/tmp/crabbot-home"),
         );
+
         assert!(values.iter().any(|(key, value)| key == "CRABBOT_SHELL" && value == "off"));
 
         let values = env_for(
@@ -9917,6 +10022,7 @@ mod tests {
     fn propagates_default_home_with_database_override() {
         let mut values = vec![("CRABBOT_DB".into(), "/tmp/crabbot.db".into())];
         ensure_home(&mut values, Path::new("/tmp/crabbot-home"));
+
         assert!(
             values.iter().any(|(key, value)| key == "CRABBOT_HOME" && value == "/tmp/crabbot-home")
         );
@@ -9928,6 +10034,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("plugins")).unwrap();
         let lock = daemon_lock(&root).unwrap();
+
         assert!(daemon_lock(&root).is_err());
         drop(lock);
         let stale = root.join("stale.lock");
@@ -9938,6 +10045,7 @@ mod tests {
         fs::create_dir_all(root.join("plugins/.echo.stage-test")).unwrap();
         let active = super::lock_at(&root, ".plugins.lock").unwrap();
         let error = recover_plugins(&root).unwrap_err();
+
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert!(root.join("plugins/.echo.stage-test").exists());
         drop(active);
@@ -9962,10 +10070,12 @@ mod tests {
         fs::write(root.join("plugins.lock"), serde_json::to_vec(&super::Lock { plugins }).unwrap())
             .unwrap();
         recover_plugins(&root).unwrap();
+
         assert!(root.join("plugins/echo").is_dir());
         assert!(!root.join("plugins/.echo.stage-test").exists());
         fs::create_dir_all(root.join("plugins/.gone.backup-remove-test")).unwrap();
         recover_plugins(&root).unwrap();
+
         assert!(!root.join("plugins/.gone.backup-remove-test").exists());
         let _ = fs::remove_dir_all(root);
     }
@@ -9979,6 +10089,7 @@ mod tests {
         let stop = Stop::new();
         stop.signal();
         let mut failures = 0;
+
         assert!(!recover(&process, &mut failures, "test", &stop).await.unwrap());
         process.stop().await.unwrap();
     }
@@ -10000,6 +10111,7 @@ mod tests {
         let cancels = Arc::new(Mutex::new(BTreeMap::new()));
         let first = super::cancellation(&cancels, "session");
         let second = super::cancellation(&cancels, "session");
+
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(
             send_params("matrix", "delivery", "room", "hello", Some("topic")).unwrap(),
@@ -10014,6 +10126,7 @@ mod tests {
     #[test]
     fn service_definition_has_a_restart_policy() {
         let text = service_text(std::path::Path::new("/tmp/crabbot"), &[]);
+
         assert!(text.contains("/tmp/crabbot"));
         assert!(!text.contains("serve"));
         #[cfg(target_os = "linux")]
@@ -10033,6 +10146,7 @@ mod tests {
             ("CRABBOT_CREDENTIALS".into(), "/tmp/crabbot-credentials.json".into()),
         ];
         let text = service_text(std::path::Path::new("/tmp/crabbot"), &environment);
+
         assert!(text.contains("CRABBOT_HOME"));
         assert!(text.contains("/tmp/crabbot-home"));
         assert!(text.contains("CRABBOT_ROOT"));
@@ -10059,6 +10173,7 @@ mod tests {
         environment.insert("CRABBOT_CODEX_KEY".into(), "secret".into());
         let service = root.join("crabbot.service");
         let values = service_environment_from(&service, root.clone(), &environment).unwrap();
+
         assert!(values.iter().any(|(name, value)| {
             name == "CRABBOT_HOME" && value == &root.display().to_string()
         }));
@@ -10069,6 +10184,7 @@ mod tests {
             ("CRABBOT_DB", "crabbot.db"),
         ] {
             let expected = service_path_value(PathBuf::from(path)).unwrap();
+
             assert!(
                 values
                     .iter()
@@ -10077,6 +10193,7 @@ mod tests {
         }
 
         let credential_path = super::service_credentials_path(&service);
+
         assert!(values.iter().any(|(name, value)| {
             name == "CRABBOT_CREDENTIALS" && value == &credential_path.display().to_string()
         }));
@@ -10090,6 +10207,7 @@ mod tests {
                 .iter()
                 .any(|(name, value)| name == "CRABBOT_SANDBOX_RUNTIME" && value == "docker")
         );
+
         assert!(
             values.iter().any(
                 |(name, value)| name == "CRABBOT_SANDBOX_IMAGE" && value == "local/tool:latest"
@@ -10103,6 +10221,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("crabbot-service-{}", std::process::id()));
         let _ = fs::remove_file(&path);
         service_at(&path, ServiceCommand::Install(super::ServiceInstall { force: false })).unwrap();
+
         assert!(path.is_file());
         assert!(
             service_at(&path, ServiceCommand::Install(super::ServiceInstall { force: false }))
@@ -10121,6 +10240,7 @@ mod tests {
             },
         )
         .unwrap();
+
         assert!(stopped);
         assert!(!path.exists());
         service_at(&path, ServiceCommand::Remove(super::ServiceRemove { yes: true })).unwrap();
@@ -10161,6 +10281,7 @@ mod tests {
         .unwrap();
         let binary = plugin.join("bin").join(super::plugin_name("echo"));
         fs::write(&binary, "binary").unwrap();
+
         assert_eq!(installed_at(&root), vec!["echo"]);
         assert_eq!(binary_at("echo", &root), Some(binary.clone()));
         assert!(binary_at("../escape", &root).is_none());
@@ -10169,6 +10290,7 @@ mod tests {
         fs::create_dir_all(&default_source).unwrap();
         fs::create_dir_all(default_binary.parent().unwrap()).unwrap();
         fs::write(&default_binary, "default binary").unwrap();
+
         assert_eq!(plugin_binary(&default_source, "echo", true), Some(default_binary));
         let entry = super::Entry {
             source: plugin.display().to_string(),
@@ -10194,6 +10316,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("crabbot-updates-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+
         assert!(super::updates(&root, "off").is_ok());
         assert!(super::updates(&root, "check").is_ok());
         assert!(super::updates(&root, "prompt").is_ok());
@@ -10237,6 +10360,7 @@ mod tests {
 
         let text = toml::to_string(&value).unwrap();
         let parsed: Manifest = toml::from_str(&text).unwrap();
+
         assert_eq!(parsed.id, "echo");
     }
 
@@ -10272,6 +10396,7 @@ mod tests {
         );
         super::save_lock_at(&root, &lock).unwrap();
         let help = super::help_text_with_plugins(&root);
+
         assert!(help.contains("Plugin Commands:"));
         assert!(help.contains("login"));
         assert!(help.find("Plugin Commands:") < help.find("Options:"));
@@ -10287,6 +10412,7 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(
             super::validate_commands(
                 &root,
@@ -10326,11 +10452,13 @@ mod tests {
             },
         );
         super::save_lock_at(&root, &lock).unwrap();
+
         assert!(!super::plugin_commands(&root).contains_key("ask"));
 
         let binary = root.join("plugins/fake/bin").join(super::plugin_name("fake"));
         fs::write(binary, b"plugin").unwrap();
         let commands = super::plugin_commands(&root);
+
         assert_eq!(commands["ask"][0].0, "__runtime");
         assert_eq!(super::model_plugin_at(&root, Some("fake")).unwrap(), "fake");
 
@@ -10360,21 +10488,27 @@ mod tests {
         assert!(cli.verbose);
 
         let cli = Cli::try_parse_from(["crabbot", "version", "--json"]).unwrap();
+
         assert!(matches!(cli.command, Command::Version(Output { json: true })));
 
         let cli = Cli::try_parse_from(["crabbot", "status", "--json"]).unwrap();
+
         assert!(matches!(cli.command, Command::Status(Output { json: true })));
 
         let cli = Cli::try_parse_from(["crabbot", "--json", "doctor"]).unwrap();
+
         assert!(cli.json);
 
         let cli = Cli::try_parse_from(["crabbot", "doctor", "--fix"]).unwrap();
+
         assert!(matches!(cli.command, Command::Doctor(DoctorArgs { fix: true })));
 
         let cli = Cli::try_parse_from(["crabbot", "service", "status", "--json"]).unwrap();
+
         assert!(cli.json);
 
         let cli = Cli::try_parse_from(["crabbot", "service", "install", "--force"]).unwrap();
+
         assert!(matches!(
             cli.command,
             Command::Service {
@@ -10383,6 +10517,7 @@ mod tests {
         ));
 
         let cli = Cli::try_parse_from(["crabbot", "service", "remove", "--yes"]).unwrap();
+
         assert!(matches!(
             cli.command,
             Command::Service {
@@ -10395,9 +10530,11 @@ mod tests {
         assert!(cli.json);
 
         let cli = Cli::try_parse_from(["crabbot", "session", "new", "main", "--json"]).unwrap();
+
         assert!(cli.json);
 
         let cli = Cli::try_parse_from(["crabbot", "session", "show", "main", "--json"]).unwrap();
+
         assert!(cli.json);
 
         let cli = Cli::try_parse_from(["crabbot", "session", "delete", "main", "--yes", "--json"])
@@ -10409,9 +10546,11 @@ mod tests {
         assert!(cli.json);
 
         let cli = Cli::try_parse_from(["crabbot", "export", "--json"]).unwrap();
+
         assert!(cli.json);
 
         let cli = Cli::try_parse_from(["crabbot", "export", "."]).unwrap();
+
         assert!(matches!(
             cli.command,
             Command::Export(CrabfileExport { destination: Some(path), path: None, force: false })
@@ -10419,6 +10558,7 @@ mod tests {
         ));
 
         let cli = Cli::try_parse_from(["crabbot", "export", "--force"]).unwrap();
+
         assert!(matches!(cli.command, Command::Export(CrabfileExport { force: true, .. })));
 
         let cli =
@@ -10433,11 +10573,13 @@ mod tests {
             crabfile_output_path(None, Some(PathBuf::from("."))).unwrap(),
             Path::new("./Crabfile")
         );
+
         assert!(
             crabfile_output_path(Some(PathBuf::from("one")), Some(PathBuf::from("two"))).is_err()
         );
 
         let help = Cli::command().render_help().to_string();
+
         assert!(help.contains("Initialize the Crabbot home directory and configuration."));
         assert!(help.contains("-h, --help"));
         assert!(help.contains("alias: -H"));
@@ -10448,11 +10590,13 @@ mod tests {
 
         for argument in ["-h", "-H", "--help"] {
             let error = Cli::try_parse_from(["crabbot", argument]).unwrap_err();
+
             assert_eq!(error.kind(), ErrorKind::DisplayHelp);
         }
 
         for argument in ["-v", "-V", "--version"] {
             let error = Cli::try_parse_from(["crabbot", argument]).unwrap_err();
+
             assert_eq!(error.kind(), ErrorKind::DisplayVersion);
         }
     }
@@ -10483,6 +10627,7 @@ mod tests {
             let mut output = Vec::new();
             generate_completion(shell, &mut Cli::command(), NAME, &mut output);
             let output = String::from_utf8(output).unwrap();
+
             assert!(output.contains(expected), "completion output for {name} was unexpected");
         }
 
@@ -10494,6 +10639,7 @@ mod tests {
         assert_eq!(completion_name_from(Some(std::ffi::OsStr::new("other"))), NAME);
 
         let cli = Cli::try_parse_from(["crabbot", "init", "--force"]).unwrap();
+
         assert!(matches!(cli.command, Command::Init(InitArgs { force: true })));
     }
 
@@ -10507,13 +10653,16 @@ mod tests {
         fs::write(root.join("plugins/keep"), "plugin state").unwrap();
 
         super::init_at_with_force(&root, false).unwrap();
+
         assert_eq!(fs::read_to_string(root.join("config.toml")).unwrap(), "update = 'auto'\n");
         assert!(root.join("plugins/keep").exists());
 
         super::init_at_with_force(&root, true).unwrap();
+
         assert!(
             fs::read_to_string(root.join("config.toml")).unwrap().contains("update = \"prompt\"")
         );
+
         assert!(root.join("plugins/keep").exists());
 
         let _ = fs::remove_dir_all(root);
@@ -10525,14 +10674,17 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
 
         super::doctor_at(&root, false, false).unwrap();
+
         assert!(!root.exists());
 
         super::doctor_at(&root, true, false).unwrap();
+
         assert!(root.join("config.toml").is_file());
         assert!(root.join("plugins").is_dir());
 
         fs::write(root.join("config.toml"), "update = 'auto'\n").unwrap();
         super::doctor_at(&root, true, false).unwrap();
+
         assert_eq!(fs::read_to_string(root.join("config.toml")).unwrap(), "update = 'auto'\n");
 
         let _ = fs::remove_dir_all(root);
@@ -10554,8 +10706,10 @@ mod tests {
         assert_eq!(ask.plugin, None);
 
         let ask = super::Ask::try_parse_from(["ask", "hello"]).unwrap();
+
         assert_eq!(ask.model, "gpt-4o-mini");
         let cli = Cli::try_parse_from(["crabbot", "ask", "hello"]).unwrap();
+
         assert!(matches!(cli.command, Command::External(args) if args == vec!["ask", "hello"]));
     }
 
@@ -10565,8 +10719,10 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("crabbot-plugin.toml"), "id = 'echo'\nversion = '0.1.0'\nprotocol = { major = 0, minor = 1 }\ncapabilities = ['model']\n").unwrap();
+
         assert_eq!(read_manifest(&root).unwrap().id, "echo");
         fs::write(root.join("crabbot-plugin.toml"), "broken = true\n").unwrap();
+
         assert!(read_manifest(&root).is_none());
         let _ = fs::remove_dir_all(root);
     }
@@ -10587,6 +10743,15 @@ mod tests {
         assert!(super::valid("plugin-2"));
         assert!(!super::valid("../escape"));
         assert!(!super::valid("Telegram"));
+    }
+
+    #[test]
+    fn encodes_unsafe_channel_routing_in_session_ids() {
+        let session = super::session_id("slack", "CABC123", Some("+15551234567"));
+
+        assert!(super::valid(&session));
+        assert!(session.starts_with("slack-x"));
+        assert_ne!(session, "slack-CABC123-thread-+15551234567");
     }
 
     #[test]
@@ -10612,6 +10777,23 @@ mod tests {
         };
 
         assert_eq!(assistant(&reply), "[Tool call read]: {\"path\":\"note.txt\"}");
+    }
+
+    #[test]
+    fn preserves_large_tool_arguments_in_model_context() {
+        let args = serde_json::json!({"patch": "x".repeat(super::META_LIMIT + 1)});
+        let reply = ModelReply {
+            text: String::new(),
+            stop: "tool".into(),
+            input: None,
+            output: None,
+            events: vec![Event::Tool { name: "patch".into(), args: args.clone() }],
+        };
+
+        let rendered = assistant(&reply);
+        let (_, serialized) = rendered.split_once("]: ").unwrap();
+
+        assert_eq!(serde_json::from_str::<serde_json::Value>(serialized).unwrap(), args);
     }
 
     #[test]
@@ -10667,31 +10849,53 @@ mod tests {
         };
 
         super::merge_stream(&mut reply, vec![note("Hello "), note("world")]);
+
         assert_eq!(reply.text, "Hello world");
         assert!(reply.events.is_empty());
 
         reply.text.clear();
         super::merge_stream(&mut reply, vec![note("Hello "), note("world")]);
+
         assert_eq!(reply.text, "Hello world");
     }
 
     #[test]
     fn bounds_model_history_by_frame_size() {
-        let messages = (0..40)
-            .map(|index| Message {
-                id: index.to_string(),
+        let mut messages = vec![
+            Message {
+                id: "assistant-tool".into(),
                 session: "test".into(),
-                role: Role::User,
+                role: Role::Assistant,
                 sender: None,
                 content: vec![Content::Text { text: "x".repeat(256 * 1024) }],
-            })
-            .collect::<Vec<_>>();
+            },
+            Message {
+                id: "tool".into(),
+                session: "test".into(),
+                role: Role::Tool,
+                sender: Some("read".into()),
+                content: vec![Content::Text { text: "x".repeat(256 * 1024) }],
+            },
+        ];
+        messages.extend((0..40).map(|index| Message {
+            id: index.to_string(),
+            session: "test".into(),
+            role: Role::User,
+            sender: None,
+            content: vec![Content::Text { text: "x".repeat(256 * 1024) }],
+        }));
         let request = super::model_request(1, "model", &messages, &[], None).unwrap();
         let encoded = serde_json::to_vec(&request).unwrap();
+
         assert!(encoded.len() < crabbot_core::jsonl::MAX);
         let retained =
             serde_json::to_value(request).unwrap()["params"]["messages"].as_array().unwrap().len();
         assert!(retained < messages.len());
+        let request = super::model_request(1, "model", &messages, &[], None).unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        let retained = value["params"]["messages"].as_array().unwrap();
+
+        assert!(retained.iter().all(|message| message["role"] != "tool"));
         let current = Message {
             id: "current".into(),
             session: "test".into(),
@@ -10705,6 +10909,7 @@ mod tests {
         let request = super::model_request(1, "model", &history, &[], None).unwrap();
         let value = serde_json::to_value(request).unwrap();
         let retained = value["params"]["messages"].as_array().unwrap();
+
         assert!(retained.iter().any(|message| message["id"] == "current"));
         let current = Message {
             id: "current".into(),
@@ -10727,6 +10932,7 @@ mod tests {
             "git",
             &serde_json::json!({"args": ["worktree", "remove", "path"]})
         ));
+
         assert!(!super::mutating("read", &serde_json::json!({})));
         assert!(!super::mutating("git", &serde_json::json!({"args": ["status"]})));
     }
@@ -10737,17 +10943,21 @@ mod tests {
             super::approval_text("write", &serde_json::json!({"path": "note.txt"}))
                 .contains("write to note.txt")
         );
+
         assert!(
             super::approval_text("patch", &serde_json::json!({"text": "diff"})).contains("4 bytes")
         );
+
         assert!(
             super::approval_text("shell", &serde_json::json!({"command": "cargo test"}))
                 .contains("cargo test")
         );
+
         assert!(
             super::approval_text("git", &serde_json::json!({"args": ["status"]}))
                 .contains("status")
         );
+
         assert!(super::approval_text("read", &serde_json::json!({})).contains("read tool"));
 
         let telegram =
@@ -10766,6 +10976,7 @@ mod tests {
             "deny",
         )
         .unwrap();
+
         assert_eq!(discord["channel"], "channel");
         assert!(discord.get("thread").is_none());
         assert!(super::approval_params("other", "room", None, "Approve?", "a", "d").is_err());
@@ -10778,6 +10989,7 @@ mod tests {
         let process = Process::start_with("sh", ["-c", script]).await.unwrap();
         let process = Live::new(process);
         let mut failures = 3;
+
         assert!(!recover(&process, &mut failures, "test", &Stop::new()).await.unwrap());
         assert_eq!(failures, 4);
         process.stop().await.unwrap();
@@ -10847,6 +11059,7 @@ mod tests {
 
         {
             let store = sessions.lock().unwrap();
+
             assert_eq!(store.outbox[0].message_id.as_deref(), Some("99"));
             assert_eq!(store.outbox[0].text, "answer");
             assert_eq!(store.outbox[0].status, super::state::DeliveryStatus::Streaming);
@@ -10892,6 +11105,7 @@ mod tests {
         let mut output = super::StreamOutput::new();
         output.apply(super::StreamNotice::Tool("read".into()));
         let mut call = 7;
+
         assert!(
             super::flush_stream(
                 &mut output,
@@ -10941,19 +11155,23 @@ mod tests {
             super::send_params("discord", "delivery", "room", "hello", None).unwrap()["channel"],
             "room"
         );
+
         assert_eq!(
             super::send_params("telegram", "delivery", "7", "hello", None).unwrap()["chat"],
             7
         );
+
         assert_eq!(
             super::send_params("telegram", "delivery", "7", "hello", Some("4")).unwrap()["thread"],
             "4"
         );
+
         assert!(super::send_params("telegram", "delivery", "room", "hello", None).is_err());
         assert_eq!(
             super::edit_params("discord", "delivery", "room", "42", "hello", None).unwrap()["message"],
             "42"
         );
+
         assert_eq!(
             super::edit_params("telegram", "delivery", "7", "42", "hello", Some("4")).unwrap()["thread"],
             "4"
@@ -10962,6 +11180,7 @@ mod tests {
             id: "delivery".into(),
             channel: "discord".into(),
             chat: "room".into(),
+            private: true,
             thread: None,
             text: "updated".into(),
             attempts: 0,
@@ -10976,14 +11195,42 @@ mod tests {
             delivery_request("discord", 12, &delivery).unwrap(),
             Request::Call { method, .. } if method == "edit"
         ));
+        let group_delivery = super::state::Delivery {
+            id: "group-delivery".into(),
+            channel: "signal".into(),
+            chat: "group".into(),
+            private: false,
+            thread: None,
+            text: "hello".into(),
+            attempts: 0,
+            created: 0,
+            status: super::state::DeliveryStatus::Pending,
+            last_error: None,
+            message_id: None,
+            updated: 0,
+        };
+
+        assert!(matches!(
+            delivery_request("signal", 13, &group_delivery).unwrap(),
+            Request::Call { params, .. } if params["private"] == false
+        ));
+
+        assert!(matches!(
+            send_request("signal", 14, "stream-delivery", "group", false, "hello", None)
+                .unwrap(),
+            Request::Call { params, .. } if params["private"] == false
+        ));
+
         assert_eq!(
             channel_message_id("telegram", &serde_json::json!({"message_id": 9})),
             Some("9".into())
         );
+
         assert_eq!(
             channel_message_id("discord", &serde_json::json!({"id": "9"})),
             Some("9".into())
         );
+
         assert!(stream_fits("telegram", &"🙂".repeat(2_048)));
         assert!(!stream_fits("telegram", &"🙂".repeat(2_049)));
         assert!(stream_fits("discord", &"x".repeat(2_000)));
@@ -10993,22 +11240,27 @@ mod tests {
             std::env::temp_dir().join(format!("crabbot-context-{}", std::process::id()));
         let _ = fs::remove_dir_all(&context_root);
         fs::create_dir_all(context_root.join("nested")).unwrap();
+
         assert!(super::context_at("test", &context_root).is_none());
         fs::write(context_root.join("AGENTS.md"), "   ").unwrap();
+
         assert!(super::context_at("test", &context_root).is_none());
         fs::write(context_root.join("AGENTS.md"), "Use the workspace.").unwrap();
         fs::write(context_root.join("nested/AGENTS.md"), "Use the nested workspace.").unwrap();
+
         assert_eq!(
             super::context_at("test", &context_root.join("nested")).unwrap().role,
             crabbot_core::types::Role::System
         );
         let context = super::context_at("test", &context_root.join("nested")).unwrap();
         let rendered = context.content[0].render();
+
         assert!(rendered.contains("Use the nested workspace."));
         assert!(!rendered.contains("Use the workspace."));
         fs::write(context_root.join("nested/AGENTS.md"), "x".repeat(super::CONTEXT_LIMIT * 4))
             .unwrap();
         let bounded = super::context_at("test", &context_root.join("nested")).unwrap();
+
         assert!(bounded.content[0].render().len() <= super::CONTEXT_LIMIT);
         #[cfg(unix)]
         {
@@ -11018,16 +11270,19 @@ mod tests {
             fs::write(&outside, "outside instructions").unwrap();
             fs::remove_file(context_root.join("nested/AGENTS.md")).unwrap();
             symlink(&outside, context_root.join("nested/AGENTS.md")).unwrap();
+
             assert!(super::context_at("test", &context_root.join("nested")).is_none());
         }
 
         let _ = fs::remove_dir_all(context_root);
+
         assert!(super::allowed(
             &super::ChannelConfig::default(),
             &serde_json::json!({"private": true, "text": "hello"}),
             "7"
         ));
         let mut policy = super::ChannelConfig { tools: true, ..Default::default() };
+
         assert!(!super::tools_allowed(
             &policy,
             &serde_json::json!({"private": true, "sender": "7", "text": "hello"}),
@@ -11035,28 +11290,33 @@ mod tests {
             true
         ));
         policy.allow.push("7".into());
+
         assert!(super::tools_allowed(
             &policy,
             &serde_json::json!({"private": true, "sender": "7", "text": "hello"}),
             "7",
             true
         ));
+
         assert!(!super::tools_allowed(
             &policy,
             &serde_json::json!({"private": true, "sender": "7", "text": "hello"}),
             "7",
             false
         ));
+
         assert!(!super::allowed(
             &super::ChannelConfig::default(),
             &serde_json::json!({"private": false, "text": "hello"}),
             "7"
         ));
+
         assert!(!super::allowed(
             &super::ChannelConfig { allow: vec!["8".into()], mention: None, ..Default::default() },
             &serde_json::json!({"text": "hello"}),
             "7"
         ));
+
         assert!(!super::allowed(
             &super::ChannelConfig {
                 allow: Vec::new(),
@@ -11066,12 +11326,17 @@ mod tests {
             &serde_json::json!({"text": "hello"}),
             "7"
         ));
+
         assert!(super::env_nonempty("PATH"));
         assert!(!super::env_nonempty("CRABBOT_TEST_MISSING"));
-        assert!(!super::file_credential(&["CRABBOT_TEST_MISSING"]));
+        assert!(!super::file_credential_at(None, &["CRABBOT_TEST_MISSING"]));
         let credentials =
             std::env::temp_dir().join(format!("crabbot-credentials-{}.json", std::process::id()));
-        fs::write(&credentials, r#"{"CRABBOT_CODEX_KEY":"secret"}"#).unwrap();
+        fs::write(
+            &credentials,
+            r#"{"CRABBOT_CODEX_KEY":"secret","CRABBOT_SIGNAL_ACCOUNT":"signal","CRABBOT_SLACK_BOT_TOKEN":"slack"}"#,
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -11081,10 +11346,14 @@ mod tests {
         }
 
         assert!(super::credential(&credentials, &["CRABBOT_CODEX_KEY"]));
+        assert!(super::ready_at("signal", Some(&credentials)));
+        assert!(super::ready_at("slack", Some(&credentials)));
         assert!(!super::credential(&credentials, &["MISSING"]));
         fs::write(&credentials, "broken").unwrap();
+
         assert!(!super::credential(&credentials, &["CRABBOT_CODEX_KEY"]));
         let _ = fs::remove_file(credentials);
+
         assert_eq!(super::event_id(&serde_json::json!("abc")), Some("abc".into()));
         assert_eq!(super::event_id(&serde_json::json!(7)), Some("7".into()));
         assert_eq!(super::event_id(&serde_json::Value::Null), None);
@@ -11106,6 +11375,7 @@ mod tests {
             1
         );
         let clipped = super::content(&serde_json::json!({"text": "x".repeat(300 * 1024)}));
+
         assert!(clipped[0].render().len() <= super::TEXT_LIMIT);
         assert!(super::content(&serde_json::json!({"text":""})).is_empty());
         assert!(super::allowed(
@@ -11136,6 +11406,7 @@ mod tests {
             &event,
             "7"
         ));
+
         assert!(!super::allowed(
             &super::ChannelConfig {
                 allow: vec!["7".into()],
@@ -11161,6 +11432,7 @@ mod tests {
             .await,
             std::process::ExitCode::SUCCESS
         );
+
         assert_eq!(
             super::main_with(Cli {
                 json: false,
@@ -11182,6 +11454,7 @@ mod tests {
 
         let path = std::env::temp_dir().join(format!("crabbot-secure-{}", std::process::id()));
         super::secure(&path, b"secret").unwrap();
+
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_file(path);
     }
@@ -11272,6 +11545,7 @@ mod tests {
         };
 
         super::link_at(source, true, &root).unwrap();
+
         assert_eq!(super::installed_at(&root), vec!["memory"]);
         assert!(
             super::link_at(
@@ -11287,6 +11561,7 @@ mod tests {
             .is_err()
         );
         #[cfg(unix)]
+
         assert!(
             fs::symlink_metadata(root.join("plugins/memory/bin").join(&memory_binary))
                 .unwrap()
@@ -11296,6 +11571,7 @@ mod tests {
         super::list_at(&root, true).unwrap();
         super::list_at(&root, false).unwrap();
         let lock = super::load_lock_at(&root).unwrap();
+
         assert!(lock.plugins.contains_key("memory"));
         assert_eq!(lock.plugins["memory"].hash.len(), 64);
         assert!(!lock.plugins["memory"].revision.is_empty());
@@ -11316,6 +11592,7 @@ mod tests {
         }
 
         update_at(&root, true).unwrap();
+
         assert_eq!(read_manifest(&root.join("plugins/memory")).unwrap().version, "0.2.0");
 
         fs::write(
@@ -11323,6 +11600,7 @@ mod tests {
             "id = 'memory'\nversion = '0.3.0'\ncapabilities = ['memory']\npermissions = ['network']\n",
         )
         .unwrap();
+
         assert!(update_at(&root, true).is_err());
         assert_eq!(read_manifest(&root.join("plugins/memory")).unwrap().version, "0.2.0");
         fs::write(
@@ -11344,6 +11622,7 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(
             super::link_at(
                 Source { id: "bad_id".into(), source: None, revision: None, yes: true },
@@ -11357,6 +11636,7 @@ mod tests {
             "id = 'memory'\nversion = '0.1.0'\nprotocol = { major = 1, minor = 0 }\ncapabilities = ['memory']\n",
         )
         .unwrap();
+
         assert!(
             super::link_at(
                 Source {
@@ -11371,6 +11651,7 @@ mod tests {
             .is_err()
         );
         fs::remove_file(plugin_root.join("bin").join(&memory_binary)).unwrap();
+
         assert!(
             super::link_at(
                 Source {
@@ -11384,10 +11665,13 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(update_at(&root, false).is_err());
         super::remove_at(Name { id: "memory".into(), yes: true }, &root).unwrap();
+
         assert!(super::installed_at(&root).is_empty());
         super::list_at(&root, false).unwrap();
+
         assert!(super::remove_at(Name { id: "missing".into(), yes: false }, &root).is_err());
         assert!(super::remove_at(Name { id: "missing".into(), yes: true }, &root).is_err());
         assert!(
@@ -11403,6 +11687,7 @@ mod tests {
             .await
             .is_err()
         );
+
         assert!(super::remove(Name { id: "bad_id".into(), yes: true }).is_err());
         local_session(SessionCommand::List(Output { json: false }), &root).unwrap();
         let _ = fs::remove_dir_all(root);
@@ -11488,6 +11773,7 @@ mod tests {
             &root,
         )
         .unwrap();
+
         assert!(export_dir.join("Crabfile").is_file());
 
         let error = import_crabfile_at(
@@ -11496,6 +11782,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
+
         assert!(error.contains("requires confirmation"));
 
         let missing = root.join("missing-crabfile");
@@ -11505,6 +11792,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
+
         assert!(error.contains("Crabfile not found"));
         assert!(error.contains(&missing.display().to_string()));
 
@@ -11516,6 +11804,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
+
         assert!(error.contains("Crabfile at"));
         assert!(error.contains("is invalid at line 1, column"));
 
@@ -11609,11 +11898,13 @@ mod tests {
             "id = 'memory'\nversion = '0.3.0'\nprotocol = { major = 0, minor = 1 }\ncapabilities = ['memory']\npermissions = ['network']\n",
         )
         .unwrap();
+
         assert!(
             super::update_live(&root, false, vec!["memory".into()], &mut unload, &mut activate,)
                 .await
                 .is_err()
         );
+
         assert_eq!(
             *calls.lock().unwrap(),
             ["unload:memory", "activate:memory", "unload:memory", "activate:memory"]
@@ -11652,6 +11943,7 @@ mod tests {
         )
         .await
         .unwrap_err();
+
         assert!(error.to_string().contains("Could not unload tools"));
         assert_eq!(*calls.lock().unwrap(), ["unload:memory", "unload:tools", "activate:memory"]);
         let _ = fs::remove_dir_all(root);
@@ -11667,6 +11959,7 @@ mod tests {
             super::active_ids(serde_json::json!({"items": ["memory", "tools"]})).unwrap(),
             ["memory", "tools"]
         );
+
         assert!(super::active_ids(serde_json::json!({})).is_err());
         assert!(super::active_ids(serde_json::json!({"items": ["../escape"]})).is_err());
 
@@ -11706,6 +11999,7 @@ mod tests {
         )
         .await
         .unwrap_err();
+
         assert!(error.to_string().contains("before tools could be unloaded"));
 
         let mut unload = |_: String| {
@@ -11810,6 +12104,7 @@ fn main() {
         )
         .unwrap();
         fs::write(repo.join("bin/crabbot-plugin-memory"), "plugin").unwrap();
+
         assert!(
             std::process::Command::new("git")
                 .args(["-C", repo.to_str().unwrap(), "init", "-q"])
@@ -11817,6 +12112,7 @@ fn main() {
                 .unwrap()
                 .success()
         );
+
         assert!(
             std::process::Command::new("git")
                 .args(["-C", repo.to_str().unwrap(), "config", "user.email", "test@example.com"])
@@ -11824,6 +12120,7 @@ fn main() {
                 .unwrap()
                 .success()
         );
+
         assert!(
             std::process::Command::new("git")
                 .args(["-C", repo.to_str().unwrap(), "config", "user.name", "Crabbot Test"])
@@ -11831,6 +12128,7 @@ fn main() {
                 .unwrap()
                 .success()
         );
+
         assert!(
             std::process::Command::new("git")
                 .args(["-C", repo.to_str().unwrap(), "config", "commit.gpgsign", "false"])
@@ -11838,6 +12136,7 @@ fn main() {
                 .unwrap()
                 .success()
         );
+
         assert!(
             std::process::Command::new("git")
                 .args(["-C", repo.to_str().unwrap(), "add", "."])
@@ -11845,6 +12144,7 @@ fn main() {
                 .unwrap()
                 .success()
         );
+
         assert!(
             std::process::Command::new("git")
                 .args(["-C", repo.to_str().unwrap(), "commit", "-qm", "initial"])
@@ -11854,6 +12154,7 @@ fn main() {
         );
         let head = revision(&repo);
         let cloned = resolve(&format!("git+file://{}", repo.display()), Some(&head)).unwrap();
+
         assert!(cloned.path.join("crabbot-plugin.toml").is_file());
         assert!(resolve(&format!("git+file://{}", repo.display()), Some("wrong")).is_err());
         assert!(
@@ -11864,9 +12165,11 @@ fn main() {
                 .success()
         );
         let pinned = resolve(&format!("git+file://{}", repo.display()), Some(&head)).unwrap();
+
         assert_eq!(revision(&pinned.path), head);
 
         let archive = root.join("memory.tar.gz");
+
         assert!(
             std::process::Command::new("tar")
                 .args(["-czf", archive.to_str().unwrap(), "-C", root.to_str().unwrap(), "repo"])
@@ -11885,6 +12188,7 @@ fn main() {
             resolve(&format!("file://{}#sha256={}", archive.display(), "0".repeat(64)), None,)
                 .is_err()
         );
+
         assert!(resolve("https://example.com/plugin.zip", None).is_err());
         assert!(resolve(&root.join("plain.txt").display().to_string(), None).is_err());
         let _ = fs::remove_dir_all(root);
@@ -11896,13 +12200,16 @@ fn main() {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("plain.txt"), "plain").unwrap();
+
         assert_eq!(
             canonical_source(&format!("file://{}", root.join("plain.txt").display())),
             format!("file://{}", root.join("plain.txt").canonicalize().unwrap().display())
         );
+
         assert!(verify_archive(&root.join("plain.txt"), None).is_err());
         let oversized = root.join("oversized.tar");
         std::fs::File::create(&oversized).unwrap().set_len(ARCHIVE_LIMIT + 1).unwrap();
+
         assert!(verify_archive(&oversized, Some(&"0".repeat(64))).is_err());
         assert!(download("https://127.0.0.1:1/missing.tar", &root.join("missing")).is_err());
         assert!(!archive_url("https://example.com/plugin.txt"));
@@ -11912,6 +12219,7 @@ fn main() {
         assert!(archive(Path::new("plugin.tar.gz")));
         assert!(!archive(Path::new("plugin.txt")));
         let redacted = redact(b"https://user:secret@example.com/path Authorization: Bearer token");
+
         assert!(!redacted.contains("secret"));
         assert!(!redacted.contains("Bearer token"));
         assert!(embedded("https://user@example.com/repo.git"));
@@ -11932,14 +12240,17 @@ fn main() {
         )
         .unwrap();
         fs::write(root.join("nested/data"), "data").unwrap();
+
         assert_eq!(archive_root(&root).unwrap(), root);
         safe_archive(&root).unwrap();
         let outer = root.join("outer");
         fs::create_dir_all(outer.join("echo")).unwrap();
         fs::copy(root.join("crabbot-plugin.toml"), outer.join("echo/crabbot-plugin.toml")).unwrap();
+
         assert_eq!(archive_root(&outer).unwrap(), outer.join("echo"));
         let empty = root.join("empty");
         fs::create_dir_all(&empty).unwrap();
+
         assert!(archive_root(&empty).is_err());
         let _ = fs::remove_dir_all(root);
     }
@@ -11952,6 +12263,7 @@ fn main() {
         fs::write(root.join("symlink/target"), "data").unwrap();
         std::os::unix::fs::symlink("target", root.join("symlink/link")).unwrap();
         let symlink_archive = root.join("symlink.tar");
+
         assert!(
             std::process::Command::new("tar")
                 .args([
@@ -11966,12 +12278,14 @@ fn main() {
                 .unwrap()
                 .success()
         );
+
         assert!(validate_archive(&symlink_archive).is_err());
 
         fs::create_dir_all(root.join("hardlink")).unwrap();
         fs::write(root.join("hardlink/source"), "data").unwrap();
         fs::hard_link(root.join("hardlink/source"), root.join("hardlink/link")).unwrap();
         let hardlink_archive = root.join("hardlink.tar");
+
         assert!(
             std::process::Command::new("tar")
                 .args([
@@ -11986,12 +12300,14 @@ fn main() {
                 .unwrap()
                 .success()
         );
+
         assert!(validate_archive(&hardlink_archive).is_err());
 
         let zip_root = root.join("zip");
         fs::create_dir_all(&zip_root).unwrap();
         fs::write(zip_root.join("target"), "data").unwrap();
         let regular_archive = root.join("regular.zip");
+
         assert!(
             std::process::Command::new("zip")
                 .current_dir(&zip_root)
@@ -12000,10 +12316,12 @@ fn main() {
                 .unwrap()
                 .success()
         );
+
         assert!(validate_archive(&regular_archive).is_ok());
 
         std::os::unix::fs::symlink("target", zip_root.join("link")).unwrap();
         let symlink_zip = root.join("symlink.zip");
+
         assert!(
             std::process::Command::new("zip")
                 .current_dir(&zip_root)
@@ -12012,6 +12330,7 @@ fn main() {
                 .unwrap()
                 .success()
         );
+
         assert!(validate_archive(&symlink_zip).is_err());
         let _ = fs::remove_dir_all(root);
     }
@@ -12022,6 +12341,7 @@ fn main() {
         let root = std::env::temp_dir().join(format!("crabbot-isolate-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+
         assert!(
             std::process::Command::new("git")
                 .args(["-C", root.to_str().unwrap(), "init", "-q"])
@@ -12045,10 +12365,12 @@ fn main() {
         assert!(isolate_at("telegram-7", &root).unwrap().is_some());
         assert!(isolate_at("../escape", &root).unwrap().is_none());
         fs::write(root.join(".crabbot/worktrees/telegram-7/dirty"), "keep me").unwrap();
+
         assert!(super::state::remove_worktree(&root, "telegram-7").is_err());
         assert!(root.join(".crabbot/worktrees/telegram-7/dirty").is_file());
         fs::remove_file(root.join(".crabbot/worktrees/telegram-7/dirty")).unwrap();
         super::state::remove_worktree(&root, "telegram-7").unwrap();
+
         assert!(!root.join(".crabbot/worktrees/telegram-7").exists());
         let _ = fs::remove_dir_all(root);
     }
@@ -12057,6 +12379,7 @@ fn main() {
     async fn falls_back_when_daemon_is_absent() {
         let root = std::env::temp_dir().join(format!("crabbot-control-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
+
         assert!(super::control_at("status", serde_json::json!({}), &root).await.unwrap().is_none());
     }
 
@@ -12073,6 +12396,7 @@ fn main() {
             &mut 2,
         )
         .await;
+
         assert_eq!(content[0], Content::Image { uri: "file:///tmp/media.bin".into(), alt: None });
         channel.stop().await.unwrap();
     }
@@ -12085,24 +12409,32 @@ fn main() {
         fs::create_dir_all(&media).unwrap();
         let voice = media.join("voice.ogg");
         fs::write(&voice, b"voice").unwrap();
-        let script = r#"while IFS= read -r line; do case "$line" in *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"whisper","version":"0.1.0","capabilities":["speech"]}}' ;; *transcribe*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"text":"recognized words"}}' ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;; esac; done"#;
+        let script = r#"while IFS= read -r line; do request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); case "$line" in *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"protocol":{"major":0,"minor":1},"id":"whisper","version":"0.1.0","capabilities":["speech"]}}' ;; *transcribe*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"text":"recognized words"}}' ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"ok":true}}'; exit 0 ;; esac; done"#;
         let plugin = Process::start_with("sh", ["-c", script]).await.unwrap();
         let plugins = Plugins::default();
         plugins.insert(Live::new(plugin)).await;
         let mut call = 2;
-        let content = super::transcribe_media(
-            &plugins,
-            "telegram",
-            vec![Content::Audio {
-                uri: format!("file://{}", voice.display()),
-                mime: Some("audio/ogg".into()),
-            }],
-            &media,
-            &mut call,
-        )
-        .await;
 
-        assert_eq!(content, vec![Content::Text { text: "recognized words".into() }]);
+        for (index, channel) in ["telegram", "signal", "slack"].into_iter().enumerate() {
+            if index > 0 {
+                fs::write(&voice, b"voice").unwrap();
+            }
+
+            let content = super::transcribe_media(
+                &plugins,
+                channel,
+                vec![Content::Audio {
+                    uri: format!("file://{}", voice.display()),
+                    mime: Some("audio/ogg".into()),
+                }],
+                &media,
+                &mut call,
+            )
+            .await;
+
+            assert_eq!(content, vec![Content::Text { text: "recognized words".into() }]);
+        }
+
         assert!(!voice.exists());
         plugins.all().await.into_iter().next().unwrap().1.stop().await.unwrap();
         let _ = fs::remove_dir_all(root);
@@ -12161,12 +12493,15 @@ fn main() {
 
         let uri = uri.clone();
         let alt = alt.clone();
+
         assert_eq!(alt.as_deref(), Some("photo"));
         let pinned = PathBuf::from(uri.strip_prefix("file://").unwrap());
+
         assert!(pinned.starts_with(root.join("pinned")));
         assert!(pinned.is_file());
 
         let again = super::pin_media(content, &root);
+
         assert_eq!(again[0], Content::Image { uri, alt: Some("photo".into()) });
         let _ = fs::remove_dir_all(root);
     }
@@ -12205,6 +12540,7 @@ fn main() {
         };
 
         let (header, encoded) = uri.split_once(',').unwrap();
+
         assert_eq!(header, "data:image/png;base64");
         assert_eq!(super::STANDARD.decode(encoded).unwrap(), first_bytes);
         assert!(messages[0].content[1].render().contains("omitted"));
@@ -12215,6 +12551,7 @@ fn main() {
                 text: "[Image attachment unavailable. Description: description]".into()
             }
         );
+
         assert!(
             !messages[0]
                 .content
@@ -12243,6 +12580,7 @@ fn main() {
             result[0].render(),
             "[Voice message omitted because transcription is unavailable.]"
         );
+
         assert_eq!(call, 2);
     }
 
@@ -12274,13 +12612,16 @@ fn main() {
             },
         ];
 
-        let result = super::expand_media_files("telegram", content, &root);
+        for channel in ["telegram", "signal", "slack"] {
+            let result = super::expand_media_files(channel, content.clone(), &root);
 
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0], Content::Text { text: "[File: note.md]\nA short note.".into() });
-        assert!(result[1].render().contains("unsafe or unsupported"));
-        assert!(result[2].render().contains("unsafe or unsupported"));
-        assert!(!result.iter().any(|item| item.render().contains(&root.display().to_string())));
+            assert_eq!(result.len(), 3);
+            assert_eq!(result[0], Content::Text { text: "[File: note.md]\nA short note.".into() });
+            assert!(result[1].render().contains("unsafe or unsupported"));
+            assert!(result[2].render().contains("unsafe or unsupported"));
+            assert!(!result.iter().any(|item| item.render().contains(&root.display().to_string())));
+        }
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -12310,9 +12651,11 @@ fn main() {
         .await
         .unwrap();
         session_at(SessionCommand::Cancel(Id { id: "copy".into() }), &root).await.unwrap();
+
         assert!(
             session_at(SessionCommand::Show(Id { id: "missing".into() }), &root).await.is_err()
         );
+
         assert!(
             session_at(
                 SessionCommand::Delete(SessionDelete { id: "main".into(), yes: false }),
@@ -12386,6 +12729,7 @@ fn main() {
         let mut lock = super::load_lock_at(&root).unwrap();
         lock.plugins.get_mut("fake").unwrap().capabilities = vec!["tool".into()];
         super::save_lock_at(&root, &lock).unwrap();
+
         assert!(
             super::ask_at(
                 super::Ask {
@@ -12642,6 +12986,7 @@ fn main() {
         notifier.await.unwrap();
         {
             let store = sessions.lock().unwrap();
+
             assert!(store.sessions["telegram-7"].queued.is_empty());
             assert_eq!(store.sessions["telegram-7"].messages.len(), 2);
         }
@@ -12693,6 +13038,7 @@ fn main() {
         notifier.await.unwrap();
         {
             let store = sessions.lock().unwrap();
+
             assert_eq!(store.sessions["telegram-7"].messages.len(), 4);
             assert_eq!(store.sessions["telegram-7"].messages[1].role, Role::Assistant);
             assert_eq!(store.sessions["telegram-7"].messages[2].role, Role::Tool);
@@ -12769,9 +13115,11 @@ fn main() {
         .unwrap();
 
         notifier.await.unwrap();
+
         assert!(marker.is_file());
         {
             let store = sessions.lock().unwrap();
+
             assert_eq!(store.sessions["telegram-7"].status, "idle");
             assert!(store.sessions["telegram-7"].messages.iter().any(|message| {
                 message.content.iter().any(|content| {
@@ -12821,6 +13169,7 @@ fn main() {
             execution.await.unwrap().unwrap(),
             "The request was denied. No changes were made."
         );
+
         assert!(!approvals.lock().await.has_pending());
     }
 
@@ -12885,6 +13234,7 @@ done
             )
             .await
             .unwrap();
+
             assert_eq!(offset, id + 1);
         }
 
@@ -12964,6 +13314,7 @@ done
         )
         .await
         .unwrap();
+
         assert_eq!(response.result.unwrap()["output"], "workspace content");
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
 
@@ -12992,6 +13343,7 @@ done
         )
         .await
         .unwrap();
+
         assert!(mutation.error.unwrap().message.contains("Approval policy blocks"));
         assert_eq!(sessions.lock().unwrap().sessions["room"].phase, "safe");
 
@@ -13017,6 +13369,7 @@ done
         )
         .await
         .unwrap();
+
         assert!(disabled.error.unwrap().message.contains("disabled"));
 
         let approved = super::host_tool(
@@ -13044,9 +13397,40 @@ done
         )
         .await
         .unwrap();
+
         assert_eq!(approved.result.unwrap()["output"], "Write executed.");
         assert_eq!(sessions.lock().unwrap().sessions["room"].phase, "unsafe");
         stop_registry(&plugins).await;
+    }
+
+    #[test]
+    fn validates_selected_code_workspaces() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-selected-workspace-{}", std::process::id()));
+        let child = root.join("repo");
+        let outside =
+            root.with_file_name(format!("{}-outside", root.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let configured = std::fs::canonicalize(&root).unwrap();
+        let selected = super::selected_workspace(
+            &serde_json::json!({"workspace": child.display().to_string()}),
+            &configured,
+        )
+        .unwrap();
+
+        assert_eq!(selected, std::fs::canonicalize(&child).unwrap());
+        assert!(
+            super::selected_workspace(
+                &serde_json::json!({"workspace": outside.display().to_string()}),
+                &configured,
+            )
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[cfg(unix)]
@@ -13112,6 +13496,7 @@ done
         .await
         .unwrap()
         .unwrap_err();
+
         assert_eq!(result.to_string(), "The turn was interrupted.");
         notifier.await.unwrap();
         drain.await.unwrap();
@@ -13143,6 +13528,7 @@ done
         )
         .await
         .unwrap_err();
+
         assert!(error.to_string().contains("closed stdout"));
         assert_eq!(failed.as_deref(), Some("tools"));
 
@@ -13159,6 +13545,7 @@ done
         )
         .await
         .unwrap();
+
         assert_eq!(output, "recovered");
         stop_registry(&plugins).await;
         let _ = fs::remove_file(marker);
@@ -13226,6 +13613,7 @@ done
         notifier.await.unwrap();
         {
             let store = sessions.lock().unwrap();
+
             assert_eq!(store.sessions["telegram-7"].status, "idle");
             assert_eq!(store.outbox[0].status, super::state::DeliveryStatus::Uncertain);
         }
@@ -13261,6 +13649,7 @@ done
         )
         .await
         .unwrap();
+
         assert_eq!(current, 2);
         assert_eq!(call, 12);
         assert!(sessions.lock().unwrap().known("telegram", "event"));
@@ -13303,6 +13692,7 @@ done
         .await
         .unwrap();
         notifier.await.unwrap();
+
         assert_eq!(sessions.lock().unwrap().sessions["telegram-7"].status, "interrupted");
         stop_registry(&plugins).await;
         let _ = fs::remove_dir_all(root);

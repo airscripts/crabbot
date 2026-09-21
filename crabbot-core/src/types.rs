@@ -262,6 +262,7 @@ mod tests {
     #[test]
     fn requests_and_responses_round_trip() {
         let call = Request::call(7, "generate", serde_json::json!({"model": "local"}));
+
         assert_eq!(call.id(), Some(7));
 
         let note = Request::Note {
@@ -286,9 +287,11 @@ mod tests {
 
         let response = Response::ok(7, serde_json::json!({"ok": true}));
         let encoded = serde_json::to_string(&response).unwrap();
+
         assert_eq!(serde_json::from_str::<Response>(&encoded).unwrap(), response);
 
         let failed = Response::fail(8, -1, "failed");
+
         assert_eq!(failed.error.as_ref().unwrap().message, "failed");
     }
 
@@ -301,6 +304,7 @@ mod tests {
         });
 
         let request: ModelRequest = serde_json::from_value(value).unwrap();
+
         assert_eq!(request.workspace, None);
         assert!(serde_json::to_value(request).unwrap().get("workspace").is_none());
     }
@@ -308,6 +312,7 @@ mod tests {
     #[test]
     fn content_and_events_use_stable_tags() {
         let content = Content::Image { uri: "file://image".into(), alt: None };
+
         assert_eq!(serde_json::to_value(content).unwrap()["kind"], "image");
 
         assert_eq!(Content::Text { text: "hello".into() }.render(), "hello");
@@ -336,6 +341,7 @@ mod tests {
         );
 
         let event = Event::Tool { name: "read".into(), args: serde_json::json!({}) };
+
         assert_eq!(serde_json::to_value(event).unwrap()["kind"], "tool");
         let legacy = serde_json::from_value::<Event>(serde_json::json!({
             "kind": "tool",
@@ -351,16 +357,21 @@ mod tests {
     #[test]
     fn validates_ipc_requests_and_builds_errors() {
         let mut request = IpcRequest::call(1, "token", "status", serde_json::json!({}));
+
         assert!(request.valid());
         request.token.clear();
+
         assert!(!request.valid());
         request.token = "token".into();
         request.method.clear();
+
         assert!(!request.valid());
         request.method = "status".into();
         request.jsonrpc = "1.0".into();
+
         assert!(!request.valid());
         let error = IpcResponse::fail(1, 400, "bad");
+
         assert_eq!(error.error.unwrap().code, 400);
         assert_eq!(Response::fail(2, 500, "failed").error.unwrap().message, "failed");
     }

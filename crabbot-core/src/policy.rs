@@ -58,6 +58,7 @@ mod tests {
     #[test]
     fn shell_ask_needs_approval() {
         let policy = Policy { shell: Shell::Ask, ..Policy::default() };
+
         assert!(policy.shell(false).is_err());
         assert!(policy.shell(true).is_ok());
     }

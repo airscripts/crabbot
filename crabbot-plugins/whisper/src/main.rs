@@ -125,6 +125,7 @@ async fn capture(mut command: Command) -> std::io::Result<std::process::Output> 
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
     let mut child = command.spawn()?;
     let stdout = child.stdout.take().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Process has no stdout.")
@@ -163,6 +164,7 @@ async fn capture(mut command: Command) -> std::io::Result<std::process::Output> 
 
 async fn limited<R: AsyncRead + Unpin>(mut input: R) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
+
     let mut buffer = [0_u8; 16 * 1024];
 
     loop {
@@ -201,12 +203,14 @@ fn hello() -> Hello {
 #[cfg(test)]
 mod tests {
     use super::{call, call_at, hello};
+
     use crabbot_core::{policy::Policy, types::Request};
     use serde_json::json;
 
     #[test]
     fn describes_speech_capability() {
         let hello = hello();
+
         assert_eq!(hello.id, "whisper");
         assert_eq!(hello.capabilities, vec![crabbot_core::types::Capability::Speech]);
     }
@@ -214,6 +218,7 @@ mod tests {
     #[tokio::test]
     async fn validates_transcription_requests() {
         let policy = Policy::default();
+
         assert!(call(&policy, Request::call(1, "unknown", json!({}))).await.unwrap().is_none());
         assert!(call(&policy, Request::call(2, "transcribe", json!({}))).await.is_err());
         assert!(
@@ -271,6 +276,7 @@ mod tests {
 
         let empty = root.join(format!("empty.{extension}"));
         write_transcriber(&empty, "", "", 0);
+
         assert!(
             call_at(
                 &policy,
@@ -283,6 +289,7 @@ mod tests {
 
         let failed = root.join(format!("failed.{extension}"));
         write_transcriber(&failed, "", "nope\n", 1);
+
         assert!(
             call_at(
                 &policy,
@@ -292,12 +299,14 @@ mod tests {
             .await
             .is_err()
         );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn bounds_transcriber_output() {
         let error = super::limited(tokio::io::repeat(b'o')).await.unwrap_err();
+
         assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
     }
 }

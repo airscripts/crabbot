@@ -1,6 +1,7 @@
 # Product
 
-Crabbot is a local-first, open-source general-purpose agent. This document
+Crabbot is a lightweight, open-source general-purpose agent runtime that turns
+models, tools, memory, and messaging into an assistant you control. This document
 describes the product’s purpose, capabilities, boundaries, and engineering
 principles. [PLAN.md](../PLAN.md) contains only active work, while
 [ROADMAP.md](../ROADMAP.md) contains future expansions.
@@ -25,11 +26,11 @@ Brand positioning:
 
 - Primary claim: Your last next agent.
 - Primary description: Crabbot is a lightweight, open-source general-purpose
-  agent that runs on your machine and meets you wherever you work—starting
-  with Telegram, Discord, and the terminal.
-- GitHub description: A lightweight, open-source general-purpose agent for
-  Telegram, Discord, and the terminal—powered by the models and tools you
-  choose.
+  agent runtime that turns models, tools, memory, and messaging into an
+  assistant you control.
+- GitHub description: A lightweight, open-source general-purpose agent runtime
+  that turns models, tools, memory, and messaging into an assistant you
+  control.
 
 ## Architecture And Interfaces
 

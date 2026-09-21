@@ -264,6 +264,7 @@ where
     E: std::fmt::Display,
 {
     let mut buffer = Vec::new();
+
     let mut text = String::new();
     let mut pending = String::new();
     let mut calls = BTreeMap::<usize, (String, String)>::new();
@@ -516,7 +517,9 @@ mod tests {
     #[test]
     fn builds_messages_tools_and_images() {
         let input = model();
+
         let values = messages(&input).unwrap();
+
         assert_eq!(values[0], json!({"role":"system","content":"rules"}));
         assert_eq!(values[1]["content"][1]["type"], "image_url");
         assert_eq!(tools(&input).len(), 1);
@@ -538,6 +541,7 @@ mod tests {
     async fn ignores_notes_and_unknown_calls_without_provider_access() {
         let (output, _) = tokio::sync::mpsc::channel(1);
         let emitter = crabbot_core::plugin::Emitter::new(output);
+
         assert!(
             generate(
                 &reqwest::Client::new(),
@@ -551,6 +555,7 @@ mod tests {
 
         let (output, _) = tokio::sync::mpsc::channel(1);
         let emitter = crabbot_core::plugin::Emitter::new(output);
+
         assert!(
             generate(&reqwest::Client::new(), Request::call(1, "other", json!({})), emitter,)
                 .await
@@ -560,6 +565,7 @@ mod tests {
 
         let (output, _) = tokio::sync::mpsc::channel(1);
         let emitter = crabbot_core::plugin::Emitter::new(output);
+
         assert!(
             generate(&reqwest::Client::new(), Request::call(1, "generate", json!({})), emitter,)
                 .await
@@ -605,19 +611,23 @@ mod tests {
         let (output, mut events) = tokio::sync::mpsc::channel(4);
         let mut emitter = crabbot_core::plugin::Emitter::new(output);
         let response = stream_body(2, chunks, &mut emitter).await.unwrap().unwrap();
+
         assert_eq!(response.result.unwrap()["text"], "ok");
         assert_eq!(events.recv().await.unwrap()["params"]["event"]["text"], "ok");
 
         let mut text = String::new();
         let mut pending = String::new();
         let mut calls = std::collections::BTreeMap::new();
+
         assert!(stream_line(b"data: [DONE]\n", &mut text, &mut pending, &mut calls).unwrap());
         assert!(stream_line(b"data: nope\n", &mut text, &mut pending, &mut calls).is_err());
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(vec![b'x'; BODY_LIMIT + 1])]);
+
         assert!(collect(chunks).await.is_err());
         let mut text = String::new();
         let mut pending = String::new();
         let mut calls = std::collections::BTreeMap::new();
+
         assert!(stream_line(
             br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"{\"path\":\"note\"}"}}]}}]}"#,
             &mut text,
@@ -625,6 +635,7 @@ mod tests {
             &mut calls,
         )
         .is_ok());
+
         assert_eq!(calls[&0].0, "read");
         assert!(stream_line(b"invalid", &mut text, &mut pending, &mut calls).is_ok());
         assert!(stream_line(&[0xff], &mut text, &mut pending, &mut calls).is_err());
@@ -642,6 +653,7 @@ mod tests {
         let (output, _) = tokio::sync::mpsc::channel(1);
         let mut emitter = crabbot_core::plugin::Emitter::new(output);
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(b"data: nope\n".to_vec())]);
+
         assert!(stream_body(2, chunks, &mut emitter).await.is_err());
     }
 

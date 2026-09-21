@@ -197,6 +197,7 @@ async fn call_with(
     base: &str,
 ) -> crabbot_core::Result<Option<Response>> {
     let gateway = AsyncMutex::new(GatewayState::default());
+
     call_with_state(client, &gateway, id, method, params, token, base).await
 }
 
@@ -1380,29 +1381,35 @@ mod tests {
 
         assert_eq!(normalize(&message).unwrap()["chat"], "2");
         let attachment = json!({"id":"1","channel_id":"2","content":"","attachments":[{"id":"4","url":"https://cdn.discordapp.com/a.png","content_type":"image/png","filename":"a.png"}],"author":{"id":"3","bot":false}});
+
         assert_eq!(normalize(&attachment).unwrap()["content"][0]["kind"], "image");
         let file = json!({"id":"2","channel_id":"2","guild_id":"9","content":"","thread":{"id":"thread"},"attachments":[{"id":"5","url":"https://cdn.discordapp.com/a.txt","content_type":"text/plain","filename":"a.txt"}],"author":{"id":"3","bot":false}});
         let normalized = normalize(&file).unwrap();
+
         assert_eq!(normalized["kind"], "guild");
         assert_eq!(normalized["private"], false);
         assert_eq!(normalized["thread"], "thread");
         assert_eq!(normalized["topic"], "thread");
         assert_eq!(normalized["content"][0]["kind"], "file");
         let voice = json!({"id":"6","channel_id":"2","content":"","attachments":[{"id":"7","url":"https://cdn.discordapp.com/a.ogg","content_type":"audio/ogg","filename":"a.ogg"}],"author":{"id":"3","bot":false}});
+
         assert_eq!(normalize(&voice).unwrap()["content"][0]["kind"], "audio");
         let thread = json!({"id":"3","channel_id":"thread","channel_type":11,"content":"inside","guild_id":"9","author":{"id":"3","bot":false}});
+
         assert_eq!(normalize(&thread).unwrap()["thread"], "thread");
         assert!(normalize(&json!({"channel_id":"2","content":"hi"})).is_none());
         assert!(
             normalize(&json!({"id":"1","channel_id":"2","content":"hello","author":{"bot":true}}))
                 .is_none()
         );
+
         assert!(normalize(&json!({"id":"1","channel_id":"2","content":""})).is_none());
         assert_eq!(intents(), 37_377);
         assert_eq!(
             gateway_url("https://discord.com/api/v10"),
             "wss://gateway.discord.gg/?v=10&encoding=json"
         );
+
         assert_eq!(gateway_url("https://example.test"), "wss://example.test");
         assert_eq!(gateway_url("http://127.0.0.1:1"), "ws://127.0.0.1:1");
     }
@@ -1415,20 +1422,24 @@ mod tests {
             ),
             Action::Event(Some(_))
         ));
+
         assert!(matches!(
             action(&json!({"op":0,"t":"MESSAGE_CREATE","d":{}})),
             Action::Event(None)
         ));
+
         assert!(matches!(
             action(
                 &json!({"op":0,"t":"INTERACTION_CREATE","d":{"type":3,"id":"1","channel_id":"2","token":"token","data":{"custom_id":"allow"},"user":{"id":"3"}}})
             ),
             Action::Event(Some(_))
         ));
+
         assert!(matches!(
             action(&json!({"op":1,"d":null})),
             Action::Heartbeat(serde_json::Value::Null)
         ));
+
         assert!(matches!(action(&json!({"op":7})), Action::Reconnect));
         assert!(matches!(action(&json!({"op":9,"d":true})), Action::Reject { resumable: true }));
         assert!(matches!(action(&json!({"op":9,"d":false})), Action::Reject { resumable: false }));
@@ -1443,6 +1454,7 @@ mod tests {
 
                 if channel == "1" && text == "hello" && content.is_empty()
         ));
+
         assert!(matches!(
             operation("edit", &json!({"channel": "1", "message": "2", "text": "hello"}))
                 .unwrap(),
@@ -1450,6 +1462,7 @@ mod tests {
 
                 if channel == "1" && message_id == "2" && text == "hello"
         ));
+
         assert!(matches!(
             operation(
                 "approval",
@@ -1460,15 +1473,18 @@ mod tests {
 
                 if channel == "1" && text == "Approve write?" && approve == "allow" && deny == "deny"
         ));
+
         assert!(matches!(
             operation("callback", &json!({"id": "1", "text": "Denied."})).unwrap(),
             Some(Operation::Callback { id, text }) if id == "1" && text == "Denied."
         ));
+
         assert!(matches!(operation("poll", &json!({})).unwrap(), Some(Operation::Poll(25))));
         assert!(matches!(
             operation("ack", &json!({"sequence": 7})).unwrap(),
             Some(Operation::Ack(7))
         ));
+
         assert!(operation("send", &json!({})).is_err());
         assert!(operation("send", &json!({"channel": "1"})).is_err());
         assert!(operation("edit", &json!({"channel": "x", "message": "2", "text": "hi"})).is_err());
@@ -1477,12 +1493,14 @@ mod tests {
             operation("edit", &json!({"channel": "1", "message": "2", "text": "x".repeat(2_001)}))
                 .is_ok()
         );
+
         assert!(operation("ack", &json!({})).is_err());
         assert!(operation(
             "approval",
             &json!({"channel": "1", "text": "Approve?", "approve": "x".repeat(101), "deny": "deny"})
         )
         .is_err());
+
         assert!(operation("callback", &json!({"id": "invalid"})).is_err());
         assert!(operation("unknown", &json!({})).unwrap().is_none());
     }
@@ -1490,6 +1508,7 @@ mod tests {
     #[test]
     fn prepares_approval_controls_and_normalizes_interactions() {
         let body = approval_request("Approve write?", "approve-token", "deny-token").unwrap();
+
         assert_eq!(body["content"], "Approve write?");
         assert_eq!(body["components"][0]["type"], 1);
         assert_eq!(body["components"][0]["components"][0]["label"], "Approve");
@@ -1533,6 +1552,7 @@ mod tests {
     #[test]
     fn prepares_message_edits() {
         let (method, url, body) = edit_request("https://discord.test/api/v10", "1", "2", "hello");
+
         assert_eq!(method, reqwest::Method::PATCH);
         assert_eq!(url, "https://discord.test/api/v10/channels/1/messages/2");
         assert_eq!(body, json!({"content": "hello"}));
@@ -1559,10 +1579,13 @@ mod tests {
 
         assert_eq!(load_cursor_at(&path), (None, None));
         std::fs::write(&path, "{}").unwrap();
+
         assert_eq!(load_cursor_at(&path), (None, None));
         save_cursor_at(&path, Some(7), Some("session")).unwrap();
+
         assert_eq!(load_cursor_at(&path), (Some(7), Some("session".into())));
         std::fs::write(&path, "not json").unwrap();
+
         assert_eq!(load_cursor_at(&path), (None, None));
         let _ = std::fs::remove_file(path);
     }
@@ -1588,6 +1611,7 @@ mod tests {
     fn stages_gateway_sequences_for_host_acknowledgement() {
         let mut pending = None;
         let event = stage_event(Some(json!({"id": "1"})), Some(2), &mut pending).unwrap().unwrap();
+
         assert_eq!(event["gateway_sequence"], 2);
         assert_eq!(pending, Some(2));
         assert!(stage_event(None, Some(3), &mut pending).unwrap().is_none());
@@ -1600,11 +1624,13 @@ mod tests {
         let mut session_id = None;
         let mut pending = None;
         let ready = json!({"op": 0, "t": "READY", "s": 1, "d": {"session_id": "session"}});
+
         assert!(matches!(
             prepare_gateway_value(&ready, &mut sequence, &mut session_id, None, &mut pending)
                 .unwrap(),
             Action::Ignore
         ));
+
         assert_eq!(sequence, Some(1));
         assert_eq!(session_id.as_deref(), Some("session"));
         let message = json!({
@@ -1619,6 +1645,7 @@ mod tests {
                 .unwrap(),
             Action::Event(Some(_))
         ));
+
         assert_eq!(pending, Some(2));
     }
 
@@ -1629,32 +1656,39 @@ mod tests {
 
         assert_eq!(heartbeat(&message).unwrap(), 45000);
         let bad = Message::Text(json!({"op":0,"d":{}}).to_string().into());
+
         assert!(heartbeat(&bad).is_err());
         let zero = Message::Text(json!({"op":10,"d":{"heartbeat_interval":0}}).to_string().into());
+
         assert!(heartbeat(&zero).is_err());
         let invalid = Message::Text("not json".into());
+
         assert!(heartbeat(&invalid).is_err());
     }
 
     #[tokio::test]
     async fn validates_channel_calls() {
         let client = reqwest::Client::new();
+
         assert!(
             call_with(&client, 1, "unknown".into(), json!({}), "secret", "http://127.0.0.1:1")
                 .await
                 .unwrap()
                 .is_none()
         );
+
         assert!(
             call_with(&client, 1, "poll".into(), json!({}), "secret", "http://127.0.0.1:1")
                 .await
                 .is_err()
         );
+
         assert!(
             call_with(&client, 1, "send".into(), json!({}), "secret", "http://127.0.0.1:1")
                 .await
                 .is_err()
         );
+
         assert!(
             call_with(
                 &client,
@@ -1667,6 +1701,7 @@ mod tests {
             .await
             .is_err()
         );
+
         assert!(
             call_with(
                 &client,
@@ -1864,6 +1899,7 @@ mod tests {
             collect(stream::iter(vec![Ok::<_, std::io::Error>(b"ok".to_vec())])).await.unwrap(),
             "ok"
         );
+
         assert!(collect(stream::iter(vec![Ok::<_, std::io::Error>(vec![0xff])])).await.is_err());
         assert!(
             collect(stream::iter(vec![Ok::<_, std::io::Error>(vec![b'x'; BODY_LIMIT + 1])]))
@@ -1875,6 +1911,7 @@ mod tests {
     #[test]
     fn chunks_long_messages() {
         let parts = chunks(&"x".repeat(9), 4);
+
         assert_eq!(parts, vec!["xxxx", "xxxx", "x"]);
         assert_eq!(chunks("", 4), vec![String::new()]);
     }
@@ -1884,6 +1921,7 @@ mod tests {
         assert!(super::parse_content(&json!({})).unwrap().is_empty());
         assert!(super::parse_content(&json!([{"kind": "unknown"}])).is_err());
         let too_many = (0..9).map(|_| json!({"kind": "text", "text": "x"})).collect::<Vec<_>>();
+
         assert!(super::parse_content(&json!(too_many)).is_err());
         assert!(discord_media_url("https://cdn.discordapp.com/files/a.png"));
         assert!(discord_media_url("https://media.discordapp.net/files/a.png"));
@@ -1911,6 +1949,7 @@ mod tests {
             }),
             &mut attachments,
         );
+
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments["1"].name, "a.txt");
 
@@ -1925,14 +1964,17 @@ mod tests {
             .collect::<Vec<_>>();
 
         remember_attachments(&json!({"attachments": many}), &mut attachments);
+
         assert_eq!(attachments.len(), 256);
         cleanup(std::path::Path::new("/path/that/does/not/exist"));
 
         let content = json!([{"kind":"text","text":"hello"}]);
+
         assert!(matches!(
             operation("send", &json!({"channel":"1", "content": content})).unwrap(),
             Some(Operation::Send { content, .. }) if content.len() == 1
         ));
+
         assert!(operation("media", &json!({"uri":"discord://attachment/1"})).is_ok());
         assert!(operation("media", &json!({})).is_err());
         assert!(
@@ -1966,6 +2008,7 @@ mod tests {
         ));
 
         std::fs::write(&path, json!({"version": 2, "sequence": 4}).to_string()).unwrap();
+
         assert_eq!(load_cursor_at(&path), (None, None));
         let _ = std::fs::remove_file(path);
     }

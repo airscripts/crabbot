@@ -1,7 +1,9 @@
 # Documentation Home
 
-Crabbot is a local-first agent made from a small host, a capability-free core,
-and replaceable process plugins. Start with the first-run workflow, then use
+Crabbot is a lightweight, open-source general-purpose agent runtime that turns
+models, tools, memory, and messaging into an assistant you control. It is made
+from a small host, a capability-free core, and replaceable process plugins.
+Start with the first-run workflow, then use
 these guides when operating or extending an installation:
 
 1. [Workflows](workflows.md) — first run, development, updates, and operations.

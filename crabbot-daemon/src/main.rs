@@ -47,6 +47,7 @@ mod tests {
     async fn returns_success_or_failure() {
         assert_eq!(super::run(async { Ok(()) }).await, std::process::ExitCode::SUCCESS);
         let error: Box<dyn std::error::Error + Send + Sync> = "failed".into();
+
         assert_eq!(super::run(async { Err(error) }).await, std::process::ExitCode::FAILURE);
     }
 }

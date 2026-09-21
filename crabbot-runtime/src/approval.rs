@@ -266,6 +266,7 @@ mod tests {
     async fn approves_a_bound_request_once() {
         let mut gate = Gate::new().unwrap();
         let challenge = gate.issue(target()).unwrap();
+
         assert!(challenge.approve.len() <= 64);
         assert_eq!(gate.resolve(&challenge.approve, "telegram", "8", Some("4"), true), Some(true));
         assert!(challenge.answer.await.unwrap());
@@ -276,6 +277,7 @@ mod tests {
     async fn denies_a_bound_request_once() {
         let mut gate = Gate::new().unwrap();
         let challenge = gate.issue(target()).unwrap();
+
         assert_eq!(gate.resolve(&challenge.deny, "telegram", "8", Some("4"), true), Some(false));
         assert!(!challenge.answer.await.unwrap());
     }
@@ -308,6 +310,7 @@ mod tests {
     #[test]
     fn rejects_invalid_local_approval_ids() {
         let mut gate = Gate::new().unwrap();
+
         assert_eq!(gate.resolve_local("invalid", true), None);
         assert!(gate.list().unwrap().is_empty());
     }
@@ -316,6 +319,7 @@ mod tests {
     fn rejects_untrusted_mismatched_and_tampered_callbacks() {
         let mut gate = Gate::new().unwrap();
         let challenge = gate.issue(target()).unwrap();
+
         assert_eq!(gate.resolve(&challenge.approve, "telegram", "8", Some("4"), false), None);
         assert_eq!(gate.resolve(&challenge.approve, "telegram", "9", Some("4"), true), None);
         assert_eq!(gate.resolve(&challenge.approve, "telegram", "8", None, true), None);
@@ -323,6 +327,7 @@ mod tests {
         let last = changed.len() - 1;
         changed[last] = b'd';
         let changed = String::from_utf8(changed).unwrap();
+
         assert_eq!(gate.resolve(&changed, "telegram", "8", Some("4"), true), None);
         assert_eq!(gate.resolve(&challenge.approve, "discord", "8", Some("4"), true), None);
     }
@@ -332,11 +337,13 @@ mod tests {
         let mut gate = Gate::new().unwrap();
         let challenge = gate.issue(target()).unwrap();
         let (id, action, signature) = decode(&challenge.approve).unwrap();
+
         assert_eq!(id.len(), ID_BYTES * 2);
         assert_eq!(action, b'a');
         assert_eq!(signature.len(), 16);
         let pending = gate.pending.get_mut(id).unwrap();
         pending.expires = 1;
+
         assert_eq!(gate.resolve_at(&challenge.approve, "telegram", "8", Some("4"), true, 2), None);
         assert_eq!(gate.pending.len(), 1);
         assert!(decode("invalid").is_none());
@@ -347,6 +354,7 @@ mod tests {
         let mut gate = Gate::new().unwrap();
         let challenge = gate.issue(target()).unwrap();
         gate.cancel(&challenge.approve);
+
         assert!(gate.pending.is_empty());
     }
 
@@ -360,12 +368,14 @@ mod tests {
         }
 
         let full = gate.issue(target()).err().unwrap();
+
         assert_eq!(full.kind(), std::io::ErrorKind::WouldBlock);
         assert!(challenges.iter().all(|challenge| challenge.approve.len() <= 64));
 
         let mut oversized = target();
         oversized.args = serde_json::json!({"text": "x".repeat(super::TARGET_LIMIT)});
         let large = gate.issue(oversized).err().unwrap();
+
         assert_eq!(large.kind(), std::io::ErrorKind::InvalidData);
 
         for challenge in challenges {

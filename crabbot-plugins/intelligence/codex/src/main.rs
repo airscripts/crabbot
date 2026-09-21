@@ -662,10 +662,13 @@ mod tests {
 
         assert_eq!(credential_file(&path).unwrap(), Some("key".into()));
         std::fs::write(&path, r#"{"access_token":"secret"}"#).unwrap();
+
         assert_eq!(credential_file(&path).unwrap(), None);
         std::fs::write(&path, "broken").unwrap();
+
         assert!(credential_file(&path).is_err());
         std::fs::write(&path, r#"{"CRABBOT_CODEX_KEY":" "}"#).unwrap();
+
         assert_eq!(credential_file(&path).unwrap(), None);
         #[cfg(unix)]
         {
@@ -673,6 +676,7 @@ mod tests {
             permissions.set_mode(0o644);
             std::fs::set_permissions(&path, permissions).unwrap();
             std::fs::write(&path, r#"{"CRABBOT_CODEX_KEY":"key"}"#).unwrap();
+
             assert_eq!(credential_file(&path).unwrap(), Some("key".into()));
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
@@ -693,16 +697,20 @@ mod tests {
         use futures_util::stream;
 
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(b"ok".to_vec())]);
+
         assert_eq!(collect(chunks, "OpenAI").await.unwrap(), "ok");
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(vec![0xff])]);
+
         assert!(collect(chunks, "OpenAI").await.is_err());
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(vec![b'x'; BODY_LIMIT + 1])]);
+
         assert!(collect(chunks, "OpenAI").await.is_err());
     }
 
     #[test]
     fn builds_messages_for_each_role() {
         let messages = messages(&model()).unwrap();
+
         assert_eq!(messages[0], json!({"role": "system", "content": "rules"}));
         assert_eq!(messages[1], json!({"role": "user", "content": "hello\n[Audio attachment.]"}));
         assert_eq!(messages[2], json!({"role": "assistant", "content": "prior"}));
@@ -716,6 +724,7 @@ mod tests {
             .content
             .push(Content::Image { uri: "data:image/png;base64,aW1hZ2U=".into(), alt: None });
         let values = messages(&input).unwrap();
+
         assert_eq!(
             values[1]["content"],
             json!([
@@ -770,6 +779,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_provider_and_request_errors() {
         let client = reqwest::Client::new();
+
         assert!(
             response_body(1, reqwest::StatusCode::UNAUTHORIZED, json!({"error":{"message":"no"}}))
                 .is_err()
@@ -805,6 +815,7 @@ mod tests {
 
         let mut stream = model();
         stream.stream = true;
+
         assert!(
             generate_at(&client, 1, stream, "secret", "http://127.0.0.1:1/v1", quiet_emitter().0,)
                 .await
@@ -862,12 +873,14 @@ mod tests {
 
         let (mut emitter, _) = quiet_emitter();
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Vec::new())]);
+
         assert!(
             stream_body(2, reqwest::StatusCode::BAD_REQUEST, chunks, &mut emitter).await.is_err()
         );
 
         let (mut emitter, _) = quiet_emitter();
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(b"data: nope\n".to_vec())]);
+
         assert!(stream_body(2, reqwest::StatusCode::OK, chunks, &mut emitter).await.is_err());
     }
 

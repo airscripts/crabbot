@@ -323,6 +323,7 @@ mod tests {
         let root = root("roundtrip");
         let path = root.join("state.json");
         save(&path, b"hello").unwrap();
+
         assert_eq!(load(&path, 16).unwrap().as_deref(), Some(&b"hello"[..]));
         check(&path).unwrap();
         private(&path).unwrap();
@@ -339,6 +340,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         #[cfg(windows)]
         std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
         assert!(save(&link, b"changed").is_err());
         assert!(load(&link, 16).is_err());
         let _ = fs::remove_dir_all(root);
@@ -349,6 +351,7 @@ mod tests {
         let root = root("credentials");
         let path = root.join("credentials.json");
         fs::write(&path, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+
         assert!(credential(&path).is_err());
         let _ = fs::remove_dir_all(root);
     }
@@ -373,19 +376,23 @@ mod tests {
         .unwrap();
 
         recover(&path).unwrap();
+
         assert_eq!(fs::read(&path).unwrap(), b"temporary");
 
         fs::write(&path, b"current").unwrap();
         fs::write(&temporary, b"stale").unwrap();
         fs::write(&journal, b"not-json").unwrap();
         recover(&path).unwrap();
+
         assert!(!journal.exists());
         assert_eq!(fs::read(&path).unwrap(), b"current");
 
         assert!(load(root.join("missing"), 16).unwrap().is_none());
         fs::write(root.join("large"), b"0123456789").unwrap();
+
         assert!(load(root.join("large"), 2).is_err());
         fs::create_dir(root.join("directory")).unwrap();
+
         assert!(load(root.join("directory"), 16).is_err());
         let _ = fs::remove_dir_all(root);
     }
@@ -396,30 +403,35 @@ mod tests {
         let path = root.join("state.json");
 
         recover(std::path::Path::new("")).unwrap();
+
         assert!(recover(root.join("missing").join("state.json")).is_ok());
 
         fs::write(&path, b"current").unwrap();
         fs::write(root.join(".state.json.tmp-prepared"), b"stale").unwrap();
         write_transaction(&root, "prepared", "tmp-prepared", "backup-prepared");
         recover(&path).unwrap();
+
         assert_eq!(fs::read(&path).unwrap(), b"current");
 
         let _ = fs::remove_file(&path);
         fs::write(root.join(".backup-prepared"), b"prepared backup").unwrap();
         write_transaction(&root, "prepared", "tmp-unused", "backup-prepared");
         recover(&path).unwrap();
+
         assert_eq!(fs::read(&path).unwrap(), b"prepared backup");
 
         let _ = fs::remove_file(&path);
         fs::write(root.join(".backup-installed"), b"installed backup").unwrap();
         write_transaction(&root, "installed", "tmp-unused", "backup-installed");
         recover(&path).unwrap();
+
         assert_eq!(fs::read(&path).unwrap(), b"installed backup");
 
         let _ = fs::remove_file(&path);
         fs::write(root.join(".backup-backed-up"), b"backed up backup").unwrap();
         write_transaction(&root, "backed_up", "tmp-missing", "backup-backed-up");
         recover(&path).unwrap();
+
         assert_eq!(fs::read(&path).unwrap(), b"backed up backup");
 
         fs::write(&path, b"current").unwrap();
@@ -467,6 +479,7 @@ mod tests {
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o644);
         fs::set_permissions(&path, permissions).unwrap();
+
         assert!(credential(&path).is_err());
         let _ = fs::remove_dir_all(root);
     }

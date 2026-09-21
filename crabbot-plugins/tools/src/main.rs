@@ -438,6 +438,7 @@ async fn sandbox_shell(
     sandbox: &Sandbox,
 ) -> std::io::Result<std::process::Output> {
     let cid_dir = cid_dir()?;
+
     let cidfile = cid_dir.join("id");
     let process = match sandbox.process(command, root, &cidfile) {
         Ok(process) => process,
@@ -580,6 +581,7 @@ async fn capture(
         })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
     let mut child = command.spawn()?;
     let process_id = child.id();
 
@@ -642,6 +644,7 @@ async fn capture(
 
 async fn limited<R: AsyncRead + Unpin>(mut input: R) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
+
     let mut buffer = [0_u8; 16 * 1024];
 
     loop {
@@ -1036,6 +1039,7 @@ fn write_confined(path: &Confined, value: &str) -> std::io::Result<()> {
 #[cfg(windows)]
 fn open_confined(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
     use std::fs::OpenOptions;
+
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
@@ -1381,6 +1385,7 @@ fn search_request(
     cancel: Arc<AtomicBool>,
 ) -> crabbot_core::Result<Vec<String>> {
     let workspace = workspace(policy, workspace_path)?;
+
     let path = file_at(policy, path, workspace.as_deref())?;
     let mut hits = Vec::new();
     let mut budget = Search::with_cancel(cancel);
@@ -1474,6 +1479,7 @@ mod tests {
         }
 
         assert!(!args.iter().any(|value| value.contains("/var/run/docker.sock")));
+
         assert!(
             sandbox.process("true", Path::new("/tmp/work,space"), Path::new("/tmp/id")).is_err()
         );
@@ -1509,6 +1515,7 @@ mod tests {
             "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --cidfile) printf '%s\\n' 0123456789abcdef > \"$2\"; shift 2 ;;\n    -lc) shift; /bin/sh -c \"$1\"; exit $? ;;\n    *) shift ;;\n  esac\ndone\n",
         )
         .unwrap();
+
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
         let sandbox =
             Sandbox { runtime: runtime.display().to_string(), image: "local/tool:latest".into() };
@@ -1551,6 +1558,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+
         assert_eq!(fs::read_to_string(root.join("a/b/note.txt")).unwrap(), "nested");
 
         let read = call(&policy, Request::call(2, "read", json!({"path": "note.txt"})))
@@ -1598,6 +1606,7 @@ mod tests {
 
         let mut hits = Vec::new();
         search(&root, &policy, "ell", &mut hits).unwrap();
+
         assert_eq!(hits.len(), 1);
 
         assert!(file(&policy, "../outside").is_err());
@@ -1616,6 +1625,7 @@ mod tests {
 
         let path = confined(&policy(&root), ".", None, false).unwrap();
         let error = list_confined(&path).unwrap_err();
+
         assert_eq!(error.to_string(), "List exceeds the entry limit");
 
         let _ = fs::remove_dir_all(root);
@@ -1636,6 +1646,7 @@ mod tests {
 
         let mut hits = Vec::new();
         search(&root, &policy(&root), "secret", &mut hits).unwrap();
+
         assert!(hits.is_empty());
 
         let _ = fs::remove_dir_all(root);
@@ -1674,20 +1685,26 @@ mod tests {
     fn search_enforces_workload_limits() {
         let cancel = Arc::new(super::AtomicBool::new(true));
         let mut budget = super::Search::with_cancel(cancel);
+
         assert!(budget.visit(0, false).is_err());
         let mut budget = super::Search::new();
         budget.nodes = super::SEARCH_NODES;
+
         assert!(budget.visit(0, false).is_err());
         let mut budget = super::Search::new();
         budget.bytes = super::SEARCH_BYTES;
+
         assert!(budget.read(1).is_err());
         let mut budget = super::Search::new();
+
         assert!(budget.visit(super::SEARCH_DEPTH + 1, false).is_err());
         let mut budget = super::Search::new();
         budget.files = super::SEARCH_FILES;
+
         assert!(budget.visit(0, false).is_err());
         let mut budget = super::Search::new();
         budget.directories = super::SEARCH_DIRECTORIES;
+
         assert!(budget.visit(0, true).is_err());
     }
 
@@ -1729,16 +1746,19 @@ mod tests {
             .await
             .is_err()
         );
+
         assert!(!root.join("blocked").exists());
         assert!(
             call(&approved, Request::call(4, "write", json!({"path": "x", "text": "x"})))
                 .await
                 .is_err()
         );
+
         assert!(call(&approved, Request::call(5, "search", json!({}))).await.is_err());
         assert!(
             call(&approved, Request::call(6, "list", json!({"path": "missing"}))).await.is_err()
         );
+
         let git = call(&approved, Request::call(7, "git", json!({"args": ["status"]})))
             .await
             .unwrap()
@@ -1751,6 +1771,7 @@ mod tests {
                 .await
                 .is_ok()
         );
+
         assert!(
             call(
                 &approved,
@@ -1759,6 +1780,7 @@ mod tests {
             .await
             .is_err()
         );
+
         assert!(
             call(
                 &approved,
@@ -1771,6 +1793,7 @@ mod tests {
             .await
             .is_err()
         );
+
         assert!(
             call(
                 &approved,
@@ -1779,10 +1802,12 @@ mod tests {
             .await
             .is_err()
         );
+
         let active = root.join("active");
         let sibling = root.join("sibling");
         fs::create_dir_all(&active).unwrap();
         fs::create_dir_all(&sibling).unwrap();
+
         assert!(
             call(
                 &approved,
@@ -1799,12 +1824,15 @@ mod tests {
             .await
             .is_err()
         );
+
         assert!(
             call(&approved, Request::call(7, "git", json!({"args": ["status", 1]}))).await.is_err()
         );
+
         assert!(
             call(&approved, Request::call(8, "git", json!({"args": ["reset"]}))).await.is_err()
         );
+
         assert!(call(&approved, Request::call(9, "unknown", json!({}))).await.unwrap().is_none());
         let note =
             Request::Note { jsonrpc: "2.0".into(), method: "list".into(), params: json!({}) };
@@ -1833,6 +1861,7 @@ mod tests {
             vec!["commit".into(), "-qm".into(), "initial".into()],
         ] {
             let output = git(&args, &root).await.unwrap();
+
             assert!(
                 output.status.success(),
                 "git {:?} failed: {}",
@@ -1842,6 +1871,7 @@ mod tests {
         }
 
         let marker = root.join("hook-ran");
+
         let hook = root.join(".git/hooks/post-checkout");
         fs::write(&hook, format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display())).unwrap();
         let mut permissions = fs::metadata(&hook).unwrap().permissions();
@@ -1865,11 +1895,13 @@ mod tests {
         .unwrap();
 
         let payload = result.result.unwrap();
+
         assert_eq!(
             payload["status"], 0,
             "git worktree add failed: stdout={} stderr={}",
             payload["stdout"], payload["stderr"]
         );
+
         assert!(target.join("README").is_file());
         assert!(!marker.exists());
         let _ = fs::remove_dir_all(root);
@@ -1880,12 +1912,14 @@ mod tests {
         let root = test_root("crabbot-tools-helpers");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+
         assert!(shell("printf hello", &root).await.unwrap().status.success());
         assert!(git(&["status".into()], &root).await.is_ok());
         assert!(denied("Already denied.").to_string().ends_with("Already denied."));
         assert!(
             file(&Policy { root: Some(root.join("missing")), shell: Shell::Off }, ".").is_err()
         );
+
         assert!(search(&root.join("missing"), &policy(&root), "x", &mut Vec::new()).is_ok());
         let _ = fs::remove_dir_all(root);
     }
@@ -1900,6 +1934,7 @@ mod tests {
 
         shell("(sleep 1; touch marker) >/dev/null 2>&1 &", &root).await.unwrap();
         tokio::time::sleep(Duration::from_millis(1_200)).await;
+
         assert!(!marker.exists());
         let _ = fs::remove_dir_all(root);
     }
@@ -1908,6 +1943,7 @@ mod tests {
     #[test]
     fn process_cleanup_rejects_its_own_group() {
         let group = u32::try_from(rustix::process::getpgrp().as_raw_pid()).unwrap();
+
         assert!(super::external_group(group).is_none());
         assert!(super::external_group(u32::MAX).is_none());
     }
@@ -1918,6 +1954,7 @@ mod tests {
         let mut command = tokio::process::Command::new("sh");
         command.args(["-c", "yes output"]);
         let error = super::capture(command, None, false).await.unwrap_err();
+
         assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
         let response =
             Response::ok(1, json!({"stdout": "x".repeat(super::OUTPUT_LIMIT), "stderr": ""}));
@@ -1933,11 +1970,14 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("note.txt"), "before\n").unwrap();
+
         assert!(git(&["init".into()], &root).await.unwrap().status.success());
         assert!(git(&["add".into(), "note.txt".into()], &root).await.unwrap().status.success());
         let patch = "diff --git a/note.txt b/note.txt\nindex 8f6f5f0..9d5e3f4 100644\n--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-before\n+after\n";
+
         assert!(apply(&root, patch, true).await.unwrap().status.success());
         let policy = Arc::new(policy(&root));
+
         assert!(call(&policy, Request::call(1, "patch", json!({"text": patch}))).await.is_err());
         assert!(
             patch_paths(
@@ -1946,6 +1986,7 @@ mod tests {
             )
             .is_err()
         );
+
         let result =
             call(&policy, Request::call(2, "patch", json!({"text": patch, "approve": true})))
                 .await

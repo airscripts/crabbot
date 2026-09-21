@@ -380,6 +380,7 @@ impl Server {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+
         command.env_clear();
 
         for name in ["PATH", "TEMP", "TMP", "TMPDIR"] {
@@ -421,6 +422,7 @@ impl Server {
             }),
         )
         .await?;
+
         self.notify("initialized", json!({})).await
     }
 
@@ -428,6 +430,7 @@ impl Server {
         let id = self.next;
         self.next =
             self.next.checked_add(1).ok_or_else(|| denied("Codex request IDs exhausted."))?;
+
         let request = json!({"id": id, "method": method, "params": params});
         jsonl::write(&mut self.output, &request).await?;
         timeout(RPC_TIMEOUT, async {
@@ -483,6 +486,7 @@ impl Server {
         emitter: &mut Emitter,
     ) -> crabbot_core::Result<String> {
         let deadline = Instant::now() + TURN_TIMEOUT;
+
         let mut text = String::new();
         let mut pending = String::new();
         let mut calls = 0_usize;
@@ -604,6 +608,7 @@ impl Server {
         if serde_json::to_vec(&reply)?.len().saturating_add(1) > jsonl::MAX {
             reply["result"]["contentItems"][0]["text"] =
                 "Tool output exceeded the Codex protocol limit.".into();
+
             reply["result"]["success"] = false.into();
         }
 
@@ -823,6 +828,7 @@ mod tests {
         }];
 
         let value = dynamic_tools(&tools).unwrap();
+
         assert_eq!(value[0]["name"], "read");
         assert_eq!(value[0]["inputSchema"]["type"], "object");
         assert!(
@@ -857,6 +863,7 @@ mod tests {
         ];
 
         let prompt = prompt(&messages).unwrap();
+
         assert!(instructions(&messages).unwrap().contains("Rules"));
         assert_eq!(prompt[1], json!({"type": "image", "url": "data:image/png;base64,aW1hZ2U="}));
         assert_eq!(prompt[2], json!({"type": "text", "text": "A photo"}));
@@ -926,6 +933,7 @@ mod tests {
 
         let mut other = request.clone();
         other["params"]["tool"] = "shell".into();
+
         assert_eq!(
             tool_denial(&other, "thread-1", "turn-1", &allowed),
             Some("The requested tool was not declared by Crabbot.")
@@ -933,16 +941,19 @@ mod tests {
 
         let mut mismatched = request.clone();
         mismatched["params"]["turnId"] = "turn-2".into();
+
         assert!(tool_denial(&mismatched, "thread-1", "turn-1", &allowed).is_some());
 
         let mut invalid = request;
         invalid["params"]["arguments"] = json!("README.md");
+
         assert!(tool_denial(&invalid, "thread-1", "turn-1", &allowed).is_some());
     }
 
     #[test]
     fn resolves_a_canonical_workspace() {
         let path = workspace(Some(".")).unwrap();
+
         assert!(path.is_absolute());
         assert!(path.is_dir());
         assert!(workspace(Some("./crabbot-core/src/lib.rs")).is_err());
@@ -953,6 +964,7 @@ mod tests {
     fn accepts_model_requests_without_a_workspace_field() {
         let request = json!({"model": "codex", "messages": [], "stream": true});
         let parsed: crabbot_core::types::ModelRequest = serde_json::from_value(request).unwrap();
+
         assert_eq!(parsed.workspace, None);
     }
 
@@ -1007,6 +1019,7 @@ done
 
         assert_eq!(text, "Hello");
         let event = events.try_recv().unwrap();
+
         assert_eq!(event["params"]["event"]["text"], "Hello");
         drop(server);
         let _ = std::fs::remove_file(path);
@@ -1025,13 +1038,16 @@ done
             .join(format!("crabbot-codex-workspace-{}-{nonce}", std::process::id()));
 
         let script = r#"#!/bin/sh
+
 if [ "$1" = "--version" ]; then
     printf '%s\n' 'codex-cli 99.0.0'
     exit 0
 fi
+
 while IFS= read -r line; do
     case "$line" in
         *initialize*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+
         *account/read*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt"}}}' ;;
         *thread/start*) printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"thread":{"id":"thread-1"}}}' ;;
         *turn/start*)
@@ -1127,6 +1143,7 @@ done
 
         assert_eq!(result, "Codex sign-in completed.");
         let event = events.try_recv().unwrap();
+
         assert!(event["params"]["event"]["text"].as_str().unwrap().contains("ABCD-EFGH"));
         let _ = std::fs::remove_file(path);
     }

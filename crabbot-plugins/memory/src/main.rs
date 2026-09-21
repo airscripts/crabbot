@@ -401,6 +401,7 @@ mod tests {
         assert_eq!(put.result.unwrap()["ok"], true);
 
         let list = call(&items, Request::call(2, "list", json!({}))).unwrap().unwrap();
+
         assert_eq!(list.result.unwrap()["items"][0]["value"], "Ada");
 
         let audit =
@@ -426,6 +427,7 @@ mod tests {
     fn memory_bounds_key_and_value_size() {
         let items = items();
         let value = "x".repeat(VALUE_LIMIT + 1);
+
         assert!(
             call(
                 &items,
@@ -464,6 +466,7 @@ mod tests {
     #[test]
     fn memory_rejects_missing_keys_and_unknown_methods() {
         let items = items();
+
         assert!(call(&items, Request::call(1, "remember", json!({"value": "Ada"}))).is_err());
         assert!(call(&items, Request::call(2, "forget", json!({}))).is_err());
         assert!(call(&items, Request::call(3, "unknown", json!({}))).unwrap().is_none());
@@ -494,20 +497,24 @@ mod tests {
         );
 
         persist_at(Some(&path), &state).unwrap();
+
         assert_eq!(
             load_at(Some(&path)).lock().unwrap().items[&storage("global", "key")].value,
             "value"
         );
 
         std::fs::write(&path, r#"{"legacy":"value"}"#).unwrap();
+
         assert_eq!(
             load_at(Some(&path)).lock().unwrap().items[&storage("global", "legacy")].scope,
             "global"
         );
 
         std::fs::write(&path, "broken").unwrap();
+
         assert!(load_at(Some(&path)).lock().unwrap().items.is_empty());
         std::fs::File::create(&path).unwrap().set_len(BYTE_LIMIT as u64 + 1).unwrap();
+
         assert!(load_at(Some(&path)).lock().unwrap().items.is_empty());
         assert!(persist_at(Some(&path.with_file_name("missing-dir/item")), &state).is_err());
         let _ = std::fs::remove_file(path);
@@ -516,6 +523,7 @@ mod tests {
     #[test]
     fn handles_disabled_persistence() {
         let _ = path();
+
         assert!(load().lock().unwrap().items.is_empty());
         assert!(load_at(None).lock().unwrap().items.is_empty());
         persist_at(None, &State::default()).unwrap();
@@ -524,6 +532,7 @@ mod tests {
     #[test]
     fn memory_modes_and_scopes_are_enforced() {
         let items = items();
+
         assert!(
             call(
                 &items,
@@ -623,6 +632,7 @@ mod tests {
         }
 
         let state = items.lock().unwrap();
+
         assert_eq!(state.items.len(), LIMIT);
         assert_eq!(state.audit.len(), LIMIT);
         drop(state);
@@ -699,6 +709,7 @@ mod tests {
         call(&items, Request::call(1, "forget", json!({"key": "last"}))).unwrap();
 
         let state = items.lock().unwrap();
+
         assert_eq!(state.audit.len(), LIMIT);
         assert_eq!(state.audit.last().unwrap().action, "forget");
     }
@@ -742,6 +753,7 @@ mod tests {
         let blocker = root.join("blocker");
         std::fs::write(&blocker, "file").unwrap();
         let state = items();
+
         assert!(
             call_at(
                 &state,
@@ -768,6 +780,7 @@ mod tests {
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o644);
         std::fs::set_permissions(&path, permissions).unwrap();
+
         assert!(load_at(Some(&path)).lock().unwrap().items.is_empty());
         let _ = std::fs::remove_file(path);
     }

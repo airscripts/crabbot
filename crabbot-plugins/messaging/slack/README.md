@@ -12,4 +12,6 @@ Set
 Socket Mode events and falls back to Web API history polling for configured
 conversations. Text, images, voice, and text files are normalized through the
 channel boundary, and bounded downloads are stored under `CRABBOT_MEDIA`. Set
-`CRABBOT_SLACK_CHANNELS` to a comma-separated list of channel IDs.
+`CRABBOT_SLACK_CHANNELS` to a comma-separated list of channel IDs. Inbound
+events and the per-channel history cursor are stored under `CRABBOT_HOME` and
+are removed only after the host acknowledges them.

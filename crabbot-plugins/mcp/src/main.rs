@@ -250,6 +250,7 @@ mod tests {
     #[test]
     fn describes_mcp_capability() {
         let hello = hello();
+
         assert_eq!(hello.id, "mcp");
         assert_eq!(hello.capabilities, vec![Capability::Mcp, Capability::Resource]);
         assert!(denied("failed").to_string().ends_with('.'));
@@ -257,6 +258,7 @@ mod tests {
             response_body(reqwest::StatusCode::OK, json!({"ok": true})).unwrap()["ok"],
             true
         );
+
         assert!(response_body(reqwest::StatusCode::BAD_REQUEST, json!({})).is_err());
         assert!(safe_url("https://example.test/mcp"));
         assert!(!safe_url("https://user:password@example.test/mcp"));
@@ -271,12 +273,14 @@ mod tests {
     #[tokio::test]
     async fn validates_calls_and_stdio() {
         let client = Client::new();
+
         assert!(call(&client, Request::call(1, "stdio", json!({}))).await.is_err());
         assert!(
             call(&client, Request::call(2, "stdio", json!({"command":"sh","args":[1]})))
                 .await
                 .is_err()
         );
+
         assert!(call(&client, Request::call(3, "stdio", json!({"command":"sh"}))).await.is_err());
         assert!(
             call(
@@ -286,6 +290,7 @@ mod tests {
             .await
             .is_err()
         );
+
         assert!(call(&client, Request::call(5, "unknown", json!({}))).await.unwrap().is_none());
         let note =
             Request::Note { jsonrpc: "2.0".into(), method: "describe".into(), params: json!({}) };
@@ -334,11 +339,13 @@ mod tests {
     #[tokio::test]
     async fn validates_http_requests() {
         let client = Client::new();
+
         assert!(http(&client, &json!({})).await.is_err());
         assert!(http(&client, &json!({"url":"file:///tmp/mcp","request":{}})).await.is_err());
         assert!(
             http(&client, &json!({"url":"http://127.0.0.1.evil.test","request":{}})).await.is_err()
         );
+
         assert!(http(&client, &json!({"url":"http://127.0.0.1:1","request":{}})).await.is_err());
     }
 
@@ -350,6 +357,7 @@ mod tests {
             collect(stream::iter(vec![Ok::<_, std::io::Error>(b"{}".to_vec())])).await.unwrap(),
             "{}"
         );
+
         assert!(collect(stream::iter(vec![Ok::<_, std::io::Error>(vec![0xff])])).await.is_err());
         assert!(
             collect(stream::iter(vec![Ok::<_, std::io::Error>(vec![b'x'; BODY_LIMIT + 1])]))

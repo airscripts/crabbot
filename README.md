@@ -4,8 +4,8 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 
-Crabbot is a lightweight, open-source general-purpose agent that turns models,
-tools, memory, and messaging into one assistant you control. It runs on your
+Crabbot is a lightweight, open-source general-purpose agent runtime that turns
+models, tools, memory, and messaging into an assistant you control. It runs on your
 machine, connects to the capabilities you choose, and stays understandable
 and extendable through isolated plugins while keeping the host small. You can
 shape it around the way you work instead of adopting a fixed workflow or
@@ -324,7 +324,28 @@ is useful during diagnosis. Each orchestrator pass performs a deep
 review and records every distinct material finding it identifies. Blocking
 findings still control worker cycles and the bounded
 `CRABBOT_REVLOOP_MAX_CYCLES` convergence limit; non-blocking findings remain
-visible without forcing additional cycles.
+visible without forcing additional cycles. Revloop requires three consecutive
+clean orchestrator reviews in every scope before it succeeds, and allows up to
+50 cycles by default. Each Codex
+invocation is bounded by `CRABBOT_REVLOOP_CODEX_TIMEOUT` (60 minutes by
+default). Set `CRABBOT_REVLOOP_MAX_CYCLES` or `CRABBOT_REVLOOP_CLEAN_PASSES` to
+change the loop limits. Each focused or complete verification phase is bounded
+by `CRABBOT_REVLOOP_VERIFICATION_TIMEOUT` (30 minutes by default). A timed-out
+verification is retried once without consuming a cycle; if it times out twice,
+revloop starts a separately logged recovery worker and re-runs focused
+verification before continuing.
+Before focused and complete verification, revloop applies `make spacing` so
+repository-required Rust block spacing does not become a repeated worker
+failure; this may update Rust files in the working tree.
+The latest orchestrator output and log are kept in the run directory under
+`.revloop/`; use `--verbose` when a clean-mode invocation appears idle.
+If focused verification repeats the same test failure after two worker passes,
+the loop warns, preserves the verification log, and continues with another
+orchestrator/worker cycle. Verification timeouts follow the same autonomous
+recovery path; only fatal errors or the configured cycle limit stop the loop.
+Coverage-artifact permission failures and unavailable advisory databases are
+reported as environment warnings and sent to the worker for assessment; they
+do not get misclassified as product-code defects or terminate the loop early.
 
 ## Contributing
 

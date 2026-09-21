@@ -7,10 +7,11 @@ use crabbot_core::{
     types::{Capability, Hello, Protocol},
 };
 
-use serde_json::{Value, json};
+use std::collections::VecDeque;
 #[cfg(not(test))]
 use std::time::Duration;
 
+use serde_json::{Value, json};
 const BODY_LIMIT: usize = crabbot_core::jsonl::MAX / 2;
 
 #[tokio::main]
@@ -108,15 +109,7 @@ async fn generate_at(
         .map_err(|error| crabbot_core::Error::Denied(format!("Gemini request failed: {error}.")))?;
 
     let status = response.status();
-    let body = response.bytes().await.map_err(|error| {
-        crabbot_core::Error::Denied(format!("Gemini response failed: {error}."))
-    })?;
-
-    if body.len() > BODY_LIMIT {
-        return Err(crabbot_core::Error::Denied(
-            "Gemini response exceeded the protocol limit.".into(),
-        ));
-    }
+    let body = collect_response(response).await?;
 
     let value: Value = serde_json::from_slice(&body).map_err(|error| {
         crabbot_core::Error::Denied(format!("Gemini response was invalid: {error}."))
@@ -143,6 +136,26 @@ async fn generate_at(
     )))
 }
 
+async fn collect_response(mut response: reqwest::Response) -> crabbot_core::Result<Vec<u8>> {
+    let mut body = Vec::new();
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| crabbot_core::Error::Denied(format!("Gemini response failed: {error}.")))?
+    {
+        if chunk.len() > BODY_LIMIT.saturating_sub(body.len()) {
+            return Err(crabbot_core::Error::Denied(
+                "Gemini response exceeded the protocol limit.".into(),
+            ));
+        }
+
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
+
 fn parse_reply(value: &Value) -> (String, Vec<Event>) {
     let mut text = String::new();
     let mut events = Vec::new();
@@ -163,32 +176,63 @@ fn parse_reply(value: &Value) -> (String, Vec<Event>) {
 }
 
 fn request_body(input: &ModelRequest) -> crabbot_core::Result<Value> {
+    if requires_thought_signature(&input.model)
+        && (!input.tools.is_empty()
+            || input.messages.iter().any(|message| message.role == Role::Tool))
+    {
+        return Err(crabbot_core::Error::Denied(
+            "Gemini models requiring thought signatures do not support tool workflows.".into(),
+        ));
+    }
+
     let mut contents = Vec::new();
     let mut system = Vec::new();
+    let mut calls = VecDeque::new();
 
     for message in &input.messages {
-        let parts = message
-            .content
-            .iter()
-            .map(|content| match content {
-                Content::Text { text } => json!({"text": text}),
-
-                Content::Image { alt, .. } => {
-                    json!({"text": alt.as_deref().unwrap_or("[Image attachment.]" )})
-                }
-
-                content => json!({"text": content.render()}),
-            })
-            .collect::<Vec<_>>();
-
         if message.role == Role::System {
-            system.extend(parts);
-        } else {
-            contents.push(json!({
-                "role": if message.role == Role::Assistant { "model" } else { "user" },
-                "parts": parts,
-            }));
+            system.extend(message.content.iter().map(text_part));
+            continue;
         }
+
+        if message.role == Role::Assistant {
+            let (parts, found) = assistant_parts(message);
+            calls.extend(found);
+            contents.push(json!({"role": "model", "parts": parts}));
+            continue;
+        }
+
+        if message.role == Role::Tool {
+            let index = message
+                .sender
+                .as_deref()
+                .and_then(|sender| calls.iter().position(|call| call.name == sender))
+                .or_else(|| message.sender.is_none().then_some(0));
+
+            let matched = index.and_then(|index| calls.remove(index));
+            let name = message
+                .sender
+                .clone()
+                .or_else(|| matched.as_ref().map(|call| call.name.clone()))
+                .unwrap_or_else(|| "tool".into());
+
+            let mut response = json!({
+                "name": name,
+                "response": {"output": rendered_content(&message.content)},
+            });
+
+            if let Some(id) = matched.map(|call| call.id) {
+                response["id"] = json!(id);
+            }
+
+            contents.push(json!({"role": "user", "parts": [{"functionResponse": response}]}));
+            continue;
+        }
+
+        contents.push(json!({
+            "role": "user",
+            "parts": message.content.iter().map(text_part).collect::<Vec<_>>(),
+        }));
     }
 
     let mut body = json!({"contents": contents});
@@ -206,6 +250,82 @@ fn request_body(input: &ModelRequest) -> crabbot_core::Result<Value> {
     }
 
     Ok(body)
+}
+
+fn requires_thought_signature(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("gemini-3")
+}
+
+#[derive(Debug)]
+struct FunctionCall {
+    id: String,
+    name: String,
+}
+
+fn text_part(content: &Content) -> Value {
+    match content {
+        Content::Text { text } => json!({"text": text}),
+
+        Content::Image { alt, .. } => {
+            json!({"text": alt.as_deref().unwrap_or("[Image attachment.]" )})
+        }
+
+        content => json!({"text": content.render()}),
+    }
+}
+
+fn rendered_content(content: &[Content]) -> String {
+    content
+        .iter()
+        .map(|content| match content {
+            Content::Image { alt, .. } => alt.as_deref().unwrap_or("[Image attachment.]").into(),
+            content => content.render(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn assistant_parts(message: &crabbot_core::types::Message) -> (Vec<Value>, Vec<FunctionCall>) {
+    let mut parts = Vec::new();
+
+    let mut calls = Vec::new();
+    let mut index = 0;
+
+    for content in &message.content {
+        let Content::Text { text: value } = content else {
+            parts.push(text_part(content));
+            continue;
+        };
+
+        let mut buffered = String::new();
+
+        for line in value.split_inclusive('\n') {
+            let candidate = line.strip_suffix('\n').unwrap_or(line);
+            let Some((name, args)) = candidate.strip_prefix("[Tool call ").and_then(|value| {
+                let (name, args) = value.split_once("]: ")?;
+                Some((name, serde_json::from_str::<Value>(args).ok()?))
+            }) else {
+                buffered.push_str(line);
+                continue;
+            };
+
+            if !buffered.is_empty() {
+                parts.push(json!({"text": buffered}));
+                buffered.clear();
+            }
+
+            let id = format!("{}-{index}", message.id);
+            index += 1;
+            parts.push(json!({"functionCall": {"id": id, "name": name, "args": args}}));
+            calls.push(FunctionCall { id, name: name.into() });
+        }
+
+        if !buffered.is_empty() {
+            parts.push(json!({"text": buffered}));
+        }
+    }
+
+    (parts, calls)
 }
 
 #[cfg(test)]
@@ -252,23 +372,49 @@ mod tests {
         };
 
         let body = request_body(&request).unwrap();
+
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "Be concise.");
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["tools"][0]["functionDeclarations"][0]["name"], "read");
 
         let mut input = request;
         input.messages.push(Message {
-            id: "assistant".into(),
+            id: "assistant-tool".into(),
             session: "s".into(),
             role: Role::Assistant,
             sender: None,
-            content: vec![Content::Text { text: "done".into() }],
+            content: vec![Content::Text {
+                text: "I will read it.\n[Tool call read]: {\"path\":\"README.md\"}".into(),
+            }],
         });
 
         input.messages.push(Message {
             id: "tool".into(),
             session: "s".into(),
             role: Role::Tool,
+            sender: None,
+            content: vec![Content::Text { text: "content".into() }],
+        });
+
+        let body = request_body(&input).unwrap();
+
+        assert_eq!(body["contents"][1]["role"], "model");
+        assert_eq!(body["contents"][1]["parts"][0]["text"], "I will read it.\n");
+        assert_eq!(body["contents"][1]["parts"][1]["functionCall"]["name"], "read");
+        assert_eq!(body["contents"][1]["parts"][1]["functionCall"]["args"]["path"], "README.md");
+        assert_eq!(body["contents"][1]["parts"][1]["functionCall"]["id"], "assistant-tool-0");
+        assert_eq!(body["contents"][2]["role"], "user");
+        assert_eq!(body["contents"][2]["parts"][0]["functionResponse"]["name"], "read");
+        assert_eq!(body["contents"][2]["parts"][0]["functionResponse"]["id"], "assistant-tool-0");
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["response"]["output"],
+            "content"
+        );
+
+        input.messages.push(Message {
+            id: "media".into(),
+            session: "s".into(),
+            role: Role::User,
             sender: None,
             content: vec![
                 Content::Image { uri: "file://image".into(), alt: Some("alt".into()) },
@@ -282,10 +428,52 @@ mod tests {
         });
 
         let body = request_body(&input).unwrap();
-        assert_eq!(body["contents"][1]["role"], "model");
-        assert_eq!(body["contents"][2]["parts"][0]["text"], "alt");
-        assert_eq!(body["contents"][2]["parts"][1]["text"], "[File: note.txt]");
-        assert_eq!(body["contents"][2]["parts"][2]["text"], "[Audio attachment.]");
+
+        assert_eq!(body["contents"][3]["parts"][0]["text"], "alt");
+        assert_eq!(body["contents"][3]["parts"][1]["text"], "[File: note.txt]");
+        assert_eq!(body["contents"][3]["parts"][2]["text"], "[Audio attachment.]");
+    }
+
+    #[test]
+    fn preserves_large_function_call_arguments() {
+        let args = json!({"patch": "x".repeat(4097)});
+        let input = ModelRequest {
+            model: "gemini-2.0-flash".into(),
+            workspace: None,
+            messages: vec![Message {
+                id: "assistant-large".into(),
+                session: "s".into(),
+                role: Role::Assistant,
+                sender: None,
+                content: vec![Content::Text { text: format!("[Tool call patch]: {args}") }],
+            }],
+            stream: false,
+            tools: Vec::new(),
+        };
+
+        let body = request_body(&input).unwrap();
+
+        assert_eq!(body["contents"][0]["parts"][0]["functionCall"]["args"], args);
+        assert_eq!(body["contents"][0]["parts"][0]["functionCall"]["id"], "assistant-large-0");
+    }
+
+    #[test]
+    fn rejects_gemini_three_tool_workflows_without_signatures() {
+        let request = ModelRequest {
+            model: "gemini-3-pro-preview".into(),
+            workspace: None,
+            messages: Vec::new(),
+            stream: false,
+            tools: vec![crabbot_core::types::ToolSpec {
+                name: "read".into(),
+                description: None,
+                schema: json!({"type": "object"}),
+            }],
+        };
+
+        let error = request_body(&request).unwrap_err();
+
+        assert!(error.to_string().contains("thought signatures"));
     }
 
     #[tokio::test]
@@ -336,6 +524,7 @@ mod tests {
         });
 
         let (text, events) = parse_reply(&value);
+
         assert_eq!(text, "I will read it.");
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -388,6 +577,41 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.result.unwrap()["text"], "ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_an_oversized_response_before_parsing() {
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
+
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let body = vec![b'x'; BODY_LIMIT + 1];
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+
+        let request = ModelRequest {
+            model: "test".into(),
+            workspace: None,
+            messages: Vec::new(),
+            stream: false,
+            tools: Vec::new(),
+        };
+
+        assert!(
+            generate_at(&reqwest::Client::new(), 1, request, "key", &format!("http://{address}"),)
+                .await
+                .is_err()
+        );
+
         server.await.unwrap();
     }
 

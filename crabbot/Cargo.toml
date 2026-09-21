@@ -1,6 +1,6 @@
 [package]
 name = "crabbot"
-description = "A lightweight, open-source general-purpose agent for Telegram, Discord, and the terminal"
+description = "Crabbot is a lightweight, open-source general-purpose agent runtime that turns models, tools, memory, and messaging into an assistant you control."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

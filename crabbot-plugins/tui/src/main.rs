@@ -1076,6 +1076,7 @@ mod tests {
     #[test]
     fn describes_client_capability() {
         let hello = super::hello();
+
         assert_eq!(hello.id, "tui");
         assert_eq!(hello.capabilities, vec![crabbot_core::types::Capability::Client]);
         assert_eq!(hello.commands[0].name, "tui");
@@ -1084,9 +1085,11 @@ mod tests {
     #[test]
     fn formats_status() {
         let text = super::format_status(&serde_json::json!({"running": true, "sessions": 2}));
+
         assert_eq!(text, "Daemon: running. Sessions: 2.\n> ");
 
         let text = super::format_status(&serde_json::json!({"running": false}));
+
         assert_eq!(text, "Daemon: stopped. Sessions: 0.\n> ");
     }
 
@@ -1115,6 +1118,7 @@ mod tests {
             super::format_approvals(&value),
             "Pending approvals:\n0123456789abcdef01234567: write for telegram-7 — {\"path\":\"note.txt\"}\nUse /approve <id> or /deny <id>.\n> "
         );
+
         assert_eq!(super::format_approvals(&json!({"items": []})), "Pending approvals: none.\n> ");
         assert_eq!(super::preview(&"x".repeat(600), 512).chars().count(), 513);
     }
@@ -1131,6 +1135,7 @@ mod tests {
             super::format_sessions(&serde_json::json!({"items": [{}]})),
             "Sessions: none.\n> "
         );
+
         assert_eq!(super::format_sessions(&serde_json::json!({})), "Sessions: none.\n> ");
     }
 
@@ -1152,6 +1157,7 @@ mod tests {
             ),
             "Deliveries: one (pending).\n> "
         );
+
         assert_eq!(super::format_deliveries(&serde_json::json!({})), "Deliveries: none.\n> ");
     }
 
@@ -1161,6 +1167,7 @@ mod tests {
             super::format_timers(&json!({"items": [{"id": 7, "due": 42, "text": "call back"}]})),
             "Timers: 7 (due 42): call back.\n> "
         );
+
         assert_eq!(
             super::format_memories(&json!({"items": [{"key": "drink", "value": "tea"}]})),
             "Memories: drink = tea.\n> "
@@ -1173,6 +1180,7 @@ mod tests {
             super::delivery_action("/tmp/missing", "delivery.retry", "bad id", mock_control).await,
             "Delivery ID is invalid."
         );
+
         assert_eq!(
             super::approval_action("/tmp", "bad", true, mock_control).await,
             "Approval ID is invalid."
@@ -1297,6 +1305,7 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
 
         tokio::time::timeout(std::time::Duration::from_secs(10), run).await.unwrap().unwrap();
         let text = fs::read_to_string(&output_path).unwrap();
+
         assert_eq!(text.matches("Reply").count(), 1);
         assert!(text.contains("Model cannot be empty."));
         assert!(text.contains("Daemon status unavailable"));

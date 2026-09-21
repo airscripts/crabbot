@@ -55,6 +55,7 @@ mod tests {
         write(&mut bytes, &serde_json::json!({"ok": true})).await.unwrap();
         let mut input = BufReader::new(bytes.as_slice());
         let value: serde_json::Value = read(&mut input, 1024).await.unwrap().unwrap();
+
         assert_eq!(value["ok"], true);
     }
 
@@ -67,6 +68,7 @@ mod tests {
         );
 
         let result: crate::Result<Option<serde_json::Value>> = read(&mut input, 2).await;
+
         assert!(result.is_err());
     }
 
@@ -74,6 +76,7 @@ mod tests {
     async fn rejects_frames_without_newlines() {
         let mut input = BufReader::new(br#"{"ok":true}"#.as_slice());
         let result: crate::Result<Option<serde_json::Value>> = read(&mut input, 1024).await;
+
         assert!(result.unwrap_err().to_string().contains("newline"));
     }
 
@@ -81,6 +84,7 @@ mod tests {
     async fn rejects_invalid_utf8() {
         let mut input = BufReader::new([0xff, b'\n'].as_slice());
         let result: crate::Result<Option<serde_json::Value>> = read(&mut input, 1024).await;
+
         assert!(result.is_err());
     }
 }

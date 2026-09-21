@@ -926,16 +926,20 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         assert!(response.error.is_none(), "{:?}", response.error);
         assert_eq!(response.result.unwrap()["loaded"], true);
         let loaded = state.plugins.get("tools").await.unwrap();
+
         assert_eq!(loaded.hello.id, "tools");
         let request = IpcRequest::call(2, "secret", "plugin.active", json!({}));
         let response = active(&request, &state).await;
+
         assert_eq!(response.result.unwrap()["items"], json!(["tools"]));
         let request = IpcRequest::call(2, "secret", "plugin.unload", json!({"id": "tools"}));
         let response = unload(&request, &state).await;
+
         assert_eq!(response.result.unwrap()["unloaded"], true);
         assert!(state.plugins.get("tools").await.is_none());
         let request = IpcRequest::call(3, "secret", "plugin.active", json!({}));
         let response = active(&request, &state).await;
+
         assert_eq!(response.result.unwrap()["items"], json!([]));
         let _ = std::fs::remove_dir_all(home);
     }
@@ -945,6 +949,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         let state = state();
         let status = dispatch(&IpcRequest::call(0, "secret", "status", json!({})), &state).unwrap();
         let status = status.result.unwrap();
+
         assert_eq!(status["sessions"], 0);
         assert!(status["plugins"].is_array());
         assert_eq!(status["approval"], "off");
@@ -1030,6 +1035,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         );
 
         state.sessions.lock().unwrap().set_status("terminal", "working").unwrap();
+
         assert!(
             dispatch(
                 &IpcRequest::call(26, "secret", "session.clear", json!({"id": "terminal"}),),
@@ -1089,6 +1095,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
 
         assert_eq!(fork.result.unwrap()["id"], "copy");
         state.sessions.lock().unwrap().set_status("one", "working").unwrap();
+
         assert!(
             dispatch(
                 &IpcRequest::call(6, "secret", "session.delete", json!({"id": "one"})),
@@ -1237,6 +1244,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         std::fs::create_dir(plugin_root.join("telegram-1")).unwrap();
         std::fs::write(plugin_root.join("file"), "not a plugin").unwrap();
         std::fs::create_dir(plugin_root.join("Bad")).unwrap();
+
         assert_eq!(
             plugins(&root),
             vec![
@@ -1414,9 +1422,11 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         tokio::time::timeout(Duration::from_secs(1), token.cancelled()).await.unwrap();
+
         assert!(!cancel_request.is_finished());
         token.acknowledge();
         let response = cancel_request.await.unwrap();
+
         assert_eq!(response.result.unwrap()["status"], "cancelled");
         assert!(state.cancels.lock().unwrap().get("active").is_none());
     }
@@ -1442,12 +1452,14 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         let listed = approval_list(&request, &state).await;
         let listed = listed.result.unwrap();
         let id = listed["items"][0]["id"].as_str().unwrap();
+
         assert_eq!(id.len(), 24);
 
         let request =
             IpcRequest::call(2, "secret", "approval.resolve", json!({"id": id, "approved": true}));
 
         let resolved = approval_resolve(&request, &state).await;
+
         assert_eq!(resolved.result.unwrap()["approved"], true);
         assert!(challenge.answer.await.unwrap());
     }
@@ -1505,6 +1517,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
             dispatch(&IpcRequest::call(1, "secret", "session.list", json!({})), &state).unwrap();
 
         let encoded = serde_json::to_vec(&response).unwrap();
+
         assert!(encoded.len().saturating_add(1) <= FRAME);
         assert!(response.result.unwrap()["items"][0]["messages"].is_null());
         let detail =
@@ -1543,6 +1556,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         let result = response.result.unwrap();
+
         assert_eq!(result["worktree"]["status"], "pending");
         assert!(result["worktree"]["error"].as_str().is_some());
         assert!(!state.sessions.lock().unwrap().sessions.contains_key("copy"));
@@ -1553,6 +1567,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
     async fn rejects_bad_credentials_and_missing_ipc_files() {
         let root = std::env::temp_dir().join(format!("crabbot-ipc-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+
         assert!(super::call(&root, "status", json!({})).await.is_err());
         assert_eq!(
             super::to_io(crabbot_core::Error::Denied("no".into())).kind(),
@@ -1600,6 +1615,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         let task = tokio::spawn(async move { super::serve(listener, task_state).await });
 
         let status = super::call(&root, "status", json!({})).await.unwrap();
+
         assert_eq!(status["running"], true);
 
         let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -1607,6 +1623,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         jsonl::write(&mut write, &IpcRequest::call(2, "wrong", "status", json!({}))).await.unwrap();
         let mut read = BufReader::new(read);
         let response: IpcResponse = jsonl::read(&mut read, FRAME).await.unwrap().unwrap();
+
         assert_eq!(response.error.unwrap().code, 401);
 
         state.stop.signal();

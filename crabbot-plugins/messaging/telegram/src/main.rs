@@ -403,6 +403,7 @@ async fn media(
     base: &str,
 ) -> crabbot_core::Result<serde_json::Value> {
     let root = media_root()?;
+
     media_at(client, uri, token, base, &root).await
 }
 
@@ -744,6 +745,7 @@ mod tests {
             operation("media", &json!({"uri": "telegram://file/abc_1"})).unwrap(),
             Some(Operation::Media(uri)) if uri == "telegram://file/abc_1"
         ));
+
         assert!(operation("media", &json!({})).is_err());
         assert!(operation("media", &json!({"uri": "file://outside"})).is_ok());
         assert!(valid_file_id(b'a'));
@@ -812,6 +814,7 @@ mod tests {
             media_at(&client, "telegram://file/abc_1", "TOKEN", &base, &root).await.unwrap();
 
         let path = value["uri"].as_str().unwrap().strip_prefix("file://").unwrap();
+
         assert_eq!(std::fs::read(path).unwrap(), b"abc");
         server.await.unwrap();
         let _ = std::fs::remove_dir_all(root);
@@ -854,6 +857,7 @@ mod tests {
         });
 
         let base = format!("http://127.0.0.1:{port}/botTOKEN");
+
         assert!(media_at(&client, "telegram://file/abc", "TOKEN", &base, &root).await.is_err());
         assert!(media_at(&client, "telegram://file/abc", "TOKEN", &base, &root).await.is_err());
         server.await.unwrap();
@@ -869,6 +873,7 @@ mod tests {
         std::fs::create_dir_all(root.join("nested")).unwrap();
         std::fs::write(root.join("fresh"), "ok").unwrap();
         cleanup(&root);
+
         assert!(root.join("fresh").exists());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -879,10 +884,12 @@ mod tests {
             response_body(reqwest::StatusCode::OK, json!({"ok":true,"result":{"id":1}})).unwrap()["id"],
             1
         );
+
         assert!(
             response_body(reqwest::StatusCode::BAD_REQUEST, json!({"ok":false,"description":"no"}))
                 .is_err()
         );
+
         assert!(
             response_body(reqwest::StatusCode::OK, json!({"ok":true})).unwrap()["missing"]
                 .is_null()
@@ -896,20 +903,24 @@ mod tests {
             operation("poll", &json!({"offset": 3})).unwrap(),
             Some(Operation::Poll(3))
         ));
+
         assert!(matches!(
             operation("send", &json!({"chat": 8, "text": "hello"})).unwrap(),
             Some(Operation::Send { chat: 8, text, thread: None }) if text == "hello"
         ));
+
         assert!(matches!(
             operation("send", &json!({"chat": 8, "text": "hello", "thread": "4"})).unwrap(),
             Some(Operation::Send { chat: 8, text, thread: Some(thread) })
 
                 if text == "hello" && thread == "4"
         ));
+
         assert!(matches!(
             operation("edit", &json!({"chat": 8, "message": 12, "text": "hello"})).unwrap(),
             Some(Operation::Edit { chat: 8, message: 12, text, thread: None }) if text == "hello"
         ));
+
         assert!(operation("send", &json!({})).is_err());
         assert!(operation("send", &json!({"chat": 8})).is_err());
         assert!(matches!(
@@ -922,12 +933,14 @@ mod tests {
 
                 if text == "Approve write?" && approve == "allow" && deny == "deny"
         ));
+
         assert!(matches!(
             operation("callback", &json!({"id": "callback-1", "text": "Denied."})).unwrap(),
             Some(Operation::Callback { id, text: Some(text) })
 
                 if id == "callback-1" && text == "Denied."
         ));
+
         assert!(
             operation(
                 "approval",
@@ -935,6 +948,7 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(operation("callback", &json!({})).is_err());
         assert!(operation("edit", &json!({"chat": 8, "message": 12, "text": ""})).is_err());
         assert!(operation("edit", &json!({"chat": 8, "message": 0, "text": "hello"})).is_err());
@@ -942,12 +956,14 @@ mod tests {
             operation("edit", &json!({"chat": 8, "message": 12, "text": "x".repeat(4_097)}))
                 .is_ok()
         );
+
         assert!(operation("unknown", &json!({})).unwrap().is_none());
     }
 
     #[test]
     fn prepares_message_edits() {
         let (url, body) = super::edit_request("https://telegram.test/bot", 8, 12, "hello");
+
         assert_eq!(url, "https://telegram.test/bot/editMessageText");
         assert_eq!(body, json!({"chat_id": 8, "message_id": 12, "text": "hello"}));
 
@@ -1003,10 +1019,12 @@ mod tests {
             )
             .is_err()
         );
+
         assert!(
             approval_request("https://telegram.test/bot", 8, "Approve?", "same", "same", None,)
                 .is_err()
         );
+
         assert!(
             approval_request(
                 "https://telegram.test/bot",
@@ -1023,17 +1041,20 @@ mod tests {
     #[tokio::test]
     async fn validates_channel_calls_and_transport_errors() {
         let client = reqwest::Client::new();
+
         assert!(
             call_with(&client, 1, "unknown".into(), json!({}), "secret", "http://127.0.0.1:1")
                 .await
                 .unwrap()
                 .is_none()
         );
+
         assert!(
             call_with(&client, 1, "info".into(), json!({}), "secret", "http://127.0.0.1:1")
                 .await
                 .is_err()
         );
+
         assert!(
             call_with(
                 &client,
@@ -1046,11 +1067,13 @@ mod tests {
             .await
             .is_err()
         );
+
         assert!(
             call_with(&client, 1, "send".into(), json!({}), "secret", "http://127.0.0.1:1")
                 .await
                 .is_err()
         );
+
         assert!(
             call_with(
                 &client,
@@ -1063,6 +1086,7 @@ mod tests {
             .await
             .is_err()
         );
+
         assert!(
             call_with(
                 &client,
@@ -1075,6 +1099,7 @@ mod tests {
             .await
             .is_err()
         );
+
         assert!(send(&client, "http://127.0.0.1:1", json!({})).await.is_err());
         let note =
             Request::Note { jsonrpc: "2.0".into(), method: "poll".into(), params: json!({}) };
@@ -1098,6 +1123,7 @@ mod tests {
             collect(stream::iter(vec![Ok::<_, std::io::Error>(b"ok".to_vec())])).await.unwrap(),
             "ok"
         );
+
         assert!(collect(stream::iter(vec![Ok::<_, std::io::Error>(vec![0xff])])).await.is_err());
         assert!(
             collect(stream::iter(vec![Ok::<_, std::io::Error>(vec![b'x'; BODY_LIMIT + 1])]))
@@ -1109,6 +1135,7 @@ mod tests {
     #[test]
     fn chunks_long_messages() {
         let parts = super::chunks(&"x".repeat(9), 4);
+
         assert_eq!(parts, vec!["xxxx", "xxxx", "x"]);
         assert_eq!(super::chunks("😀😀😀", 4), vec!["😀😀", "😀"]);
         assert_eq!(super::chunks("", 4), vec![String::new()]);

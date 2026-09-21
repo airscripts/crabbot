@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crabbot_core::types::Message;
+use crabbot_core::types::{Message, Role};
 use crabbot_file::{load as load_file, private as private_file, save as save_file};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,6 +16,60 @@ pub const LIMIT: usize = 100;
 const SEEN_LIMIT: usize = 10_000;
 const SEEN_KEY_LIMIT: usize = 4 * 1024;
 const BYTE_LIMIT: u64 = 32 * 1024 * 1024;
+
+pub fn compact_messages(messages: &mut Vec<Message>) {
+    while messages.len() > LIMIT {
+        if !remove_oldest_message_group(messages, None) {
+            break;
+        }
+    }
+}
+
+pub fn remove_oldest_message_group(messages: &mut Vec<Message>, protected: Option<usize>) -> bool {
+    let mut index = 0;
+
+    while index < messages.len() {
+        if messages[index].role == Role::System {
+            index += 1;
+            continue;
+        }
+
+        let (start, end) = message_group(messages, index);
+
+        if protected.is_none_or(|protected| protected < start || protected > end) {
+            messages.drain(start..=end);
+            return true;
+        }
+
+        index = end + 1;
+    }
+
+    false
+}
+
+fn message_group(messages: &[Message], index: usize) -> (usize, usize) {
+    let mut start = index;
+
+    if messages[index].role == Role::Tool {
+        while start > 0 && messages[start - 1].role == Role::Tool {
+            start -= 1;
+        }
+
+        if start > 0 && messages[start - 1].role == Role::Assistant {
+            start -= 1;
+        }
+    }
+
+    let mut end = start;
+
+    if messages[start].role == Role::Assistant {
+        while messages.get(end + 1).is_some_and(|message| message.role == Role::Tool) {
+            end += 1;
+        }
+    }
+
+    (start, end)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Session {
@@ -54,6 +108,8 @@ pub struct Delivery {
     pub id: String,
     pub channel: String,
     pub chat: String,
+    #[serde(default = "direct")]
+    pub private: bool,
     #[serde(default)]
     pub thread: Option<String>,
     pub text: String,
@@ -115,7 +171,21 @@ impl Store {
         let text = String::from_utf8(bytes)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
 
-        let mut store: Self = serde_json::from_str(&text).map_err(std::io::Error::other)?;
+        let document: serde_json::Value =
+            serde_json::from_str(&text).map_err(std::io::Error::other)?;
+
+        let mut store: Self =
+            serde_json::from_value(document.clone()).map_err(std::io::Error::other)?;
+
+        let mut changed = migrate_delivery_routes(
+            &mut store.outbox,
+            document.get("outbox"),
+            &store.sessions,
+            true,
+        )?;
+
+        changed |=
+            migrate_delivery_routes(&mut store.dead, document.get("dead"), &store.sessions, false)?;
 
         for (id, session) in &mut store.sessions {
             if !valid(id) || session.id != *id {
@@ -125,9 +195,9 @@ impl Store {
                 ));
             }
 
-            if session.messages.len() > LIMIT {
-                session.messages.drain(..session.messages.len() - LIMIT);
-            }
+            let message_count = session.messages.len();
+            compact_messages(&mut session.messages);
+            changed |= session.messages.len() != message_count;
 
             if session.inflight.is_some() && session.queued.len() > LIMIT {
                 return Err(std::io::Error::new(
@@ -164,8 +234,6 @@ impl Store {
                 session.status = "interrupted".into();
             }
         }
-
-        let mut changed = false;
 
         for delivery in &mut store.outbox {
             if delivery.updated == 0 {
@@ -372,9 +440,7 @@ impl Store {
 
             session.messages.push(message);
 
-            if session.messages.len() > LIMIT {
-                session.messages.drain(..session.messages.len() - LIMIT);
-            }
+            compact_messages(&mut session.messages);
 
             session.updated = now();
 
@@ -466,6 +532,7 @@ impl Store {
         }
 
         let mut message = None;
+
         self.change(|store| {
             if let Some(session) = store.sessions.get_mut(id)
                 && !session.queued.is_empty()
@@ -525,9 +592,7 @@ impl Store {
             if !session.messages.iter().any(|item| item.id == message.id) {
                 session.messages.push(message.clone());
 
-                if session.messages.len() > LIMIT {
-                    session.messages.drain(..session.messages.len() - LIMIT);
-                }
+                compact_messages(&mut session.messages);
             }
 
             session.inflight = Some(message);
@@ -597,9 +662,11 @@ impl Store {
         }
 
         let id = id.into();
+
         let channel = channel.into();
         let chat = chat.into();
         let text = text.into();
+        let private = self.sessions.get(session).is_some_and(|session| session.private);
         let uncertain_delivery = self.outbox.iter().any(|delivery| {
             delivery.id == id
                 && matches!(delivery.status, DeliveryStatus::Sending | DeliveryStatus::Uncertain)
@@ -627,9 +694,7 @@ impl Store {
             if let Some(session) = store.sessions.get_mut(session) {
                 session.messages.push(message);
 
-                if session.messages.len() > LIMIT {
-                    session.messages.drain(..session.messages.len() - LIMIT);
-                }
+                compact_messages(&mut session.messages);
 
                 session.updated = now();
                 session.status = "idle".into();
@@ -643,6 +708,7 @@ impl Store {
                 if completing_stream {
                     delivery.channel = channel;
                     delivery.chat = chat;
+                    delivery.private = private;
                     delivery.thread = thread;
                     delivery.text = text;
                     delivery.status = if uncertain_delivery {
@@ -663,6 +729,7 @@ impl Store {
                     id,
                     channel,
                     chat,
+                    private,
                     thread,
                     text,
                     attempts: 0,
@@ -686,6 +753,7 @@ impl Store {
         text: impl Into<String>,
     ) -> std::io::Result<()> {
         let id = id.into();
+
         let channel = channel.into();
         let chat = chat.into();
         let text = text.into();
@@ -695,6 +763,8 @@ impl Store {
                 "Session was not found.",
             ));
         };
+
+        let private = current.private;
 
         if current.inflight.is_none() || current.stream_delivery.is_some() {
             return Err(std::io::Error::new(
@@ -728,6 +798,7 @@ impl Store {
                 id,
                 channel,
                 chat,
+                private,
                 thread,
                 text,
                 attempts: 0,
@@ -742,6 +813,7 @@ impl Store {
 
     pub fn stream_sending(&mut self, id: &str, text: impl Into<String>) -> std::io::Result<()> {
         let text = text.into();
+
         self.update_delivery(id, |delivery| {
             delivery.text = text;
             delivery.status = DeliveryStatus::Sending;
@@ -756,6 +828,7 @@ impl Store {
         message_id: impl Into<String>,
     ) -> std::io::Result<()> {
         let message_id = message_id.into();
+
         self.update_delivery(id, |delivery| {
             delivery.message_id = Some(message_id);
             delivery.status = DeliveryStatus::Streaming;
@@ -1016,6 +1089,7 @@ impl Store {
 
     pub fn uncertain(&mut self, id: &str, error: impl Into<String>) -> std::io::Result<()> {
         let error = error.into();
+
         self.update_delivery(id, |delivery| {
             delivery.status = DeliveryStatus::Uncertain;
             delivery.last_error = Some(error);
@@ -1088,6 +1162,7 @@ impl Store {
 
     pub fn commit(&mut self, channel: &str, id: &str, offset: Option<i64>) -> std::io::Result<()> {
         let key = seen_key(channel, id);
+
         self.change(|store| {
             store.seen.insert(key.clone(), seen_now());
 
@@ -1105,6 +1180,7 @@ impl Store {
 
     fn change(&mut self, update: impl FnOnce(&mut Self)) -> std::io::Result<()> {
         let previous = self.sessions.clone();
+
         let outbox = self.outbox.clone();
         let dead = self.dead.clone();
         let offsets = self.offsets.clone();
@@ -1258,6 +1334,69 @@ fn direct() -> bool {
     true
 }
 
+fn migrate_delivery_routes(
+    deliveries: &mut [Delivery],
+    raw: Option<&serde_json::Value>,
+    sessions: &BTreeMap<String, Session>,
+    require_match: bool,
+) -> std::io::Result<bool> {
+    let Some(raw) = raw.and_then(serde_json::Value::as_array) else {
+        return Ok(false);
+    };
+
+    let mut changed = false;
+
+    for (index, delivery) in deliveries.iter_mut().enumerate() {
+        let missing = raw
+            .get(index)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|value| !value.contains_key("private"));
+
+        if !missing {
+            continue;
+        }
+
+        let matching = sessions.values().filter(|session| {
+            session.channel.as_deref() == Some(delivery.channel.as_str())
+                && session.chat.as_deref() == Some(delivery.chat.as_str())
+                && session.thread.as_deref() == delivery.thread.as_deref()
+        });
+
+        let mut matching = matching.peekable();
+
+        match matching.next() {
+            Some(session) if matching.peek().is_none() => {
+                delivery.private = session.private;
+                changed = true;
+            }
+
+            Some(_) if require_match => {
+                delivery.status = DeliveryStatus::Uncertain;
+                delivery.last_error = Some(
+                    "The legacy delivery route could not be matched to exactly one session; verify the channel before retrying.".into(),
+                );
+
+                changed = true;
+            }
+
+            Some(_) => {}
+
+            None if require_match => {
+                delivery.status = DeliveryStatus::Uncertain;
+                delivery.last_error = Some(
+                    "The legacy delivery route could not be matched to exactly one session; verify the channel before retrying.".into(),
+                );
+
+                changed = true;
+            }
+
+            None => {}
+        }
+    }
+
+    Ok(changed)
+}
+
 fn safe() -> String {
     "safe".into()
 }
@@ -1278,7 +1417,7 @@ fn seen_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeliveryStatus, LIMIT, Session, Store, valid};
+    use super::{DeliveryStatus, LIMIT, Session, Store, compact_messages, valid};
 
     use crabbot_core::types::{Content, Message, Role};
     use std::collections::BTreeMap;
@@ -1309,17 +1448,46 @@ mod tests {
         assert_eq!(store.sessions["main"].messages.len(), LIMIT);
 
         let loaded = Store::load(path.clone()).unwrap();
+
         assert_eq!(loaded.sessions["main"].messages.len(), LIMIT);
         assert_eq!(loaded.sessions["main"].status, "idle");
         let mut store = loaded;
         store.set_status("main", "working").unwrap();
         let recovered = Store::load(path.clone()).unwrap();
+
         assert_eq!(recovered.sessions["main"].status, "interrupted");
         assert!(!std::fs::metadata(path).unwrap().permissions().readonly());
         let large = root.join("large.json");
         std::fs::write(&large, vec![b'x'; 32 * 1024 * 1024 + 1]).unwrap();
+
         assert!(Store::load(large).is_err());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compacts_tool_call_groups_atomically() {
+        let mut messages = vec![
+            Message {
+                id: "assistant".into(),
+                session: "main".into(),
+                role: Role::Assistant,
+                sender: None,
+                content: vec![Content::Text { text: "[Tool call read]: {}".into() }],
+            },
+            Message {
+                id: "tool".into(),
+                session: "main".into(),
+                role: Role::Tool,
+                sender: Some("read".into()),
+                content: vec![Content::Text { text: "result".into() }],
+            },
+        ];
+
+        messages.extend((0..LIMIT - 1).map(|id| message(id, "main")));
+        compact_messages(&mut messages);
+
+        assert_eq!(messages.len(), LIMIT - 1);
+        assert!(messages.iter().all(|message| message.role != Role::Tool));
     }
 
     #[test]
@@ -1330,6 +1498,7 @@ mod tests {
         store.create("main", "local").unwrap();
         store.push("main", message(1, "main")).unwrap();
         store.fork("main", "copy").unwrap();
+
         assert_eq!(store.sessions["copy"].messages.len(), 1);
         assert!(valid("copy-2"));
         assert!(!valid("../escape"));
@@ -1373,6 +1542,7 @@ mod tests {
         .unwrap();
 
         let store = Store::load(&path).unwrap();
+
         assert_eq!(store.sessions.len(), LIMIT);
         let _ = std::fs::remove_file(path);
     }
@@ -1386,6 +1556,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let malformed = root.join("broken.json");
         std::fs::write(&malformed, "not json").unwrap();
+
         assert!(Store::load(malformed).is_err());
 
         let invalid = root.join("invalid.json");
@@ -1399,19 +1570,24 @@ mod tests {
 
         let path = root.join("sessions.json");
         let mut store = Store::load(&path).unwrap();
+
         assert!(store.create("Bad", "model").is_err());
         assert!(store.create("blank", "").is_err());
         store.ensure("main", "model").unwrap();
         store.ensure("main", "other").unwrap();
         store.set_model("main", "next").unwrap();
+
         assert_eq!(store.sessions["main"].model, "next");
         assert!(store.set_model("main", "").is_err());
         assert!(store.set_model("missing", "next").is_err());
         store.set_workspace("main", Some("/tmp")).unwrap();
+
         assert_eq!(store.sessions["main"].workspace.as_deref(), Some("/tmp"));
         store.fork("main", "workspace-copy").unwrap();
+
         assert_eq!(store.sessions["workspace-copy"].workspace.as_deref(), Some("/tmp"));
         store.set_workspace("main", None).unwrap();
+
         assert!(store.sessions["main"].workspace.is_none());
         assert!(store.set_workspace("main", Some(" ")).is_err());
         assert!(store.set_workspace("missing", None).is_err());
@@ -1421,15 +1597,18 @@ mod tests {
         assert!(store.fork("missing", "copy").is_err());
         assert!(store.fork("main", "bad_id").is_err());
         store.fork("main", "copy").unwrap();
+
         assert!(store.fork("main", "copy").is_err());
         assert!(store.cancel("missing").is_err());
         assert!(store.remove("missing").is_err());
         store.remove("copy").unwrap();
+
         assert!(!store.sessions.contains_key("copy"));
 
         let blocker = root.join("blocker");
         std::fs::write(&blocker, "file").unwrap();
         let mut failed = Store::load(blocker.join("sessions.json")).unwrap();
+
         assert!(failed.create("safe", "model").is_err());
         failed.sessions.insert(
             "safe".into(),
@@ -1477,6 +1656,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut store = Store::load(&path).unwrap();
         store.create("main", "model").unwrap();
+
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_file(path);
     }
@@ -1501,13 +1681,132 @@ mod tests {
         assert_eq!(store.outbox[0].attempts, 0);
         assert_eq!(store.outbox.len(), 1);
         store.retry("delivery").unwrap();
+
         assert_eq!(store.outbox[0].attempts, 1);
         let loaded = Store::load(&path).unwrap();
+
         assert_eq!(loaded.outbox[0].text, "hello");
         let mut loaded = loaded;
         loaded.ack("missing").unwrap();
         loaded.ack("delivery").unwrap();
+
         assert!(loaded.outbox.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migrates_legacy_delivery_routes_from_sessions() {
+        let root = std::env::temp_dir()
+            .join(format!("crabbot-state-legacy-delivery-{}", std::process::id()));
+
+        let path = root.join("sessions.json");
+        let document = serde_json::json!({
+            "sessions": {
+                "signal-group": {
+                    "id": "signal-group",
+                    "model": "model",
+                    "channel": "signal",
+                    "chat": "group-id",
+                    "private": false,
+                    "messages": [],
+                    "status": "idle",
+                    "created": 0,
+                    "updated": 0
+                }
+            },
+            "outbox": [{
+                "id": "signal-event",
+                "channel": "signal",
+                "chat": "group-id",
+                "text": "hello",
+                "attempts": 0,
+                "created": 0
+            }]
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let store = Store::load(&path).unwrap();
+
+        assert!(!store.outbox[0].private);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+
+        assert_eq!(saved["outbox"][0]["private"], false);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quarantines_unresolved_legacy_delivery_routes() {
+        let root = std::env::temp_dir()
+            .join(format!("crabbot-state-unresolved-delivery-{}", std::process::id()));
+
+        let path = root.join("sessions.json");
+        let session = serde_json::json!({
+            "id": "signal-group",
+            "model": "model",
+            "channel": "signal",
+            "chat": "group-id",
+            "private": false,
+            "messages": [],
+            "status": "idle",
+            "created": 0,
+            "updated": 0
+        });
+
+        let delivery = serde_json::json!({
+            "id": "signal-event",
+            "channel": "signal",
+            "chat": "group-id",
+            "text": "hello",
+            "attempts": 0,
+            "created": 0
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "sessions": {},
+                "outbox": [delivery.clone()]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = Store::load(&path).unwrap();
+
+        assert_eq!(store.outbox[0].status, DeliveryStatus::Uncertain);
+        assert!(store.outbox[0].last_error.is_some());
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "sessions": {
+                    "signal-group": session,
+                    "signal-copy": {
+                        "id": "signal-copy",
+                        "model": "model",
+                        "channel": "signal",
+                        "chat": "group-id",
+                        "private": false,
+                        "messages": [],
+                        "status": "idle",
+                        "created": 0,
+                        "updated": 0
+                    }
+                },
+                "outbox": [delivery]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = Store::load(&path).unwrap();
+
+        assert_eq!(store.outbox[0].status, DeliveryStatus::Uncertain);
+        assert!(store.outbox[0].last_error.is_some());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1533,6 +1832,7 @@ mod tests {
         assert!(store.sessions["main"].stream_delivery.is_none());
 
         let loaded = Store::load(root.join("sessions.json")).unwrap();
+
         assert_eq!(loaded.outbox[0].message_id.as_deref(), Some("9"));
         assert_eq!(loaded.outbox[0].status, DeliveryStatus::Pending);
         let _ = std::fs::remove_dir_all(root);
@@ -1551,6 +1851,7 @@ mod tests {
         store.stream_started("discord-1", "9").unwrap();
 
         let loaded = Store::load(&path).unwrap();
+
         assert_eq!(loaded.sessions["main"].status, "interrupted");
         assert!(loaded.sessions["main"].queued.is_empty());
         assert!(loaded.sessions["main"].stream_delivery.is_none());
@@ -1571,6 +1872,7 @@ mod tests {
             .unwrap();
 
         let loaded = Store::load(path).unwrap();
+
         assert_eq!(loaded.sessions["main"].messages.len(), 1);
         assert_eq!(loaded.outbox[0].text, "hello");
         let _ = std::fs::remove_dir_all(root);
@@ -1600,6 +1902,7 @@ mod tests {
 
         store.sending("delivery").unwrap();
         let recovered = Store::load(&path).unwrap();
+
         assert_eq!(recovered.outbox[0].status, DeliveryStatus::Uncertain);
         assert!(recovered.outbox[0].last_error.is_some());
         let _ = std::fs::remove_dir_all(root);
@@ -1613,6 +1916,7 @@ mod tests {
         let mut store = Store::load(&path).unwrap();
         store.create("main", "model").unwrap();
         store.queue("main", message(1, "main")).unwrap();
+
         assert_eq!(store.sessions["main"].queued.len(), 1);
         assert_eq!(store.take("main").unwrap().unwrap().id, "1");
         assert!(store.take("main").unwrap().is_none());
@@ -1631,9 +1935,11 @@ mod tests {
         let mut store = Store::load(&path).unwrap();
         store.create("main", "model").unwrap();
         store.begin_with_roles("main", message(1, "main"), vec!["moderator".into()]).unwrap();
+
         assert_eq!(store.sessions["main"].messages[0].id, "1");
         assert!(store.remove("main").is_err());
         let recovered = Store::load(path).unwrap();
+
         assert_eq!(recovered.sessions["main"].status, "interrupted");
         assert_eq!(recovered.sessions["main"].queued[0].id, "1");
         assert_eq!(recovered.sessions["main"].queue_roles["1"], vec!["moderator"]);
@@ -1654,6 +1960,7 @@ mod tests {
         store.phase("main", "unsafe").unwrap();
         let recovered = Store::load(path).unwrap();
         let session = &recovered.sessions["main"];
+
         assert!(session.queued.is_empty());
         assert!(session.inflight.is_none());
         assert_eq!(session.status, "interrupted");
@@ -1674,6 +1981,7 @@ mod tests {
         value["sessions"]["main"].as_object_mut().unwrap().remove("phase");
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         let recovered = Store::load(path).unwrap();
+
         assert!(recovered.sessions["main"].queued.is_empty());
         assert!(recovered.sessions["main"].inflight.is_none());
         let _ = std::fs::remove_dir_all(root);
@@ -1704,6 +2012,7 @@ mod tests {
 
         let recovered = Store::load(path).unwrap();
         let session = &recovered.sessions["main"];
+
         assert_eq!(session.queued.len(), LIMIT + 1);
         assert_eq!(session.queued.first().unwrap().id, "999");
         assert_eq!(session.queued.last().unwrap().id, "99");
@@ -1718,25 +2027,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let path = root.join("sessions.json");
         let mut store = Store::load(&path).unwrap();
+
         assert!(store.begin("missing", message(1, "missing")).is_err());
         store.create("main", "model").unwrap();
         store.begin("main", message(1, "main")).unwrap();
+
         assert!(store.begin("main", message(2, "main")).is_err());
         store.queue_with_roles("main", message(2, "main"), vec!["moderator".into()]).unwrap();
+
         assert_eq!(store.sessions["main"].queue_roles["2"], vec!["moderator"]);
         store.cancel("main").unwrap();
+
         assert!(store.sessions["main"].inflight.is_some());
         assert!(store.sessions["main"].queued.is_empty());
         assert!(store.sessions["main"].queue_roles.is_empty());
         store.set_status("main", "working").unwrap();
+
         assert_eq!(store.sessions["main"].status, "cancelled");
         assert!(store.phase("main", "invalid").is_err());
         store.clear("main", "cancelled").unwrap();
+
         assert!(store.sessions["main"].queued.is_empty());
         assert!(store.sessions["main"].inflight.is_none());
         assert_eq!(store.sessions["main"].status, "cancelled");
         store.begin("main", message(2, "main")).unwrap();
         store.reply("main", message(3, "main"), "delivery", "telegram", "7", None, "done").unwrap();
+
         assert!(store.sessions["main"].inflight.is_none());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1754,6 +2070,7 @@ mod tests {
         store.cancel("main").unwrap();
         let recovered = Store::load(path).unwrap();
         let session = &recovered.sessions["main"];
+
         assert_eq!(session.status, "interrupted");
         assert!(session.inflight.is_none());
         assert!(session.queued.is_empty());
@@ -1766,6 +2083,7 @@ mod tests {
             std::env::temp_dir().join(format!("crabbot-state-worktree-{}", std::process::id()));
 
         let _ = std::fs::remove_dir_all(&root);
+
         assert!(super::remove_worktree(&root, "../escape").is_err());
         assert!(super::remove_worktree(&root, "safe").is_ok());
     }
@@ -1779,12 +2097,16 @@ mod tests {
         let path = root.join("sessions.json");
         let mut store = Store::load(&path).unwrap();
         store.create("main", "model").unwrap();
+
         assert_eq!(store.offset("telegram"), 0);
         store.commit("telegram", "first", Some(4)).unwrap();
+
         assert_eq!(store.offset("telegram"), 4);
         store.commit("telegram", "older", Some(2)).unwrap();
+
         assert_eq!(store.offset("telegram"), 4);
         store.commit("telegram", "accepted", Some(5)).unwrap();
+
         assert!(store.known("telegram", "accepted"));
         assert_eq!(store.offset("telegram"), 5);
         assert!(store.known("telegram", "first"));
@@ -1793,8 +2115,10 @@ mod tests {
             .unwrap();
 
         store.retry("delivery").unwrap();
+
         assert_eq!(store.attempts("delivery"), Some(1));
         store.dead("delivery").unwrap();
+
         assert!(store.outbox.is_empty());
         assert_eq!(store.dead.len(), 1);
         store.dead("missing").unwrap();
@@ -1837,6 +2161,7 @@ mod tests {
         }
 
         store.commit("telegram", "00000", None).unwrap();
+
         assert!(store.known("telegram", "00000"));
         assert_eq!(store.seen.len(), 10_000);
         assert!(!store.known("telegram", "00001"));

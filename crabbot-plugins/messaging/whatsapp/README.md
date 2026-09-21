@@ -21,4 +21,5 @@ Required values are `CRABBOT_WHATSAPP_TOKEN`, `CRABBOT_WHATSAPP_APP_SECRET`,
 
 Inbound text, images, voice messages, and text files are normalized. The plugin
 can send all four content types, while the current daemon response path sends
-generated replies as text.
+generated replies as text. Verified webhook events are stored under
+`CRABBOT_HOME` until the host acknowledges them.

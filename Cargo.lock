@@ -635,7 +635,10 @@ dependencies = [
 name = "crabbot-plugin-signal"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "crabbot-core",
+ "crabbot-file",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -645,8 +648,10 @@ name = "crabbot-plugin-slack"
 version = "0.1.0"
 dependencies = [
  "crabbot-core",
+ "crabbot-file",
  "futures-util",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
@@ -716,6 +721,7 @@ dependencies = [
  "futures-util",
  "reqwest",
  "ring",
+ "serde",
  "serde_json",
  "tokio",
 ]

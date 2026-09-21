@@ -666,6 +666,7 @@ mod tests {
     #[test]
     fn parses_success_and_failure_responses() {
         let result = response_body(3, reqwest::StatusCode::OK, json!({"message":{"content":"done"},"done_reason":"stop","prompt_eval_count":2,"eval_count":4})).unwrap().unwrap();
+
         assert_eq!(result.result.unwrap()["text"], "done");
         assert!(response_body(3, reqwest::StatusCode::BAD_REQUEST, json!({"error":"no"})).is_err());
         assert!(response_body(3, reqwest::StatusCode::OK, json!({})).is_err());
@@ -683,6 +684,7 @@ mod tests {
     #[test]
     fn builds_messages_for_each_role() {
         let messages = messages(&model()).unwrap();
+
         assert_eq!(messages[0], json!({"role": "system", "content": "rules"}));
         assert_eq!(
             messages[1],
@@ -692,6 +694,7 @@ mod tests {
                 "images": ["aW1hZ2U="]
             })
         );
+
         assert_eq!(messages[2], json!({"role": "assistant", "content": "prior"}));
         assert_eq!(messages[3], json!({"role": "tool", "content": "result"}));
         assert_eq!(tools(&model())[0]["function"]["name"], "read");
@@ -715,10 +718,13 @@ mod tests {
         use futures_util::stream;
 
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(b"ok".to_vec())]);
+
         assert_eq!(collect(chunks, "Ollama").await.unwrap(), "ok");
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(vec![0xff])]);
+
         assert!(collect(chunks, "Ollama").await.is_err());
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(vec![b'x'; BODY_LIMIT + 1])]);
+
         assert!(collect(chunks, "Ollama").await.is_err());
     }
 
@@ -733,6 +739,7 @@ mod tests {
         .unwrap();
 
         let reply = result.result.unwrap();
+
         assert_eq!(reply["text"], "hello");
         assert_eq!(reply["stop"], "stop");
         assert!(stream_body(4, reqwest::StatusCode::BAD_REQUEST, "").is_err());
@@ -742,6 +749,7 @@ mod tests {
     #[tokio::test]
     async fn validates_requests_and_network_failures() {
         let client = reqwest::Client::new();
+
         assert!(
             generate(&client, Request::call(1, "unknown", json!({})), test_emitter())
                 .await
@@ -754,17 +762,20 @@ mod tests {
         assert!(generate(&client, note, test_emitter()).await.unwrap().is_none());
         assert!(generate_request(&client, 1, model(), "http://127.0.0.1:1").await.is_err());
         let mut emitter = test_emitter();
+
         assert!(
             generate_at(&client, 1, model(), "http://127.0.0.1:1", &mut emitter).await.is_err()
         );
         let mut stream = model();
         stream.stream = true;
+
         assert!(generate_at(&client, 1, stream, "http://127.0.0.1:1", &mut emitter).await.is_err());
         assert!(
             generate(&client, Request::call(1, "generate", json!({})), test_emitter())
                 .await
                 .is_err()
         );
+
         assert!(response_body(3, reqwest::StatusCode::OK, json!({"message":{}})).is_err());
         assert!(response_body(3, reqwest::StatusCode::BAD_REQUEST, json!({})).is_err());
     }

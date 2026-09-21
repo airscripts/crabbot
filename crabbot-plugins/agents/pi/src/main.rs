@@ -11,7 +11,11 @@ use crabbot_core::{
 };
 
 use serde_json::{Value, json};
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
@@ -207,7 +211,13 @@ async fn run_pi(
     tokio::fs::create_dir_all(&session_root).await?;
     tokio::fs::write(&extension, extension_source(address.port(), &token)).await?;
     args.extend(["--extension".into(), extension.display().to_string()]);
-    let bridge = tokio::spawn(tool_bridge(listener, emitter.clone(), token.clone()));
+    let bridge = tokio::spawn(tool_bridge(
+        listener,
+        emitter.clone(),
+        token.clone(),
+        request.workspace.clone(),
+    ));
+
     let mut child = match Command::new(command)
         .args(args)
         .current_dir(&request.workspace)
@@ -316,14 +326,15 @@ fn full_message_text(message: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-async fn tool_bridge(listener: TcpListener, emitter: Emitter, token: String) {
+async fn tool_bridge(listener: TcpListener, emitter: Emitter, token: String, workspace: PathBuf) {
     loop {
         let Ok((stream, _)) = listener.accept().await else { break };
 
         let emitter = emitter.clone();
         let token = token.clone();
+        let workspace = workspace.clone();
         tokio::spawn(async move {
-            let _ = handle_tool_call(stream, emitter, &token).await;
+            let _ = handle_tool_call(stream, emitter, &token, &workspace).await;
         });
     }
 }
@@ -332,6 +343,7 @@ async fn handle_tool_call(
     mut stream: TcpStream,
     emitter: Emitter,
     token: &str,
+    workspace: &Path,
 ) -> crabbot_core::Result<()> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
@@ -359,8 +371,10 @@ async fn handle_tool_call(
     let length = headers
         .lines()
         .find_map(|line| {
-            line.strip_prefix("Content-Length:")
-                .and_then(|value| value.trim().parse::<usize>().ok())
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("Content-Length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
         })
         .ok_or_else(|| {
             crabbot_core::Error::Protocol("Pi tool request had no content length.".into())
@@ -385,7 +399,14 @@ async fn handle_tool_call(
         json!({"error": "Pi tool authorization failed."})
     } else {
         let response = emitter
-            .call("host/tool", json!({"name": request["name"], "args": request["args"]}))
+            .call(
+                "host/tool",
+                json!({
+                    "name": request["name"],
+                    "args": request["args"],
+                    "workspace": workspace.display().to_string(),
+                }),
+            )
             .await?;
         response
             .result
@@ -434,6 +455,7 @@ fn safe(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn loopback_listener() -> Option<tokio::net::TcpListener> {
@@ -483,12 +505,14 @@ mod tests {
         assert_eq!(delta["assistantMessageEvent"]["delta"], "hello");
 
         let message = json!({"content": [{"type": "text", "text": "done"}]});
+
         assert_eq!(full_message_text(&message).as_deref(), Some("done"));
     }
 
     #[test]
     fn generates_an_authenticated_extension() {
         let source = extension_source(1234, "token");
+
         assert!(source.contains("http://127.0.0.1:1234"));
         assert!(source.contains("const token = \"token\""));
         assert!(source.contains("registerTool"));
@@ -505,13 +529,13 @@ mod tests {
         let emitter = Emitter::new(sender);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_tool_call(stream, emitter, "expected").await
+            handle_tool_call(stream, emitter, "expected", Path::new(".")).await
         });
 
         let mut client = TcpStream::connect(address).await.unwrap();
         let body = br#"{"token":"wrong","name":"read","args":{}}"#;
         let request = format!(
-            "POST / HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "POST / HTTP/1.1\r\ncontent-length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
 
@@ -519,6 +543,7 @@ mod tests {
         client.write_all(body).await.unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
+
         assert!(String::from_utf8_lossy(&response).contains("authorization failed"));
         server.await.unwrap().unwrap();
     }

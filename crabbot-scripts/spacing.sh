@@ -71,14 +71,23 @@ is_match_block() {
     [[ "$1" =~ $pattern ]]
 }
 
+is_assertion() {
+    [[ "$1" =~ ^(debug_)?assert(_(eq|ne))?! ]]
+}
+
 is_multiline_start() {
     local value=$1
+    local function_signature='^\)[[:space:]]*->[^{]*\{[[:space:]]*$'
     [[ "$value" == *\; ]] && return 1
     [[ "$value" == //* || "$value" == \#* || "$value" == \}* ]] && return 1
     [[ "$value" =~ ^(if|for|while|loop|match|else)([[:space:]]|$) ]] && return 1
     [[ "$value" =~ ^(pub[[:space:]]+)?(impl|struct|enum|trait|mod)([[:space:]]|$) ]] && return 1
     is_match_block "$value" && return 1
     [[ "$value" =~ ^(pub[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]] ]] && return 1
+    [[ "$value" =~ $function_signature ]] && return 1
+    if is_assertion "$value" || [[ "$value" =~ ^(let|const|static|return|break|continue)([[:space:]]|$) ]]; then
+        [[ "$value" != *\; && "$value" == *"("* ]] && return 0
+    fi
     [[ "$value" == *'(' || "$value" == *'{' || "$value" == *'=' \
         || "$value" == *'.' || "$value" =~ ^(let|const|static|return|break|continue)([[:space:]]|$) ]]
 }
@@ -259,6 +268,11 @@ format_file() {
                     needs_blank=true
                 fi
 
+                if is_assertion "$trimmed" && ! is_assertion "$previous_trimmed" \
+                    && ((current_indent == previous_indent)); then
+                    needs_blank=true
+                fi
+
                 if $needs_blank; then
                     append_blank formatted
                 fi
@@ -317,7 +331,7 @@ format_file() {
     fi
 
     if $check_only; then
-        printf '[ERROR] Rust spacing needs formatting: %s\n' "${path#"$repo_root/"}" >&2
+        printf '[WARN] Rust spacing needs formatting: %s\n' "${path#"$repo_root/"}" >&2
         rm -f "$temporary"
         return 1
     fi

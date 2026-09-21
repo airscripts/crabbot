@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly DEFAULT_MAX_CYCLES=10
+readonly DEFAULT_MAX_CYCLES=50
+readonly DEFAULT_CLEAN_PASSES=3
+readonly DEFAULT_CODEX_TIMEOUT='60m'
+readonly DEFAULT_VERIFICATION_TIMEOUT='30m'
 readonly EXIT_USAGE=2
 readonly EXIT_CODEX=70
 readonly EXIT_VERIFICATION=71
 readonly EXIT_ORCHESTRATOR_OUTPUT=72
 readonly EXIT_EXHAUSTED=73
 readonly EXIT_REPOSITORY=74
+readonly EXIT_VERIFICATION_TIMEOUT=75
 readonly REVIEW_CLEAR='Review is clean, so no findings will be listed.'
 readonly REVIEW_FINDINGS='Review is not clean, findings are:'
 
 MAX_CYCLES="${CRABBOT_REVLOOP_MAX_CYCLES:-$DEFAULT_MAX_CYCLES}"
+CLEAN_PASSES="${CRABBOT_REVLOOP_CLEAN_PASSES:-$DEFAULT_CLEAN_PASSES}"
+CODEX_TIMEOUT="${CRABBOT_REVLOOP_CODEX_TIMEOUT:-$DEFAULT_CODEX_TIMEOUT}"
+VERIFICATION_TIMEOUT="${CRABBOT_REVLOOP_VERIFICATION_TIMEOUT:-$DEFAULT_VERIFICATION_TIMEOUT}"
 OUTPUT_MODE="${CRABBOT_REVLOOP_OUTPUT:-clean}"
 MODEL="${CRABBOT_REVLOOP_MODEL:-gpt-5.6-luna}"
 REASONING="${CRABBOT_REVLOOP_REASONING:-high}"
@@ -40,7 +47,10 @@ usage() {
     printf '%s\n' '  CRABBOT_CODEX_HOME=~/.codex'
     printf '%s\n' '  CRABBOT_REVLOOP_MODEL=gpt-5.6-luna'
     printf '%s\n' '  CRABBOT_REVLOOP_REASONING=high'
-    printf '%s\n' '  CRABBOT_REVLOOP_MAX_CYCLES=10 CRABBOT_REVLOOP_OUTPUT=clean|verbose.'
+    printf '%s\n' '  CRABBOT_REVLOOP_MAX_CYCLES=50 CRABBOT_REVLOOP_OUTPUT=clean|verbose'
+    printf '%s\n' '  CRABBOT_REVLOOP_CLEAN_PASSES=3.'
+    printf '%s\n' '  CRABBOT_REVLOOP_CODEX_TIMEOUT=60m.'
+    printf '%s\n' '  CRABBOT_REVLOOP_VERIFICATION_TIMEOUT=30m.'
 }
 
 die() {
@@ -95,6 +105,11 @@ esac
 
 if ! [[ "$MAX_CYCLES" =~ ^[1-9][0-9]*$ ]]; then
     die "$EXIT_USAGE" "CRABBOT_REVLOOP_MAX_CYCLES must be a positive integer; got '$MAX_CYCLES'."
+fi
+
+if ! [[ "$CLEAN_PASSES" =~ ^[1-9][0-9]*$ ]]; then
+    die "$EXIT_USAGE" \
+        "CRABBOT_REVLOOP_CLEAN_PASSES must be a positive integer; got '$CLEAN_PASSES'."
 fi
 
 if ! SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"; then
@@ -152,10 +167,20 @@ fi
 
 export CRABBOT_CODEX_HOME
 
-for required_tool in bash cargo make; do
+for required_tool in bash cargo cksum make timeout; do
     command -v "$required_tool" >/dev/null 2>&1 || die "$EXIT_VERIFICATION" \
         "Required verification tool '$required_tool' is not available on PATH."
 done
+
+if ! timeout "$CODEX_TIMEOUT" true >/dev/null 2>&1; then
+    die "$EXIT_USAGE" \
+        "CRABBOT_REVLOOP_CODEX_TIMEOUT must be accepted by timeout; got '$CODEX_TIMEOUT'."
+fi
+
+if ! timeout "$VERIFICATION_TIMEOUT" true >/dev/null 2>&1; then
+    die "$EXIT_USAGE" \
+        "CRABBOT_REVLOOP_VERIFICATION_TIMEOUT must be accepted by timeout; got '$VERIFICATION_TIMEOUT'."
+fi
 
 if [[ "$OUTPUT_MODE" == 'verbose' ]] && \
     ! command -v tee >/dev/null 2>&1
@@ -178,6 +203,7 @@ RUN_DIR="$STATE_ROOT/$RUN_ID"
 mkdir -p "$RUN_DIR"
 
 LATEST_ORCHESTRATOR="$RUN_DIR/latest-orchestrator.txt"
+LATEST_ORCHESTRATOR_LOG="$RUN_DIR/latest-orchestrator.log"
 LATEST_WORKER="$RUN_DIR/latest-worker.txt"
 LATEST_WORKER_LOG="$RUN_DIR/latest-worker.log"
 
@@ -233,16 +259,17 @@ run_codex() {
         cd "$REPO_ROOT"
 
         # Codex CLI has no flag for its home, so translate the canonical setting at this boundary.
-        CODEX_HOME="$CRABBOT_CODEX_HOME" codex exec \
-            --cd "$REPO_ROOT" \
-            --sandbox "$sandbox" \
-            --model "$MODEL" \
-            --config 'approval_policy="never"' \
-            --config "model_reasoning_effort=\"$REASONING\"" \
-            --ephemeral \
-            --color never \
-            --output-last-message "$output_file" \
-            - < "$prompt_file"
+        timeout --foreground --kill-after=30s "$CODEX_TIMEOUT" \
+            env CODEX_HOME="$CRABBOT_CODEX_HOME" codex exec \
+                --cd "$REPO_ROOT" \
+                --sandbox "$sandbox" \
+                --model "$MODEL" \
+                --config 'approval_policy="never"' \
+                --config "model_reasoning_effort=\"$REASONING\"" \
+                --ephemeral \
+                --color never \
+                --output-last-message "$output_file" \
+                - < "$prompt_file"
     ) </dev/null 2>&1 | write_log "$log_file"
     pipeline_status=("${PIPESTATUS[@]}")
     status=${pipeline_status[0]}
@@ -251,6 +278,12 @@ run_codex() {
 
     if (( status == 0 && sink_status != 0 )); then
         status=$sink_status
+    fi
+
+    if (( status == 124 )); then
+        print_error "$role_name invocation timed out after $CODEX_TIMEOUT."
+        print_error "Codex log: $log_file"
+        return "$EXIT_CODEX"
     fi
 
     if (( status != 0 )); then
@@ -956,6 +989,25 @@ finding_count() {
         "$review_file"
 }
 
+run_verification_command() {
+    local label=$1
+    shift
+    local status
+
+    if timeout --foreground --kill-after=30s "$VERIFICATION_TIMEOUT" "$@"; then
+        status=0
+    else
+        status=$?
+    fi
+
+    if (( status == 124 )); then
+        print_warn "$label timed out after $VERIFICATION_TIMEOUT."
+        return "$EXIT_VERIFICATION_TIMEOUT"
+    fi
+
+    return "$status"
+}
+
 run_fast_verification() {
     local log_file=$1
     local status
@@ -969,17 +1021,20 @@ run_fast_verification() {
         set -e
         cd "$REPO_ROOT"
 
+        print_info 'Applying Rust spacing formatter...'
+        run_verification_command 'Rust spacing formatter' make spacing || exit $?
+
         print_info 'Running format check (1/4)...'
-        make fmt
+        run_verification_command 'Format check' make fmt || exit $?
 
         print_info 'Running workspace check (2/4)...'
-        make check
+        run_verification_command 'Workspace check' make check || exit $?
 
         print_info 'Running workspace tests (3/4)...'
-        make test
+        run_verification_command 'Workspace tests' make test || exit $?
 
         print_info 'Running shell syntax check (4/4)...'
-        bash -n crabbot-scripts/*.sh install.sh
+        run_verification_command 'Shell syntax check' bash -n crabbot-scripts/*.sh install.sh || exit $?
     ) </dev/null 2>&1 | write_log "$log_file"
     pipeline_status=("${PIPESTATUS[@]}")
     status=${pipeline_status[0]}
@@ -991,23 +1046,75 @@ run_fast_verification() {
     fi
 
     if (( status != 0 )); then
-        print_error "Focused verification failed with exit status $status."
-        print_error "Verification log: $log_file"
-        return 1
+        if (( status == EXIT_VERIFICATION_TIMEOUT )); then
+            print_warn 'Focused verification stopped because a phase timed out.'
+            print_warn "Verification log: $log_file"
+        else
+            print_error "Focused verification failed with exit status $status."
+            print_error "Verification log: $log_file"
+        fi
+        return "$status"
     fi
+}
+
+run_fast_verification_with_retry() {
+    local log_file=$1
+    local status
+
+    if run_fast_verification "$log_file"; then
+        return 0
+    else
+        status=$?
+    fi
+
+    if (( status != EXIT_VERIFICATION_TIMEOUT )); then
+        return "$status"
+    fi
+
+    print_warn 'Focused verification timed out; retrying once without consuming a cycle.'
+
+    if run_fast_verification "$log_file"; then
+        return 0
+    else
+        status=$?
+    fi
+
+    if (( status == EXIT_VERIFICATION_TIMEOUT )); then
+        print_warn 'Focused verification timed out twice.'
+    fi
+
+    return "$status"
+}
+
+verification_failure_signature() {
+    local log_file=$1
+    local failure_lines
+
+    failure_lines="$(grep -E \
+        '^(---- .* stdout ----|test result: FAILED|error: test failed|[[:space:]]*called .+ panicked)' \
+        "$log_file" || true)"
+
+    [[ -n "$failure_lines" ]] || return 0
+
+    printf '%s' "$failure_lines" | cksum | awk '{ print $1 ":" $2 }'
 }
 
 run_final_verification() {
     local log_file=$1
     local status
     local environment_failure_pattern
+    local coverage_environment_pattern
     local pipeline_status
     local sink_status
 
     environment_failure_pattern='failed to acquire advisory database'
     environment_failure_pattern+='|couldn.t fetch advisory database'
     environment_failure_pattern+='|network is unreachable'
+    environment_failure_pattern+='|request could not be completed in the allotted timeframe'
+    environment_failure_pattern+='|couldn.t check if the package is yanked'
     environment_failure_pattern+='|read-only path'
+    coverage_environment_pattern='target/llvm-cov-target'
+    coverage_environment_pattern+='|failed to remove file.*permission denied'
 
     print_info 'Running final CI-equivalent verification.'
 
@@ -1033,54 +1140,74 @@ run_final_verification() {
             exit "$EXIT_VERIFICATION"
         fi
 
+        print_info 'Applying Rust spacing formatter before complete verification...'
+        run_verification_command \
+            'Rust spacing formatter' \
+            make spacing || exit $?
+
         print_info 'Running complete verification (1/10)...'
-        make verify
+        run_verification_command 'Complete verification' make verify || exit $?
 
         print_info 'Running Rustdoc check (2/10)...'
-        env RUSTDOCFLAGS='-D warnings' \
+        run_verification_command \
+            'Rustdoc check' \
+            env RUSTDOCFLAGS='-D warnings' \
             cargo doc \
-                --workspace \
-                --no-deps \
-                --locked
+            --workspace \
+            --no-deps \
+            --locked || exit $?
 
         print_info 'Running shell syntax check (3/10)...'
-        bash -n crabbot-scripts/*.sh install.sh
+        run_verification_command \
+            'Shell syntax check' \
+            bash -n crabbot-scripts/*.sh install.sh || exit $?
 
         print_info 'Running all-target workspace check (4/10)...'
-        env CARGO_BUILD_JOBS=4 \
+        run_verification_command \
+            'All-target workspace check' \
+            env CARGO_BUILD_JOBS=4 \
             cargo check \
-                --workspace \
-                --all-targets \
-                --locked
+            --workspace \
+            --all-targets \
+            --locked || exit $?
 
         print_info 'Running MSRV workspace check (5/10)...'
-        env CARGO_BUILD_JOBS=4 \
+        run_verification_command \
+            'MSRV workspace check' \
+            env CARGO_BUILD_JOBS=4 \
             cargo +1.89 check \
-                --workspace \
-                --all-targets \
-                --locked
+            --workspace \
+            --all-targets \
+            --locked || exit $?
 
         print_info 'Running release build (6/10)...'
-        cargo build \
+        run_verification_command \
+            'Release build' \
+            cargo build \
             --workspace \
             --release \
-            --locked
+            --locked || exit $?
 
         print_info 'Running release smoke test (7/10)...'
-        cargo run \
+        run_verification_command \
+            'Release smoke test' \
+            cargo run \
             -p crabbot \
+            --bin crabbot \
             --release \
             -- \
-            version
+            version || exit $?
 
         print_info 'Running Agentskill document check (8/10)...'
-        agentskill validate . --signature auto
+        run_verification_command \
+            'Agentskill document check' \
+            agentskill validate . --signature auto || exit $?
 
         print_info 'Running dependency policy check (9/10)...'
-        cargo deny check
+        run_verification_command 'Dependency policy check' cargo deny check || exit $?
 
         print_info 'Running RustSec audit (10/10)...'
-        cargo audit
+        run_verification_command 'RustSec audit' cargo audit || exit $?
     ) </dev/null 2>&1 | write_log "$log_file"
     pipeline_status=("${PIPESTATUS[@]}")
     status=${pipeline_status[0]}
@@ -1092,13 +1219,28 @@ run_final_verification() {
     fi
 
     if (( status != 0 )); then
+        if (( status == EXIT_VERIFICATION_TIMEOUT )); then
+            print_warn 'Final verification stopped because a phase timed out.'
+            print_warn "Verification log: $log_file"
+            return "$status"
+        fi
+
+        if grep -Eiq "$coverage_environment_pattern" "$log_file"; then
+            print_warn \
+                'Coverage verification was unavailable because existing build artifacts could not be removed.'
+            print_warn "Verification log: $log_file"
+            return "$EXIT_VERIFICATION"
+        fi
+
         if grep -Eiq "$environment_failure_pattern" "$log_file" && \
-            grep -Eiq 'cargo deny check|cargo audit|advisory database' "$log_file"
+            grep -Eiq \
+                'Running dependency policy check|Running RustSec audit|advisory database' \
+                "$log_file"
         then
             print_warn \
                 'Dependency audit was unavailable because the local advisory database could not be accessed.'
             print_warn "Verification log: $log_file"
-            return 0
+            return "$EXIT_VERIFICATION"
         fi
 
         if (( status == EXIT_VERIFICATION )); then
@@ -1110,8 +1252,37 @@ run_final_verification() {
 
         print_error "Final verification failed with exit status $status."
         print_error "Verification log: $log_file"
-        return 1
+        return "$status"
     fi
+}
+
+run_final_verification_with_retry() {
+    local log_file=$1
+    local status
+
+    if run_final_verification "$log_file"; then
+        return 0
+    else
+        status=$?
+    fi
+
+    if (( status != EXIT_VERIFICATION_TIMEOUT )); then
+        return "$status"
+    fi
+
+    print_warn 'Final verification timed out; retrying once without consuming a cycle.'
+
+    if run_final_verification "$log_file"; then
+        return 0
+    else
+        status=$?
+    fi
+
+    if (( status == EXIT_VERIFICATION_TIMEOUT )); then
+        print_warn 'Final verification timed out twice.'
+    fi
+
+    return "$status"
 }
 
 copy_latest_verification() {
@@ -1124,6 +1295,7 @@ run_worker_pass() {
     local cycle=$1
     local review_file=$2
     local verification_file=${3:-}
+    local artifact_name=${4:-worker}
     local cycle_tag
     local prompt_file
     local worker_file
@@ -1131,9 +1303,9 @@ run_worker_pass() {
 
     printf -v cycle_tag '%02d' "$cycle"
 
-    prompt_file="$RUN_DIR/cycle-${cycle_tag}-worker-prompt.txt"
-    worker_file="$RUN_DIR/cycle-${cycle_tag}-worker.txt"
-    worker_log="$RUN_DIR/cycle-${cycle_tag}-worker.log"
+    prompt_file="$RUN_DIR/cycle-${cycle_tag}-${artifact_name}-prompt.txt"
+    worker_file="$RUN_DIR/cycle-${cycle_tag}-${artifact_name}.txt"
+    worker_log="$RUN_DIR/cycle-${cycle_tag}-${artifact_name}.log"
 
     write_worker_prompt \
         "$prompt_file" \
@@ -1165,6 +1337,10 @@ report_exhausted() {
 }
 
 pending_verification=''
+final_verification_pending=0
+clean_passes=0
+repeated_verification_failures=0
+last_verification_signature=''
 cycle=1
 
 print_info "Repository: $REPO_ROOT."
@@ -1175,6 +1351,8 @@ print_info "Reasoning: $REASONING."
 print_info "Output mode: $OUTPUT_MODE."
 print_info "Review scope: $REVIEW_SCOPE."
 print_info "Maximum cycles: $MAX_CYCLES."
+print_info "Required consecutive clean reviews: $CLEAN_PASSES."
+print_info "Verification timeout per phase: $VERIFICATION_TIMEOUT."
 
 while (( cycle <= MAX_CYCLES )); do
     printf '\n'
@@ -1197,12 +1375,16 @@ while (( cycle <= MAX_CYCLES )); do
         "$review_file" \
         "$review_log"
     then
+        if [[ -f "$review_log" ]]; then
+            cp "$review_log" "$LATEST_ORCHESTRATOR_LOG"
+        fi
         print_error \
             "Orchestrator output is preserved at $review_file and $review_log."
         exit "$EXIT_CODEX"
     fi
 
     cp "$review_file" "$LATEST_ORCHESTRATOR"
+    cp "$review_log" "$LATEST_ORCHESTRATOR_LOG"
 
     if ! validate_review_output "$review_file"; then
         print_error "Orchestrator output is preserved at $review_file."
@@ -1210,6 +1392,10 @@ while (( cycle <= MAX_CYCLES )); do
     fi
 
     report_content="$(<"$review_file")"
+
+    if [[ "$report_content" != "$REVIEW_CLEAR" ]]; then
+        clean_passes=0
+    fi
 
     if [[ "$report_content" != "$REVIEW_CLEAR" ]]; then
         print_info "Orchestrator reported $(finding_count "$review_file") finding(s)."
@@ -1225,15 +1411,51 @@ while (( cycle <= MAX_CYCLES )); do
                 "No blocking findings remain; non-blocking findings are recorded in $review_file."
         fi
 
+        if [[ "$report_content" == "$REVIEW_CLEAR" && clean_passes -gt 0 && \
+            final_verification_pending -eq 0 ]]
+        then
+            clean_passes=$((clean_passes + 1))
+            print_info \
+                "Review remained clean ($clean_passes/$CLEAN_PASSES)."
+
+            if (( clean_passes >= CLEAN_PASSES )); then
+                print_info 'Review reached its clean stability threshold.'
+                exit 0
+            fi
+
+            if (( cycle == MAX_CYCLES )); then
+                report_exhausted "$review_file"
+            fi
+
+            cycle=$((cycle + 1))
+            continue
+        fi
+
         print_info 'Running final verification.'
 
         final_log="$RUN_DIR/cycle-${cycle_tag}-final-verification.log"
 
-        if run_final_verification "$final_log"; then
+        if run_final_verification_with_retry "$final_log"; then
             cp "$final_log" "$RUN_DIR/latest-verification.log"
+            pending_verification=''
+            final_verification_pending=0
 
             if [[ "$report_content" == "$REVIEW_CLEAR" ]]; then
-                print_info 'Review is clear and final verification passed.'
+                clean_passes=1
+
+                if (( clean_passes < CLEAN_PASSES )); then
+                    print_info \
+                        "Review is clean (1/$CLEAN_PASSES); starting a stability recheck."
+
+                    if (( cycle == MAX_CYCLES )); then
+                        report_exhausted "$review_file"
+                    fi
+
+                    cycle=$((cycle + 1))
+                    continue
+                fi
+
+                print_info 'Review reached its clean stability threshold.'
             else
                 print_info 'No blocking findings remain and final verification passed.'
             fi
@@ -1242,22 +1464,32 @@ while (( cycle <= MAX_CYCLES )); do
             final_status=$?
         fi
 
-        if (( final_status == EXIT_VERIFICATION )); then
-            print_error \
-                'Final verification did not run to completion.'
-            print_error "Verification log: $final_log"
-            exit "$EXIT_VERIFICATION"
+        if (( final_status == EXIT_VERIFICATION_TIMEOUT )); then
+            print_warn \
+                'Final verification timed out twice; starting a recovery worker without consuming a cycle.'
+            print_warn "Verification log: $final_log"
+        elif (( final_status == EXIT_VERIFICATION )); then
+            print_warn \
+                'Final verification was unavailable in the current environment; continuing with worker assessment.'
+            print_warn "Verification log: $final_log"
         fi
 
         copy_latest_verification "$final_log"
         pending_verification="$final_log"
+        final_verification_pending=1
 
         print_info 'Final verification failure is being sent to a worker.'
+
+        worker_artifact='worker'
+        if (( final_status == EXIT_VERIFICATION_TIMEOUT )); then
+            worker_artifact='timeout-recovery-worker'
+        fi
 
         if ! run_worker_pass \
             "$cycle" \
             "$review_file" \
-            "$pending_verification"
+            "$pending_verification" \
+            "$worker_artifact"
         then
             exit "$EXIT_CODEX"
         fi
@@ -1276,14 +1508,72 @@ while (( cycle <= MAX_CYCLES )); do
 
     verification_log="$RUN_DIR/cycle-${cycle_tag}-focused-verification.log"
 
-    if run_fast_verification "$verification_log"; then
+    focused_status=0
+    if run_fast_verification_with_retry "$verification_log"; then
+        focused_status=0
+    else
+        focused_status=$?
+    fi
+
+    if (( focused_status == EXIT_VERIFICATION_TIMEOUT )); then
+        copy_latest_verification "$verification_log"
+        pending_verification="$verification_log"
+        print_warn \
+            'Focused verification timed out twice; starting a recovery worker without consuming a cycle.'
+        print_warn "Verification log: $verification_log"
+
+        if ! run_worker_pass \
+            "$cycle" \
+            "$review_file" \
+            "$pending_verification" \
+            'timeout-recovery-worker'
+        then
+            exit "$EXIT_CODEX"
+        fi
+
+        print_info 'Re-running focused verification after the timeout recovery worker.'
+        if run_fast_verification_with_retry "$verification_log"; then
+            focused_status=0
+        else
+            focused_status=$?
+        fi
+    fi
+
+    if (( focused_status == 0 )); then
         cp "$verification_log" "$RUN_DIR/latest-verification.log"
-        pending_verification=''
+        if (( final_verification_pending == 0 )); then
+            pending_verification=''
+        fi
+        repeated_verification_failures=0
+        last_verification_signature=''
 
         print_info 'Focused verification passed.'
     else
         copy_latest_verification "$verification_log"
-        pending_verification="$verification_log"
+        if (( final_verification_pending == 0 )); then
+            pending_verification="$verification_log"
+        fi
+
+        verification_signature="$(verification_failure_signature "$verification_log")"
+        if [[ -n "$verification_signature" && \
+            "$verification_signature" == "$last_verification_signature" ]]
+        then
+            repeated_verification_failures=$((repeated_verification_failures + 1))
+        elif [[ -n "$verification_signature" ]]; then
+            repeated_verification_failures=1
+            last_verification_signature="$verification_signature"
+        else
+            repeated_verification_failures=0
+            last_verification_signature=''
+        fi
+
+        if (( repeated_verification_failures >= 2 )); then
+            print_warn \
+                'Focused verification repeated the same failure after two worker passes; continuing autonomously.'
+            print_warn "Verification log: $verification_log"
+            repeated_verification_failures=0
+            last_verification_signature=''
+        fi
 
         print_info \
             'Continuing so a fresh orchestrator and worker can assess the verification failure.'

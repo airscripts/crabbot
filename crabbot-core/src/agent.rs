@@ -224,6 +224,7 @@ mod tests {
         };
 
         let reply = turn(&mut Echo, &[input], 4).unwrap();
+
         assert_eq!(reply.content, vec![Content::Text { text: "done".into() }]);
     }
 
@@ -253,6 +254,7 @@ mod tests {
 
         assert!(turn(&mut Events, &[], 2).is_err());
         let reply = turn(&mut Echo, &[], 1).unwrap();
+
         assert_eq!(reply.session, "session");
         assert!(turn(&mut Mixed, std::slice::from_ref(&input), 2).is_err());
     }
@@ -269,6 +271,7 @@ mod tests {
 
         let mut model = Calls { count: 0 };
         let reply = run(&mut model, &mut Read, std::slice::from_ref(&input), 2).unwrap();
+
         assert_eq!(reply.content, vec![Content::Text { text: "finished".into() }]);
         assert_eq!(model.count, 1);
         assert!(run(&mut Calls { count: 0 }, &mut Read, &[], 0).is_err());
