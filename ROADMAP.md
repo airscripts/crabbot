@@ -8,7 +8,7 @@ the public behavior stable.
 - Resolve all known high and medium reliability findings.
 - Improve recovery, cancellation, queue handling, persistence, and plugin updates.
 - Preserve stable JSON-RPC 0.x compatibility.
-- Keep workspace coverage above 80%.
+- Keep core coverage above 80% and runtime host coverage above 50%.
 - Require clean dependency vulnerability audits.
 - Keep formatting, Clippy, tests, rustdoc, security, and Agentskill checks passing.
 

@@ -62,10 +62,30 @@ pub enum Role {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Content {
-    Text { text: String },
-    Image { uri: String, alt: Option<String> },
-    File { uri: String, name: String, mime: Option<String> },
-    Audio { uri: String, mime: Option<String> },
+    Text {
+        text: String,
+    },
+    Image {
+        uri: String,
+        alt: Option<String>,
+    },
+    File {
+        uri: String,
+        name: String,
+        mime: Option<String>,
+    },
+    Audio {
+        uri: String,
+        mime: Option<String>,
+    },
+    ToolCall {
+        name: String,
+        args: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
+    },
 }
 
 impl Content {
@@ -79,6 +99,7 @@ impl Content {
 
             Self::File { name, .. } => format!("[File: {name}]"),
             Self::Audio { .. } => "[Audio attachment.]".into(),
+            Self::ToolCall { name, args, .. } => format!("[Tool call {name}]: {args}"),
         }
     }
 }
@@ -124,10 +145,23 @@ pub struct ToolSpec {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
-    Text { text: String },
-    Tool { name: String, args: Value },
-    Done { text: String },
-    Error { message: String },
+    Text {
+        text: String,
+    },
+    Tool {
+        name: String,
+        args: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
+    },
+    Done {
+        text: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -340,7 +374,22 @@ mod tests {
             "[Audio attachment.]"
         );
 
-        let event = Event::Tool { name: "read".into(), args: serde_json::json!({}) };
+        let tool_call = Content::ToolCall {
+            name: "read".into(),
+            args: serde_json::json!({"path": "note.txt"}),
+            id: None,
+            thought_signature: Some("sig-1".into()),
+        };
+
+        assert_eq!(serde_json::to_value(&tool_call).unwrap()["kind"], "tool_call");
+        assert_eq!(tool_call.render(), "[Tool call read]: {\"path\":\"note.txt\"}");
+
+        let event = Event::Tool {
+            name: "read".into(),
+            args: serde_json::json!({}),
+            id: None,
+            thought_signature: None,
+        };
 
         assert_eq!(serde_json::to_value(event).unwrap()["kind"], "tool");
         let legacy = serde_json::from_value::<Event>(serde_json::json!({

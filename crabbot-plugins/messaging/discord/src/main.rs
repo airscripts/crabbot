@@ -484,6 +484,19 @@ async fn send_content(
                 result = upload(client, channel, uri, "audio", "", token, base).await?;
                 let _ = mime;
             }
+
+            Content::ToolCall { .. } => {
+                let text = item.render();
+
+                result = message(
+                    client,
+                    reqwest::Method::POST,
+                    format!("{base}/channels/{channel}/messages"),
+                    token,
+                    json!({"content": text}),
+                )
+                .await?;
+            }
         }
     }
 
@@ -1664,6 +1677,29 @@ mod tests {
         let invalid = Message::Text("not json".into());
 
         assert!(heartbeat(&invalid).is_err());
+    }
+
+    #[test]
+    fn covers_gateway_helpers_and_control_actions() {
+        assert_eq!(super::cursor_version(), 1);
+        assert_eq!(
+            gateway_url("https://discord.com/api/v10"),
+            "wss://gateway.discord.gg/?v=10&encoding=json"
+        );
+
+        assert_eq!(gateway_url("https://gateway.example"), "wss://gateway.example");
+        assert_eq!(gateway_url("http://gateway.example"), "ws://gateway.example");
+        assert_eq!(gateway_url("gateway.example"), "gateway.example");
+
+        assert!(matches!(
+            action(&json!({"op": 1, "d": {"heartbeat": true}})),
+            Action::Heartbeat(_)
+        ));
+
+        assert!(matches!(action(&json!({"op": 7})), Action::Reconnect));
+        assert!(matches!(action(&json!({"op": 9, "d": true})), Action::Reject { resumable: true }));
+        assert!(matches!(action(&json!({"op": 42})), Action::Ignore));
+        assert_eq!(chunks("😀ab", 2), vec!["😀a", "b"]);
     }
 
     #[tokio::test]

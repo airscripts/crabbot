@@ -12,7 +12,7 @@ help:
 	@printf '%s\n' '  clippy    Run Clippy with warnings denied'
 	@printf '%s\n' '  check     Type-check the workspace'
 	@printf '%s\n' '  test      Run workspace tests'
-	@printf '%s\n' '  coverage  Run the required 80% coverage gate'
+	@printf '%s\n' '  coverage  Run the required 80% coverage gate for every crate'
 	@printf '%s\n' '  build     Build the debug workspace'
 	@printf '%s\n' '  release   Build optimized binaries'
 	@printf '%s\n' '  metrics   Report source and test counts'

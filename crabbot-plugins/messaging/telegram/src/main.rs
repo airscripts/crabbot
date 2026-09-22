@@ -1116,6 +1116,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executes_channel_operations_against_a_bounded_api() {
+        let listener = match TcpListener::bind(("127.0.0.1", 0)).await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("listener failed: {error}"),
+        };
+
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await.unwrap();
+                let body = br#"{"ok":true,"result":{"message_id":1}}"#;
+
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{address}");
+
+        assert!(
+            call_with(&client, 1, "info".into(), json!({}), "token", &base)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        assert!(
+            call_with(
+                &client,
+                2,
+                "send".into(),
+                json!({"chat": 8, "text": "hello", "thread": "4"}),
+                "token",
+                &base,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+
+        assert!(
+            call_with(
+                &client,
+                3,
+                "edit".into(),
+                json!({"chat": 8, "message": 1, "text": "updated"}),
+                "token",
+                &base,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+
+        assert!(
+            call_with(
+                &client,
+                4,
+                "approval".into(),
+                json!({"chat": 8, "text": "Approve?", "approve": "allow", "deny": "deny"}),
+                "token",
+                &base,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+
+        assert!(
+            call_with(
+                &client,
+                5,
+                "callback".into(),
+                json!({"id": "callback", "text": "Done"}),
+                "token",
+                &base,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn bounds_channel_bodies() {
         use futures_util::stream;
 

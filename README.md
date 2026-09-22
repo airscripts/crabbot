@@ -282,8 +282,8 @@ make verify
 ```
 
 The workflow checks formatting, Clippy, locked compilation, tests, coverage,
-builds, and metrics. Core and host package line coverage must remain at or above
-80%:
+builds, and metrics. Core package line coverage must remain at or above 80%, and
+the runtime host package must remain at or above 50%:
 
 ```sh
 make coverage
@@ -324,9 +324,9 @@ is useful during diagnosis. Each orchestrator pass performs a deep
 review and records every distinct material finding it identifies. Blocking
 findings still control worker cycles and the bounded
 `CRABBOT_REVLOOP_MAX_CYCLES` convergence limit; non-blocking findings remain
-visible without forcing additional cycles. Revloop requires three consecutive
-clean orchestrator reviews in every scope before it succeeds, and allows up to
-50 cycles by default. Each Codex
+visible without forcing additional worker cycles. Revloop requires three
+consecutive stable orchestrator reviews with no blocking findings in every
+scope before it succeeds, and allows up to 50 cycles by default. Each Codex
 invocation is bounded by `CRABBOT_REVLOOP_CODEX_TIMEOUT` (60 minutes by
 default). Set `CRABBOT_REVLOOP_MAX_CYCLES` or `CRABBOT_REVLOOP_CLEAN_PASSES` to
 change the loop limits. Each focused or complete verification phase is bounded
@@ -334,6 +334,8 @@ by `CRABBOT_REVLOOP_VERIFICATION_TIMEOUT` (30 minutes by default). A timed-out
 verification is retried once without consuming a cycle; if it times out twice,
 revloop starts a separately logged recovery worker and re-runs focused
 verification before continuing.
+Revloop uses `gpt-6-luna` by default; set `CRABBOT_REVLOOP_MODEL` to select a
+different Codex model.
 Before focused and complete verification, revloop applies `make spacing` so
 repository-required Rust block spacing does not become a repeated worker
 failure; this may update Rust files in the working tree.

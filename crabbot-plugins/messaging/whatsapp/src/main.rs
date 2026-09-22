@@ -760,6 +760,19 @@ async fn send(app: &App, params: &Value) -> crabbot_core::Result<Value> {
                 Content::File { uri, name, mime } => {
                     send_media(app, &base, &token, chat, &uri, "document", mime.as_deref(), Some(&name)).await?
                 }
+
+                Content::ToolCall { .. } => graph(
+                    app,
+                    &format!("{base}/{}/messages", phone()?),
+                    &token,
+                    json!({
+                        "messaging_product": "whatsapp",
+                        "to": chat,
+                        "type": "text",
+                        "text": {"body": item.render()}
+                    }),
+                )
+                .await?,
             }
         }
     }

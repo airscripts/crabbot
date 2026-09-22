@@ -58,7 +58,7 @@ async fn run() -> crabbot_core::Result<()> {
 
     let output = terminal("w")?;
     let plugin = std::env::var("CRABBOT_MODEL_PLUGIN").unwrap_or_else(|_| "codex".into());
-    let model = std::env::var("CRABBOT_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+    let model = std::env::var("CRABBOT_MODEL").unwrap_or_else(|_| "gpt-6-luna".into());
     let home = std::env::var("CRABBOT_HOME").unwrap_or_else(|_| ".config/crabbot".into());
     run_at(input, output, home, plugin, model).await
 }

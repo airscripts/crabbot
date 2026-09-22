@@ -1331,6 +1331,8 @@ mod tests {
             std::env::temp_dir().join(format!("crabbot-signal-fetch-{}", std::process::id()));
 
         let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
         let value = signal_media_at(
             "+1000",
             "signal://attachment/7?recipient=KzEwMDA",
@@ -1373,12 +1375,16 @@ mod tests {
         fs::write(&oldest, b"oldest").unwrap();
         fs::write(&newest, b"newest").unwrap();
         let now = SystemTime::now();
-        fs::File::open(&expired)
+        OpenOptions::new()
+            .write(true)
+            .open(&expired)
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(now - MEDIA_TTL - Duration::from_secs(1)))
             .unwrap();
 
-        fs::File::open(&oldest)
+        OpenOptions::new()
+            .write(true)
+            .open(&oldest)
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(now - Duration::from_secs(2)))
             .unwrap();
@@ -1389,6 +1395,61 @@ mod tests {
         assert!(!oldest.exists());
         assert!(newest.exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_an_oversized_pending_event() {
+        let mut inbox = Inbox::default();
+        inbox.pending.push(Pending {
+            sequence: 1,
+            event: json!({"text": "x".repeat(crabbot_core::jsonl::MAX)}),
+        });
+
+        assert!(inbox.events(1).is_err());
+    }
+
+    #[test]
+    fn stops_before_an_event_that_would_exceed_the_frame_limit() {
+        let inbox = Inbox {
+            pending: vec![
+                Pending { sequence: 1, event: json!({"text": "small"}) },
+                Pending {
+                    sequence: 2,
+                    event: json!({"text": "x".repeat(crabbot_core::jsonl::MAX)}),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(inbox.events(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_full_inbox() {
+        let mut inbox = Inbox {
+            pending: (0..QUEUE_LIMIT)
+                .map(|sequence| Pending {
+                    sequence: sequence as u64,
+                    event: json!({"id": sequence}),
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        assert!(inbox.stage([json!({"id": "new"})]).is_err());
+    }
+
+    #[test]
+    fn rejects_an_oversized_staged_event() {
+        let mut inbox = Inbox::default();
+        let event = json!({"text": "x".repeat(crabbot_core::jsonl::MAX)});
+
+        assert!(inbox.stage([event]).is_err());
+    }
+
+    #[test]
+    fn rejects_an_acknowledgement_for_a_future_sequence() {
+        assert!(Inbox::default().acknowledge(1).is_err());
     }
 
     #[cfg(unix)]

@@ -26,7 +26,7 @@ async fn main() -> crabbot_core::Result<()> {
 
     serve_events(
         Hello {
-            protocol: Protocol::CURRENT,
+            protocol: Protocol { major: 0, minor: 1 },
             id: "codex".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             capabilities: vec![Capability::Model, Capability::Vision],
@@ -379,7 +379,7 @@ where
                 })?
             };
 
-            Ok(Event::Tool { name: tool.name, args })
+            Ok(Event::Tool { name: tool.name, args, id: None, thought_signature: None })
         })
         .collect::<crabbot_core::Result<Vec<_>>>()?;
 
@@ -487,7 +487,12 @@ fn response_body(
                         .as_str()
                         .and_then(|value| serde_json::from_str(value).ok())
                         .unwrap_or_else(|| call["function"]["arguments"].clone());
-                    Some(crabbot_core::types::Event::Tool { name, args })
+                    Some(crabbot_core::types::Event::Tool {
+                        name,
+                        args,
+                        id: None,
+                        thought_signature: None,
+                    })
                 })
                 .collect::<Vec<_>>()
         })

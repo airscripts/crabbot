@@ -69,8 +69,8 @@ pub fn run<M: Model, T: Tool>(
                 Event::Done { text: done } => text = done,
                 Event::Error { message } => return Err(Error::Denied(message)),
 
-                Event::Tool { name, args } => {
-                    calls.push((name, args));
+                Event::Tool { name, args, id, thought_signature } => {
+                    calls.push((name, args, id, thought_signature));
                     called = true;
                 }
             }
@@ -79,7 +79,8 @@ pub fn run<M: Model, T: Tool>(
         if called {
             let marker = calls
                 .iter()
-                .map(|(name, args)| format!("[Tool call {name}]: {args}"))
+                .filter(|(_, _, _, signature)| signature.is_none())
+                .map(|(name, args, _, _)| format!("[Tool call {name}]: {args}"))
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -88,12 +89,27 @@ pub fn run<M: Model, T: Tool>(
             }
 
             text.push_str(&marker);
+            let mut content = Vec::new();
+
+            if !text.is_empty() {
+                content.push(Content::Text { text: text.clone() });
+            }
+
+            content.extend(calls.iter().filter_map(|(name, args, id, signature)| {
+                signature.as_ref().map(|signature| Content::ToolCall {
+                    name: name.clone(),
+                    args: args.clone(),
+                    id: id.clone(),
+                    thought_signature: Some(signature.clone()),
+                })
+            }));
+
             history.push(Message {
                 id: format!("assistant-tool-{step}-{}", history.len()),
                 session: history.first().map_or_else(|| "session".into(), |m| m.session.clone()),
                 role: Role::Assistant,
                 sender: None,
-                content: vec![Content::Text { text: text.clone() }],
+                content,
             });
 
             if history.len() > LIMIT {
@@ -101,7 +117,7 @@ pub fn run<M: Model, T: Tool>(
             }
         }
 
-        for (name, args) in calls {
+        for (name, args, _id, _thought_signature) in calls {
             used = used.saturating_add(1);
 
             if used > CALLS {
@@ -169,7 +185,12 @@ mod tests {
             }
 
             self.count += 1;
-            Ok(vec![Event::Tool { name: "read".into(), args: serde_json::json!({"path": "note"}) }])
+            Ok(vec![Event::Tool {
+                name: "read".into(),
+                args: serde_json::json!({"path": "note"}),
+                id: None,
+                thought_signature: None,
+            }])
         }
     }
 
@@ -201,7 +222,12 @@ mod tests {
 
     impl Model for Flood {
         fn reply(&mut self, _: &[Message]) -> crate::Result<Vec<Event>> {
-            Ok(vec![Event::Tool { name: "read".into(), args: serde_json::json!({"path": "note"}) }])
+            Ok(vec![Event::Tool {
+                name: "read".into(),
+                args: serde_json::json!({"path": "note"}),
+                id: None,
+                thought_signature: None,
+            }])
         }
     }
 
@@ -246,13 +272,19 @@ mod tests {
         impl Model for Events {
             fn reply(&mut self, _: &[Message]) -> crate::Result<Vec<Event>> {
                 Ok(vec![
-                    Event::Tool { name: "read".into(), args: serde_json::json!({}) },
+                    Event::Tool {
+                        name: "read".into(),
+                        args: serde_json::json!({}),
+                        id: None,
+                        thought_signature: None,
+                    },
                     Event::Error { message: "event failed".into() },
                 ])
             }
         }
 
         assert!(turn(&mut Events, &[], 2).is_err());
+
         let reply = turn(&mut Echo, &[], 1).unwrap();
 
         assert_eq!(reply.session, "session");

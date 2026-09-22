@@ -304,13 +304,14 @@ impl Inbox {
         let pending = self.pending.remove(index);
 
         if pending.history
-            && let (Some(channel), Some(timestamp)) = (pending.channel, pending.timestamp)
-            && !self.cursors.contains_key(&channel)
+            && let (Some(channel), Some(timestamp)) =
+                (pending.channel.as_deref(), pending.timestamp.as_deref())
+            && !self.cursors.contains_key(channel)
         {
-            let current = self.channels.entry(channel).or_default();
+            let current = self.channels.entry(channel.to_owned()).or_default();
 
-            if slack_timestamp_after(&timestamp, current) {
-                *current = timestamp;
+            if slack_timestamp_after(timestamp, current) {
+                *current = timestamp.to_owned();
             }
         }
 
@@ -390,6 +391,10 @@ impl Inbox {
     }
 }
 
+fn socket_timestamp_seen(socket_events: &BTreeSet<String>, timestamp: &str) -> bool {
+    socket_events.contains(timestamp)
+}
+
 fn inbox_path() -> Option<PathBuf> {
     std::env::var_os("CRABBOT_HOME").map(|home| PathBuf::from(home).join("slack-inbox.json"))
 }
@@ -424,6 +429,7 @@ fn load_inbox() -> crabbot_core::Result<Inbox> {
     }
 
     inbox.next_sequence = inbox.next_sequence.max(1);
+
     Ok(inbox)
 }
 
@@ -745,7 +751,10 @@ async fn poll_at(
         let mut messages = Vec::new();
         let mut message_bytes = 2_usize;
         let mut history_complete = true;
-        let socket_events = app.inbox.lock().await.socket.get(channel).cloned().unwrap_or_default();
+        let socket_events = {
+            let inbox = app.inbox.lock().await;
+            inbox.socket.get(channel).cloned().unwrap_or_default()
+        };
 
         loop {
             let remaining = capacity.saturating_sub(messages.len()) as u64;
@@ -826,7 +835,7 @@ async fn poll_at(
                 continue;
             };
 
-            if socket_events.contains(timestamp) {
+            if socket_timestamp_seen(&socket_events, timestamp) {
                 continue;
             }
 
@@ -1436,6 +1445,7 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(modified))
             .unwrap();
+
         cleanup_media(&root);
 
         assert!(!expired.exists());
@@ -1461,14 +1471,17 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(3)))
             .unwrap();
+
         std::fs::File::open(&current)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(2)))
             .unwrap();
+
         std::fs::File::open(&newest)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(1)))
             .unwrap();
+
         cleanup_media_with_limits(&root, 5, 10);
 
         assert!(!oldest.exists());
@@ -1547,6 +1560,7 @@ mod tests {
 
         let root =
             std::env::temp_dir().join(format!("crabbot-slack-media-failed-{}", std::process::id()));
+
         let _ = std::fs::remove_dir_all(&root);
         let app = App {
             client: reqwest::Client::new(),
@@ -1591,6 +1605,7 @@ mod tests {
                 None,
             )
             .unwrap();
+
         assert_eq!(inbox.pending_event().unwrap()["gateway_sequence"], 1);
         inbox.acknowledge(1).unwrap();
         inbox.acknowledge(1).unwrap();
@@ -1600,7 +1615,7 @@ mod tests {
     }
 
     #[test]
-    fn socket_acknowledgement_does_not_advance_history_watermarks() {
+    fn socket_acknowledgement_persists_exact_history_deduplication_identity() {
         let mut inbox = Inbox::default();
         inbox
             .stage_socket(
@@ -1609,10 +1624,35 @@ mod tests {
                 "",
             )
             .unwrap();
+
         inbox.acknowledge(1).unwrap();
 
         assert!(!inbox.channels.contains_key("C1"));
         assert!(inbox.socket["C1"].contains("2.0"));
+        assert!(!socket_timestamp_seen(&inbox.socket["C1"], "1.0"));
+        assert!(socket_timestamp_seen(&inbox.socket["C1"], "2.0"));
+    }
+
+    #[test]
+    fn socket_identity_set_evicts_old_entries_at_its_bound() {
+        let mut inbox = Inbox::default();
+        inbox
+            .stage_socket(
+                [(json!({"id": "1.0", "chat": "C1"}), Some("C1".into()), Some("1.0".into()), None)],
+                &BTreeMap::new(),
+                "",
+            )
+            .unwrap();
+
+        inbox.acknowledge(1).unwrap();
+
+        for sequence in 2..=(SOCKET_EVENT_LIMIT + 1) {
+            inbox.remember_socket("C1", &format!("{sequence}.0"));
+        }
+
+        assert!(!inbox.socket["C1"].contains("1.0"));
+        assert!(!socket_timestamp_seen(&inbox.socket["C1"], "1.0"));
+        assert!(socket_timestamp_seen(&inbox.socket["C1"], "4097.0"));
     }
 
     #[test]
@@ -1633,6 +1673,7 @@ mod tests {
             inbox.fitting_count(&staged, &BTreeMap::new(), "C1", None, Some("older")).unwrap(),
             1
         );
+
         inbox.stage(staged, &BTreeMap::new(), "C1", None, Some("older")).unwrap();
 
         assert!(inbox.pending[0].event["content"].as_array().unwrap().is_empty());
@@ -1658,6 +1699,7 @@ mod tests {
                 None,
             )
             .unwrap();
+
         assert!(inbox.attachments.contains_key("F1"));
         inbox.acknowledge(1).unwrap();
 
@@ -1725,9 +1767,11 @@ mod tests {
                 )
                 .is_err()
         );
+
         let events = (0..17)
             .map(|_| (json!({"text": "x".repeat(1_000_000)}), None, None, None))
             .collect::<Vec<_>>();
+
         assert!(inbox.stage(events, &BTreeMap::new(), "C1", None, None).is_err());
         assert!(inbox.pending.is_empty());
     }
@@ -1870,6 +1914,7 @@ mod tests {
             .await
             .is_err()
         );
+
         server.await.unwrap();
     }
 
@@ -1973,6 +2018,7 @@ mod tests {
         history_succeeded(&state).await;
         let due =
             tokio::time::timeout(Duration::from_millis(100), pace_history(&state)).await.unwrap();
+
         assert!(!due);
     }
 
@@ -1985,12 +2031,14 @@ mod tests {
         let messages = (0..INBOX_LIMIT)
             .map(|id| json!({"ts": id.to_string(), "user": "U1", "text": "event"}))
             .collect::<Vec<_>>();
+
         let body = serde_json::to_vec(&json!({
             "ok":true,
             "messages":messages,
             "response_metadata":{"next_cursor":"older"}
         }))
         .unwrap();
+
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -2035,6 +2083,7 @@ mod tests {
             "response_metadata": {"next_cursor": "older"}
         }))
         .unwrap();
+
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -2088,6 +2137,7 @@ mod tests {
             "messages": [{"ts": "1.0", "user": "U1", "text": "hello"}],
             "response_metadata": {"next_cursor": "older"}
         }"#;
+
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();

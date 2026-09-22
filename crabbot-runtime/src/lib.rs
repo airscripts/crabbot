@@ -70,11 +70,14 @@ const TEXT_LIMIT: usize = 256 * 1024;
 const META_LIMIT: usize = 4 * 1024;
 const CONTENT_LIMIT: usize = 64;
 const CONTEXT_LIMIT: usize = 32 * 1024;
+const TOOL_ARGS_LIMIT: usize = 64 * 1024;
+const TOOL_CONTENT_LIMIT: usize = 2 * 1024 * 1024;
 const MANIFEST_LIMIT: u64 = 1024 * 1024;
 const LOCK_LIMIT: u64 = 8 * 1024 * 1024;
 const COMMAND_TIME: Duration = Duration::from_secs(120);
 const COMMAND_OUTPUT: usize = 2 * 1024 * 1024;
 const ACK_ATTEMPTS: u32 = 3;
+const TOOL_CALL_PROTOCOL_MINOR: u16 = 1;
 type PluginError = Box<dyn std::error::Error + Send + Sync>;
 type PluginControl = Result<Option<serde_json::Value>, PluginError>;
 type PluginTask = Pin<Box<dyn Future<Output = PluginControl> + Send>>;
@@ -638,7 +641,7 @@ struct ServiceRemove {
 struct SessionNew {
     #[arg(help = "Session identifier.")]
     id: String,
-    #[arg(long, default_value = "gpt-4o-mini", help = "Model identifier.")]
+    #[arg(long, default_value = "gpt-6-luna", help = "Model identifier.")]
     model: String,
 }
 
@@ -738,7 +741,7 @@ struct Id {
 struct Ask {
     #[arg(long, help = "Intelligence plugin identifier.")]
     plugin: Option<String>,
-    #[arg(long, default_value = "gpt-4o-mini", help = "Model identifier.")]
+    #[arg(long, default_value = "gpt-6-luna", help = "Model identifier.")]
     model: String,
     #[arg(help = "Prompt words.")]
     prompt: Vec<String>,
@@ -1659,8 +1662,16 @@ async fn model_at(
     let mut process = launch(root, path, &plugin, Some(Capability::Model), false, &config).await?;
     let result = async {
         let workspace = std::env::var_os("CRABBOT_ROOT").map(PathBuf::from);
-        let response =
-            process.call(model_request(2, &model, &messages, &[], workspace.as_deref())?).await?;
+        let response = process
+            .call(model_request(
+                2,
+                &model,
+                &messages,
+                &[],
+                workspace.as_deref(),
+                process.hello.protocol,
+            )?)
+            .await?;
         let value = response.result.ok_or_else(|| {
             response
                 .error
@@ -2376,7 +2387,7 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 async fn serve_at(root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel_id = std::env::var("CRABBOT_CHANNEL").unwrap_or_else(|_| "telegram".into());
     let model_id = std::env::var("CRABBOT_MODEL_PLUGIN").unwrap_or_else(|_| "codex".into());
-    let model = std::env::var("CRABBOT_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+    let model = std::env::var("CRABBOT_MODEL").unwrap_or_else(|_| "gpt-6-luna".into());
     serve_inner(root, &channel_id, &model_id, &model, false).await
 }
 
@@ -4295,7 +4306,7 @@ async fn resolve_media(
                 *uri = clip(resolved, META_LIMIT);
             }
 
-            Content::Text { .. } => {}
+            Content::Text { .. } | Content::ToolCall { .. } => {}
         }
     }
 
@@ -4672,6 +4683,9 @@ fn unavailable_image(alt: Option<String>) -> Content {
 
 fn bound(mut content: Vec<Content>) -> Vec<Content> {
     content.truncate(CONTENT_LIMIT);
+    content.retain(
+        |item| !matches!(item, Content::ToolCall { args, .. } if validate_tool_args(args).is_err()),
+    );
     let mut text = TEXT_LIMIT;
 
     for item in &mut content {
@@ -4695,6 +4709,12 @@ fn bound(mut content: Vec<Content>) -> Vec<Content> {
             Content::Audio { uri, mime } => {
                 *uri = clip(std::mem::take(uri), META_LIMIT);
                 *mime = mime.take().map(|value| clip(value, META_LIMIT));
+            }
+
+            Content::ToolCall { name, id, thought_signature, .. } => {
+                *name = clip(std::mem::take(name), META_LIMIT);
+                *id = id.take().map(|value| clip(value, META_LIMIT));
+                *thought_signature = thought_signature.take().map(|value| clip(value, META_LIMIT));
             }
         }
     }
@@ -5852,7 +5872,8 @@ async fn answer(
     };
 
     for step in 0..=TOOL_STEPS {
-        let request = model_request(*call, model, &messages, &specs, workspace)?;
+        let request =
+            model_request(*call, model, &messages, &specs, workspace, provider.hello.protocol)?;
         let mut notes = Vec::new();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
         let host_plugins = plugins.clone();
@@ -5995,15 +6016,15 @@ async fn answer(
             return Err("The turn exceeded the tool step limit.".into());
         }
 
-        let assistant_text = assistant(&parsed);
+        let assistant_content = model_content(&parsed)?;
 
-        if !assistant_text.is_empty() {
+        if !assistant_content.is_empty() {
             let assistant = Message {
                 id: format!("assistant-tool-{call}"),
                 session: session.into(),
                 role: Role::Assistant,
                 sender: None,
-                content: vec![Content::Text { text: assistant_text }],
+                content: assistant_content,
             };
 
             messages.push(assistant.clone());
@@ -6108,17 +6129,21 @@ fn model_request(
     messages: &[Message],
     tools: &[ToolSpec],
     workspace: Option<&Path>,
+    protocol: Protocol,
 ) -> Result<Request, Box<dyn std::error::Error + Send + Sync>> {
     let mut history = messages.to_vec();
 
     loop {
+        let request_messages =
+            if supports_tool_calls(protocol) { history.clone() } else { legacy_messages(&history) };
+
         let request = Request::call(
             call,
             "generate",
             serde_json::to_value(ModelRequest {
                 model: model.into(),
                 workspace: workspace.map(|path| path.to_string_lossy().into_owned()),
-                messages: history.clone(),
+                messages: request_messages,
                 stream: true,
                 tools: tools.to_vec(),
             })?,
@@ -6139,6 +6164,33 @@ fn model_request(
     }
 }
 
+fn supports_tool_calls(protocol: Protocol) -> bool {
+    protocol.major == Protocol::CURRENT.major && protocol.minor >= TOOL_CALL_PROTOCOL_MINOR
+}
+
+fn legacy_messages(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|message| Message {
+            id: message.id.clone(),
+            session: message.session.clone(),
+            role: message.role.clone(),
+            sender: message.sender.clone(),
+            content: message
+                .content
+                .iter()
+                .map(|content| match content {
+                    Content::ToolCall { name, args, .. } => {
+                        Content::Text { text: format!("[Tool call {name}]: {args}") }
+                    }
+
+                    content => content.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 fn assistant(reply: &ModelReply) -> String {
     let mut text = reply.text.clone();
 
@@ -6152,22 +6204,71 @@ fn assistant(reply: &ModelReply) -> String {
                 }
             }
 
-            Event::Tool { name, args } => {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-
-                text.push_str("[Tool call ");
-                text.push_str(name);
-                text.push_str("]: ");
-                text.push_str(&args.to_string());
-            }
+            Event::Tool { .. } => {}
 
             Event::Error { .. } => {}
         }
     }
 
     text
+}
+
+fn model_content(reply: &ModelReply) -> Result<Vec<Content>, &'static str> {
+    for event in &reply.events {
+        if let Event::Tool { name, args, id, thought_signature } = event {
+            validate_tool_args(args)?;
+            validate_tool_metadata(name, id.as_deref(), thought_signature.as_deref())?;
+        }
+    }
+
+    let mut content = Vec::new();
+    let text = assistant(reply);
+
+    if !text.is_empty() {
+        content.push(Content::Text { text });
+    }
+
+    content.extend(reply.events.iter().filter_map(|event| {
+        let Event::Tool { name, args, id, thought_signature } = event else {
+            return None;
+        };
+
+        Some(Content::ToolCall {
+            name: name.clone(),
+            args: args.clone(),
+            id: id.clone(),
+            thought_signature: thought_signature.clone(),
+        })
+    }));
+
+    if serde_json::to_vec(&content).is_ok_and(|value| value.len() <= TOOL_CONTENT_LIMIT) {
+        Ok(content)
+    } else {
+        Err("Tool content exceeds the size limit.")
+    }
+}
+
+fn validate_tool_args(args: &serde_json::Value) -> Result<(), &'static str> {
+    if serde_json::to_vec(args).is_ok_and(|value| value.len() <= TOOL_ARGS_LIMIT) {
+        Ok(())
+    } else {
+        Err("Tool arguments exceed the size limit.")
+    }
+}
+
+fn validate_tool_metadata(
+    name: &str,
+    id: Option<&str>,
+    thought_signature: Option<&str>,
+) -> Result<(), &'static str> {
+    if name.len() <= META_LIMIT
+        && id.is_none_or(|value| value.len() <= META_LIMIT)
+        && thought_signature.is_none_or(|value| value.len() <= META_LIMIT)
+    {
+        Ok(())
+    } else {
+        Err("Tool metadata exceeds the size limit.")
+    }
 }
 
 fn stream_event(note: Request) -> Option<Event> {
@@ -6433,6 +6534,10 @@ async fn host_tool(
     };
 
     let args = params.get("args").cloned().unwrap_or(serde_json::Value::Null);
+
+    if let Err(message) = validate_tool_args(&args) {
+        return Ok(Response::fail(id, -32602, message));
+    }
 
     let mut failed_tool = None;
     let output = match tokio::time::timeout_at(
@@ -9539,11 +9644,11 @@ mod tests {
         command_output_limited, commit_event, completion_name_from, crabfile_output_path,
         daemon_lock, default_crabfile_path, delivery_at, delivery_request, download, embedded,
         ensure_home, env_for, export_crabfile_at, generate_completion, import_crabfile_at, init_at,
-        installed_at, isolate_at, local_session, plugin_binary, read_manifest, reclaim_worktrees,
-        recover, recover_plugins, redact, resolve, restart_tool, revision, safe_archive,
-        send_params, send_request, service_at, service_at_with, service_environment_from,
-        service_path_value, service_text, session_at, stream_fits, tool, update_at,
-        validate_archive, verify_archive, write_debug_report_at,
+        installed_at, isolate_at, local_session, model_content, plugin_binary, read_manifest,
+        reclaim_worktrees, recover, recover_plugins, redact, resolve, restart_tool, revision,
+        safe_archive, send_params, send_request, service_at, service_at_with,
+        service_environment_from, service_path_value, service_text, session_at, stream_fits, tool,
+        update_at, validate_archive, verify_archive, write_debug_report_at,
     };
 
     use base64::Engine;
@@ -10707,7 +10812,7 @@ mod tests {
 
         let ask = super::Ask::try_parse_from(["ask", "hello"]).unwrap();
 
-        assert_eq!(ask.model, "gpt-4o-mini");
+        assert_eq!(ask.model, "gpt-6-luna");
         let cli = Cli::try_parse_from(["crabbot", "ask", "hello"]).unwrap();
 
         assert!(matches!(cli.command, Command::External(args) if args == vec!["ask", "hello"]));
@@ -10764,36 +10869,127 @@ mod tests {
     }
 
     #[test]
-    fn preserves_tool_calls_in_model_context() {
+    fn preserves_ordered_tool_calls_in_model_context() {
+        let reply = ModelReply {
+            text: String::new(),
+            stop: "tool".into(),
+            input: None,
+            output: None,
+            events: vec![
+                Event::Tool {
+                    name: "read".into(),
+                    args: serde_json::json!({"path": "note.txt"}),
+                    id: Some("call-1".into()),
+                    thought_signature: Some("sig-1".into()),
+                },
+                Event::Tool {
+                    name: "patch".into(),
+                    args: serde_json::json!({"path": "note.txt"}),
+                    id: Some("call-2".into()),
+                    thought_signature: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            model_content(&reply).unwrap(),
+            vec![
+                Content::ToolCall {
+                    name: "read".into(),
+                    args: serde_json::json!({"path": "note.txt"}),
+                    id: Some("call-1".into()),
+                    thought_signature: Some("sig-1".into()),
+                },
+                Content::ToolCall {
+                    name: "patch".into(),
+                    args: serde_json::json!({"path": "note.txt"}),
+                    id: Some("call-2".into()),
+                    thought_signature: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_tool_arguments_before_model_context() {
+        let args = serde_json::json!({"patch": "x".repeat(super::TOOL_ARGS_LIMIT)});
         let reply = ModelReply {
             text: String::new(),
             stop: "tool".into(),
             input: None,
             output: None,
             events: vec![Event::Tool {
-                name: "read".into(),
-                args: serde_json::json!({"path": "note.txt"}),
+                name: "patch".into(),
+                args: args.clone(),
+                id: None,
+                thought_signature: None,
             }],
         };
 
-        assert_eq!(assistant(&reply), "[Tool call read]: {\"path\":\"note.txt\"}");
+        assert_eq!(model_content(&reply), Err("Tool arguments exceed the size limit."));
     }
 
     #[test]
-    fn preserves_large_tool_arguments_in_model_context() {
-        let args = serde_json::json!({"patch": "x".repeat(super::META_LIMIT + 1)});
+    fn rejects_oversized_tool_metadata_before_model_context() {
+        for (name, id, thought_signature) in [
+            ("x".repeat(super::META_LIMIT + 1), None, None),
+            ("patch".into(), Some("x".repeat(super::META_LIMIT + 1)), None),
+            ("patch".into(), None, Some("x".repeat(super::META_LIMIT + 1))),
+        ] {
+            let reply = ModelReply {
+                text: String::new(),
+                stop: "tool".into(),
+                input: None,
+                output: None,
+                events: vec![Event::Tool {
+                    name,
+                    args: serde_json::json!({}),
+                    id,
+                    thought_signature,
+                }],
+            };
+
+            assert_eq!(model_content(&reply), Err("Tool metadata exceeds the size limit."));
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_tool_content_before_model_context() {
+        let args = serde_json::json!({
+            "patch": "x".repeat(super::TOOL_ARGS_LIMIT.saturating_sub(32))
+        });
+
         let reply = ModelReply {
             text: String::new(),
             stop: "tool".into(),
             input: None,
             output: None,
-            events: vec![Event::Tool { name: "patch".into(), args: args.clone() }],
+            events: (0..super::CONTENT_LIMIT)
+                .map(|index| Event::Tool {
+                    name: "patch".into(),
+                    args: args.clone(),
+                    id: Some(format!("call-{index}")),
+                    thought_signature: None,
+                })
+                .collect(),
         };
 
-        let rendered = assistant(&reply);
-        let (_, serialized) = rendered.split_once("]: ").unwrap();
+        assert_eq!(model_content(&reply), Err("Tool content exceeds the size limit."));
+    }
 
-        assert_eq!(serde_json::from_str::<serde_json::Value>(serialized).unwrap(), args);
+    #[test]
+    fn drops_accumulated_oversized_tool_arguments_from_bounded_content() {
+        let args = serde_json::json!({"patch": "x".repeat(super::TOOL_ARGS_LIMIT)});
+        let content = (0..super::CONTENT_LIMIT)
+            .map(|_| Content::ToolCall {
+                name: "patch".into(),
+                args: args.clone(),
+                id: None,
+                thought_signature: None,
+            })
+            .collect();
+
+        assert!(super::bound(content).is_empty());
     }
 
     #[test]
@@ -10884,14 +11080,17 @@ mod tests {
             sender: None,
             content: vec![Content::Text { text: "x".repeat(256 * 1024) }],
         }));
-        let request = super::model_request(1, "model", &messages, &[], None).unwrap();
+        let request =
+            super::model_request(1, "model", &messages, &[], None, Protocol::CURRENT).unwrap();
         let encoded = serde_json::to_vec(&request).unwrap();
 
         assert!(encoded.len() < crabbot_core::jsonl::MAX);
         let retained =
             serde_json::to_value(request).unwrap()["params"]["messages"].as_array().unwrap().len();
         assert!(retained < messages.len());
-        let request = super::model_request(1, "model", &messages, &[], None).unwrap();
+        let request =
+            super::model_request(1, "model", &messages, &[], None, Protocol::CURRENT).unwrap();
+
         let value = serde_json::to_value(request).unwrap();
         let retained = value["params"]["messages"].as_array().unwrap();
 
@@ -10906,7 +11105,9 @@ mod tests {
 
         let mut history = messages;
         history.push(current.clone());
-        let request = super::model_request(1, "model", &history, &[], None).unwrap();
+        let request =
+            super::model_request(1, "model", &history, &[], None, Protocol::CURRENT).unwrap();
+
         let value = serde_json::to_value(request).unwrap();
         let retained = value["params"]["messages"].as_array().unwrap();
 
@@ -10919,7 +11120,45 @@ mod tests {
             content: vec![Content::Text { text: "x".repeat(crabbot_core::jsonl::MAX) }],
         };
 
-        assert!(super::model_request(1, "model", &[current], &[], None).is_err());
+        assert!(
+            super::model_request(1, "model", &[current], &[], None, Protocol::CURRENT).is_err()
+        );
+    }
+
+    #[test]
+    fn supports_structured_tool_calls_in_protocol_01() {
+        let messages = [Message {
+            id: "assistant-tool".into(),
+            session: "test".into(),
+            role: Role::Assistant,
+            sender: None,
+            content: vec![Content::ToolCall {
+                name: "read".into(),
+                args: serde_json::json!({"path": "note.txt"}),
+                id: Some("call-1".into()),
+                thought_signature: Some("sig-1".into()),
+            }],
+        }];
+
+        let current =
+            super::model_request(1, "model", &messages, &[], None, Protocol::CURRENT).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(current).unwrap()["params"]["messages"][0]["content"][0]["kind"],
+            "tool_call"
+        );
+
+        let legacy =
+            super::model_request(1, "model", &messages, &[], None, Protocol { major: 0, minor: 0 })
+                .unwrap();
+
+        let legacy_content =
+            serde_json::to_value(legacy).unwrap()["params"]["messages"][0]["content"].clone();
+
+        assert_eq!(
+            legacy_content,
+            serde_json::json!([{"kind": "text", "text": "[Tool call read]: {\"path\":\"note.txt\"}"}])
+        );
     }
 
     #[test]

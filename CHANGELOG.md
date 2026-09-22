@@ -197,3 +197,12 @@ Semantic Versioning.
 - Added plugin byte restoration when lock persistence fails during updates or
   removal, and channel restarts after reply-delivery transport failures.
 - Added Rustls 0.23.45 as the release dependency baseline.
+- Added the supported `gemini-3.8-flash` Gemini default model and ignored the
+  host's generic `gpt-6-luna` fallback for Gemini workflows.
+- Added Gemini 3 thought-signature round-tripping for tool calls while
+  retaining compatibility with explicitly selected Gemini 2.x models.
+- Added structured tool calls and Gemini 3 thought-signature support within
+  the unreleased 0.1 plugin protocol.
+- Added `gpt-6-luna` as the default revloop model, with
+  `CRABBOT_REVLOOP_MODEL` available for overrides.
+- Added `gpt-6-luna` as the default model for new sessions and one-shot requests.

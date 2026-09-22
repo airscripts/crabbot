@@ -407,7 +407,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             let id = request.params["id"]
                 .as_str()
                 .ok_or_else(|| invalid("session.ensure.id is required."))?;
-            let model = request.params["model"].as_str().unwrap_or("gpt-4o-mini");
+            let model = request.params["model"].as_str().unwrap_or("gpt-6-luna");
             let mut sessions = state.sessions.lock().map_err(lock)?;
             sessions.ensure(id, model)?;
             json!({"id": id})
@@ -417,7 +417,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             let id = request.params["id"]
                 .as_str()
                 .ok_or_else(|| invalid("session.new.id is required."))?;
-            let model = request.params["model"].as_str().unwrap_or("gpt-4o-mini");
+            let model = request.params["model"].as_str().unwrap_or("gpt-6-luna");
             let mut sessions = state.sessions.lock().map_err(lock)?;
             sessions.create(id, model)?;
             json!({"id": id})
@@ -643,6 +643,16 @@ fn message_value(message: &Message) -> Value {
                 "kind": "audio",
                 "uri": super::clip(uri.clone(), DETAIL_LIMIT),
                 "mime": mime.as_ref().map(|value| super::clip(value.clone(), DETAIL_LIMIT)),
+            }),
+
+            Content::ToolCall { name, args, id, thought_signature } => json!({
+                "kind": "tool_call",
+                "name": super::clip(name.clone(), DETAIL_LIMIT),
+                "args": args,
+                "id": id.as_ref().map(|value| super::clip(value.clone(), SUMMARY_LIMIT)),
+                "thought_signature": thought_signature
+                    .as_ref()
+                    .map(|value| super::clip(value.clone(), DETAIL_LIMIT)),
             }),
         })
         .collect::<Vec<_>>();
@@ -1069,7 +1079,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
             dispatch(&IpcRequest::call(3, "secret", "session.get", json!({"id": "one"})), &state)
                 .unwrap();
 
-        assert_eq!(get.result.unwrap()["model"], "gpt-4o-mini");
+        assert_eq!(get.result.unwrap()["model"], "gpt-6-luna");
         let model = dispatch(
             &IpcRequest::call(
                 4,

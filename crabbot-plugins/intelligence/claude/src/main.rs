@@ -26,7 +26,7 @@ async fn main() -> crabbot_core::Result<()> {
 
     serve_events(
         Hello {
-            protocol: Protocol::CURRENT,
+            protocol: Protocol { major: 0, minor: 1 },
             id: "claude".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             capabilities: vec![Capability::Model, Capability::Vision],
@@ -318,7 +318,7 @@ where
                 })?
             };
 
-            Ok(Event::Tool { name: tool.name, args })
+            Ok(Event::Tool { name: tool.name, args, id: None, thought_signature: None })
         })
         .collect::<crabbot_core::Result<Vec<_>>>()?;
 
@@ -602,6 +602,8 @@ fn response_body(
             Some(crabbot_core::types::Event::Tool {
                 name: content["name"].as_str()?.into(),
                 args: content["input"].clone(),
+                id: content["id"].as_str().map(str::to_owned),
+                thought_signature: None,
             })
         })
         .collect::<Vec<_>>();

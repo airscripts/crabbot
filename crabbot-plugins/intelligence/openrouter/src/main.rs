@@ -28,7 +28,7 @@ async fn main() -> crabbot_core::Result<()> {
 
     serve_events(
         Hello {
-            protocol: Protocol::CURRENT,
+            protocol: Protocol { major: 0, minor: 1 },
             id: "openrouter".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             capabilities: vec![Capability::Model, Capability::Vision],
@@ -312,7 +312,7 @@ where
         .map(|(name, args)| {
             let args = if args.is_empty() { json!({}) } else { serde_json::from_str(&args)? };
 
-            Ok(Event::Tool { name, args })
+            Ok(Event::Tool { name, args, id: None, thought_signature: None })
         })
         .collect::<crabbot_core::Result<Vec<_>>>()?;
 
@@ -416,7 +416,7 @@ fn response_body(
                         .as_str()
                         .and_then(|value| serde_json::from_str(value).ok())
                         .unwrap_or_else(|| value["function"]["arguments"].clone());
-                    Some(Event::Tool { name, args })
+                    Some(Event::Tool { name, args, id: None, thought_signature: None })
                 })
                 .collect()
         })
@@ -732,5 +732,70 @@ mod tests {
         assert_eq!(response.result.unwrap()["text"], "ok");
         assert_eq!(events.recv().await.unwrap()["params"]["event"]["text"], "ok");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_provider_failures_and_oversized_results() {
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
+
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await.unwrap();
+                let body = br#"{"error":{"message":"nope"}}"#;
+
+                let header = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{address}");
+
+        assert!(super::complete(&client, 1, model(), "key", &base).await.is_err());
+
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let mut emitter = crabbot_core::plugin::Emitter::new(output);
+        let mut input = model();
+        input.stream = true;
+
+        assert!(super::stream(&client, 2, input, "key", &base, &mut emitter).await.is_err());
+
+        assert!(collect(stream::iter(vec![Err::<Vec<u8>, _>("broken")])).await.is_err());
+        assert!(response(1, json!({"payload": "x".repeat(crabbot_core::jsonl::MAX)})).is_err());
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn renders_non_image_content_and_rejects_invalid_configuration() {
+        let mut input = model();
+        input.messages[1].content = vec![
+            Content::Image {
+                uri: "https://cdn.example/image.png".into(),
+                alt: Some("diagram".into()),
+            },
+            Content::ToolCall {
+                name: "read".into(),
+                args: json!({"path": "README.md"}),
+                id: Some("call-1".into()),
+                thought_signature: None,
+            },
+        ];
+
+        let values = messages(&input).unwrap();
+
+        assert_eq!(values[1]["content"][0]["type"], "image_url");
+        assert_eq!(values[1]["content"][1]["text"], "[Tool call read]: {\"path\":\"README.md\"}");
+        assert!(base_url().is_ok());
+        assert!(credential().is_err());
     }
 }

@@ -13,6 +13,9 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 const BODY_LIMIT: usize = crabbot_core::jsonl::MAX / 2;
+const DEFAULT_MODEL: &str = "gemini-3.8-flash";
+const LEGACY_MODEL: &str = "gemini-2.5-flash";
+const HOST_DEFAULT_MODEL: &str = "gpt-6-luna";
 
 #[tokio::main]
 #[cfg(not(test))]
@@ -94,11 +97,7 @@ async fn generate_at(
     key: &str,
     base: &str,
 ) -> crabbot_core::Result<Option<Response>> {
-    let model = if input.model.trim().is_empty() || input.model == "default" {
-        "gemini-2.0-flash".into()
-    } else {
-        input.model.clone()
-    };
+    let model = effective_model(&input);
 
     let response = client
         .post(format!("{}/models/{}:generateContent", base.trim_end_matches('/'), model))
@@ -168,7 +167,12 @@ fn parse_reply(value: &Value) -> (String, Vec<Event>) {
         if let Some(call) = part.get("functionCall")
             && let Some(name) = call["name"].as_str()
         {
-            events.push(Event::Tool { name: name.into(), args: call["args"].clone() });
+            events.push(Event::Tool {
+                name: name.into(),
+                args: call["args"].clone(),
+                id: call["id"].as_str().map(str::to_owned),
+                thought_signature: part["thoughtSignature"].as_str().map(str::to_owned),
+            });
         }
     }
 
@@ -176,27 +180,31 @@ fn parse_reply(value: &Value) -> (String, Vec<Event>) {
 }
 
 fn request_body(input: &ModelRequest) -> crabbot_core::Result<Value> {
-    if requires_thought_signature(&input.model)
-        && (!input.tools.is_empty()
-            || input.messages.iter().any(|message| message.role == Role::Tool))
-    {
-        return Err(crabbot_core::Error::Denied(
-            "Gemini models requiring thought signatures do not support tool workflows.".into(),
-        ));
-    }
+    let model = effective_model(input);
+
+    let require_signature = requires_thought_signature(&model);
 
     let mut contents = Vec::new();
     let mut system = Vec::new();
     let mut calls = VecDeque::new();
+    let mut tool_parts = None;
+
+    let flush_tool_parts = |contents: &mut Vec<Value>, tool_parts: &mut Option<Vec<Value>>| {
+        if let Some(parts) = tool_parts.take() {
+            contents.push(json!({"role": "user", "parts": parts}));
+        }
+    };
 
     for message in &input.messages {
         if message.role == Role::System {
-            system.extend(message.content.iter().map(text_part));
+            flush_tool_parts(&mut contents, &mut tool_parts);
+            system.extend(message.content.iter().flat_map(content_parts));
             continue;
         }
 
         if message.role == Role::Assistant {
-            let (parts, found) = assistant_parts(message);
+            flush_tool_parts(&mut contents, &mut tool_parts);
+            let (parts, found) = assistant_parts(message, require_signature)?;
             calls.extend(found);
             contents.push(json!({"role": "model", "parts": parts}));
             continue;
@@ -216,6 +224,14 @@ fn request_body(input: &ModelRequest) -> crabbot_core::Result<Value> {
                 .or_else(|| matched.as_ref().map(|call| call.name.clone()))
                 .unwrap_or_else(|| "tool".into());
 
+            if matched.as_ref().is_some_and(|call| call.legacy) {
+                tool_parts.get_or_insert_with(Vec::new).push(json!({
+                    "text": format!("[Tool result {name}]: {}", rendered_content(&message.content)),
+                }));
+
+                continue;
+            }
+
             let mut response = json!({
                 "name": name,
                 "response": {"output": rendered_content(&message.content)},
@@ -225,15 +241,18 @@ fn request_body(input: &ModelRequest) -> crabbot_core::Result<Value> {
                 response["id"] = json!(id);
             }
 
-            contents.push(json!({"role": "user", "parts": [{"functionResponse": response}]}));
+            tool_parts.get_or_insert_with(Vec::new).push(json!({"functionResponse": response}));
             continue;
         }
 
+        flush_tool_parts(&mut contents, &mut tool_parts);
         contents.push(json!({
             "role": "user",
-            "parts": message.content.iter().map(text_part).collect::<Vec<_>>(),
+            "parts": message.content.iter().flat_map(content_parts).collect::<Vec<_>>(),
         }));
     }
+
+    flush_tool_parts(&mut contents, &mut tool_parts);
 
     let mut body = json!({"contents": contents});
 
@@ -253,25 +272,115 @@ fn request_body(input: &ModelRequest) -> crabbot_core::Result<Value> {
 }
 
 fn requires_thought_signature(model: &str) -> bool {
+    // Compatibility layer for Gemini 2.x transcripts. Remove this branch when
+    // Google no longer supports those models and all persisted histories have
+    // migrated to Gemini 3.x thought signatures.
     model.to_ascii_lowercase().starts_with("gemini-3")
+}
+
+fn effective_model(input: &ModelRequest) -> String {
+    if input.model.trim().is_empty()
+        || input.model == "default"
+        || input.model == HOST_DEFAULT_MODEL
+    {
+        if has_legacy_tool_history(input) {
+            return LEGACY_MODEL.into();
+        }
+
+        return DEFAULT_MODEL.into();
+    }
+
+    input.model.clone()
+}
+
+fn has_legacy_tool_history(input: &ModelRequest) -> bool {
+    input.messages.iter().any(|message| {
+        if message.role != Role::Assistant {
+            return false;
+        }
+
+        let mut saw_tool_call = false;
+
+        for content in &message.content {
+            match content {
+                Content::ToolCall { thought_signature, .. } => {
+                    if thought_signature.is_none() && !saw_tool_call {
+                        return true;
+                    }
+
+                    saw_tool_call = true;
+                }
+
+                Content::Text { text } => {
+                    for line in text.split_inclusive('\n') {
+                        let candidate = line.strip_suffix('\n').unwrap_or(line);
+                        let is_tool_call = candidate
+                            .strip_prefix("[Tool call ")
+                            .and_then(|value| {
+                                let (_, args) = value.split_once("]: ")?;
+                                serde_json::from_str::<Value>(args).ok()
+                            })
+                            .is_some();
+
+                        if is_tool_call {
+                            if !saw_tool_call {
+                                return true;
+                            }
+
+                            saw_tool_call = true;
+                        }
+                    }
+                }
+
+                _ => {}
+            }
+        }
+
+        false
+    })
 }
 
 #[derive(Debug)]
 struct FunctionCall {
     id: String,
     name: String,
+    legacy: bool,
 }
 
-fn text_part(content: &Content) -> Value {
+fn content_parts(content: &Content) -> Vec<Value> {
     match content {
-        Content::Text { text } => json!({"text": text}),
+        Content::Text { text } => vec![json!({"text": text})],
 
-        Content::Image { alt, .. } => {
-            json!({"text": alt.as_deref().unwrap_or("[Image attachment.]" )})
-        }
+        Content::Image { uri, alt } => image_part(uri).map_or_else(
+            || vec![json!({"text": alt.as_deref().unwrap_or("[Image attachment.]" )})],
+            |image| {
+                let mut parts = vec![image];
 
-        content => json!({"text": content.render()}),
+                if let Some(alt) = alt {
+                    parts.push(json!({"text": alt}));
+                }
+
+                parts
+            },
+        ),
+
+        content => vec![json!({"text": content.render()})],
     }
+}
+
+fn image_part(uri: &str) -> Option<Value> {
+    let (mime, data) = uri.strip_prefix("data:")?.split_once(";base64,")?;
+
+    if !matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp")
+        || data.is_empty()
+        || !data
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    {
+        return None;
+    }
+
+    Some(json!({"inlineData": {"mimeType": mime, "data": data}}))
 }
 
 fn rendered_content(content: &[Content]) -> String {
@@ -285,18 +394,53 @@ fn rendered_content(content: &[Content]) -> String {
         .join("\n")
 }
 
-fn assistant_parts(message: &crabbot_core::types::Message) -> (Vec<Value>, Vec<FunctionCall>) {
+fn assistant_parts(
+    message: &crabbot_core::types::Message,
+    require_signature: bool,
+) -> crabbot_core::Result<(Vec<Value>, Vec<FunctionCall>)> {
     let mut parts = Vec::new();
 
     let mut calls = Vec::new();
     let mut index = 0;
+    let mut saw_tool_call = false;
+    let mut legacy_turn = false;
 
     for content in &message.content {
+        if let Content::ToolCall { name, args, id, thought_signature } = content {
+            let legacy = require_signature
+                && (legacy_turn || (!saw_tool_call && thought_signature.is_none()));
+
+            let id = id.clone().unwrap_or_else(|| format!("{}-{index}", message.id));
+            index += 1;
+
+            if legacy {
+                parts.push(json!({"text": content.render()}));
+                calls.push(FunctionCall { id, name: name.clone(), legacy });
+                legacy_turn = true;
+                saw_tool_call = true;
+                continue;
+            }
+
+            let call = json!({"id": id, "name": name, "args": args});
+            let mut part = json!({"functionCall": call});
+
+            if require_signature && let Some(signature) = thought_signature {
+                part["thoughtSignature"] = json!(signature);
+            }
+
+            parts.push(part);
+            calls.push(FunctionCall { id, name: name.clone(), legacy });
+            saw_tool_call = true;
+            continue;
+        }
+
         let Content::Text { text: value } = content else {
-            parts.push(text_part(content));
+            parts.extend(content_parts(content));
             continue;
         };
 
+        // TODO(remove-gemini-2-compat): delete marker parsing once Gemini 2.x
+        // support and its persisted transcripts are no longer supported.
         let mut buffered = String::new();
 
         for line in value.split_inclusive('\n') {
@@ -309,6 +453,27 @@ fn assistant_parts(message: &crabbot_core::types::Message) -> (Vec<Value>, Vec<F
                 continue;
             };
 
+            if require_signature {
+                let id = format!("{}-{index}", message.id);
+                index += 1;
+
+                if !buffered.is_empty() {
+                    parts.push(json!({"text": buffered}));
+                    buffered.clear();
+                }
+
+                parts.push(json!({"text": candidate}));
+                calls.push(FunctionCall { id, name: name.into(), legacy: true });
+                legacy_turn = true;
+                saw_tool_call = true;
+
+                if line.ends_with('\n') {
+                    parts.push(json!({"text": "\n"}));
+                }
+
+                continue;
+            }
+
             if !buffered.is_empty() {
                 parts.push(json!({"text": buffered}));
                 buffered.clear();
@@ -316,8 +481,10 @@ fn assistant_parts(message: &crabbot_core::types::Message) -> (Vec<Value>, Vec<F
 
             let id = format!("{}-{index}", message.id);
             index += 1;
+
             parts.push(json!({"functionCall": {"id": id, "name": name, "args": args}}));
-            calls.push(FunctionCall { id, name: name.into() });
+            calls.push(FunctionCall { id, name: name.into(), legacy: false });
+            saw_tool_call = true;
         }
 
         if !buffered.is_empty() {
@@ -325,337 +492,8 @@ fn assistant_parts(message: &crabbot_core::types::Message) -> (Vec<Value>, Vec<F
         }
     }
 
-    (parts, calls)
+    Ok((parts, calls))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crabbot_core::types::Message;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    async fn loopback_listener() -> Option<tokio::net::TcpListener> {
-        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-            Ok(listener) => Some(listener),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
-            Err(error) => panic!("Could not bind the Gemini test listener: {error}."),
-        }
-    }
-
-    #[test]
-    fn builds_gemini_messages_and_tools() {
-        let request = ModelRequest {
-            model: "gemini-2.0-flash".into(),
-            workspace: None,
-            messages: vec![
-                Message {
-                    id: "system".into(),
-                    session: "s".into(),
-                    role: Role::System,
-                    sender: None,
-                    content: vec![Content::Text { text: "Be concise.".into() }],
-                },
-                Message {
-                    id: "user".into(),
-                    session: "s".into(),
-                    role: Role::User,
-                    sender: None,
-                    content: vec![Content::Image { uri: "file://image".into(), alt: None }],
-                },
-            ],
-            stream: false,
-            tools: vec![crabbot_core::types::ToolSpec {
-                name: "read".into(),
-                description: Some("Read a file.".into()),
-                schema: json!({"type": "object"}),
-            }],
-        };
-
-        let body = request_body(&request).unwrap();
-
-        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "Be concise.");
-        assert_eq!(body["contents"][0]["role"], "user");
-        assert_eq!(body["tools"][0]["functionDeclarations"][0]["name"], "read");
-
-        let mut input = request;
-        input.messages.push(Message {
-            id: "assistant-tool".into(),
-            session: "s".into(),
-            role: Role::Assistant,
-            sender: None,
-            content: vec![Content::Text {
-                text: "I will read it.\n[Tool call read]: {\"path\":\"README.md\"}".into(),
-            }],
-        });
-
-        input.messages.push(Message {
-            id: "tool".into(),
-            session: "s".into(),
-            role: Role::Tool,
-            sender: None,
-            content: vec![Content::Text { text: "content".into() }],
-        });
-
-        let body = request_body(&input).unwrap();
-
-        assert_eq!(body["contents"][1]["role"], "model");
-        assert_eq!(body["contents"][1]["parts"][0]["text"], "I will read it.\n");
-        assert_eq!(body["contents"][1]["parts"][1]["functionCall"]["name"], "read");
-        assert_eq!(body["contents"][1]["parts"][1]["functionCall"]["args"]["path"], "README.md");
-        assert_eq!(body["contents"][1]["parts"][1]["functionCall"]["id"], "assistant-tool-0");
-        assert_eq!(body["contents"][2]["role"], "user");
-        assert_eq!(body["contents"][2]["parts"][0]["functionResponse"]["name"], "read");
-        assert_eq!(body["contents"][2]["parts"][0]["functionResponse"]["id"], "assistant-tool-0");
-        assert_eq!(
-            body["contents"][2]["parts"][0]["functionResponse"]["response"]["output"],
-            "content"
-        );
-
-        input.messages.push(Message {
-            id: "media".into(),
-            session: "s".into(),
-            role: Role::User,
-            sender: None,
-            content: vec![
-                Content::Image { uri: "file://image".into(), alt: Some("alt".into()) },
-                Content::File {
-                    uri: "file://note".into(),
-                    name: "note.txt".into(),
-                    mime: Some("text/plain".into()),
-                },
-                Content::Audio { uri: "file://voice".into(), mime: None },
-            ],
-        });
-
-        let body = request_body(&input).unwrap();
-
-        assert_eq!(body["contents"][3]["parts"][0]["text"], "alt");
-        assert_eq!(body["contents"][3]["parts"][1]["text"], "[File: note.txt]");
-        assert_eq!(body["contents"][3]["parts"][2]["text"], "[Audio attachment.]");
-    }
-
-    #[test]
-    fn preserves_large_function_call_arguments() {
-        let args = json!({"patch": "x".repeat(4097)});
-        let input = ModelRequest {
-            model: "gemini-2.0-flash".into(),
-            workspace: None,
-            messages: vec![Message {
-                id: "assistant-large".into(),
-                session: "s".into(),
-                role: Role::Assistant,
-                sender: None,
-                content: vec![Content::Text { text: format!("[Tool call patch]: {args}") }],
-            }],
-            stream: false,
-            tools: Vec::new(),
-        };
-
-        let body = request_body(&input).unwrap();
-
-        assert_eq!(body["contents"][0]["parts"][0]["functionCall"]["args"], args);
-        assert_eq!(body["contents"][0]["parts"][0]["functionCall"]["id"], "assistant-large-0");
-    }
-
-    #[test]
-    fn rejects_gemini_three_tool_workflows_without_signatures() {
-        let request = ModelRequest {
-            model: "gemini-3-pro-preview".into(),
-            workspace: None,
-            messages: Vec::new(),
-            stream: false,
-            tools: vec![crabbot_core::types::ToolSpec {
-                name: "read".into(),
-                description: None,
-                schema: json!({"type": "object"}),
-            }],
-        };
-
-        let error = request_body(&request).unwrap_err();
-
-        assert!(error.to_string().contains("thought signatures"));
-    }
-
-    #[tokio::test]
-    async fn rejects_notes_and_unknown_calls_before_credentials() {
-        let client = reqwest::Client::new();
-
-        let note =
-            Request::Note { jsonrpc: "2.0".into(), method: "note".into(), params: json!({}) };
-
-        assert!(generate(&client, note).await.unwrap().is_none());
-        assert!(generate(&client, Request::call(1, "other", json!({}))).await.unwrap().is_none());
-        assert!(generate(&client, Request::call(1, "generate", json!("bad"))).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn validates_gemini_configuration_before_network_access() {
-        let client = reqwest::Client::new();
-        let request = ModelRequest {
-            model: "test".into(),
-            workspace: None,
-            messages: Vec::new(),
-            stream: false,
-            tools: Vec::new(),
-        };
-
-        assert!(
-            generate_configured(&client, 1, request.clone(), "key", "not a URL").await.is_err()
-        );
-
-        assert!(
-            generate_configured(&client, 1, request.clone(), "key", "http://example.com")
-                .await
-                .is_err()
-        );
-
-        assert!(
-            generate_configured(&client, 1, request, "key", "http://127.0.0.1:1").await.is_err()
-        );
-    }
-
-    #[test]
-    fn parses_text_and_function_calls() {
-        let value = json!({
-            "candidates": [{"content": {"parts": [
-                {"text": "I will read it."},
-                {"functionCall": {"name": "read", "args": {"path": "README.md"}}}
-            ]}}]
-        });
-
-        let (text, events) = parse_reply(&value);
-
-        assert_eq!(text, "I will read it.");
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0],
-            Event::Tool { name: "read".into(), args: json!({"path": "README.md"}) }
-        );
-
-        assert_eq!(parse_reply(&json!({})), (String::new(), Vec::new()));
-        assert_eq!(
-            parse_reply(&json!({"candidates": [{"content": {"parts": [
-                {"functionCall": {"args": {}}},
-                {}
-            ]}}]})),
-            (String::new(), Vec::new())
-        );
-    }
-
-    #[tokio::test]
-    async fn sends_a_bounded_request_and_parses_status() {
-        let Some(listener) = loopback_listener().await else {
-            return;
-        };
-
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).await.unwrap();
-            let body = br#"{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}"#;
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(header.as_bytes()).await.unwrap();
-            stream.write_all(body).await.unwrap();
-        });
-
-        let client = reqwest::Client::new();
-        let request = ModelRequest {
-            model: "test".into(),
-            workspace: None,
-            messages: Vec::new(),
-            stream: false,
-            tools: Vec::new(),
-        };
-
-        let response = generate_at(&client, 1, request, "key", &format!("http://{address}"))
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(response.result.unwrap()["text"], "ok");
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn rejects_an_oversized_response_before_parsing() {
-        let Some(listener) = loopback_listener().await else {
-            return;
-        };
-
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let body = vec![b'x'; BODY_LIMIT + 1];
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(header.as_bytes()).await.unwrap();
-            stream.write_all(&body).await.unwrap();
-        });
-
-        let request = ModelRequest {
-            model: "test".into(),
-            workspace: None,
-            messages: Vec::new(),
-            stream: false,
-            tools: Vec::new(),
-        };
-
-        assert!(
-            generate_at(&reqwest::Client::new(), 1, request, "key", &format!("http://{address}"),)
-                .await
-                .is_err()
-        );
-
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn rejects_failed_and_invalid_responses() {
-        for (status, body) in [
-            ("403 Forbidden", br#"{"error":"denied"}"#.as_slice()),
-            ("200 OK", br#"not-json"#.as_slice()),
-        ] {
-            let Some(listener) = loopback_listener().await else {
-                return;
-            };
-
-            let address = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let header = format!(
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                stream.write_all(header.as_bytes()).await.unwrap();
-                stream.write_all(body).await.unwrap();
-            });
-
-            let request = ModelRequest {
-                model: "test".into(),
-                workspace: None,
-                messages: Vec::new(),
-                stream: false,
-                tools: Vec::new(),
-            };
-
-            assert!(
-                generate_at(
-                    &reqwest::Client::new(),
-                    1,
-                    request,
-                    "key",
-                    &format!("http://{address}")
-                )
-                .await
-                .is_err()
-            );
-            server.await.unwrap();
-        }
-    }
-}
+mod tests;

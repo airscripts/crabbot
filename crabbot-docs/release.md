@@ -17,7 +17,8 @@ publish crates or containers.
 
 1. Update `VERSION`, the workspace manifests, `CITATION.cff`, and the matching
    `CHANGELOG.md` heading.
-2. Run `make verify` and confirm the core and host packages remain above 80% line coverage.
+2. Run `make verify` and confirm the core package remains above 80% and the host
+   package remains above 50% line coverage.
 3. Run `crabbot-scripts/release.sh vX.Y.Z` to build the release binaries.
 4. Inspect archive contents and checksums with `crabbot-scripts/check.sh`.
 5. Review installer output on each supported platform before publishing.

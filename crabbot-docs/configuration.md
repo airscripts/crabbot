@@ -130,6 +130,10 @@ All Crabbot configuration variables use the `CRABBOT_` prefix:
 | `CRABBOT_SANDBOX_RUNTIME` | Optional `docker`, `podman`, or `off` shell sandbox |
 | `CRABBOT_SANDBOX_IMAGE` | Locally available image used by the shell sandbox |
 
+The default model is `gpt-6-luna` when `CRABBOT_MODEL` is unset. When Gemini is
+selected, the Gemini plugin maps that host default to its own `gemini-3.8-flash`
+default.
+
 Operating-system variables such as `HOME`, `USERPROFILE`, `PATH`, and
 `XDG_CONFIG_HOME` retain their platform-defined names and are not Crabbot
 configuration. Tool-native variables used to constrain subprocesses, such as

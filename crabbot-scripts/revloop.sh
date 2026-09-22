@@ -20,7 +20,7 @@ CLEAN_PASSES="${CRABBOT_REVLOOP_CLEAN_PASSES:-$DEFAULT_CLEAN_PASSES}"
 CODEX_TIMEOUT="${CRABBOT_REVLOOP_CODEX_TIMEOUT:-$DEFAULT_CODEX_TIMEOUT}"
 VERIFICATION_TIMEOUT="${CRABBOT_REVLOOP_VERIFICATION_TIMEOUT:-$DEFAULT_VERIFICATION_TIMEOUT}"
 OUTPUT_MODE="${CRABBOT_REVLOOP_OUTPUT:-clean}"
-MODEL="${CRABBOT_REVLOOP_MODEL:-gpt-5.6-luna}"
+MODEL="${CRABBOT_REVLOOP_MODEL:-gpt-6-luna}"
 REASONING="${CRABBOT_REVLOOP_REASONING:-high}"
 GLOBAL_REVIEW=false
 
@@ -45,7 +45,7 @@ usage() {
     printf '%s\n' 'Use --global for a repository-wide audit.'
     printf '%s\n' 'Environment:'
     printf '%s\n' '  CRABBOT_CODEX_HOME=~/.codex'
-    printf '%s\n' '  CRABBOT_REVLOOP_MODEL=gpt-5.6-luna'
+    printf '%s\n' '  CRABBOT_REVLOOP_MODEL=gpt-6-luna'
     printf '%s\n' '  CRABBOT_REVLOOP_REASONING=high'
     printf '%s\n' '  CRABBOT_REVLOOP_MAX_CYCLES=50 CRABBOT_REVLOOP_OUTPUT=clean|verbose'
     printf '%s\n' '  CRABBOT_REVLOOP_CLEAN_PASSES=3.'
@@ -1393,17 +1393,12 @@ while (( cycle <= MAX_CYCLES )); do
 
     report_content="$(<"$review_file")"
 
-    if [[ "$report_content" != "$REVIEW_CLEAR" ]]; then
+    if has_blocking_findings "$review_file"; then
         clean_passes=0
-    fi
-
-    if [[ "$report_content" != "$REVIEW_CLEAR" ]]; then
         print_info "Orchestrator reported $(finding_count "$review_file") finding(s)."
     fi
 
-    if [[ "$report_content" == "$REVIEW_CLEAR" ]] || \
-        ! has_blocking_findings "$review_file"
-    then
+    if ! has_blocking_findings "$review_file"; then
         if [[ "$report_content" == "$REVIEW_CLEAR" ]]; then
             print_info "$REVIEW_CLEAR"
         else
@@ -1411,12 +1406,12 @@ while (( cycle <= MAX_CYCLES )); do
                 "No blocking findings remain; non-blocking findings are recorded in $review_file."
         fi
 
-        if [[ "$report_content" == "$REVIEW_CLEAR" && clean_passes -gt 0 && \
-            final_verification_pending -eq 0 ]]
+        if [[ "$report_content" == "$REVIEW_CLEAR" || clean_passes -gt 0 ]] && \
+            (( final_verification_pending == 0 ));
         then
             clean_passes=$((clean_passes + 1))
             print_info \
-                "Review remained clean ($clean_passes/$CLEAN_PASSES)."
+                "Review remained without blocking findings ($clean_passes/$CLEAN_PASSES)."
 
             if (( clean_passes >= CLEAN_PASSES )); then
                 print_info 'Review reached its clean stability threshold.'
@@ -1439,27 +1434,26 @@ while (( cycle <= MAX_CYCLES )); do
             cp "$final_log" "$RUN_DIR/latest-verification.log"
             pending_verification=''
             final_verification_pending=0
+            clean_passes=1
 
             if [[ "$report_content" == "$REVIEW_CLEAR" ]]; then
-                clean_passes=1
-
-                if (( clean_passes < CLEAN_PASSES )); then
-                    print_info \
-                        "Review is clean (1/$CLEAN_PASSES); starting a stability recheck."
-
-                    if (( cycle == MAX_CYCLES )); then
-                        report_exhausted "$review_file"
-                    fi
-
-                    cycle=$((cycle + 1))
-                    continue
-                fi
-
-                print_info 'Review reached its clean stability threshold.'
+                print_info "Review is clean (1/$CLEAN_PASSES); starting a stability recheck."
             else
-                print_info 'No blocking findings remain and final verification passed.'
+                print_info \
+                    "Review has no blocking findings (1/$CLEAN_PASSES); starting a stability recheck."
             fi
-            exit 0
+
+            if (( clean_passes >= CLEAN_PASSES )); then
+                print_info 'Review reached its clean stability threshold.'
+                exit 0
+            fi
+
+            if (( cycle == MAX_CYCLES )); then
+                report_exhausted "$review_file"
+            fi
+
+            cycle=$((cycle + 1))
+            continue
         else
             final_status=$?
         fi
@@ -1477,6 +1471,7 @@ while (( cycle <= MAX_CYCLES )); do
         copy_latest_verification "$final_log"
         pending_verification="$final_log"
         final_verification_pending=1
+        clean_passes=0
 
         print_info 'Final verification failure is being sent to a worker.'
 

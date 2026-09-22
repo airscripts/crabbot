@@ -306,6 +306,11 @@ fn prompt(messages: &[Message]) -> crabbot_core::Result<Vec<Value>> {
                     "type": "text",
                     "text": "[Audio attachment omitted.]\n"
                 })),
+
+                Content::ToolCall { .. } => output.push(json!({
+                    "type": "text",
+                    "text": format!("{}\n", content.render())
+                })),
             }
         }
     }
