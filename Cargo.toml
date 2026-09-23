@@ -49,7 +49,7 @@ ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2.6"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "io-std", "fs", "net", "process", "signal", "sync", "time"] }
