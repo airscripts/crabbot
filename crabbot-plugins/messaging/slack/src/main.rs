@@ -1376,6 +1376,19 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    fn set_modified(path: &Path, modified: SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+
     async fn loopback_listener() -> Option<tokio::net::TcpListener> {
         match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => Some(listener),
@@ -1441,10 +1454,7 @@ mod tests {
         std::fs::write(&current, b"current").unwrap();
         std::fs::write(&pinned, b"pinned").unwrap();
         let modified = SystemTime::now().checked_sub(MEDIA_TTL + Duration::from_secs(1)).unwrap();
-        std::fs::File::open(&expired)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(modified))
-            .unwrap();
+        set_modified(&expired, modified);
 
         cleanup_media(&root);
 
@@ -1467,20 +1477,9 @@ mod tests {
         std::fs::write(&newest, b"n").unwrap();
         std::fs::write(root.join("pinned/image.bin"), vec![b'x'; 100]).unwrap();
         let now = SystemTime::now();
-        std::fs::File::open(&oldest)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(3)))
-            .unwrap();
-
-        std::fs::File::open(&current)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(2)))
-            .unwrap();
-
-        std::fs::File::open(&newest)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(1)))
-            .unwrap();
+        set_modified(&oldest, now - Duration::from_secs(3));
+        set_modified(&current, now - Duration::from_secs(2));
+        set_modified(&newest, now - Duration::from_secs(1));
 
         cleanup_media_with_limits(&root, 5, 10);
 
@@ -1518,7 +1517,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("crabbot-slack-media-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             socket: Arc::new(Mutex::new(None)),
             attachments: Arc::new(Mutex::new(BTreeMap::new())),
             inbox: Arc::new(Mutex::new(Inbox::default())),
@@ -1563,7 +1562,7 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             socket: Arc::new(Mutex::new(None)),
             attachments: Arc::new(Mutex::new(BTreeMap::new())),
             inbox: Arc::new(Mutex::new(Inbox::default())),
@@ -1731,7 +1730,7 @@ mod tests {
         });
 
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             socket: Arc::new(Mutex::new(None)),
             attachments: Arc::new(Mutex::new(BTreeMap::new())),
             inbox: Arc::new(Mutex::new(Inbox::default())),
@@ -1797,7 +1796,7 @@ mod tests {
         });
 
         let value = api_at(
-            &reqwest::Client::new(),
+            &test_client(),
             "xoxb-test",
             "conversations.history",
             json!({"channel":"C1"}),
@@ -1842,7 +1841,7 @@ mod tests {
         });
 
         let value = send_at(
-            &reqwest::Client::new(),
+            &test_client(),
             "xoxb-test",
             &json!({"chat":"C1","text":"hello"}),
             &format!("http://{address}"),
@@ -1875,7 +1874,7 @@ mod tests {
         });
 
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             socket: Arc::new(Mutex::new(None)),
             attachments: Arc::new(Mutex::new(BTreeMap::new())),
             inbox: Arc::new(Mutex::new(Inbox::default())),
@@ -1904,15 +1903,9 @@ mod tests {
         });
 
         assert!(
-            api_at(
-                &reqwest::Client::new(),
-                "token",
-                "auth.test",
-                json!({}),
-                &format!("http://{address}")
-            )
-            .await
-            .is_err()
+            api_at(&test_client(), "token", "auth.test", json!({}), &format!("http://{address}"))
+                .await
+                .is_err()
         );
 
         server.await.unwrap();
@@ -1939,7 +1932,7 @@ mod tests {
         });
 
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             socket: Arc::new(Mutex::new(None)),
             attachments: Arc::new(Mutex::new(BTreeMap::new())),
             inbox: Arc::new(Mutex::new(Inbox::default())),
@@ -1979,7 +1972,7 @@ mod tests {
         });
 
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             socket: Arc::new(Mutex::new(None)),
             attachments: Arc::new(Mutex::new(BTreeMap::new())),
             inbox: Arc::new(Mutex::new(Inbox::default())),
@@ -2053,7 +2046,7 @@ mod tests {
         });
 
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             socket: Arc::new(Mutex::new(None)),
             attachments: Arc::new(Mutex::new(BTreeMap::new())),
             inbox: Arc::new(Mutex::new(Inbox::default())),
@@ -2098,7 +2091,7 @@ mod tests {
         });
 
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             socket: Arc::new(Mutex::new(None)),
             attachments: Arc::new(Mutex::new(BTreeMap::new())),
             inbox: Arc::new(Mutex::new(Inbox::default())),
@@ -2152,7 +2145,7 @@ mod tests {
         });
 
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             socket: Arc::new(Mutex::new(None)),
             attachments: Arc::new(Mutex::new(BTreeMap::new())),
             inbox: Arc::new(Mutex::new(Inbox::default())),
@@ -2196,7 +2189,7 @@ mod tests {
         });
 
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             socket: Arc::new(Mutex::new(None)),
             attachments: Arc::new(Mutex::new(BTreeMap::new())),
             inbox: Arc::new(Mutex::new(Inbox::default())),
@@ -2213,7 +2206,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_invalid_media_and_send_payloads() {
         let app = App {
-            client: reqwest::Client::new(),
+            client: test_client(),
             socket: Arc::new(Mutex::new(None)),
             attachments: Arc::new(Mutex::new(BTreeMap::new())),
             inbox: Arc::new(Mutex::new(Inbox::default())),
@@ -2221,9 +2214,7 @@ mod tests {
         };
 
         assert!(media(&app, "token", &json!({})).await.is_err());
-        assert!(
-            send_at(&reqwest::Client::new(), "token", &json!({}), "http://unused").await.is_err()
-        );
+        assert!(send_at(&test_client(), "token", &json!({}), "http://unused").await.is_err());
 
         assert!(
             remember_files(
