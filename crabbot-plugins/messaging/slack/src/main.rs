@@ -1397,6 +1397,35 @@ mod tests {
         }
     }
 
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+
+            assert_ne!(read, 0, "HTTP client closed before sending its request.");
+            request.extend_from_slice(&buffer[..read]);
+
+            let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                .unwrap_or(0);
+
+            if request.len() >= headers_end + 4 + content_length {
+                return;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn normalizes_text_and_rich_files() {
         let attachments = Arc::new(Mutex::new(BTreeMap::new()));
@@ -2179,6 +2208,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
             let body = br#"{"ok":false,"error":"ratelimited","retry_after":1}"#;
             let header = format!(
                 "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

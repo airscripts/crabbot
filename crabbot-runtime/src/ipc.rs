@@ -173,7 +173,11 @@ async fn capability_call(request: &IpcRequest, state: &State) -> IpcResponse {
 
     let (capability, allowed) = match service {
         "timer" => (Capability::Timer, ["add", "list", "remove"].as_slice()),
-        "memory" => (Capability::Memory, ["audit", "forget", "list", "remember"].as_slice()),
+        "memory" => (
+            Capability::Memory,
+            ["audit", "forget", "index", "learning", "list", "recall", "remember", "search"]
+                .as_slice(),
+        ),
 
         _ => {
             return IpcResponse::fail(

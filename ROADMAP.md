@@ -7,6 +7,9 @@ the public behavior stable.
 
 - Resolve all known high and medium reliability findings.
 - Improve recovery, cancellation, queue handling, persistence, and plugin updates.
+- Design and implement native Atomic Updates: validate a staged release before
+  promotion, preserve the previous version, and recover or roll back safely
+  across interruption and failed health checks.
 - Preserve stable JSON-RPC 0.x compatibility.
 - Keep core coverage above 80% and runtime host coverage above 50%.
 - Require clean dependency vulnerability audits.

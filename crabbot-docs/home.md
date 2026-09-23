@@ -49,5 +49,5 @@ make verify
 
 Tests use deterministic local fixtures. They do not call paid provider APIs.
 Before opening a pull request, update the relevant guide and run the complete
-verification workflow, including the 80% core and 50% host package line-coverage
-gates.
+verification workflow, including Linux package coverage gates and native core
+coverage checks on macOS and Windows x86_64.

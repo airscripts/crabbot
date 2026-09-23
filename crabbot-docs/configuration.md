@@ -66,7 +66,11 @@ without a person confirming each request.
 
 `CRABBOT_HOME` contains configuration, the plugin registry, credential
 references, durable session state, IPC markers, and a `workspace/` directory
-for Crabbot's global personal data and instructions. `init` creates
+for your Crabbot's global personal data and instructions. When the optional
+memory plugin is installed, it lazily creates `memory/` on its first saved
+record or learning-mode setting; no memory directory is created when the
+plugin is absent or unused.
+`init` creates
 `workspace/CRAB.md` and `workspace/CLAW.md`; Crabbot injects their current
 contents into each model turn alongside the persisted, bounded conversation.
 Changes to either file apply on the next turn. These files guide model behavior
@@ -99,7 +103,7 @@ All Crabbot configuration variables use the `CRABBOT_` prefix:
 | `CRABBOT_CHANNEL` | Default messaging plugin ID |
 | `CRABBOT_MODEL_PLUGIN` | Default intelligence plugin ID |
 | `CRABBOT_MODEL` | Default model identifier |
-| `CRABBOT_MEMORY` | Memory plugin persistence path |
+| `CRABBOT_MEMORY` | Override the optional memory plugin's JSON index path; Markdown records live beside it |
 | `CRABBOT_TIMER` | Timer plugin persistence path |
 | `CRABBOT_DB` | SQLite plugin database path |
 | `CRABBOT_MEDIA` | Private media cache directory |

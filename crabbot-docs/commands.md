@@ -13,6 +13,7 @@ crabbot plugin install <id> [source] [--revision <rev>] [--yes] [--json]
 crabbot plugin link <id> [folder] [--revision <rev>] [--yes] [--json]
 crabbot plugin update [--json]
 crabbot plugin remove <id> [--yes] [--json]
+crabbot memory <status|search|list|show|remember|edit|forget|audit|learning> [arguments...]
 crabbot session new <id> [--model <name>] [--json]
 crabbot session list [--json]
 crabbot session show <id> [--json]
@@ -124,9 +125,20 @@ unloads and reloads only processes that were active, without restarting the
 daemon; inactive plugins stay inactive.
 
 Plugin commands are registered by installed plugins. The Pi agent plugin
-registers `crabbot code`, the TUI plugin registers `crabbot tui`, and the Codex
-plugin registers `crabbot codex`; native commands always take precedence, and
-duplicate plugin command names are rejected during installation or update.
+registers `crabbot code`, the TUI plugin registers `crabbot tui`, the Codex
+plugin registers `crabbot codex`, and the memory plugin registers
+`crabbot memory`. Native commands always take precedence, and duplicate plugin
+command names are rejected during installation or update. Optional commands
+are available only when their plugin is installed.
+
+The memory command supports `status`, `search <text>`, `list`, `show <key>`,
+`remember <key> <text>`, `edit <key> <text>`, `forget <key>`, `audit`, and
+`learning <guided|autonomous>`. Use `--scope <id>` on supported operations to
+select a scope; JSON output is available through the global `--json` flag.
+Learning defaults to `guided`, where the agent stores a memory only after an
+explicit user request. `autonomous` lets it retain stable, useful facts while
+excluding secrets and sensitive inferences. These instructions do not override
+tool availability or channel policy.
 
 When an installed model plugin is available, Crabbot also registers the
 host-managed `crabbot ask` command. It accepts `--plugin <id>`, `--model
@@ -154,8 +166,8 @@ session. `/clear` removes the selected session's transcript when it is idle.
 `/timer remove <id>` inspect or remove reminders through authenticated daemon
 IPC. `/memory remember <key>=<value>`, `/memory list`, and `/memory forget
 <key>` manage memories scoped to the selected session through the same host
-contract. Entering the `remember` command explicitly approves a suggest-mode
-memory write. `/quit` and `/exit` close the terminal client.
+contract. Entering the `remember` command explicitly approves a guided memory
+write. `/quit` and `/exit` close the terminal client.
 
 `session list --json` returns bounded session summaries. Use `session show` for
 the transcript of one session; it renders a readable transcript by default and

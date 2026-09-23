@@ -1,5 +1,6 @@
 CARGO ?= cargo
 JOBS ?= 4
+COVERAGE_PROFILE ?= full
 .DEFAULT_GOAL := help
 .PHONY: help install hooks fmt spacing clippy check test coverage build release metrics ci revloop verify
 
@@ -11,8 +12,8 @@ help:
 	@printf '%s\n' '  spacing   Apply Rust block spacing'
 	@printf '%s\n' '  clippy    Run Clippy with warnings denied'
 	@printf '%s\n' '  check     Type-check the workspace'
-	@printf '%s\n' '  test      Run workspace tests'
-	@printf '%s\n' '  coverage  Run the required 80% coverage gate for every crate'
+	@printf '%s\n' '  test      Run all workspace tests without stopping at the first failure'
+	@printf '%s\n' '  coverage  Run all package tests and coverage gates, then summarize failures'
 	@printf '%s\n' '  build     Build the debug workspace'
 	@printf '%s\n' '  release   Build optimized binaries'
 	@printf '%s\n' '  metrics   Report source and test counts'
@@ -41,10 +42,10 @@ check:
 	CARGO_BUILD_JOBS=$(JOBS) $(CARGO) check --workspace --locked
 
 test:
-	CARGO_BUILD_JOBS=$(JOBS) $(CARGO) test --workspace --locked
+	CARGO_BUILD_JOBS=$(JOBS) $(CARGO) test --workspace --no-fail-fast --locked
 
 coverage:
-	bash crabbot-scripts/coverage.sh
+	bash crabbot-scripts/coverage.sh "$(COVERAGE_PROFILE)"
 
 build:
 	CARGO_BUILD_JOBS=$(JOBS) $(CARGO) build --workspace --locked

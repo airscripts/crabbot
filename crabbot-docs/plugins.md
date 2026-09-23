@@ -199,9 +199,17 @@ outbox, acknowledgements, and expiring event deduplication.
 Host outbox entries expose stable IDs and explicit uncertainty; plugins receive
 the ID with each send so operators can correlate a provider receipt.
 
-The memory plugin persists scoped records with `off`, `suggest`, and `auto`
-modes. Suggestion writes require explicit approval, and every write or delete
-is retained in the audit stream.
+The memory plugin persists scoped records with `guided` and `autonomous`
+learning modes. Guided learning is the default and saves only when the user
+explicitly asks; autonomous learning may retain stable, useful facts while
+excluding secrets and sensitive inferences. Both modes preserve audit history,
+and records can be listed, searched, edited, recalled, or forgotten through
+the registered `memory` command. Memory tools are exposed only when the plugin
+is installed and channel tool policy permits them. The plugin lazily creates
+`CRABBOT_HOME/memory/` on its first persisted setting or record;
+`CRABBOT_MEMORY` can override the JSON index path. Markdown record files are linked from the index,
+scoped by provider and conversation, and only a bounded summary is added to a
+model turn.
 
 The timer plugin persists one-shot and repeating tasks atomically. It validates
 five-field cron expressions and resolves IANA timezones through the system

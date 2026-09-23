@@ -82,7 +82,7 @@ Brand positioning:
   install/link/list/update/remove, session, delivery, service, export, validate,
   and import. The host-managed `ask` command appears when an installed model
   plugin can run; other optional commands are registered by plugins such as
-  `code`, `codex`, and `tui`. Human output is default; JSON and noninteractive
+  `code`, `codex`, `memory`, and `tui`. Human output is default; JSON and noninteractive
   confirmation are explicit.
 - TUI supports chat, sessions, model/workspace switching, approvals, timers,
   memory, plugin health, and streamed activity.
@@ -105,8 +105,11 @@ Brand positioning:
 - Whisper downloads local models separately and is CPU-first.
 - SQLite supplies WAL persistence, migrations, leases, deduplication, and
   durable outbox support.
-- Memory modes are off, suggest, and automatic; suggest is the default and
-  requires approval. Memories are scoped, auditable, editable, and deletable.
+- The optional memory plugin provides scoped, auditable, searchable, editable,
+  and deletable records. Guided learning is the default and saves only on an
+  explicit user request; autonomous learning retains stable, useful facts
+  without secrets or sensitive inferences. Its private `memory/` home is
+  created only after the plugin is installed and first used.
 - Scheduling supports one-shot reminders and cron prompts with IANA zones.
   Missed tasks default to skip-and-notify, with configurable once recovery.
 - Tools provide root-confined files, search, patches, Git status/diff/

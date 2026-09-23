@@ -285,12 +285,20 @@ make verify
 ```
 
 The workflow checks formatting, Clippy, locked compilation, tests, coverage,
-builds, and metrics. Core package line coverage must remain at or above 80%, and
-the runtime host package must remain at or above 50%:
+builds, and metrics. Linux CI requires at least 80% line coverage for every
+package, including the runtime host. Native macOS and Windows x86_64 coverage
+checks the CLI, core, filesystem, runtime, and daemon packages at 60% (40% for
+the runtime host). Windows ARM64 runs tests without coverage until its
+instrumentation is supported:
 
 ```sh
 make coverage
 ```
+
+Both `make test` and `make coverage` continue through the remaining test
+targets after a failure, then report the failures together. Use
+`make coverage COVERAGE_PROFILE=platform` to reproduce the focused native-core
+coverage profile locally.
 
 `make fmt` checks both `cargo fmt` and the repository spacing formatter. Use
 `cargo fmt --all` followed by `make spacing` to apply formatting, then rerun

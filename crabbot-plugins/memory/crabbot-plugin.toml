@@ -3,6 +3,11 @@ version = "0.1.0"
 capabilities = ["memory"]
 permissions = ["memory"]
 
+[[commands]]
+name = "memory"
+description = "Search and manage scoped agent memories."
+interactive = false
+
 [protocol]
 major = 0
 minor = 1

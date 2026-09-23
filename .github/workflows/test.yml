@@ -40,6 +40,9 @@ jobs:
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             coverage: true
+            coverage_profile: full
+            coverage_package_min: 80
+            coverage_runtime_min: 80
 
           - name: Linux aarch64
             os: linux
@@ -47,27 +50,39 @@ jobs:
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             coverage: true
+            coverage_profile: full
+            coverage_package_min: 80
+            coverage_runtime_min: 80
 
           - name: macOS x86_64
             os: macos
             arch: x86_64
             runner: macos-15-intel
             target: x86_64-apple-darwin
-            coverage: false
+            coverage: true
+            coverage_profile: platform
+            coverage_package_min: 60
+            coverage_runtime_min: 40
 
           - name: macOS aarch64
             os: macos
             arch: aarch64
             runner: macos-15
             target: aarch64-apple-darwin
-            coverage: false
+            coverage: true
+            coverage_profile: platform
+            coverage_package_min: 60
+            coverage_runtime_min: 40
 
           - name: Windows x86_64
             os: windows
             arch: x86_64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
-            coverage: false
+            coverage: true
+            coverage_profile: platform
+            coverage_package_min: 60
+            coverage_runtime_min: 40
 
           - name: Windows aarch64
             os: windows
@@ -105,11 +120,15 @@ jobs:
       - if: matrix.coverage
         name: Run Coverage
         shell: bash
-        run: bash crabbot-scripts/coverage.sh
+        env:
+          CRABBOT_COVERAGE_PACKAGE_MIN: ${{ matrix.coverage_package_min }}
+          CRABBOT_COVERAGE_RUNTIME_MIN: ${{ matrix.coverage_runtime_min }}
+
+        run: bash crabbot-scripts/coverage.sh "${{ matrix.coverage_profile }}"
 
       - if: matrix.coverage == false
         name: Run Workspace Tests
-        run: cargo test --workspace --locked --target "${{ matrix.target }}"
+        run: cargo test --workspace --no-fail-fast --locked --target "${{ matrix.target }}"
 
       - name: Check Unix Installer Inputs
         if: runner.os != 'Windows'

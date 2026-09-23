@@ -7,6 +7,17 @@ Semantic Versioning.
 
 ### Added
 
+- Made workspace test and coverage runs continue after failures and summarize
+  all failing packages at the end, so one broken crate does not hide later CI
+  failures.
+- Added native macOS and Windows x86_64 coverage checks for the CLI, core,
+  filesystem, runtime, and daemon packages, with 60% line coverage for those
+  packages and 40% for the runtime host; Linux requires 80% for every package.
+  Windows ARM64 remains test-only while coverage instrumentation is unsupported.
+- Added optional scoped memory learning with guided and autonomous modes, a
+  bounded per-conversation memory index, editable Markdown records, and a
+  plugin-registered `memory` command. The memory home is created only when the
+  installed plugin first persists a learning setting or record.
 - Added a global Crabbot workspace with editable `CRAB.md` identity and
   `CLAW.md` behavior instructions, loaded into each model turn alongside the
   bounded conversation; the workspace is the default confined tool root.
