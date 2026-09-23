@@ -64,11 +64,20 @@ without a person confirming each request.
 
 ## Paths
 
-`CRABBOT_HOME` contains configuration, the plugin registry, credentials
-references, durable session state, and IPC markers. `CRABBOT_ROOT` is the
-workspace exposed to file and search tools. Tool paths are canonicalized and
-must remain below this root; leave it unset to keep filesystem tools
-unavailable.
+`CRABBOT_HOME` contains configuration, the plugin registry, credential
+references, durable session state, IPC markers, and a `workspace/` directory
+for Crabbot's global personal data and instructions. `init` creates
+`workspace/CRAB.md` and `workspace/CLAW.md`; Crabbot injects their current
+contents into each model turn alongside the persisted, bounded conversation.
+Changes to either file apply on the next turn. These files guide model behavior
+but cannot grant capabilities or override host policy.
+
+`CRABBOT_ROOT` is the workspace exposed to file and search tools. If unset, it
+defaults to `CRABBOT_HOME/workspace`; setting it selects a different root.
+Session workspace selection can further override the root for that session.
+Tool paths are canonicalized and must remain below the active root. A root by
+itself does not enable tools: channel `tools = true` and daemon approvals are
+still required, and shell remains separately disabled by default.
 
 Provider and channel plugins read declared secrets from their own environment
 variables or from the JSON file named by `CRABBOT_CREDENTIALS`. The file must
@@ -83,8 +92,8 @@ All Crabbot configuration variables use the `CRABBOT_` prefix:
 
 | Variable | Purpose |
 | --- | --- |
-| `CRABBOT_HOME` | Crabbot state and plugin directory |
-| `CRABBOT_ROOT` | Workspace exposed to file and search tools |
+| `CRABBOT_HOME` | Crabbot state, plugins, and global agent workspace |
+| `CRABBOT_ROOT` | Override the default `CRABBOT_HOME/workspace` tool root |
 | `CRABBOT_CREDENTIALS` | Protected JSON credential file |
 | `CRABBOT_KEYRING` | Set to `1` to use the operating-system keyring |
 | `CRABBOT_CHANNEL` | Default messaging plugin ID |
@@ -188,11 +197,11 @@ crabbot service status
 ```
 
 `doctor` is read-only unless `--fix` is supplied. Use `crabbot doctor --fix` to
-create a missing default configuration or plugins directory; existing config
-and plugin files are not overwritten. If a provider is missing, install or
-link its plugin and run `crabbot doctor` again. If a channel is silent, verify
-its token, plugin status, `allow` list,
-mention filter, and daemon logs. If tools are unavailable, check `CRABBOT_ROOT`,
+create missing safe defaults, including the workspace and instruction files;
+existing config and instruction files are not overwritten. If a provider is
+missing, install or link its plugin and run `crabbot doctor` again. If a channel
+is silent, verify its token, plugin status, `allow` list, mention filter, and
+daemon logs. If tools are unavailable, check `CRABBOT_ROOT`,
 `tools = true`, and that approval is set to `prompt` or `auto`.
 When the daemon is stopped, session commands may use the locked offline store;
 stale IPC marker files do not establish daemon ownership.

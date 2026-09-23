@@ -65,6 +65,12 @@ and the daemon process remains running.
 
 ## Turn Flow
 
+The host reads `CRABBOT_HOME/workspace/CRAB.md` and `CLAW.md` as bounded system
+context at the start of each turn. It appends the session's bounded transcript
+after that context; the instruction text is not stored in the transcript, so
+file edits take effect on the next turn. The host does not inject `AGENTS.md`
+into general Crabbot requests.
+
 1. A channel plugin polls its provider and normalizes an external update into
    an event with stable IDs, sender data, room scope, text, and attachments.
 2. The daemon checks channel policy, advances the channel offset, and records

@@ -3,7 +3,7 @@
 ```text
 crabbot help
 crabbot --version
-crabbot init [--force] [--json]
+crabbot init [--force] [--yes] [--json]
 crabbot doctor [--fix] [--json]
 crabbot status [--json]
 crabbot version [--json]
@@ -179,18 +179,33 @@ crabbot doctor
 crabbot-daemon
 ```
 
-`init` creates the home directory and starter configuration without starting
-the daemon. If the home directory already exists, it reports that Crabbot is
-already initialized and leaves existing state unchanged. Pass `--force` to
-recreate the default configuration while preserving installed plugins and
-runtime state. `doctor` is read-only by default and validates configuration,
-plugin manifests, protocol compatibility, credentials, and local state. Pass
-`doctor --fix` to create missing safe local state, such as the default config
-or plugins directory; it never overwrites an existing config or repairs plugin
-binaries. Plain human output ends with a health summary; unhealthy output
-suggests `crabbot doctor --fix`. `doctor --fix` reports only the repairs
-performed in both human and JSON output; regular `doctor --json` includes the
-full structured result and `health` object. `crabbot-daemon` keeps
+`init` creates the home directory, starter configuration, and
+`workspace/CRAB.md` and `workspace/CLAW.md` instruction templates without
+starting the daemon. Edit those files manually: `CRAB.md` defines Crabbot's
+identity and communication style; `CLAW.md` defines behavioral guidance and
+workflows. If the home directory already exists, `init` reports that Crabbot
+is already initialized and leaves it unchanged. `doctor --fix` can seed any
+missing safe local state, including the workspace and instruction files.
+
+`init --force` resets all Crabbot home data, including configuration, plugins,
+sessions, workspace data, and edited instructions. It prompts for confirmation;
+use `init --force --yes` for a non-interactive reset. Stop the daemon first.
+The reset has no backup. Do not use `--yes` without `--force`.
+
+The default file-tool root is `CRABBOT_HOME/workspace`; set `CRABBOT_ROOT` to
+use a different root. This does not enable tools: channel `tools = true` and
+the daemon approval policy are still required, and shell execution remains
+separately disabled by default. Crabbot loads the two instruction files on each
+turn alongside the bounded saved conversation. It does not load workspace
+`AGENTS.md` into its own prompt; delegated coding agents may use those files.
+
+`doctor` is read-only by default and validates configuration, plugin manifests,
+protocol compatibility, credentials, and local state. Pass `doctor --fix` to
+create missing safe local state; it never overwrites an existing config or
+repairs plugin binaries. Plain human output ends with a health summary;
+unhealthy output suggests `crabbot doctor --fix`. `doctor --fix` reports only
+the repairs performed in both human and JSON output; regular `doctor --json`
+includes the full structured result and `health` object. `crabbot-daemon` keeps
 the daemon in the foreground so service managers and operators can observe its
 diagnostics. Use `crabbot service install` only after the foreground flow is
 healthy.

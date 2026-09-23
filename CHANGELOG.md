@@ -7,6 +7,12 @@ Semantic Versioning.
 
 ### Added
 
+- Added a global Crabbot workspace with editable `CRAB.md` identity and
+  `CLAW.md` behavior instructions, loaded into each model turn alongside the
+  bounded conversation; the workspace is the default confined tool root.
+- Made `init --force` a confirmed full-home reset requiring `--yes` for
+  non-interactive use, and extended `doctor --fix` to seed missing workspace
+  instruction files without overwriting user edits.
 - Added safe, repeatable `crabbot init` behavior with explicit `--force`
   reinitialization and a friendly first-run completion message.
 - Added crash-safe Signal inbound acknowledgement and bounded attachment

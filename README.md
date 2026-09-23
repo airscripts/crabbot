@@ -186,12 +186,15 @@ The Codex app-server owns token storage and refresh. Teams and unattended
 services should use an OpenAI API key. Codex CLI is only required for personal
 Codex sign-in; it is not required for API-key authentication or other providers.
 
-Set `CRABBOT_HOME` to keep state in a dedicated directory. File tools remain
-inside `CRABBOT_ROOT`; shell tools are disabled by default. Group turns use
-isolated Git worktrees when possible. Enable channel tools only with
-`tools = true` and daemon approvals enabled. Group chats require an explicit
-allowlist; mention, owner, admin, member, topic, and thread filters are
-available for Telegram and Discord.
+Set `CRABBOT_HOME` to keep state in a dedicated directory. `crabbot init`
+creates a private `workspace/` with editable `CRAB.md` personality and
+`CLAW.md` behavior instructions; both are supplied to every model turn while
+conversation history remains in the session transcript. The default file-tool
+root is this workspace; set `CRABBOT_ROOT` to override it. Tools still require
+explicit channel configuration and approvals, and shell tools are disabled by
+default. Group turns use isolated Git worktrees when possible. Group chats
+require an explicit allowlist; mention, owner, admin, member, topic, and thread
+filters are available for Telegram and Discord.
 
 Use `crabbot service install` followed by `crabbot service start` to activate
 the native service. Existing definitions require

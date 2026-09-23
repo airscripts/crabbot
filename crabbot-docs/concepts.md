@@ -18,6 +18,21 @@ and a selected model. Session IDs combine the channel and chat identity so two
 platforms cannot accidentally share history. A session processes one turn at a
 time; later messages wait in its bounded queue.
 
+## Agent Instructions And Conversation Context
+
+Crabbot's global workspace is `CRABBOT_HOME/workspace`. `CRAB.md` defines its
+identity and communication style; `CLAW.md` defines behavioral guidance and
+workflows. The runtime reads both as system context for every user turn,
+including resumed sessions and internal tool-loop requests. It does not copy
+their contents into the saved transcript, so edits apply on the next turn.
+Conversation history remains available as a bounded transcript and may be
+compacted when limits require it. Crabbot does not load `AGENTS.md` for itself;
+coding agents it delegates to may use workspace `AGENTS.md` instructions.
+
+These Markdown files guide the model but do not grant capabilities. The host
+continues to enforce workspace confinement, channel tool settings, approvals,
+and shell policy.
+
 ## Turns
 
 The core turn loop alternates model replies and tool calls until the model

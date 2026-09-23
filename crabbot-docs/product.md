@@ -90,9 +90,10 @@ Brand positioning:
   runs per session; later messages queue; stop cancels. Bounds cover steps,
   time, and tokens. Crashes interrupt turns and mutating tools are never
   replayed.
-- Context includes persona, workspace AGENTS.md, selected skills and prompts,
-  scoped memory, transcript, and summaries. Raw text history remains until
-  deletion.
+- `CRABBOT_HOME/workspace/CRAB.md` defines Crabbot's identity and communication
+  style; `CLAW.md` defines behavioral guidance and workflows. Both are loaded
+  into every model turn alongside the bounded session transcript. Crabbot does
+  not load `AGENTS.md` itself; delegated coding agents may use it.
 - Telegram uses long polling by default; Discord uses Gateway. Support DMs,
   allowlisted Telegram topics, Discord channels/threads, mention-only groups,
   owner/admin/member roles, and signed expiring approvals.

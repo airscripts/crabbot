@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
 
+#[path = "crabbot-templates/mod.rs"]
+mod crabbot_templates;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
-    io::{Read, Write},
+    io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
     pin::Pin,
     process::{ExitCode, Stdio},
@@ -487,7 +490,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    #[command(about = "Initialize the Crabbot home directory and configuration.")]
+    #[command(about = "Initialize Crabbot configuration and its global workspace.")]
     Init(InitArgs),
     #[command(about = "Check configuration, plugins, credentials, and local state.")]
     Doctor(DoctorArgs),
@@ -677,8 +680,10 @@ struct Output {
 
 #[derive(Debug, Args)]
 struct InitArgs {
-    #[arg(long, help = "Recreate the default Crabbot configuration.")]
+    #[arg(long, help = "Reset all Crabbot home data and recreate its defaults.")]
     force: bool,
+    #[arg(long, help = "Confirm the destructive reset without prompting.")]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1181,7 +1186,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let json = cli.json;
 
     match cli.command {
-        Command::Init(args) => init(args.force, json)?,
+        Command::Init(args) => init(args.force, args.yes, json)?,
         Command::Doctor(args) => doctor(args.fix, json)?,
         Command::Status(output) => status_command(output.json || json).await?,
         Command::Version(output) => version(output.json || json),
@@ -1637,7 +1642,10 @@ async fn generate_at(
     };
 
     let plugin = ask.plugin.ok_or("An intelligence plugin is required to ask Crabbot.")?;
-    Ok(model_at(plugin, ask.model, root, vec![message]).await?.text)
+    let mut messages = context_at("cli", &root.join("workspace"));
+    messages.push(message);
+
+    Ok(model_at(plugin, ask.model, root, messages).await?.text)
 }
 
 async fn model_at(
@@ -1661,14 +1669,14 @@ async fn model_at(
 
     let mut process = launch(root, path, &plugin, Some(Capability::Model), false, &config).await?;
     let result = async {
-        let workspace = std::env::var_os("CRABBOT_ROOT").map(PathBuf::from);
+        let workspace = workspace_root_at(root);
         let response = process
             .call(model_request(
                 2,
                 &model,
                 &messages,
                 &[],
-                workspace.as_deref(),
+                Some(&workspace),
                 process.hello.protocol,
             )?)
             .await?;
@@ -2319,12 +2327,24 @@ fn home() -> PathBuf {
     })
 }
 
-fn workspace_root() -> PathBuf {
-    std::env::var_os("CRABBOT_ROOT").map_or_else(|| PathBuf::from("."), PathBuf::from)
+fn workspace_root_at(home_root: &Path) -> PathBuf {
+    std::env::var_os("CRABBOT_ROOT").map_or_else(|| home_root.join("workspace"), PathBuf::from)
 }
 
-fn init(force: bool, json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn workspace_root() -> PathBuf {
+    workspace_root_at(&home())
+}
+
+fn init(
+    force: bool,
+    yes: bool,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let root = home();
+
+    validate_init_flags(force, yes)?;
+
+    let reset_existing = force && root.exists();
 
     if root.exists() && !force {
         if json {
@@ -2343,7 +2363,33 @@ fn init(force: bool, json: bool) -> Result<(), Box<dyn std::error::Error + Send 
         return Ok(());
     }
 
-    init_at_with_force(&root, force)?;
+    if reset_existing && !yes {
+        if !std::io::stdin().is_terminal() {
+            return Err("Resetting Crabbot requires --yes when input is not a terminal.".into());
+        }
+
+        eprint!(
+            "This permanently deletes all Crabbot state, plugins, sessions, workspace data, and instructions at {}. Continue? [y/N] ",
+            root.display()
+        );
+
+        std::io::stderr().flush()?;
+
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+
+        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
+            if json {
+                println!("{}", serde_json::json!({"home": root, "status": "cancelled"}));
+            } else {
+                println!("Crabbot reset cancelled.");
+            }
+
+            return Ok(());
+        }
+    }
+
+    init_at_with_force(&root, reset_existing)?;
 
     if json {
         println!(
@@ -2361,6 +2407,14 @@ fn init(force: bool, json: bool) -> Result<(), Box<dyn std::error::Error + Send 
     Ok(())
 }
 
+fn validate_init_flags(force: bool, yes: bool) -> Result<(), &'static str> {
+    if yes && !force {
+        return Err("init --yes requires --force.");
+    }
+
+    Ok(())
+}
+
 fn init_at(root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_at_with_force(root, false)
 }
@@ -2369,15 +2423,156 @@ fn init_at_with_force(
     root: &Path,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    std::fs::create_dir_all(root.join("plugins"))?;
-    let path = root.join("config.toml");
-
-    if force || !path.exists() {
-        let config = toml::to_string_pretty(&Config::default())?;
-        secure(&path, config.as_bytes())?;
+    if force && root.exists() {
+        reset_home(root)?;
+        return Ok(());
     }
 
+    initialize_home(root, false)?;
+
     Ok(())
+}
+
+fn initialize_home(root: &Path, force_config: bool) -> std::io::Result<()> {
+    ensure_real_directory(root)?;
+    ensure_real_directory(&root.join("plugins"))?;
+    let workspace = root.join("workspace");
+    ensure_real_directory(&workspace)?;
+
+    #[cfg(unix)]
+    {
+        for directory in [root, root.join("plugins").as_path(), workspace.as_path()] {
+            let mut permissions = std::fs::metadata(directory)?.permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(directory, permissions)?;
+        }
+    }
+
+    let config_path = root.join("config.toml");
+
+    match std::fs::symlink_metadata(&config_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Crabbot config must be a regular file.",
+            ));
+        }
+
+        Ok(_) => {}
+
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    if force_config || !regular_file_present(&config_path) {
+        let config = toml::to_string_pretty(&Config::default()).map_err(std::io::Error::other)?;
+        secure(&config_path, config.as_bytes())?;
+    }
+
+    create_instruction_file(&workspace.join("CRAB.md"), crabbot_templates::CRAB)?;
+    create_instruction_file(&workspace.join("CLAW.md"), crabbot_templates::CLAW)?;
+
+    Ok(())
+}
+
+fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Expected a real directory at {}.", path.display()),
+            ))
+        }
+
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(path),
+        Err(error) => Err(error),
+    }
+}
+
+fn create_instruction_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("Instruction file cannot be a symbolic link: {}.", path.display()),
+        )),
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Instruction path must be a regular file: {}.", path.display()),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => secure(path, contents),
+        Err(error) => Err(error),
+    }
+}
+
+fn reset_home(root: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(root)?;
+
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Crabbot home must be a real directory before it can be reset.",
+        ));
+    }
+
+    if root.parent().is_none() || root.file_name().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Refusing to reset a filesystem root or unnamed directory.",
+        ));
+    }
+
+    let _daemon = lock_at(root, "daemon.lock").map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Stop the Crabbot daemon before resetting its home.",
+            )
+        } else {
+            error
+        }
+    })?;
+
+    let _plugins = lock_at(root, ".plugins.lock").map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Wait for plugin management to finish before resetting Crabbot.",
+            )
+        } else {
+            error
+        }
+    })?;
+
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+
+        if name == "daemon.lock" || name == ".plugins.lock" {
+            continue;
+        }
+
+        let path = entry.path();
+
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(path)?;
+        } else {
+            std::fs::remove_file(path)?;
+        }
+    }
+
+    initialize_home(root, true)
+}
+
+fn directory_present(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+}
+
+fn regular_file_present(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
 }
 
 pub async fn serve() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -2386,6 +2581,7 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 async fn serve_at(root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel_id = std::env::var("CRABBOT_CHANNEL").unwrap_or_else(|_| "telegram".into());
+
     let model_id = std::env::var("CRABBOT_MODEL_PLUGIN").unwrap_or_else(|_| "codex".into());
     let model = std::env::var("CRABBOT_MODEL").unwrap_or_else(|_| "gpt-6-luna".into());
     serve_inner(root, &channel_id, &model_id, &model, false).await
@@ -2410,7 +2606,7 @@ async fn serve_inner(
     updates(root, &config.update)?;
 
     let loaded = state::Store::load(root.join("sessions.json"))?;
-    let workspace = workspace_root();
+    let workspace = workspace_root_at(root);
     reclaim_worktrees(&workspace, &loaded);
     let sessions = Arc::new(Mutex::new(loaded));
     let pending = Arc::new(AsyncMutex::new(approval::Gate::new()?));
@@ -2483,6 +2679,7 @@ async fn serve_inner(
         Arc::clone(&cancels),
         config.channels,
         approval_mode,
+        root.to_owned(),
         media_root_at(root),
         pending,
     )
@@ -3227,6 +3424,7 @@ async fn bridge(
         cancels,
         channels,
         approval_mode,
+        home.clone(),
         media_root_at(&home),
         Arc::new(AsyncMutex::new(approval::Gate::new()?)),
     )
@@ -3248,6 +3446,7 @@ async fn bridge_with_media(
     cancels: Arc<Mutex<BTreeMap<String, Arc<Cancellation>>>>,
     channels: BTreeMap<String, ChannelConfig>,
     approval_mode: ApprovalMode,
+    home_root: PathBuf,
     media_root: PathBuf,
     approvals: Arc<AsyncMutex<approval::Gate>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -3822,17 +4021,7 @@ async fn bridge_with_media(
                 continue;
             };
 
-            let mut messages = Vec::with_capacity(history.len() + 1);
-            let system = workspace.as_deref().map_or_else(
-                || context(&session_name),
-                |workspace| context_at(&session_name, workspace),
-            );
-
-            if let Some(system) = system {
-                messages.push(system);
-            }
-
-            messages.extend(history);
+            let messages = turn_messages(&session_name, &home_root, history);
 
             if !queued_event {
                 commit_event(
@@ -4761,59 +4950,39 @@ fn session_id(channel: &str, chat: &str, thread: Option<&str>) -> String {
     format!("{channel}-x{:x}", key.finalize())
 }
 
-fn context(session: &str) -> Option<Message> {
-    let root = workspace_root();
-    context_at(session, &root)
+fn turn_messages(session: &str, home_root: &Path, history: Vec<Message>) -> Vec<Message> {
+    let mut messages = context_at(session, &home_root.join("workspace"));
+    messages.extend(history);
+    messages
 }
 
-fn context_at(session: &str, root: &Path) -> Option<Message> {
-    let current = std::fs::canonicalize(root).ok()?;
-    let boundary = std::env::var_os("CRABBOT_ROOT")
-        .and_then(|path| std::fs::canonicalize(path).ok())
-        .unwrap_or_else(|| current.clone());
+fn context_at(session: &str, root: &Path) -> Vec<Message> {
+    let instructions = [
+        ("CRAB.md", "Crabbot identity, values, and communication style."),
+        ("CLAW.md", "Crabbot behavioral instructions and workflows."),
+    ];
+    let header_bytes = instructions
+        .iter()
+        .map(|(name, description)| name.len() + description.len() + 32)
+        .sum::<usize>();
+    let file_limit = CONTEXT_LIMIT.saturating_sub(header_bytes) / instructions.len();
+    let mut messages = Vec::with_capacity(instructions.len());
 
-    let mut text = String::new();
-    let mut path = current.clone();
-
-    loop {
-        let separator = if text.is_empty() { 0 } else { 2 };
-
-        let remaining = CONTEXT_LIMIT.saturating_sub(text.len()).saturating_sub(separator);
-
-        if remaining == 0 {
-            break;
-        }
-
-        if let Some(value) = context_file(&path.join("AGENTS.md"), remaining) {
-            if !text.is_empty() {
-                text.push_str("\n\n");
-            }
-
-            text.push_str(&value);
-        }
-
-        if path == boundary {
-            break;
-        }
-
-        let Some(parent) = path.parent() else {
-            break;
+    for (name, description) in instructions {
+        let Some(text) = context_file(&root.join(name), file_limit) else {
+            continue;
         };
 
-        path = parent.to_path_buf();
+        messages.push(Message {
+            id: format!("crabbot-context-{name}"),
+            session: session.into(),
+            role: Role::System,
+            sender: None,
+            content: vec![Content::Text { text: format!("{description}\n\n{text}") }],
+        });
     }
 
-    if text.trim().is_empty() {
-        return None;
-    }
-
-    (!text.trim().is_empty()).then_some(Message {
-        id: "system-context".into(),
-        session: session.into(),
-        role: Role::System,
-        sender: None,
-        content: vec![Content::Text { text }],
-    })
+    messages
 }
 
 fn context_file(path: &Path, limit: usize) -> Option<String> {
@@ -4821,7 +4990,9 @@ fn context_file(path: &Path, limit: usize) -> Option<String> {
         return None;
     }
 
-    if std::fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return None;
     }
 
@@ -6623,8 +6794,16 @@ fn doctor_healthy(
     config_present: bool,
     config_valid: Option<bool>,
     plugins_directory_present: bool,
+    workspace_directory_present: bool,
+    crab_instructions_present: bool,
+    claw_instructions_present: bool,
 ) -> bool {
-    config_present && config_valid == Some(true) && plugins_directory_present
+    config_present
+        && config_valid == Some(true)
+        && plugins_directory_present
+        && workspace_directory_present
+        && crab_instructions_present
+        && claw_instructions_present
 }
 
 fn doctor_at(
@@ -6634,24 +6813,45 @@ fn doctor_at(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config_path = root.join("config.toml");
     let plugins_path = root.join("plugins");
-    let config_was_present = config_path.is_file();
-    let plugins_directory_was_present = plugins_path.is_dir();
+    let workspace_path = root.join("workspace");
+    let crab_path = workspace_path.join("CRAB.md");
+    let claw_path = workspace_path.join("CLAW.md");
+    let config_was_present = regular_file_present(&config_path);
+    let plugins_directory_was_present = directory_present(&plugins_path);
+    let workspace_directory_was_present = directory_present(&workspace_path);
+    let crab_instructions_were_present = regular_file_present(&crab_path);
+    let claw_instructions_were_present = regular_file_present(&claw_path);
     let mut repairs = Vec::new();
 
     if fix {
         init_at(root)?;
 
-        if !config_was_present && config_path.is_file() {
+        if !config_was_present && regular_file_present(&config_path) {
             repairs.push("created_config");
         }
 
-        if !plugins_directory_was_present && plugins_path.is_dir() {
+        if !plugins_directory_was_present && directory_present(&plugins_path) {
             repairs.push("created_plugins_directory");
+        }
+
+        if !workspace_directory_was_present && directory_present(&workspace_path) {
+            repairs.push("created_workspace_directory");
+        }
+
+        if !crab_instructions_were_present && regular_file_present(&crab_path) {
+            repairs.push("created_crab_instructions");
+        }
+
+        if !claw_instructions_were_present && regular_file_present(&claw_path) {
+            repairs.push("created_claw_instructions");
         }
     }
 
-    let config_present = root.join("config.toml").is_file();
-    let plugins_directory_present = root.join("plugins").is_dir();
+    let config_present = regular_file_present(&config_path);
+    let plugins_directory_present = directory_present(&plugins_path);
+    let workspace_directory_present = directory_present(&workspace_path);
+    let crab_instructions_present = regular_file_present(&crab_path);
+    let claw_instructions_present = regular_file_present(&claw_path);
     let mut config_valid = None;
 
     if config_present {
@@ -6673,7 +6873,14 @@ fn doctor_at(
         }
     }
 
-    let healthy = doctor_healthy(config_present, config_valid, plugins_directory_present);
+    let healthy = doctor_healthy(
+        config_present,
+        config_valid,
+        plugins_directory_present,
+        workspace_directory_present,
+        crab_instructions_present,
+        claw_instructions_present,
+    );
     let health = if healthy {
         serde_json::json!({"status": "healthy"})
     } else {
@@ -6696,6 +6903,11 @@ fn doctor_at(
                     "directory_present": plugins_directory_present,
                     "installed": lock.plugins.keys().collect::<Vec<_>>(),
                 },
+                "workspace": {
+                    "directory_present": workspace_directory_present,
+                    "crab_instructions_present": crab_instructions_present,
+                    "claw_instructions_present": claw_instructions_present,
+                },
                 "protocol": {
                     "major": Protocol::CURRENT.major,
                     "minor": Protocol::CURRENT.minor,
@@ -6713,6 +6925,9 @@ fn doctor_at(
                 .map(|repair| match *repair {
                     "created_config" => "default config",
                     "created_plugins_directory" => "plugins directory",
+                    "created_workspace_directory" => "workspace directory",
+                    "created_crab_instructions" => "CRAB.md instructions",
+                    "created_claw_instructions" => "CLAW.md instructions",
                     _ => repair,
                 })
                 .collect::<Vec<_>>();
@@ -6722,6 +6937,9 @@ fn doctor_at(
         println!("Home: {}.", root.display());
         println!("Config present: {}.", config_present);
         println!("Plugins directory present: {}.", plugins_directory_present);
+        println!("Workspace directory present: {}.", workspace_directory_present);
+        println!("CRAB.md present: {}.", crab_instructions_present);
+        println!("CLAW.md present: {}.", claw_instructions_present);
         println!("Protocol: {}.{}.", Protocol::CURRENT.major, Protocol::CURRENT.minor);
 
         if config_valid.is_some() {
@@ -9918,7 +10136,11 @@ mod tests {
 
         assert_eq!(super::ApprovalMode::Off, super::ApprovalMode::Off);
         assert!(super::plugin_name("memory").contains("memory"));
-        assert_eq!(super::command_label(&Command::Init(InitArgs { force: false })), "init");
+        assert_eq!(
+            super::command_label(&Command::Init(InitArgs { force: false, yes: false })),
+            "init"
+        );
+
         assert_eq!(super::command_label(&Command::Doctor(DoctorArgs { fix: false })), "doctor");
         assert_eq!(super::command_label(&Command::Status(Output { json: false })), "status");
         assert_eq!(super::command_label(&Command::Version(Output { json: false })), "version");
@@ -10685,7 +10907,7 @@ mod tests {
 
         let help = Cli::command().render_help().to_string();
 
-        assert!(help.contains("Initialize the Crabbot home directory and configuration."));
+        assert!(help.contains("Initialize Crabbot configuration and its global workspace."));
         assert!(help.contains("-h, --help"));
         assert!(help.contains("alias: -H"));
         assert!(help.contains("-v, --version"));
@@ -10743,24 +10965,37 @@ mod tests {
         assert_eq!(completion_name_from(Some(std::ffi::OsStr::new("/usr/bin/crabbot"))), NAME);
         assert_eq!(completion_name_from(Some(std::ffi::OsStr::new("other"))), NAME);
 
-        let cli = Cli::try_parse_from(["crabbot", "init", "--force"]).unwrap();
+        let cli = Cli::try_parse_from(["crabbot", "init", "--force", "--yes"]).unwrap();
 
-        assert!(matches!(cli.command, Command::Init(InitArgs { force: true })));
+        assert!(matches!(cli.command, Command::Init(InitArgs { force: true, yes: true })));
+        assert!(Cli::try_parse_from(["crabbot", "init", "--yes"]).is_ok());
+        assert!(super::validate_init_flags(false, true).is_err());
+        assert!(super::validate_init_flags(true, true).is_ok());
     }
 
     #[test]
-    fn init_preserves_existing_state_without_force() {
+    fn init_preserves_existing_state_and_force_resets_the_home() {
         let root = test_root("init-force");
         let _ = fs::remove_dir_all(&root);
 
         super::init_at_with_force(&root, false).unwrap();
         fs::write(root.join("config.toml"), "update = 'auto'\n").unwrap();
         fs::write(root.join("plugins/keep"), "plugin state").unwrap();
+        fs::write(root.join("sessions.json"), "session state").unwrap();
+        fs::write(root.join("workspace/CRAB.md"), "custom identity").unwrap();
+        fs::write(root.join("workspace/CLAW.md"), "custom behavior").unwrap();
 
         super::init_at_with_force(&root, false).unwrap();
 
         assert_eq!(fs::read_to_string(root.join("config.toml")).unwrap(), "update = 'auto'\n");
         assert!(root.join("plugins/keep").exists());
+        assert_eq!(fs::read_to_string(root.join("workspace/CRAB.md")).unwrap(), "custom identity");
+
+        let active = super::lock_at(&root, "daemon.lock").unwrap();
+
+        assert!(super::reset_home(&root).is_err());
+        assert!(root.join("plugins/keep").exists());
+        drop(active);
 
         super::init_at_with_force(&root, true).unwrap();
 
@@ -10768,9 +11003,37 @@ mod tests {
             fs::read_to_string(root.join("config.toml")).unwrap().contains("update = \"prompt\"")
         );
 
-        assert!(root.join("plugins/keep").exists());
+        assert!(!root.join("plugins/keep").exists());
+        assert!(!root.join("sessions.json").exists());
+        let personality = fs::read_to_string(root.join("workspace/CRAB.md")).unwrap();
+        let behavior = fs::read_to_string(root.join("workspace/CLAW.md")).unwrap();
+
+        assert!(personality.contains("Personality Instructions"));
+        assert!(personality.contains("## Initiative"));
+        assert!(behavior.contains("Behavioral Instructions"));
+        assert!(behavior.contains("## Uncertainty And Mistakes"));
+        assert!(behavior.contains("## Sensitive Tasks"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_to_reset_a_symlinked_home() {
+        use std::os::unix::fs::symlink;
+
+        let parent = test_root("init-symlink");
+        let target = parent.join("target");
+        let home = parent.join("home");
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep"), "user data").unwrap();
+        symlink(&target, &home).unwrap();
+
+        assert!(super::reset_home(&home).is_err());
+        assert_eq!(fs::read_to_string(target.join("keep")).unwrap(), "user data");
+
+        let _ = fs::remove_dir_all(parent);
     }
 
     #[test]
@@ -10786,21 +11049,28 @@ mod tests {
 
         assert!(root.join("config.toml").is_file());
         assert!(root.join("plugins").is_dir());
+        assert!(root.join("workspace/CRAB.md").is_file());
+        assert!(root.join("workspace/CLAW.md").is_file());
 
+        fs::write(root.join("workspace/CRAB.md"), "custom identity").unwrap();
         fs::write(root.join("config.toml"), "update = 'auto'\n").unwrap();
         super::doctor_at(&root, true, false).unwrap();
 
         assert_eq!(fs::read_to_string(root.join("config.toml")).unwrap(), "update = 'auto'\n");
+        assert_eq!(fs::read_to_string(root.join("workspace/CRAB.md")).unwrap(), "custom identity");
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn doctor_health_requires_valid_required_state() {
-        assert!(super::doctor_healthy(true, Some(true), true));
-        assert!(!super::doctor_healthy(false, None, true));
-        assert!(!super::doctor_healthy(true, Some(false), true));
-        assert!(!super::doctor_healthy(true, Some(true), false));
+        assert!(super::doctor_healthy(true, Some(true), true, true, true, true));
+        assert!(!super::doctor_healthy(false, None, true, true, true, true));
+        assert!(!super::doctor_healthy(true, Some(false), true, true, true, true));
+        assert!(!super::doctor_healthy(true, Some(true), false, true, true, true));
+        assert!(!super::doctor_healthy(true, Some(true), true, false, true, true));
+        assert!(!super::doctor_healthy(true, Some(true), true, true, false, true));
+        assert!(!super::doctor_healthy(true, Some(true), true, true, true, false));
     }
 
     #[test]
@@ -11475,45 +11745,84 @@ mod tests {
         assert!(stream_fits("discord", &"x".repeat(2_000)));
         assert!(!stream_fits("discord", &"x".repeat(2_001)));
         assert!(!stream_fits("unknown", "hello"));
-        let context_root =
+        let context_home =
             std::env::temp_dir().join(format!("crabbot-context-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&context_root);
-        fs::create_dir_all(context_root.join("nested")).unwrap();
+        let context_root = context_home.join("workspace");
+        let _ = fs::remove_dir_all(&context_home);
+        fs::create_dir_all(&context_root).unwrap();
 
-        assert!(super::context_at("test", &context_root).is_none());
-        fs::write(context_root.join("AGENTS.md"), "   ").unwrap();
+        assert!(super::context_at("test", &context_root).is_empty());
+        fs::write(context_root.join("AGENTS.md"), "Coding-agent instructions.").unwrap();
+        fs::write(context_root.join("CRAB.md"), "A calm, helpful personality.").unwrap();
+        fs::write(context_root.join("CLAW.md"), "Ask before changing files.").unwrap();
 
-        assert!(super::context_at("test", &context_root).is_none());
-        fs::write(context_root.join("AGENTS.md"), "Use the workspace.").unwrap();
-        fs::write(context_root.join("nested/AGENTS.md"), "Use the nested workspace.").unwrap();
+        let context = super::context_at("test", &context_root);
+        let rendered =
+            context.iter().map(|message| message.content[0].render()).collect::<Vec<_>>();
 
-        assert_eq!(
-            super::context_at("test", &context_root.join("nested")).unwrap().role,
-            crabbot_core::types::Role::System
-        );
-        let context = super::context_at("test", &context_root.join("nested")).unwrap();
-        let rendered = context.content[0].render();
+        assert_eq!(context.len(), 2);
+        assert!(context.iter().all(|message| message.role == Role::System));
+        assert!(rendered[0].contains("identity, values, and communication style"));
+        assert!(rendered[0].contains("A calm, helpful personality."));
+        assert!(rendered[1].contains("behavioral instructions and workflows"));
+        assert!(rendered[1].contains("Ask before changing files."));
+        assert!(rendered.iter().all(|text| !text.contains("Coding-agent instructions.")));
 
-        assert!(rendered.contains("Use the nested workspace."));
-        assert!(!rendered.contains("Use the workspace."));
-        fs::write(context_root.join("nested/AGENTS.md"), "x".repeat(super::CONTEXT_LIMIT * 4))
-            .unwrap();
-        let bounded = super::context_at("test", &context_root.join("nested")).unwrap();
+        let history = vec![
+            Message {
+                id: "user-1".into(),
+                session: "test".into(),
+                role: Role::User,
+                sender: None,
+                content: vec![Content::Text { text: "Remember this detail.".into() }],
+            },
+            Message {
+                id: "assistant-1".into(),
+                session: "test".into(),
+                role: Role::Assistant,
+                sender: None,
+                content: vec![Content::Text { text: "I will.".into() }],
+            },
+        ];
+        let first_turn = super::turn_messages("test", &context_home, history.clone());
 
-        assert!(bounded.content[0].render().len() <= super::CONTEXT_LIMIT);
+        assert_eq!(first_turn.len(), 4);
+        assert_eq!(first_turn[2].id, "user-1");
+        assert_eq!(first_turn[3].id, "assistant-1");
+
+        fs::write(context_root.join("CRAB.md"), "Updated identity.").unwrap();
+        let second_turn = super::turn_messages("test", &context_home, history.clone());
+
+        assert!(second_turn[0].content[0].render().contains("Updated identity."));
+        assert_eq!(second_turn[2].id, "user-1");
+        assert_eq!(history.len(), 2);
+
+        fs::write(context_root.join("CRAB.md"), "x".repeat(super::CONTEXT_LIMIT * 4)).unwrap();
+        fs::write(context_root.join("CLAW.md"), "y".repeat(super::CONTEXT_LIMIT * 4)).unwrap();
+        let bounded = super::context_at("test", &context_root);
+        let total = bounded.iter().map(|message| message.content[0].render().len()).sum::<usize>();
+
+        assert!(total <= super::CONTEXT_LIMIT);
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
 
             let outside = context_root.join("outside.md");
             fs::write(&outside, "outside instructions").unwrap();
-            fs::remove_file(context_root.join("nested/AGENTS.md")).unwrap();
-            symlink(&outside, context_root.join("nested/AGENTS.md")).unwrap();
+            fs::remove_file(context_root.join("CRAB.md")).unwrap();
+            symlink(&outside, context_root.join("CRAB.md")).unwrap();
 
-            assert!(super::context_at("test", &context_root.join("nested")).is_none());
+            let context = super::context_at("test", &context_root);
+
+            assert_eq!(context.len(), 1);
+            let rendered = context[0].content[0].render();
+
+            assert!(rendered.contains("behavioral instructions and workflows"));
+            assert!(!rendered.contains("outside instructions"));
         }
 
-        let _ = fs::remove_dir_all(context_root);
+        let _ = fs::remove_dir_all(context_home);
 
         assert!(super::allowed(
             &super::ChannelConfig::default(),

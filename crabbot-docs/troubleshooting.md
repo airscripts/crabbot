@@ -12,11 +12,13 @@ Confirm that the daemon and CLI use the same `CRABBOT_HOME`. If a plugin is
 missing, build or install it, then run `crabbot doctor` again.
 
 `crabbot doctor` does not change local state by default. If the home directory,
-default configuration, or plugins directory is missing, use
-`crabbot doctor --fix` to create those safe defaults without overwriting an
-existing configuration. Invalid configuration and plugin integrity failures
-require manual correction or plugin reinstall/update. Use `crabbot init
---force` only when intentionally recreating the default configuration.
+default configuration, plugins directory, workspace, or instruction files are
+missing, use `crabbot doctor --fix` to create those safe defaults without
+overwriting existing configuration or instructions. Invalid configuration and
+plugin integrity failures require manual correction or plugin reinstall/update.
+`crabbot init --force`
+resets all Crabbot home data and requires confirmation; use it only when
+intentionally erasing configuration, plugins, sessions, and workspace data.
 
 ## No Channel Replies
 
@@ -27,8 +29,9 @@ an unauthorized event.
 
 ## Tools Are Unavailable
 
-Set `CRABBOT_ROOT` to an existing workspace and confirm that the channel has
-`tools = true`. The daemon must also use `approval = "prompt"` for inline
+The default tool root is `CRABBOT_HOME/workspace`; set `CRABBOT_ROOT` to use a
+different existing workspace. Confirm that the channel has `tools = true`. The
+daemon must also use `approval = "prompt"` for inline
 confirmation or `approval = "auto"` for unattended approval. Shell execution
 requires the separate `shell = true` setting and the configured approval mode.
 

@@ -26,8 +26,9 @@ access, with a read-only container root, dropped Linux capabilities, bounded
 resources, and only the active workspace mounted writable. The local
 container engine remains part of the trusted computing base. File tools
 canonicalize paths and reject traversal, symlink escapes, and symlinked
-write targets; workspace `AGENTS.md` context files must be regular files and
-never symbolic links. Channel
+write targets; global `CRAB.md` and `CLAW.md` context files must be regular,
+bounded files and never symbolic links. They guide the model but do not grant
+tool capabilities or replace host authorization. Channel
 allowlists can be narrowed by owner, admin, member, topic, and thread IDs. Tool
 schemas are exposed only when daemon approvals are enabled and the sender is
 trusted by the channel policy; private messages are not trusted implicitly.
@@ -53,8 +54,10 @@ and checkout staging is capped at 256 MiB. Declared archive entry counts and
 expanded sizes are checked before extraction, searches have bounded workload,
 cooperative cancellation, a single-worker cap, and a ten-second response
 deadline, and approved workspace commands have bounded output and a two-minute
-deadline. Model requests and
-workspace AGENTS.md context are bounded by serialized bytes before dispatch.
+deadline. Model requests and global `CRAB.md`/`CLAW.md` context are bounded by
+serialized bytes before dispatch. `init --force --yes` deletes all user state
+under `CRABBOT_HOME`; stop the daemon and verify that path before confirming
+the reset.
 Plugin restarts terminate their process trees so canceled shell descendants do
 not continue after the host has stopped a turn. Provider and channel response
 bodies reserve protocol-frame headroom, plugin metadata and persisted values
