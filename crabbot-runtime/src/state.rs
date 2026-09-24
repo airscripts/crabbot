@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::Stdio,
     thread,
@@ -138,6 +138,10 @@ pub enum DeliveryStatus {
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Store {
     pub sessions: BTreeMap<String, Session>,
+    #[serde(default)]
+    deferred: BTreeMap<String, Vec<serde_json::Value>>,
+    #[serde(default)]
+    deferred_acknowledged: BTreeSet<String>,
     #[serde(default)]
     pub outbox: Vec<Delivery>,
     #[serde(default)]
@@ -561,6 +565,26 @@ impl Store {
         message: Message,
         roles: Vec<String>,
     ) -> std::io::Result<()> {
+        self.begin_with_roles_clearing_deferred(id, message, roles, None)
+    }
+
+    pub fn begin_queued_with_roles(
+        &mut self,
+        id: &str,
+        message: Message,
+        roles: Vec<String>,
+        channel: &str,
+    ) -> std::io::Result<()> {
+        self.begin_with_roles_clearing_deferred(id, message, roles, Some(channel))
+    }
+
+    fn begin_with_roles_clearing_deferred(
+        &mut self,
+        id: &str,
+        message: Message,
+        roles: Vec<String>,
+        channel: Option<&str>,
+    ) -> std::io::Result<()> {
         let Some(session) = self.sessions.get(id) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -579,6 +603,23 @@ impl Store {
         }
 
         self.change(|store| {
+            if let Some(channel) = channel
+                && let Some(events) = store.deferred.get_mut(channel)
+            {
+                events.retain(|event| {
+                    !event["id"].as_i64().is_some_and(|value| value.to_string() == message.id)
+                        && event["id"].as_str() != Some(&message.id)
+                });
+
+                if events.is_empty() {
+                    store.deferred.remove(channel);
+                }
+            }
+
+            if let Some(channel) = channel {
+                store.deferred_acknowledged.remove(&seen_key(channel, &message.id));
+            }
+
             let Some(session) = store.sessions.get_mut(id) else {
                 return;
             };
@@ -1160,11 +1201,118 @@ impl Store {
         self.seen.contains_key(&seen_key(channel, id))
     }
 
+    pub fn deferred_event(&self, channel: &str) -> Option<serde_json::Value> {
+        self.deferred.get(channel).and_then(|events| events.first()).cloned()
+    }
+
+    pub fn has_deferred_event(&self, channel: &str, id: &str) -> bool {
+        self.deferred.get(channel).is_some_and(|events| {
+            events.iter().any(|event| {
+                event["id"].as_i64().is_some_and(|value| value.to_string() == id)
+                    || event["id"].as_str() == Some(id)
+            })
+        })
+    }
+
+    pub fn deferred_acknowledged(&self, channel: &str, id: &str) -> bool {
+        self.deferred_acknowledged.contains(&seen_key(channel, id))
+    }
+
+    pub fn mark_deferred_acknowledged(&mut self, channel: &str, id: &str) -> std::io::Result<()> {
+        let key = seen_key(channel, id);
+
+        if self.deferred_acknowledged.contains(&key) || !self.has_deferred_event(channel, id) {
+            return Ok(());
+        }
+
+        self.change(|store| {
+            store.deferred_acknowledged.insert(key);
+        })
+    }
+
+    pub fn defer_event(&mut self, channel: &str, event: serde_json::Value) -> std::io::Result<()> {
+        let already_deferred = self
+            .deferred
+            .get(channel)
+            .is_some_and(|events| events.iter().any(|current| current["id"] == event["id"]));
+
+        if already_deferred {
+            return Ok(());
+        }
+
+        if self.deferred.get(channel).map_or(0, Vec::len) >= LIMIT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Deferred channel event limit reached.",
+            ));
+        }
+
+        let mut candidate = serde_json::to_value(&*self).map_err(std::io::Error::other)?;
+        let deferred = candidate
+            .get_mut("deferred")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| std::io::Error::other("Session state has invalid deferred storage."))?;
+
+        let events = deferred.entry(channel).or_insert_with(|| serde_json::json!([]));
+        events
+            .as_array_mut()
+            .ok_or_else(|| std::io::Error::other("Session state has invalid deferred events."))?
+            .push(event.clone());
+
+        let bytes = serde_json::to_vec_pretty(&candidate).map_err(std::io::Error::other)?;
+
+        if bytes.len() as u64 > BYTE_LIMIT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Deferred channel event storage limit reached.",
+            ));
+        }
+
+        self.change(|store| {
+            let events = store.deferred.entry(channel.into()).or_default();
+            events.push(event);
+        })
+    }
+
     pub fn commit(&mut self, channel: &str, id: &str, offset: Option<i64>) -> std::io::Result<()> {
+        self.commit_event(channel, id, offset, false)
+    }
+
+    pub fn commit_retained(
+        &mut self,
+        channel: &str,
+        id: &str,
+        offset: Option<i64>,
+    ) -> std::io::Result<()> {
+        self.commit_event(channel, id, offset, true)
+    }
+
+    fn commit_event(
+        &mut self,
+        channel: &str,
+        id: &str,
+        offset: Option<i64>,
+        retained: bool,
+    ) -> std::io::Result<()> {
         let key = seen_key(channel, id);
 
         self.change(|store| {
             store.seen.insert(key.clone(), seen_now());
+
+            if !retained && let Some(events) = store.deferred.get_mut(channel) {
+                events.retain(|event| {
+                    !event["id"].as_i64().is_some_and(|value| value.to_string() == id)
+                        && event["id"].as_str() != Some(id)
+                });
+
+                if events.is_empty() {
+                    store.deferred.remove(channel);
+                }
+            }
+
+            if !retained {
+                store.deferred_acknowledged.remove(&key);
+            }
 
             if let Some(offset) = offset {
                 store
@@ -1185,6 +1333,8 @@ impl Store {
         let dead = self.dead.clone();
         let offsets = self.offsets.clone();
         let seen = self.seen.clone();
+        let deferred = self.deferred.clone();
+        let deferred_acknowledged = self.deferred_acknowledged.clone();
         let path = self.path.clone();
         update(self);
 
@@ -1194,6 +1344,8 @@ impl Store {
             self.dead = dead;
             self.offsets = offsets;
             self.seen = seen;
+            self.deferred = deferred;
+            self.deferred_acknowledged = deferred_acknowledged;
             self.path = path;
             return Err(error);
         }
@@ -1926,6 +2078,35 @@ mod tests {
     }
 
     #[test]
+    fn starting_a_retained_queued_event_clears_it_atomically() {
+        let root = std::env::temp_dir()
+            .join(format!("crabbot-state-queued-deferred-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        let path = root.join("sessions.json");
+        let mut store = Store::load(&path).unwrap();
+        store.create("main", "model").unwrap();
+        store.set_status("main", "working").unwrap();
+        store.queue("main", message(7, "main")).unwrap();
+        store
+            .defer_event("telegram", serde_json::json!({"id": 7, "chat": 11, "text": "retry"}))
+            .unwrap();
+
+        let mut recovered = Store::load(&path).unwrap();
+
+        recovered
+            .begin_queued_with_roles("main", message(7, "main"), Vec::new(), "telegram")
+            .unwrap();
+
+        let recovered = Store::load(&path).unwrap();
+
+        assert!(recovered.deferred_event("telegram").is_none());
+        assert_eq!(recovered.sessions["main"].queued[0].id, "7");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn recovers_inflight_work_and_rejects_active_deletion() {
         let root =
             std::env::temp_dir().join(format!("crabbot-state-inflight-{}", std::process::id()));
@@ -2086,6 +2267,71 @@ mod tests {
 
         assert!(super::remove_worktree(&root, "../escape").is_err());
         assert!(super::remove_worktree(&root, "safe").is_ok());
+    }
+
+    #[test]
+    fn retains_deferred_events_across_offset_commits() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-state-deferred-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        let path = root.join("sessions.json");
+        let mut store = Store::load(&path).unwrap();
+        let event = serde_json::json!({"id": 7, "chat": 11, "text": "keep me"});
+
+        store.defer_event("telegram", event.clone()).unwrap();
+        store.commit_retained("telegram", "7", Some(8)).unwrap();
+
+        let mut recovered = Store::load(&path).unwrap();
+
+        assert_eq!(recovered.offset("telegram"), 8);
+        assert!(recovered.known("telegram", "7"));
+        assert_eq!(recovered.deferred_event("telegram"), Some(event));
+
+        recovered.commit("telegram", "7", Some(8)).unwrap();
+
+        assert_eq!(Store::load(&path).unwrap().deferred_event("telegram"), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn records_deferred_acknowledgements_until_the_event_is_committed() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-state-deferred-ack-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        let path = root.join("sessions.json");
+        let mut store = Store::load(&path).unwrap();
+        store.defer_event("telegram", serde_json::json!({"id": "7"})).unwrap();
+        store.commit_retained("telegram", "7", Some(8)).unwrap();
+        store.mark_deferred_acknowledged("telegram", "7").unwrap();
+
+        let mut recovered = Store::load(&path).unwrap();
+
+        assert!(recovered.deferred_acknowledged("telegram", "7"));
+        recovered.commit("telegram", "7", Some(8)).unwrap();
+
+        let recovered = Store::load(&path).unwrap();
+
+        assert!(!recovered.deferred_acknowledged("telegram", "7"));
+        assert!(recovered.deferred_event("telegram").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn defers_events_only_when_the_serialized_state_fits_the_byte_limit() {
+        let mut store = Store::default();
+        let event = serde_json::json!({
+            "id": "large",
+            "payload": "x".repeat(super::BYTE_LIMIT as usize)
+        });
+
+        let error = store.defer_event("telegram", event).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(store.deferred_event("telegram").is_none());
     }
 
     #[test]

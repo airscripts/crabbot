@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 #[cfg(not(test))]
 use std::sync::Arc;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     time::SystemTime,
@@ -31,6 +31,8 @@ const TEXT_LIMIT: usize = 256 * 1024;
 const MEDIA_LIMIT: usize = 4 * 1024 * 1024;
 const ATTACHMENTS: usize = 256;
 const ATTACHMENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const PENDING_DISPATCHES: usize = 256;
+const PENDING_DISPATCH_BYTES: usize = 16 * 1024 * 1024;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 struct GatewayState {
@@ -40,6 +42,9 @@ struct GatewayState {
     sequence: Option<u64>,
     session_id: Option<String>,
     pending_sequence: Option<u64>,
+    pending_event: Option<Value>,
+    queued_dispatches: VecDeque<Value>,
+    pending_from_queue: bool,
     interactions: BTreeMap<String, Interaction>,
     attachments: BTreeMap<String, Attachment>,
 }
@@ -81,6 +86,9 @@ impl Default for GatewayState {
             sequence,
             session_id,
             pending_sequence: None,
+            pending_event: None,
+            queued_dispatches: load_dispatches(),
+            pending_from_queue: false,
             interactions: Default::default(),
             attachments: Default::default(),
         }
@@ -249,7 +257,7 @@ async fn call_with_state(
             callback(client, gateway_state, &id, &text, base).await?
         }
 
-        Operation::Media(uri) => media(client, gateway_state, &uri, token).await?,
+        Operation::Media(uri) => media(client, gateway_state, &uri, token, base).await?,
     };
 
     let response = Response::ok(id, result);
@@ -554,19 +562,44 @@ async fn media(
     gateway: &AsyncMutex<GatewayState>,
     uri: &str,
     token: &str,
+    base: &str,
 ) -> crabbot_core::Result<Value> {
-    let id = uri
+    let reference = uri
         .strip_prefix("discord://attachment/")
-        .filter(|value| snowflake(value))
-        .ok_or_else(|| crabbot_core::Error::Denied("Discord media URI is invalid.".into()))?
-        .to_owned();
+        .ok_or_else(|| crabbot_core::Error::Denied("Discord media URI is invalid.".into()))?;
+    let parts = reference.split('/').collect::<Vec<_>>();
+    let (channel, message, id) = match parts.as_slice() {
+        [id] if snowflake(id) => (None, None, (*id).to_owned()),
+
+        [channel, message, id] if snowflake(channel) && snowflake(message) && snowflake(id) => {
+            (Some(*channel), Some(*message), (*id).to_owned())
+        }
+
+        _ => {
+            return Err(crabbot_core::Error::Denied("Discord media URI is invalid.".into()));
+        }
+    };
 
     let attachment = {
         let mut state = gateway.lock().await;
         state.attachments.retain(|_, value| value.expires > Instant::now());
-        state.attachments.get(&id).cloned().ok_or_else(|| {
-            crabbot_core::Error::Denied("Discord attachment is no longer available.".into())
-        })?
+        state.attachments.get(&id).cloned()
+    };
+
+    let attachment = match attachment {
+        Some(attachment) => attachment,
+
+        None => match (channel, message) {
+            (Some(channel), Some(message)) => {
+                refresh_attachment(client, gateway, channel, message, &id, token, base).await?
+            }
+
+            _ => {
+                return Err(crabbot_core::Error::Denied(
+                    "Discord attachment is no longer available.".into(),
+                ));
+            }
+        },
     };
 
     if !discord_media_url(&attachment.url) {
@@ -607,6 +640,41 @@ async fn media(
         "name": attachment.name,
         "mime": attachment.mime,
     }))
+}
+
+async fn refresh_attachment(
+    client: &reqwest::Client,
+    gateway: &AsyncMutex<GatewayState>,
+    channel: &str,
+    message_id: &str,
+    id: &str,
+    token: &str,
+    base: &str,
+) -> crabbot_core::Result<Attachment> {
+    let value = message(
+        client,
+        reqwest::Method::GET,
+        format!("{base}/channels/{channel}/messages/{message_id}"),
+        token,
+        Value::Null,
+    )
+    .await?;
+
+    if value["id"].as_str() != Some(message_id) || value["channel_id"].as_str() != Some(channel) {
+        return Err(crabbot_core::Error::Denied(
+            "Discord attachment message does not match its reference.".into(),
+        ));
+    }
+
+    let mut attachments = BTreeMap::new();
+    remember_attachments(&value, &mut attachments);
+    let attachment = attachments
+        .remove(id)
+        .ok_or_else(|| crabbot_core::Error::Denied("Discord attachment is unavailable.".into()))?;
+
+    gateway.lock().await.attachments.insert(id.into(), attachment.clone());
+
+    Ok(attachment)
 }
 
 fn local_media(uri: &str) -> crabbot_core::Result<PathBuf> {
@@ -788,20 +856,17 @@ async fn message(
     token: &str,
     body: Value,
 ) -> crabbot_core::Result<Value> {
-    let response = client
-        .request(method, url)
-        .header(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bot {token}")).map_err(|error| {
-                crabbot_core::Error::Denied(format!("Discord token is invalid: {error}."))
-            })?,
-        )
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| {
-            crabbot_core::Error::Denied(format!("Discord request failed: {error}."))
-        })?;
+    let request = client.request(method, url).header(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bot {token}")).map_err(|error| {
+            crabbot_core::Error::Denied(format!("Discord token is invalid: {error}."))
+        })?,
+    );
+    let request = if body.is_null() { request } else { request.json(&body) };
+
+    let response = request.send().await.map_err(|error| {
+        crabbot_core::Error::Denied(format!("Discord request failed: {error}."))
+    })?;
 
     let status = response.status();
     let body = read(response).await?;
@@ -821,10 +886,13 @@ async fn gateway(
     let url = std::env::var("CRABBOT_DISCORD_GATEWAY_URL").unwrap_or_else(|_| gateway_url(base));
     let mut state = gateway_state.lock().await;
 
-    if state.pending_sequence.is_some() {
-        return Err(crabbot_core::Error::Denied(
-            "Discord Gateway event is awaiting host acknowledgement.".into(),
-        ));
+    let awaiting_acknowledgement = state.pending_sequence.is_some();
+
+    if !awaiting_acknowledgement && let Some(event) = queued_dispatch(&mut state, save_cursor)? {
+        state.pending_from_queue = true;
+        state.pending_event = Some(event.clone());
+
+        return Ok(json!({"events": [event]}));
     }
 
     if state.socket.is_none() {
@@ -869,12 +937,14 @@ async fn gateway(
     let mut sequence = state.sequence;
     let committed_sequence = state.sequence;
     let mut session_id = state.session_id.clone();
-    let mut pending_sequence = None;
+    let mut pending_sequence = state.pending_sequence;
+    let mut pending_event = state.pending_event.clone();
     let mut closed = false;
     let mut interactions = state.interactions.clone();
     interactions.retain(|_, value| value.expires > Instant::now());
     let mut attachments = state.attachments.clone();
     attachments.retain(|_, value| value.expires > Instant::now());
+    let mut queued_dispatches = std::mem::take(&mut state.queued_dispatches);
     let socket = state.socket.as_mut().expect("gateway socket is initialized");
     let mut events = Vec::new();
     let deadline = Duration::from_secs(seconds.clamp(1, 30));
@@ -897,6 +967,8 @@ async fn gateway(
                         remember_attachments(&value["d"], &mut attachments);
                     }
 
+                    let pending_before_message = pending_sequence;
+
                     match prepare_gateway_value(
                         &value,
                         &mut sequence,
@@ -905,37 +977,37 @@ async fn gateway(
                         &mut pending_sequence,
                     )? {
                         Action::Event(Some(mut event)) => {
-                            if let Some(token) = event
-                                .get("callback_token")
-                                .and_then(Value::as_str)
-                                .filter(|value| !value.is_empty() && value.len() <= 512)
-                                .map(str::to_owned)
-                                && let Some(id) = event["callback_id"].as_str()
-                            {
-                                interactions.insert(
-                                    id.into(),
-                                    Interaction {
-                                        token,
-                                        expires: Instant::now() + Duration::from_secs(300),
-                                    },
-                                );
+                            if awaiting_acknowledgement {
+                                pending_sequence = pending_before_message;
+
+                                if event["kind"] != "callback" {
+                                    if queued_dispatches.len() < PENDING_DISPATCHES {
+                                        let mut pending = queued_dispatches.clone();
+                                        pending.push_back(value);
+                                        save_dispatches(&pending)?;
+                                        queued_dispatches = pending;
+                                        break;
+                                    }
+
+                                    closed = true;
+                                    break;
+                                }
+
+                                remember_interaction(&mut event, &mut interactions);
 
                                 if let Some(values) = event.as_object_mut() {
-                                    values.remove("callback_token");
+                                    values.remove("gateway_sequence");
                                 }
 
-                                while interactions.len() > 128 {
-                                    let Some(oldest) = interactions
-                                        .iter()
-                                        .min_by_key(|(_, value)| value.expires)
-                                        .map(|(key, _)| key.clone())
-                                    else {
-                                        break;
-                                    };
-
-                                    interactions.remove(&oldest);
-                                }
+                                events.push(event);
+                                break;
                             }
+
+                            if event.get("gateway_sequence").is_some() {
+                                pending_event = Some(event.clone());
+                            }
+
+                            remember_interaction(&mut event, &mut interactions);
 
                             events.push(event);
                             break;
@@ -969,19 +1041,26 @@ async fn gateway(
     .await;
 
     if let Ok(Err(error)) = result {
+        state.queued_dispatches = queued_dispatches;
         state.socket = None;
         return Err(error);
     }
 
-    if events.is_empty() {
+    if events.is_empty() && !awaiting_acknowledgement {
         state.sequence = sequence;
     }
 
     state.pending_sequence = pending_sequence;
+    state.pending_event = pending_event;
+    state.queued_dispatches = queued_dispatches;
     state.interactions = interactions;
     state.attachments = attachments;
     state.session_id = session_id;
     state.next_heartbeat = next_heartbeat;
+
+    if awaiting_acknowledgement && let Some(event) = state.pending_event.clone() {
+        events.insert(0, event);
+    }
 
     if closed {
         state.socket = None;
@@ -995,6 +1074,68 @@ async fn gateway(
     Ok(json!({"events": events}))
 }
 
+fn remember_interaction(event: &mut Value, interactions: &mut BTreeMap<String, Interaction>) {
+    if let Some(token) = event
+        .get("callback_token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .map(str::to_owned)
+        && let Some(id) = event["callback_id"].as_str()
+    {
+        interactions.insert(
+            id.into(),
+            Interaction { token, expires: Instant::now() + Duration::from_secs(300) },
+        );
+
+        if let Some(values) = event.as_object_mut() {
+            values.remove("callback_token");
+        }
+
+        while interactions.len() > 128 {
+            let Some(oldest) = interactions
+                .iter()
+                .min_by_key(|(_, value)| value.expires)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+
+            interactions.remove(&oldest);
+        }
+    }
+}
+
+fn queued_dispatch(
+    state: &mut GatewayState,
+    persist_cursor: impl FnOnce(Option<u64>, Option<&str>) -> crabbot_core::Result<()>,
+) -> crabbot_core::Result<Option<Value>> {
+    let Some(value) = state.queued_dispatches.front().cloned() else {
+        return Ok(None);
+    };
+
+    let mut sequence = state.sequence;
+    let mut session_id = state.session_id.clone();
+    let mut pending_sequence = None;
+    let Action::Event(Some(event)) = prepare_gateway_value(
+        &value,
+        &mut sequence,
+        &mut session_id,
+        state.sequence,
+        &mut pending_sequence,
+    )?
+    else {
+        return Err(crabbot_core::Error::Denied(
+            "Queued Discord Gateway dispatch was invalid.".into(),
+        ));
+    };
+
+    persist_cursor(state.sequence, session_id.as_deref())?;
+    state.pending_sequence = pending_sequence;
+    state.session_id = session_id;
+
+    Ok(Some(event))
+}
+
 async fn acknowledge(
     gateway_state: &AsyncMutex<GatewayState>,
     sequence: u64,
@@ -1002,14 +1143,30 @@ async fn acknowledge(
     let mut state = gateway_state.lock().await;
 
     if state.pending_sequence != Some(sequence) {
+        if state.sequence == Some(sequence) {
+            save_cursor(state.sequence, state.session_id.as_deref())?;
+
+            return Ok(json!({"acknowledged": true}));
+        }
+
         return Err(crabbot_core::Error::Denied(
             "Discord Gateway acknowledgement is stale.".into(),
         ));
     }
 
     state.sequence = Some(sequence);
-    state.pending_sequence = None;
     save_cursor(state.sequence, state.session_id.as_deref())?;
+    state.pending_event = None;
+
+    if state.pending_from_queue {
+        let mut queued_dispatches = state.queued_dispatches.clone();
+        queued_dispatches.pop_front();
+        save_dispatches(&queued_dispatches)?;
+        state.queued_dispatches = queued_dispatches;
+        state.pending_from_queue = false;
+    }
+
+    state.pending_sequence = None;
     Ok(json!({"acknowledged": true}))
 }
 
@@ -1055,6 +1212,61 @@ fn prepare_gateway_value(
 
 fn cursor_path() -> Option<PathBuf> {
     std::env::var_os("CRABBOT_HOME").map(|home| PathBuf::from(home).join("discord-gateway.json"))
+}
+
+fn dispatches_path() -> Option<PathBuf> {
+    std::env::var_os("CRABBOT_HOME")
+        .map(|home| PathBuf::from(home).join("discord-gateway-dispatches.json"))
+}
+
+fn load_dispatches() -> VecDeque<Value> {
+    let Some(path) = dispatches_path() else {
+        return VecDeque::new();
+    };
+
+    load_dispatches_at(&path)
+}
+
+fn load_dispatches_at(path: &Path) -> VecDeque<Value> {
+    let Ok(Some(bytes)) = load_file(path, PENDING_DISPATCH_BYTES as u64) else {
+        return VecDeque::new();
+    };
+
+    let Ok(dispatches) = serde_json::from_slice::<VecDeque<Value>>(&bytes) else {
+        return VecDeque::new();
+    };
+
+    if dispatches.len() > PENDING_DISPATCHES
+        || serde_json::to_vec(&dispatches).is_ok_and(|bytes| bytes.len() > PENDING_DISPATCH_BYTES)
+    {
+        return VecDeque::new();
+    }
+
+    dispatches
+}
+
+fn save_dispatches(dispatches: &VecDeque<Value>) -> crabbot_core::Result<()> {
+    let Some(path) = dispatches_path() else {
+        return Ok(());
+    };
+
+    save_dispatches_at(&path, dispatches)
+}
+
+fn save_dispatches_at(path: &Path, dispatches: &VecDeque<Value>) -> crabbot_core::Result<()> {
+    let bytes = serde_json::to_vec(dispatches)?;
+
+    if dispatches.len() > PENDING_DISPATCHES || bytes.len() > PENDING_DISPATCH_BYTES {
+        return Err(crabbot_core::Error::Denied(
+            "Discord Gateway dispatch queue exceeds its storage limit.".into(),
+        ));
+    }
+
+    save_file(path, bytes).map_err(|error| {
+        crabbot_core::Error::Denied(format!(
+            "Discord Gateway dispatches could not be stored: {error}."
+        ))
+    })
 }
 
 fn load_cursor() -> (Option<u64>, Option<String>) {
@@ -1166,7 +1378,7 @@ fn normalize(value: &serde_json::Value) -> Option<serde_json::Value> {
         return None;
     }
 
-    let id = value["id"].as_str()?;
+    let message_id = value["id"].as_str()?;
     let channel = value["channel_id"].as_str()?;
     let text = value["content"].as_str().unwrap_or_default();
     let mut content = Vec::new();
@@ -1181,7 +1393,7 @@ fn normalize(value: &serde_json::Value) -> Option<serde_json::Value> {
                 continue;
             };
 
-            let uri = format!("discord://attachment/{id}");
+            let uri = format!("discord://attachment/{channel}/{message_id}/{id}");
             let mime = attachment["content_type"].as_str();
             let voice = attachment["flags"].as_u64().is_some_and(|flags| flags & (1 << 13) != 0);
             let kind = if voice || mime.is_some_and(|value| value.starts_with("audio/")) {
@@ -1215,7 +1427,7 @@ fn normalize(value: &serde_json::Value) -> Option<serde_json::Value> {
         .or_else(|| matches!(value["type"].as_u64(), Some(11 | 12)).then(|| channel));
 
     Some(json!({
-        "id": id,
+        "id": message_id,
         "chat": channel,
         "kind": if value["guild_id"].is_string() { "guild" } else { "private" },
         "private": !value["guild_id"].is_string(),
@@ -1353,9 +1565,10 @@ mod tests {
     use super::{
         Action, BODY_LIMIT, GatewayState, Operation, acknowledge, action, approval_request, call,
         call_with, chunks, cleanup, collect, custom_id, discord_media_url, edit_request,
-        edit_requests, gateway_url, heartbeat, intents, load_cursor_at, local_media, media_root,
-        normalize, normalize_interaction, operation, prepare_gateway_value, remember_attachments,
-        response_body, safe_name, save_cursor_at, snowflake, stage_event,
+        edit_requests, gateway_url, heartbeat, intents, load_cursor_at, load_dispatches_at,
+        local_media, media_root, normalize, normalize_interaction, operation,
+        prepare_gateway_value, queued_dispatch, remember_attachments, response_body, safe_name,
+        save_cursor_at, save_dispatches_at, snowflake, stage_event,
     };
 
     use crabbot_core::types::Request;
@@ -1396,6 +1609,10 @@ mod tests {
         let attachment = json!({"id":"1","channel_id":"2","content":"","attachments":[{"id":"4","url":"https://cdn.discordapp.com/a.png","content_type":"image/png","filename":"a.png"}],"author":{"id":"3","bot":false}});
 
         assert_eq!(normalize(&attachment).unwrap()["content"][0]["kind"], "image");
+        assert_eq!(
+            normalize(&attachment).unwrap()["content"][0]["uri"],
+            "discord://attachment/2/1/4"
+        );
         let file = json!({"id":"2","channel_id":"2","guild_id":"9","content":"","thread":{"id":"thread"},"attachments":[{"id":"5","url":"https://cdn.discordapp.com/a.txt","content_type":"text/plain","filename":"a.txt"}],"author":{"id":"3","bot":false}});
         let normalized = normalize(&file).unwrap();
 
@@ -1603,6 +1820,63 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn persists_queued_gateway_dispatches() {
+        let path = std::env::temp_dir().join(format!(
+            "crabbot-discord-dispatches-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let dispatches = [json!({"op": 0, "t": "MESSAGE_CREATE", "s": 7})].into();
+
+        assert!(load_dispatches_at(&path).is_empty());
+        save_dispatches_at(&path, &dispatches).unwrap();
+
+        assert_eq!(load_dispatches_at(&path), dispatches);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn keeps_queued_gateway_dispatch_when_cursor_persistence_fails() {
+        let dispatch = json!({
+            "op": 0,
+            "t": "MESSAGE_CREATE",
+            "s": 7,
+            "d": {
+                "id": "1",
+                "channel_id": "2",
+                "content": "hello",
+                "author": {"id": "3", "bot": false}
+            }
+        });
+
+        let mut state = GatewayState {
+            sequence: Some(6),
+            session_id: Some("session".into()),
+            queued_dispatches: [dispatch.clone()].into(),
+            ..Default::default()
+        };
+
+        let result = queued_dispatch(&mut state, |sequence, session_id| {
+            assert_eq!(sequence, Some(6));
+            assert_eq!(session_id, Some("session"));
+
+            Err(crabbot_core::Error::Denied("cursor write failed".into()))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(state.queued_dispatches.front(), Some(&dispatch));
+        assert_eq!(state.pending_sequence, None);
+        assert_eq!(state.session_id.as_deref(), Some("session"));
+
+        let event = queued_dispatch(&mut state, |_, _| Ok(())).unwrap().unwrap();
+
+        assert_eq!(event["gateway_sequence"], 7);
+        assert_eq!(state.queued_dispatches.front(), Some(&dispatch));
+        assert_eq!(state.pending_sequence, Some(7));
+    }
+
     #[tokio::test]
     async fn acknowledges_only_the_pending_gateway_event() {
         let state = AsyncMutex::new(GatewayState {
@@ -1612,12 +1886,16 @@ mod tests {
             sequence: Some(6),
             session_id: Some("session".into()),
             pending_sequence: Some(7),
+            pending_event: None,
+            queued_dispatches: Default::default(),
+            pending_from_queue: false,
             interactions: Default::default(),
             attachments: Default::default(),
         });
 
         assert_eq!(acknowledge(&state, 7).await.unwrap()["acknowledged"], true);
-        assert!(acknowledge(&state, 7).await.is_err());
+        assert_eq!(acknowledge(&state, 7).await.unwrap()["acknowledged"], true);
+        assert!(acknowledge(&state, 6).await.is_err());
     }
 
     #[test]
@@ -1799,6 +2077,221 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receives_approval_callbacks_while_a_gateway_event_is_pending() {
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
+
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket: WebSocketStream<_> = accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"op":10,"d":{"heartbeat_interval":1000}}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+
+            let _ = socket.next().await.unwrap().unwrap();
+            socket
+                .send(Message::Text(
+                    json!({
+                        "op":0,
+                        "t":"MESSAGE_CREATE",
+                        "s":7,
+                        "d":{"id":"10","channel_id":"20","content":"pending","author":{"id":"30","bot":false}}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    json!({
+                        "op":0,
+                        "t":"INTERACTION_CREATE",
+                        "s":8,
+                        "d":{"type":3,"id":"11","channel_id":"20","token":"interaction-token","data":{"custom_id":"approve-token"},"user":{"id":"30"}}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    json!({
+                        "op":0,
+                        "t":"MESSAGE_CREATE",
+                        "s":9,
+                        "d":{"id":"12","channel_id":"20","content":"queued","author":{"id":"30","bot":false}}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let state = AsyncMutex::new(GatewayState::default());
+        let base = format!("http://{address}");
+        let pending = super::gateway(&state, "token", 2, &base).await.unwrap();
+
+        assert_eq!(pending["events"][0]["gateway_sequence"], 7);
+
+        let callback = super::gateway(&state, "token", 2, &base).await.unwrap();
+
+        assert_eq!(callback["events"][0]["text"], "pending");
+        assert_eq!(callback["events"][0]["gateway_sequence"], 7);
+        assert_eq!(callback["events"][1]["kind"], "callback");
+        assert!(callback["events"][1].get("gateway_sequence").is_none());
+
+        let queued = super::gateway(&state, "token", 2, &base).await.unwrap();
+
+        assert_eq!(queued["events"][0]["text"], "pending");
+        {
+            let state = state.lock().await;
+
+            assert_eq!(state.sequence, None);
+            assert_eq!(state.pending_sequence, Some(7));
+            assert_eq!(state.queued_dispatches.len(), 1);
+        }
+
+        assert_eq!(super::acknowledge(&state, 7).await.unwrap()["acknowledged"], true);
+        let queued = super::gateway(&state, "token", 2, &base).await.unwrap();
+
+        assert_eq!(queued["events"][0]["text"], "queued");
+        assert_eq!(queued["events"][0]["gateway_sequence"], 9);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn receives_approval_callbacks_when_the_dispatch_queue_is_full() {
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
+
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket: WebSocketStream<_> = accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"op":10,"d":{"heartbeat_interval":10}}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+
+            let _ = socket.next().await.unwrap().unwrap();
+            let heartbeat = socket.next().await.unwrap().unwrap();
+
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(heartbeat.to_text().unwrap()).unwrap()["op"],
+                1
+            );
+
+            socket
+                .send(Message::Text(
+                    json!({
+                        "op":0,
+                        "t":"INTERACTION_CREATE",
+                        "s":8,
+                        "d":{"type":3,"id":"11","channel_id":"20","token":"interaction-token","data":{"custom_id":"approve-token"},"user":{"id":"30"}}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let gateway_state = super::GatewayState {
+            sequence: Some(6),
+            pending_sequence: Some(7),
+            queued_dispatches: (0..super::PENDING_DISPATCHES)
+                .map(|_| json!({"op":0,"t":"MESSAGE_CREATE"}))
+                .collect(),
+            ..Default::default()
+        };
+
+        let state = AsyncMutex::new(gateway_state);
+        let base = format!("http://{address}");
+        let callback = super::gateway(&state, "token", 2, &base).await.unwrap();
+
+        assert_eq!(callback["events"][0]["kind"], "callback");
+        assert_eq!(callback["events"][0]["callback_id"], "11");
+        assert!(callback["events"][0].get("callback_token").is_none());
+
+        let state = state.lock().await;
+
+        assert_eq!(state.pending_sequence, Some(7));
+        assert_eq!(state.queued_dispatches.len(), super::PENDING_DISPATCHES);
+        assert_eq!(state.interactions["11"].token, "interaction-token");
+        drop(state);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnects_from_the_committed_cursor_when_the_dispatch_queue_is_full() {
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
+
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket: WebSocketStream<_> = accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"op":10,"d":{"heartbeat_interval":1000}}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+
+            let _ = socket.next().await.unwrap().unwrap();
+            socket
+                .send(Message::Text(
+                    json!({
+                        "op":0,
+                        "t":"MESSAGE_CREATE",
+                        "s":8,
+                        "d":{"id":"12","channel_id":"20","content":"overflow","author":{"id":"30","bot":false}}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let gateway_state = super::GatewayState {
+            sequence: Some(6),
+            pending_sequence: Some(7),
+            queued_dispatches: (0..super::PENDING_DISPATCHES)
+                .map(|_| json!({"op":0,"t":"MESSAGE_CREATE"}))
+                .collect(),
+            ..Default::default()
+        };
+
+        let state = AsyncMutex::new(gateway_state);
+        let base = format!("http://{address}");
+        let response = super::gateway(&state, "token", 2, &base).await.unwrap();
+
+        assert!(response["events"].as_array().unwrap().is_empty());
+
+        let state = state.lock().await;
+
+        assert_eq!(state.sequence, Some(6));
+        assert_eq!(state.pending_sequence, Some(7));
+        assert_eq!(state.queued_dispatches.len(), super::PENDING_DISPATCHES);
+        assert!(state.socket.is_none());
+        drop(state);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn sends_edits_and_acknowledges_approvals() {
         let Some(listener) = loopback_listener().await else {
             return;
@@ -1890,6 +2383,9 @@ mod tests {
             sequence: None,
             session_id: None,
             pending_sequence: None,
+            pending_event: None,
+            queued_dispatches: Default::default(),
+            pending_from_queue: false,
             interactions: [(
                 "10".into(),
                 super::Interaction {
@@ -2022,6 +2518,83 @@ mod tests {
         assert!(operation("send", &json!({"channel":"1", "content": too_many})).is_err());
         assert!(media_root().is_err());
         assert!(local_media("outside").is_err());
+    }
+
+    #[tokio::test]
+    async fn refreshes_an_attachment_from_its_message_after_a_restart() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
+
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = Vec::new();
+
+            loop {
+                let mut line = Vec::new();
+                let length = reader.read_until(b'\n', &mut line).await.unwrap();
+
+                assert_ne!(length, 0, "request ended before the header block");
+
+                let end_of_headers = line == b"\r\n";
+                request.extend_from_slice(&line);
+
+                if end_of_headers {
+                    break;
+                }
+            }
+
+            let mut stream = reader.into_inner();
+            let request = String::from_utf8(request).unwrap();
+
+            assert!(request.starts_with("GET /channels/2/messages/1 HTTP/1.1\r\n"));
+            let authorization = request
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+
+            assert_eq!(authorization.map(|(_, value)| value.trim()), Some("Bot test-token"));
+
+            let body = json!({
+                "id": "1",
+                "channel_id": "2",
+                "attachments": [{
+                    "id": "4",
+                    "url": "https://cdn.discordapp.com/a.png",
+                    "content_type": "image/png",
+                    "filename": "a.png"
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let gateway = super::AsyncMutex::new(GatewayState::default());
+        let attachment = super::refresh_attachment(
+            &reqwest::Client::new(),
+            &gateway,
+            "2",
+            "1",
+            "4",
+            "test-token",
+            &format!("http://{address}"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(attachment.url, "https://cdn.discordapp.com/a.png");
+        assert_eq!(gateway.lock().await.attachments["4"].name, "a.png");
+        server.await.unwrap();
     }
 
     #[test]

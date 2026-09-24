@@ -1360,7 +1360,9 @@ mod tests {
         fs::write(&current, b"current").unwrap();
         fs::write(&pinned, b"pinned").unwrap();
         let modified = SystemTime::now().checked_sub(MEDIA_TTL + Duration::from_secs(1)).unwrap();
-        fs::File::open(&expired)
+        fs::File::options()
+            .write(true)
+            .open(&expired)
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(modified))
             .unwrap();
@@ -1386,15 +1388,21 @@ mod tests {
         fs::write(&newest, b"n").unwrap();
         fs::write(root.join("pinned/image.bin"), vec![b'x'; 100]).unwrap();
         let now = SystemTime::now();
-        fs::File::open(&oldest)
+        fs::File::options()
+            .write(true)
+            .open(&oldest)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(3)))
             .unwrap();
-        fs::File::open(&current)
+        fs::File::options()
+            .write(true)
+            .open(&current)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(2)))
             .unwrap();
-        fs::File::open(&newest)
+        fs::File::options()
+            .write(true)
+            .open(&newest)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(1)))
             .unwrap();

@@ -3565,6 +3565,9 @@ async fn bridge_with_media(
                 })
         };
 
+        let deferred =
+            sessions.lock().map_err(|_| "Session lock is poisoned.")?.deferred_event(channel_id);
+
         let response = if let Some((message, chat, thread, private, roles)) = queued.as_ref() {
             channel_failures = 0;
             let text = message.content.iter().map(Content::render).collect::<Vec<_>>().join("\n");
@@ -3584,6 +3587,8 @@ async fn bridge_with_media(
                     }]
                 }),
             )
+        } else if let Some(event) = deferred {
+            Response::ok(call, serde_json::json!({"events": [event]}))
         } else {
             let polled = {
                 let poll = channel.call(Request::call(
@@ -3661,6 +3666,7 @@ async fn bridge_with_media(
                     &sessions,
                     &mut offset,
                     &mut call,
+                    true,
                 )
                 .await?;
                 continue;
@@ -3683,7 +3689,13 @@ async fn bridge_with_media(
 
             let queued_event = queued.as_ref().is_some_and(|(queued, ..)| queued.id == event_key);
 
+            let retained_event = sessions
+                .lock()
+                .map_err(|_| "Session lock is poisoned.")?
+                .has_deferred_event(channel_id, &event_key);
+
             if !queued_event
+                && !retained_event
                 && sessions
                     .lock()
                     .map_err(|_| "Session lock is poisoned.")?
@@ -3874,14 +3886,22 @@ async fn bridge_with_media(
 
             let retry_message = message.clone();
             let event_id = message.id.clone();
-            let (workspace, prepared, commit) = {
+            let (workspace, prepared, commit, defer) = {
                 let mut store = sessions.lock().map_err(|_| "Session lock is poisoned.")?;
                 let mut commit = false;
-                let workspace = if !store.sessions.contains_key(&session_name)
+                let mut defer = false;
+                let workspace = if store
+                    .sessions
+                    .get(&session_name)
+                    .is_some_and(|session| session.status == "cancelled")
+                {
+                    commit = true;
+                    None
+                } else if !store.sessions.contains_key(&session_name)
                     && store.sessions.len() >= state::LIMIT
                 {
-                    warn!(session = %session_name, event = %event_id, "Session capacity reached; message rejected.");
-                    commit = true;
+                    warn!(session = %session_name, event = %event_id, "Session capacity reached; message deferred.");
+                    defer = true;
                     None
                 } else if event["private"] != true && channel_policy.worktree {
                     match isolate(&session_name) {
@@ -3905,8 +3925,8 @@ async fn bridge_with_media(
                     None
                 } else if let Err(error) = store.ensure(&session_name, model) {
                     if error.kind() == std::io::ErrorKind::WouldBlock {
-                        warn!(session = %session_name, event = %event_id, "Session capacity reached; message rejected.");
-                        commit = true;
+                        warn!(session = %session_name, event = %event_id, "Session capacity reached; message deferred.");
+                        defer = true;
                         None
                     } else {
                         error!(session = %session_name, error = %diagnostic(sentence(error.to_string())), "Session creation failed.");
@@ -3942,8 +3962,8 @@ async fn bridge_with_media(
                             store.queue_with_roles(&session_name, message, roles.clone())
                         {
                             if error.kind() == std::io::ErrorKind::WouldBlock {
-                                warn!(session = %session_name, event = %event_id, "Session queue is full; message rejected.");
-                                commit = true;
+                                warn!(session = %session_name, event = %event_id, "Session queue is full; message deferred.");
+                                defer = true;
                                 None
                             } else {
                                 error!(
@@ -3970,11 +3990,20 @@ async fn bridge_with_media(
                         });
 
                         if prepared.is_some()
-                            && let Err(error) = store.begin_with_roles(
-                                &session_name,
-                                message.clone(),
-                                roles.clone(),
-                            )
+                            && let Err(error) = if queued_event {
+                                store.begin_queued_with_roles(
+                                    &session_name,
+                                    message.clone(),
+                                    roles.clone(),
+                                    channel_id,
+                                )
+                            } else {
+                                store.begin_with_roles(
+                                    &session_name,
+                                    message.clone(),
+                                    roles.clone(),
+                                )
+                            }
                         {
                             error!(
                                 session = %session_name,
@@ -3988,8 +4017,53 @@ async fn bridge_with_media(
                     }
                 };
 
-                (workspace, prepared, commit)
+                (workspace, prepared, commit, defer)
             };
+
+            if defer {
+                if retained_event {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::signal::ctrl_c() => return Ok(()),
+                        _ = stop.notified() => return Ok(()),
+
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                    }
+
+                    continue;
+                }
+
+                let deferred = {
+                    let mut store = sessions.lock().map_err(|_| "Session lock is poisoned.")?;
+                    store.defer_event(channel_id, event.clone())
+                };
+
+                if let Err(error) = deferred {
+                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                        warn!(
+                            session = %session_name,
+                            event = %event_id,
+                            "Message remains uncommitted because deferred storage is full."
+                        );
+                        break;
+                    }
+
+                    return Err(error.into());
+                }
+
+                commit_retained_event(
+                    &channel,
+                    &sessions,
+                    channel_id,
+                    &event_key,
+                    next_offset,
+                    &mut offset,
+                    gateway_sequence,
+                    &mut call,
+                )
+                .await?;
+                continue;
+            }
 
             if commit {
                 commit_event(
@@ -5346,13 +5420,77 @@ async fn commit_event(
     gateway_sequence: Option<u64>,
     call: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    sessions.lock().map_err(|_| "Session lock is poisoned.")?.commit(channel, id, offset)?;
+    commit_event_inner(
+        channel_process,
+        sessions,
+        channel,
+        id,
+        offset,
+        current,
+        gateway_sequence,
+        call,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_retained_event(
+    channel_process: &Live,
+    sessions: &Arc<Mutex<state::Store>>,
+    channel: &str,
+    id: &str,
+    offset: Option<i64>,
+    current: &mut i64,
+    gateway_sequence: Option<u64>,
+    call: &mut u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    commit_event_inner(
+        channel_process,
+        sessions,
+        channel,
+        id,
+        offset,
+        current,
+        gateway_sequence,
+        call,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_event_inner(
+    channel_process: &Live,
+    sessions: &Arc<Mutex<state::Store>>,
+    channel: &str,
+    id: &str,
+    offset: Option<i64>,
+    current: &mut i64,
+    gateway_sequence: Option<u64>,
+    call: &mut u64,
+    retained: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (was_retained, acknowledgement_complete) = {
+        let mut store = sessions.lock().map_err(|_| "Session lock is poisoned.")?;
+        let was_retained = store.has_deferred_event(channel, id);
+        let acknowledgement_complete = was_retained && store.deferred_acknowledged(channel, id);
+
+        if retained {
+            store.commit_retained(channel, id, offset)?;
+        } else {
+            store.commit(channel, id, offset)?;
+        }
+
+        (was_retained, acknowledgement_complete)
+    };
 
     if let Some(next) = offset {
         *current = (*current).max(next);
     }
 
-    if let Some(sequence) = gateway_sequence {
+    if let Some(sequence) = gateway_sequence.filter(|_| !was_retained || !acknowledgement_complete)
+    {
         let mut attempts = 0;
 
         loop {
@@ -5363,7 +5501,13 @@ async fn commit_event(
             *call += 1;
 
             match response {
-                Ok(response) if response.error.is_none() && response.result.is_some() => break,
+                Ok(response) if response.error.is_none() && response.result.is_some() => {
+                    sessions
+                        .lock()
+                        .map_err(|_| "Session lock is poisoned.")?
+                        .mark_deferred_acknowledged(channel, id)?;
+                    break;
+                }
 
                 Ok(response) => {
                     let message = response.error.map_or_else(
@@ -5408,17 +5552,41 @@ async fn handle_callback(
     sessions: &Arc<Mutex<state::Store>>,
     offset: &mut i64,
     call: &mut u64,
+    advance_offset: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let id = event_id(&event["id"]).ok_or("Callback event has no ID.")?;
     let next_offset = event["id"].as_i64().map(|value| value.saturating_add(1));
     let gateway_sequence = event["gateway_sequence"].as_u64();
+
+    if sessions.lock().map_err(|_| "Session lock is poisoned.")?.known(channel_id, &id) {
+        let offset_is_ready = next_offset.is_some_and(|next| next <= offset.saturating_add(1));
+
+        if advance_offset {
+            return commit_event(
+                channel,
+                sessions,
+                channel_id,
+                &id,
+                offset_is_ready.then_some(next_offset).flatten(),
+                offset,
+                gateway_sequence,
+                call,
+            )
+            .await;
+        }
+
+        return Ok(());
+    }
+
+    let commit_offset = advance_offset.then_some(next_offset).flatten();
+
     let Some(chat) = event_id(&event["chat"]) else {
         return commit_event(
             channel,
             sessions,
             channel_id,
             &id,
-            next_offset,
+            commit_offset,
             offset,
             gateway_sequence,
             call,
@@ -5435,7 +5603,7 @@ async fn handle_callback(
             sessions,
             channel_id,
             &id,
-            next_offset,
+            commit_offset,
             offset,
             gateway_sequence,
             call,
@@ -5475,7 +5643,7 @@ async fn handle_callback(
         warn!(error = %diagnostic(sentence(error.to_string())), "Channel approval acknowledgement failed.");
     }
 
-    commit_event(channel, sessions, channel_id, &id, next_offset, offset, gateway_sequence, call)
+    commit_event(channel, sessions, channel_id, &id, commit_offset, offset, gateway_sequence, call)
         .await
 }
 
@@ -5489,9 +5657,9 @@ async fn queue_during_turn(
     sessions: &Arc<Mutex<state::Store>>,
     offset: &mut i64,
     call: &mut u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let Some(id) = event_id(&event["id"]) else {
-        return Ok(());
+        return Ok(true);
     };
 
     let next_offset = event["id"].as_i64().map(|value| value.saturating_add(1));
@@ -5507,7 +5675,7 @@ async fn queue_during_turn(
                     .any(|role| role.as_str().is_some_and(|value| value.len() > META_LIMIT))
         })
     {
-        return commit_event(
+        commit_event(
             channel,
             sessions,
             channel_id,
@@ -5517,11 +5685,18 @@ async fn queue_during_turn(
             gateway_sequence,
             call,
         )
-        .await;
+        .await?;
+        return Ok(true);
     }
 
-    if sessions.lock().map_err(|_| "Session lock is poisoned.")?.known(channel_id, &id) {
-        return commit_event(
+    let retained = sessions
+        .lock()
+        .map_err(|_| "Session lock is poisoned.")?
+        .has_deferred_event(channel_id, &id);
+
+    if !retained && sessions.lock().map_err(|_| "Session lock is poisoned.")?.known(channel_id, &id)
+    {
+        commit_event(
             channel,
             sessions,
             channel_id,
@@ -5531,7 +5706,8 @@ async fn queue_during_turn(
             gateway_sequence,
             call,
         )
-        .await;
+        .await?;
+        return Ok(true);
     }
 
     let Some(chat) = event["chat"]
@@ -5539,7 +5715,7 @@ async fn queue_during_turn(
         .map(str::to_owned)
         .or_else(|| event["chat"].as_i64().map(|value| value.to_string()))
     else {
-        return commit_event(
+        commit_event(
             channel,
             sessions,
             channel_id,
@@ -5549,7 +5725,8 @@ async fn queue_during_turn(
             gateway_sequence,
             call,
         )
-        .await;
+        .await?;
+        return Ok(true);
     };
 
     let thread = event_id(&event["thread"]);
@@ -5558,7 +5735,7 @@ async fn queue_during_turn(
         || thread.as_ref().is_some_and(|value| value.len() > META_LIMIT)
         || !allowed(policy, event, &chat)
     {
-        return commit_event(
+        commit_event(
             channel,
             sessions,
             channel_id,
@@ -5568,13 +5745,14 @@ async fn queue_during_turn(
             gateway_sequence,
             call,
         )
-        .await;
+        .await?;
+        return Ok(true);
     }
 
     let content = content(event);
 
     if content.is_empty() {
-        return commit_event(
+        commit_event(
             channel,
             sessions,
             channel_id,
@@ -5584,13 +5762,14 @@ async fn queue_during_turn(
             gateway_sequence,
             call,
         )
-        .await;
+        .await?;
+        return Ok(true);
     }
 
     let session = session_id(channel_id, &chat, thread.as_deref());
 
     if !valid(&session) {
-        return commit_event(
+        commit_event(
             channel,
             sessions,
             channel_id,
@@ -5600,7 +5779,8 @@ async fn queue_during_turn(
             gateway_sequence,
             call,
         )
-        .await;
+        .await?;
+        return Ok(true);
     }
 
     let roles = event["roles"]
@@ -5623,11 +5803,12 @@ async fn queue_during_turn(
     };
 
     let mut rejected = false;
+    let mut deferred = false;
     {
         let mut store = sessions.lock().map_err(|_| "Session lock is poisoned.")?;
 
         if !store.sessions.contains_key(&session) && store.sessions.len() >= state::LIMIT {
-            rejected = true;
+            deferred = true;
         } else {
             if !store.sessions.contains_key(&session)
                 && event["private"] != true
@@ -5643,24 +5824,68 @@ async fn queue_during_turn(
             }
 
             if !rejected {
-                store.ensure(&session, model)?;
-                store.route(
-                    &session,
-                    channel_id,
-                    &chat,
-                    thread.as_deref(),
-                    event["private"] == true,
-                )?;
-
-                if let Err(error) = store.queue_with_roles(&session, message, roles) {
+                if let Err(error) = store.ensure(&session, model) {
                     if error.kind() == std::io::ErrorKind::WouldBlock {
-                        rejected = true;
+                        deferred = true;
                     } else {
                         return Err(error.into());
                     }
                 }
+
+                if !deferred {
+                    store.route(
+                        &session,
+                        channel_id,
+                        &chat,
+                        thread.as_deref(),
+                        event["private"] == true,
+                    )?;
+
+                    if let Err(error) = store.queue_with_roles(&session, message, roles) {
+                        if error.kind() == std::io::ErrorKind::WouldBlock {
+                            deferred = true;
+                        } else {
+                            return Err(error.into());
+                        }
+                    }
+                }
             }
         }
+    }
+
+    if deferred {
+        if retained {
+            return Ok(false);
+        }
+
+        let result = sessions
+            .lock()
+            .map_err(|_| "Session lock is poisoned.")?
+            .defer_event(channel_id, event.clone());
+
+        if let Err(error) = result {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                warn!(event = %id, "Message remains uncommitted because deferred storage is full.");
+                return Ok(false);
+            }
+
+            return Err(error.into());
+        }
+
+        warn!(event = %id, "Message was retained because the session queue is full.");
+        commit_retained_event(
+            channel,
+            sessions,
+            channel_id,
+            &id,
+            next_offset,
+            offset,
+            gateway_sequence,
+            call,
+        )
+        .await?;
+
+        return Ok(true);
     }
 
     if rejected {
@@ -5668,7 +5893,8 @@ async fn queue_during_turn(
     }
 
     commit_event(channel, sessions, channel_id, &id, next_offset, offset, gateway_sequence, call)
-        .await
+        .await?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5771,18 +5997,37 @@ async fn wait_approval(
         };
 
         let events = value["events"].as_array().cloned().unwrap_or_default();
+        let mut blocked = false;
 
         for event in events {
             if event["kind"] == "callback" {
                 handle_callback(
                     channel, channel_id, &event, policy, mode, approvals, sessions, offset, call,
+                    !blocked,
                 )
                 .await?;
+            } else if blocked {
+                continue;
             } else {
-                queue_during_turn(
+                let processed = queue_during_turn(
                     channel, channel_id, model, &event, policy, sessions, offset, call,
                 )
                 .await?;
+
+                if !processed {
+                    blocked = true;
+                }
+            }
+        }
+
+        if blocked {
+            tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => return Err("The turn was interrupted.".into()),
+                _ = stop.notified() => return Err("The turn was interrupted.".into()),
+                _ = cancel.cancelled() => return Err("The turn was cancelled.".into()),
+
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
             }
         }
     }
@@ -6570,7 +6815,7 @@ fn merge_stream(reply: &mut ModelReply, notes: Vec<Request>) {
 
 fn mutating(name: &str, args: &serde_json::Value) -> bool {
     match name {
-        "write" | "patch" | "shell" => true,
+        "write" | "patch" | "shell" | "memory_remember" => true,
         "git" => args["args"].as_array().is_some_and(|values| {
             values.len() >= 2
                 && values[0].as_str() == Some("worktree")
@@ -6604,7 +6849,7 @@ async fn tool(
         values.insert("scope".into(), memory_scope.into());
 
         if method == "remember" {
-            values.insert("approved".into(), serde_json::Value::Bool(true));
+            values.insert("approved".into(), serde_json::Value::Bool(approve));
         }
 
         let response = match plugin.call(Request::call(id, method, params)).await {
@@ -6739,6 +6984,10 @@ async fn execute_tool(
 fn approval_text(name: &str, args: &serde_json::Value) -> String {
     let details = match name {
         "write" => format!("write to {}", args["path"].as_str().unwrap_or("a workspace path")),
+
+        "memory_remember" => {
+            format!("save memory {}", args["key"].as_str().unwrap_or("with the requested key"))
+        }
 
         "patch" => {
             format!("apply a patch containing {} bytes", args["text"].as_str().map_or(0, str::len))
@@ -11633,6 +11882,7 @@ mod tests {
         assert!(super::mutating("write", &serde_json::json!({})));
         assert!(super::mutating("patch", &serde_json::json!({})));
         assert!(super::mutating("shell", &serde_json::json!({})));
+        assert!(super::mutating("memory_remember", &serde_json::json!({})));
         assert!(super::mutating("git", &serde_json::json!({"args": ["worktree", "add", "path"]})));
         assert!(super::mutating(
             "git",
@@ -11648,6 +11898,11 @@ mod tests {
         assert!(
             super::approval_text("write", &serde_json::json!({"path": "note.txt"}))
                 .contains("write to note.txt")
+        );
+
+        assert!(
+            super::approval_text("memory_remember", &serde_json::json!({"key": "name"}))
+                .contains("save memory name")
         );
 
         assert!(
@@ -13950,6 +14205,9 @@ while IFS= read -r line; do
         *hello*)
             printf '{"jsonrpc":"2.0","id":%s,"result":{"protocol":{"major":0,"minor":1},"id":"telegram","version":"0.1.0","capabilities":["channel"]}}\n' "$request_id"
             ;;
+        *ack*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"acknowledged":true}}\n' "$request_id"
+            ;;
         *callback*)
             printf '{"jsonrpc":"2.0","id":%s,"result":{"acknowledged":true}}\n' "$request_id"
             ;;
@@ -13979,6 +14237,7 @@ done
                 &sessions,
                 &mut offset,
                 &mut call,
+                true,
             )
             .await
             .is_err()
@@ -13997,6 +14256,7 @@ done
                 &sessions,
                 &mut offset,
                 &mut call,
+                true,
             )
             .await
             .unwrap();
@@ -14022,12 +14282,370 @@ done
             &sessions,
             &mut offset,
             &mut call,
+            true,
         )
         .await
         .unwrap();
 
         assert_eq!(offset, 4);
         assert_eq!(call, 11);
+
+        let deferred_callback = serde_json::json!({
+            "kind": "callback",
+            "id": 101,
+            "chat": 7,
+            "private": true,
+            "sender": 8,
+            "callback_id": "callback-2",
+            "data": "invalid",
+        });
+
+        super::handle_callback(
+            &channel,
+            "telegram",
+            &deferred_callback,
+            &policy,
+            super::ApprovalMode::Prompt,
+            &approvals,
+            &sessions,
+            &mut offset,
+            &mut call,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(offset, 4);
+        assert_eq!(sessions.lock().unwrap().offset("telegram"), 4);
+        assert!(sessions.lock().unwrap().known("telegram", "101"));
+
+        super::handle_callback(
+            &channel,
+            "telegram",
+            &deferred_callback,
+            &policy,
+            super::ApprovalMode::Prompt,
+            &approvals,
+            &sessions,
+            &mut offset,
+            &mut call,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(offset, 4);
+        assert_eq!(sessions.lock().unwrap().offset("telegram"), 4);
+
+        sessions.lock().unwrap().commit("telegram", "100", Some(101)).unwrap();
+        offset = 101;
+
+        super::handle_callback(
+            &channel,
+            "telegram",
+            &deferred_callback,
+            &policy,
+            super::ApprovalMode::Prompt,
+            &approvals,
+            &sessions,
+            &mut offset,
+            &mut call,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(offset, 102);
+        assert_eq!(sessions.lock().unwrap().offset("telegram"), 102);
+
+        let discord_callback = serde_json::json!({
+            "kind": "callback",
+            "id": "discord-interaction",
+            "chat": 7,
+            "private": true,
+            "sender": 8,
+            "callback_id": "callback-3",
+            "data": "invalid",
+        });
+
+        super::handle_callback(
+            &channel,
+            "telegram",
+            &discord_callback,
+            &policy,
+            super::ApprovalMode::Prompt,
+            &approvals,
+            &sessions,
+            &mut offset,
+            &mut call,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(sessions.lock().unwrap().known("telegram", "discord-interaction"));
+        assert_eq!(offset, 102);
+
+        let mut replayed_callback = discord_callback;
+        replayed_callback["gateway_sequence"] = serde_json::json!(44);
+        let call_before_replay = call;
+
+        super::handle_callback(
+            &channel,
+            "telegram",
+            &replayed_callback,
+            &policy,
+            super::ApprovalMode::Prompt,
+            &approvals,
+            &sessions,
+            &mut offset,
+            &mut call,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(call, call_before_replay + 1);
+        assert_eq!(offset, 102);
+        assert_eq!(sessions.lock().unwrap().offset("telegram"), 102);
+        channel.stop().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn defers_channel_events_when_the_session_queue_is_full() {
+        let script = r#"
+while IFS= read -r line; do
+    request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+
+    case "$line" in
+        *hello*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocol":{"major":0,"minor":1},"id":"telegram","version":"0.1.0","capabilities":["channel"]}}\n' "$request_id"
+            ;;
+        *ack*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"acknowledged":true}}\n' "$request_id"
+            ;;
+        *shutdown*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$request_id"
+            exit 0
+            ;;
+    esac
+done
+"#;
+        let channel = Live::new(Process::start_with("sh", ["-c", script]).await.unwrap());
+        let mut store = super::state::Store::default();
+        store.ensure("telegram-7", "test").unwrap();
+        store.set_status("telegram-7", "working").unwrap();
+
+        for index in 0..super::state::LIMIT {
+            store
+                .queue(
+                    "telegram-7",
+                    Message {
+                        id: format!("queued-{index}"),
+                        session: "telegram-7".into(),
+                        role: Role::User,
+                        sender: None,
+                        content: vec![Content::Text { text: "queued".into() }],
+                    },
+                )
+                .unwrap();
+        }
+
+        let sessions = Arc::new(Mutex::new(store));
+        let policy = super::ChannelConfig { allow: vec!["7".into()], ..Default::default() };
+        let mut offset = 0;
+        let mut call = 10;
+        let processed = super::queue_during_turn(
+            &channel,
+            "telegram",
+            "test",
+            &serde_json::json!({
+                "id": 1,
+                "chat": 7,
+                "private": true,
+                "text": "defer me",
+                "gateway_sequence": 9
+            }),
+            &policy,
+            &sessions,
+            &mut offset,
+            &mut call,
+        )
+        .await
+        .unwrap();
+
+        assert!(processed);
+        assert_eq!(offset, 2);
+        assert_eq!(call, 11);
+        {
+            let store = sessions.lock().unwrap();
+
+            assert!(store.known("telegram", "1"));
+            assert_eq!(store.offset("telegram"), 2);
+            assert!(store.has_deferred_event("telegram", "1"));
+            assert_eq!(store.sessions["telegram-7"].queued.len(), super::state::LIMIT);
+        }
+
+        let processed = super::queue_during_turn(
+            &channel,
+            "telegram",
+            "test",
+            &serde_json::json!({
+                "id": 1,
+                "chat": 7,
+                "private": true,
+                "text": "defer me",
+                "gateway_sequence": 9
+            }),
+            &policy,
+            &sessions,
+            &mut offset,
+            &mut call,
+        )
+        .await
+        .unwrap();
+
+        assert!(!processed);
+        assert_eq!(offset, 2);
+        assert_eq!(call, 11);
+
+        for index in 0..(super::state::LIMIT - 1) {
+            let event = serde_json::json!({"id": format!("deferred-{index}")});
+            sessions.lock().unwrap().defer_event("telegram", event).unwrap();
+        }
+
+        let processed = super::queue_during_turn(
+            &channel,
+            "telegram",
+            "test",
+            &serde_json::json!({
+                "id": 2,
+                "chat": 7,
+                "private": true,
+                "text": "leave uncommitted"
+            }),
+            &policy,
+            &sessions,
+            &mut offset,
+            &mut call,
+        )
+        .await
+        .unwrap();
+
+        assert!(!processed);
+        assert_eq!(offset, 2);
+        assert!(!sessions.lock().unwrap().known("telegram", "2"));
+
+        channel.stop().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handles_approval_callback_after_an_unretained_event_without_advancing_offset() {
+        let script = r#"
+approve_token=
+while IFS= read -r line; do
+    request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+
+    case "$line" in
+        *'"method":"hello"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocol":{"major":0,"minor":1},"id":"telegram","version":"0.1.0","capabilities":["channel"]}}\n' "$request_id"
+            ;;
+        *'"method":"approval"'*)
+            approve_token=$(printf '%s' "$line" | sed -n 's/.*"approve":"\([^"]*\)".*/\1/p')
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"sent":true}}\n' "$request_id"
+            ;;
+        *'"method":"poll"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"events":[{"id":100,"chat":7,"private":true,"text":"defer me"},{"kind":"callback","id":101,"chat":7,"private":true,"sender":7,"callback_id":"callback-1","data":"%s"}]}}\n' "$request_id" "$approve_token"
+            ;;
+        *'"method":"callback"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"acknowledged":true}}\n' "$request_id"
+            ;;
+        *'"method":"ack"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"acknowledged":true}}\n' "$request_id"
+            ;;
+        *'"method":"shutdown"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$request_id"
+            exit 0
+            ;;
+    esac
+done
+"#;
+        let channel = Live::new(Process::start_with("sh", ["-c", script]).await.unwrap());
+        let mut store = super::state::Store::default();
+        store.ensure("telegram-7", "test").unwrap();
+        store.set_status("telegram-7", "working").unwrap();
+
+        for index in 0..super::state::LIMIT {
+            store
+                .queue(
+                    "telegram-7",
+                    Message {
+                        id: format!("queued-{index}"),
+                        session: "telegram-7".into(),
+                        role: Role::User,
+                        sender: None,
+                        content: vec![Content::Text { text: "queued".into() }],
+                    },
+                )
+                .unwrap();
+
+            store
+                .defer_event("telegram", serde_json::json!({"id": format!("deferred-{index}")}))
+                .unwrap();
+        }
+
+        let sessions = Arc::new(Mutex::new(store));
+        let approvals = Arc::new(super::AsyncMutex::new(super::approval::Gate::new().unwrap()));
+        let target = super::approval::Target {
+            channel: "telegram".into(),
+            chat: "7".into(),
+            thread: None,
+            session: "telegram-7".into(),
+            tool: "write".into(),
+            args: serde_json::json!({}),
+        };
+
+        let challenge = approvals.lock().await.issue(target).unwrap();
+        let stop = Arc::new(super::Stop::new());
+        let mut offset = 0;
+        let mut call = 1;
+        let cancel = super::Cancellation::new();
+
+        super::wait_approval(
+            &channel,
+            "telegram",
+            "test",
+            "7",
+            None,
+            "write file",
+            &challenge.approve,
+            &challenge.deny,
+            &super::ChannelConfig { allow: vec!["7".into()], tools: true, ..Default::default() },
+            super::ApprovalMode::Prompt,
+            &approvals,
+            &sessions,
+            &mut offset,
+            &mut call,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            &cancel,
+            &stop,
+        )
+        .await
+        .unwrap();
+
+        assert!(challenge.answer.await.unwrap());
+
+        {
+            let store = sessions.lock().unwrap();
+
+            assert_eq!(offset, 0);
+            assert!(!store.known("telegram", "100"));
+            assert!(store.known("telegram", "101"));
+            assert_eq!(store.offset("telegram"), 0);
+        }
+
         channel.stop().await.unwrap();
     }
 
@@ -14421,6 +15039,51 @@ done
         assert_eq!(current, 2);
         assert_eq!(call, 12);
         assert!(sessions.lock().unwrap().known("telegram", "event"));
+        channel.stop().await.unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retries_a_deferred_event_acknowledgement_after_replay() {
+        let root = test_root("deferred-ack");
+        let sessions =
+            Arc::new(Mutex::new(super::state::Store::load(root.join("sessions.json")).unwrap()));
+        sessions
+            .lock()
+            .unwrap()
+            .defer_event("telegram", serde_json::json!({"id": "event", "gateway_sequence": 7}))
+            .unwrap();
+        let mut current = 0;
+        let mut call = 10;
+
+        assert!(!sessions.lock().unwrap().deferred_acknowledged("telegram", "event"));
+        let success_script = r#"while IFS= read -r line; do case "$line" in *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"telegram","version":"0.1.0","capabilities":["channel"]}}' ;; *ack*) printf '%s\n' '{"jsonrpc":"2.0","id":10,"result":{"acknowledged":true}}' ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;; esac; done"#;
+        let channel = Live::new(Process::start_with("sh", ["-c", success_script]).await.unwrap());
+
+        commit_event(
+            &channel,
+            &sessions,
+            "telegram",
+            "event",
+            Some(2),
+            &mut current,
+            Some(7),
+            &mut call,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(current, 2);
+        assert_eq!(call, 11);
+
+        {
+            let store = sessions.lock().unwrap();
+
+            assert!(store.known("telegram", "event"));
+            assert!(!store.has_deferred_event("telegram", "event"));
+        }
+
         channel.stop().await.unwrap();
         let _ = fs::remove_dir_all(root);
     }

@@ -80,7 +80,11 @@ fn base_url() -> crabbot_core::Result<String> {
     let value = std::env::var("CRABBOT_OPENROUTER_BASE_URL")
         .unwrap_or_else(|_| "https://openrouter.ai/api/v1".into());
 
-    let url = reqwest::Url::parse(&value)
+    validate_base_url(&value)
+}
+
+fn validate_base_url(value: &str) -> crabbot_core::Result<String> {
+    let url = reqwest::Url::parse(value)
         .map_err(|_| crabbot_core::Error::Denied("OpenRouter base URL is invalid.".into()))?;
 
     let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
@@ -157,11 +161,19 @@ async fn stream(
 }
 
 fn headers() -> crabbot_core::Result<reqwest::header::HeaderMap> {
+    headers_with(
+        std::env::var("CRABBOT_OPENROUTER_REFERER").ok().as_deref(),
+        std::env::var("CRABBOT_OPENROUTER_TITLE").ok().as_deref(),
+    )
+}
+
+fn headers_with(
+    referer: Option<&str>,
+    title: Option<&str>,
+) -> crabbot_core::Result<reqwest::header::HeaderMap> {
     let mut headers = reqwest::header::HeaderMap::new();
 
-    if let Some(value) =
-        std::env::var("CRABBOT_OPENROUTER_REFERER").ok().filter(|value| !value.is_empty())
-    {
+    if let Some(value) = referer.filter(|value| !value.is_empty()) {
         headers.insert(
             "HTTP-Referer",
             value.parse().map_err(|_| {
@@ -170,9 +182,7 @@ fn headers() -> crabbot_core::Result<reqwest::header::HeaderMap> {
         );
     }
 
-    if let Some(value) =
-        std::env::var("CRABBOT_OPENROUTER_TITLE").ok().filter(|value| !value.is_empty())
-    {
+    if let Some(value) = title.filter(|value| !value.is_empty()) {
         headers.insert(
             "X-Title",
             value
@@ -465,8 +475,9 @@ fn credential() -> crabbot_core::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_LIMIT, base_url, collect, credential, generate, headers, image, messages, response,
-        response_body, stream_body, stream_line, tools,
+        BODY_LIMIT, TOOL_LIMIT, base_url, collect, credential, generate, headers, headers_with,
+        image, messages, response, response_body, stream_body, stream_line, tools,
+        validate_base_url,
     };
 
     use crabbot_core::types::{Content, Message, ModelRequest, Request, Role, ToolSpec};
@@ -535,6 +546,17 @@ mod tests {
         });
 
         assert_eq!(messages(&tool).unwrap().last().unwrap()["role"], "user");
+
+        let mut too_many = input;
+        too_many.tools = (0..TOOL_LIMIT + 2)
+            .map(|index| ToolSpec {
+                name: format!("tool-{index}"),
+                description: None,
+                schema: json!({"type":"object"}),
+            })
+            .collect();
+
+        assert_eq!(tools(&too_many).len(), TOOL_LIMIT);
     }
 
     #[tokio::test]
@@ -576,8 +598,23 @@ mod tests {
     #[test]
     fn validates_provider_configuration_and_protocol_size() {
         assert!(base_url().is_ok());
+        assert_eq!(
+            validate_base_url("http://localhost:8080/v1").unwrap(),
+            "http://localhost:8080/v1"
+        );
+
+        assert_eq!(validate_base_url("https://api.example/v1/").unwrap(), "https://api.example/v1");
+        assert!(validate_base_url("not a URL").is_err());
+        assert!(validate_base_url("http://api.example/v1").is_err());
         assert!(credential().is_err());
         assert!(headers().is_ok());
+        assert!(headers_with(Some("not a header\n"), None).is_err());
+        assert!(headers_with(None, Some("not a header\n")).is_err());
+
+        let headers = headers_with(Some("https://example.test"), Some("Crabbot")).unwrap();
+
+        assert_eq!(headers["HTTP-Referer"], "https://example.test");
+        assert_eq!(headers["X-Title"], "Crabbot");
         assert!(response(1, json!({"ok": true})).unwrap().is_some());
         assert!(response_body(1, reqwest::StatusCode::OK, json!({"choices": []})).is_err());
     }
@@ -594,6 +631,15 @@ mod tests {
         assert_eq!(response.result.as_ref().unwrap()["events"][0]["name"], "read");
         assert!(response_body(1, reqwest::StatusCode::UNAUTHORIZED, json!({})).is_err());
         assert!(response_body(1, reqwest::StatusCode::OK, json!({})).is_err());
+        let fallback = response_body(
+            1,
+            reqwest::StatusCode::OK,
+            json!({"choices":[{"message":{"tool_calls":[{"function":{"name":"read","arguments":"not-json"}}]}}]}),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(fallback.result.unwrap()["events"][0]["args"], "not-json");
         assert!(
             response_body(1, reqwest::StatusCode::OK, json!({"choices":[{"message":{}}]})).is_err()
         );
@@ -637,6 +683,11 @@ mod tests {
         .is_ok());
 
         assert_eq!(calls[&0].0, "read");
+        let tool_delta = br#"data: {"choices":[{"delta":{"content":"!","tool_calls":[{"index":0,"function":{"name":"File","arguments":"}"}}]}}]}"#;
+
+        assert!(stream_line(tool_delta, &mut text, &mut pending, &mut calls).is_ok());
+        assert_eq!(text, "!");
+        assert_eq!(calls[&0].0, "readFile");
         assert!(stream_line(b"invalid", &mut text, &mut pending, &mut calls).is_ok());
         assert!(stream_line(&[0xff], &mut text, &mut pending, &mut calls).is_err());
         assert!(stream_line(b"data: {", &mut text, &mut pending, &mut calls).is_err());
@@ -655,6 +706,15 @@ mod tests {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(b"data: nope\n".to_vec())]);
 
         assert!(stream_body(2, chunks, &mut emitter).await.is_err());
+
+        let (output, _) = tokio::sync::mpsc::channel(4);
+        let mut emitter = crabbot_core::plugin::Emitter::new(output);
+        let chunks = stream::iter(vec![Ok::<_, std::io::Error>(
+            br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"{\"path\":\"x\"}"}}]}}]}"#.to_vec(),
+        )]);
+        let response = stream_body(3, chunks, &mut emitter).await.unwrap().unwrap();
+
+        assert_eq!(response.result.unwrap()["events"][0]["name"], "read");
     }
 
     #[tokio::test]
