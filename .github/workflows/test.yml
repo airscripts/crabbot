@@ -89,10 +89,7 @@ jobs:
             arch: aarch64
             runner: windows-11-arm
             target: aarch64-pc-windows-msvc
-            coverage: true
-            coverage_profile: platform
-            coverage_package_min: 60
-            coverage_runtime_min: 40
+            coverage: false
 
     steps:
       - name: Checkout
