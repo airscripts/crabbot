@@ -607,7 +607,7 @@ impl Store {
                 && let Some(events) = store.deferred.get_mut(channel)
             {
                 events.retain(|event| {
-                    !event["id"].as_i64().is_some_and(|value| value.to_string() == message.id)
+                    event["id"].as_i64().is_none_or(|value| value.to_string() != message.id)
                         && event["id"].as_str() != Some(&message.id)
                 });
 
@@ -1301,7 +1301,7 @@ impl Store {
 
             if !retained && let Some(events) = store.deferred.get_mut(channel) {
                 events.retain(|event| {
-                    !event["id"].as_i64().is_some_and(|value| value.to_string() == id)
+                    event["id"].as_i64().is_none_or(|value| value.to_string() != id)
                         && event["id"].as_str() != Some(id)
                 });
 
