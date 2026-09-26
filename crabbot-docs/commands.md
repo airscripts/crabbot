@@ -35,6 +35,9 @@ crabbot <plugin-command> [arguments...]
 Native commands and currently registered plugin commands are shown in separate
 lists. The plugin list is rebuilt from the installed plugin registry, so it
 includes commands added by newly installed or linked plugins.
+Running `crabbot service` without a subcommand prints native service help,
+including the global options; use `crabbot service status` to inspect the
+installed service and its state.
 The installed `crab` executable is a shorter alias for `crabbot` and accepts
 the same commands and options.
 `crabbot --version` and `crabbot version` print the same package version.
@@ -230,7 +233,12 @@ to it; existing CRABBOT_CREDENTIALS and CRABBOT_KEYRING=1 configuration is also
 preserved. An existing definition is not replaced unless `--force` is supplied.
 `remove` requires `--yes`. `start` and `stop` activate or deactivate it through systemd-user,
 launchd, or the Windows Service Controller. remove stops or unloads the service
-before deleting the definition, and status reports whether it is present.
+before deleting the definition. `status` reports both the installed definition
+and the service-manager state. On Linux this is a user service, so use
+`systemctl --user status crabbot.service` for detailed systemd output; plain
+`systemctl status crabbot.service` checks the separate system-wide manager.
+Repeated `start` and `stop` commands report when the service is already in the
+requested state.
 
 `config.toml` accepts `update = "off"`, `"check"`, `"prompt"`, or `"auto"`;
 the default is `prompt`. Direct messages are allowed by default. Group chats

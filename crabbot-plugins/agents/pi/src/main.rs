@@ -340,12 +340,42 @@ async fn tool_bridge(listener: TcpListener, emitter: Emitter, token: String, wor
 }
 
 async fn handle_tool_call(
-    mut stream: TcpStream,
+    stream: TcpStream,
     emitter: Emitter,
     token: &str,
     workspace: &Path,
 ) -> crabbot_core::Result<()> {
+    handle_tool_call_with(stream, token, workspace, |name, args, workspace| async move {
+        let response = emitter
+            .call(
+                "host/tool",
+                json!({
+                    "name": name,
+                    "args": args,
+                    "workspace": workspace.display().to_string(),
+                }),
+            )
+            .await?;
+
+        Ok(response
+            .result
+            .unwrap_or_else(|| json!({"error": response.error.map(|error| error.message)})))
+    })
+    .await
+}
+
+async fn handle_tool_call_with<F, Fut>(
+    mut stream: TcpStream,
+    token: &str,
+    workspace: &Path,
+    call: F,
+) -> crabbot_core::Result<()>
+where
+    F: FnOnce(Value, Value, PathBuf) -> Fut,
+    Fut: std::future::Future<Output = crabbot_core::Result<Value>>,
+{
     let mut bytes = Vec::new();
+
     let mut buffer = [0_u8; 4096];
     let header_end = loop {
         let count = timeout(Duration::from_secs(5), stream.read(&mut buffer))
@@ -398,19 +428,7 @@ async fn handle_tool_call(
     let result = if request["token"].as_str() != Some(token) {
         json!({"error": "Pi tool authorization failed."})
     } else {
-        let response = emitter
-            .call(
-                "host/tool",
-                json!({
-                    "name": request["name"],
-                    "args": request["args"],
-                    "workspace": workspace.display().to_string(),
-                }),
-            )
-            .await?;
-        response
-            .result
-            .unwrap_or_else(|| json!({"error": response.error.map(|error| error.message)}))
+        call(request["name"].clone(), request["args"].clone(), workspace.to_path_buf()).await?
     };
 
     let body = serde_json::to_vec(&result)?;
@@ -464,6 +482,39 @@ mod tests {
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
             Err(error) => panic!("Could not bind the Pi test listener: {error}."),
         }
+    }
+
+    async fn send_tool_request(request: Vec<u8>) -> Option<(String, Vec<u8>)> {
+        let listener = loopback_listener().await?;
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+
+            handle_tool_call_with(
+                stream,
+                "expected",
+                Path::new("/workspace"),
+                |name, args, root| async move {
+                    Ok(json!({
+                        "name": name,
+                        "args": args,
+                        "workspace": root,
+                        "output": "ok",
+                    }))
+                },
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&request).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let error = server.await.unwrap().err().map(|error| error.to_string()).unwrap_or_default();
+
+        Some((error, response))
     }
 
     fn restricted_network(error: &crabbot_core::Error) -> bool {
@@ -546,6 +597,44 @@ mod tests {
 
         assert!(String::from_utf8_lossy(&response).contains("authorization failed"));
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn serves_authorized_tool_bridge_requests() {
+        let body = br#"{"token":"expected","name":"read","args":{"path":"README.md"}}"#;
+        let request = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len());
+        let mut request = request.into_bytes();
+        request.extend_from_slice(body);
+
+        let Some((error, response)) = send_tool_request(request).await else {
+            return;
+        };
+
+        assert!(error.is_empty());
+        let response = String::from_utf8(response).unwrap();
+
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"name\":\"read\""));
+        assert!(response.contains("\"path\":\"README.md\""));
+        assert!(response.contains("\"workspace\":\"/workspace\""));
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_tool_bridge_requests() {
+        let requests = [
+            b"POST / HTTP/1.1\r\nConnection: close\r\n\r\n".to_vec(),
+            b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nx".to_vec(),
+            b"POST / HTTP/1.1\r\nContent-Length: 1\r\n\r\n{".to_vec(),
+            vec![b'x'; LINE_LIMIT + 1],
+        ];
+
+        for request in requests {
+            let Some((error, _)) = send_tool_request(request).await else {
+                return;
+            };
+
+            assert!(!error.is_empty());
+        }
     }
 
     #[cfg(unix)]

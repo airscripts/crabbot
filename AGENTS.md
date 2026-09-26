@@ -80,6 +80,10 @@ around control flow, complex match arms, and distinct setup or assertion groups.
 Apply this spacing consistently across every crate and preserve it when
 formatting code.
 
+For Rust code edits, run `make verify` and resolve coverage-gate failures in
+changed packages before handoff; do not lower coverage thresholds to mask
+missing coverage.
+
 ## Further Context
 
 See [AGENTS.reference.md](AGENTS.reference.md) for provenance and decisions.

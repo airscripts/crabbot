@@ -48,10 +48,69 @@ core image.
 - Publish reproducible OCI-compatible deployment images for the CLI and daemon.
 - Keep Docker, Podman, and other OCI runtimes supported through the same image
   and documented entrypoints.
-- Document environment and file-based secret injection, persistent volumes for
-  `CRABBOT_HOME` and `CRABBOT_ROOT`, health checks, graceful shutdown, and
-  restart behavior.
+- Implement and document container configuration through environment variables
+  and mounted secret files, including precedence and validation.
+- Support persistent volumes for `CRABBOT_HOME` and `CRABBOT_ROOT`, health
+  checks, graceful shutdown, and restart behavior.
 - Keep plugins independently installable and hot-loadable, with explicit IPC,
   network, and volume boundaries in the container deployment guide.
 - Avoid privileged defaults and add CI smoke coverage for an OCI runtime,
   image metadata, persistence, and daemon lifecycle.
+
+## v0.6 | Multi-Agent Runtime
+
+Let operators run multiple independent agents and later coordinate them across
+process and machine boundaries, without weakening workspace or capability
+isolation.
+
+- Keep the existing single-agent home layout and behavior as the default.
+- Add an explicit `crabbot init --multiagent` mode that puts every agent,
+  including the first, under `agents/<id>` with its own configuration, state,
+  workspace, and plugin installations; do not create a special root agent in
+  this mode. Plugin configuration, enablement, and updates are scoped to their
+  owning agent.
+- Run one daemon per multi-agent home by default, supervising a separate
+  runtime context for each agent. Partition sessions, memory, workspaces,
+  plugin registries and processes, and configuration by agent; share only the
+  host-level supervisor and explicitly global infrastructure.
+- Offer a dedicated daemon or container per agent when stronger fault or
+  security isolation is needed, while keeping the shared-daemon setup the
+  straightforward local default.
+- Provide an explicit, recoverable migration for existing installations.
+  Move agent-owned data, including installed plugins and their configuration,
+  into the default agent; keep only daemon-level runtime infrastructure
+  shared. Verify the new layout before switching over and retain rollback data
+  until migration succeeds.
+- Allow a local agent workspace to run on the host or in an isolated container,
+  with explicit filesystem, tool, secret, network, and resource boundaries.
+- Define authenticated, permissioned agent-to-agent messaging and task handoff;
+  do not implicitly share conversation history, memory, credentials, or files.
+- Add supervision and lifecycle controls for independent agents, including
+  health, restart, shutdown, and bounded resource use. Bound active agents,
+  concurrent work, plugin processes, and storage per agent and across the host;
+  avoid an arbitrary hard cap on configured agents, with an optional
+  administrator-configured count limit where useful.
+- Extend the topology to multiple containers and, later, multiple machines
+  through a documented coordination protocol that tolerates disconnection and
+  partial failure.
+- Keep single-agent local operation simple and useful without requiring an
+  orchestrator, container engine, or network service.
+
+## v0.7 | Small-Footprint Runtime
+
+Reduce Crabbot's idle and peak resource use for constrained hosts while
+preserving the full feature set and clear behavior under load.
+
+- Establish and document minimum supported resource targets instead of
+  promising operation on literally any hardware.
+- Measure daemon-only and configured-plugin memory and CPU at idle, during
+  active turns, and under recovery or burst load; distinguish resident and
+  proportional memory, peak use, and plugin overhead.
+- Profile before optimizing. Investigate runtime worker/thread sizing, idle
+  work, allocations, buffers, and duplicate process overhead, and retain only
+  changes that improve representative constrained-device measurements.
+- Apply bounded concurrency, queues, and per-agent resource budgets without
+  silently dropping work or disabling capabilities; keep limits observable and
+  configurable where operators need control.
+- Add repeatable performance and low-memory smoke tests for representative
+  supported targets, and verify behavior with the full configured plugin set.

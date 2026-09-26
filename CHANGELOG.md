@@ -40,6 +40,13 @@ Semantic Versioning.
 - Hardened service installation and removal with explicit `--force` and `--yes`
   confirmations, and made plugin inventory and delivery errors fail clearly
   instead of being silently ignored.
+- Made service status report the service-manager state and name, and made
+  repeated service starts and stops explain when no state change was needed.
+- Standardized the macOS launchd and credential-store identifier as
+  `it.airscript.crabbot`, and use the friendly service name `Crabbot` on macOS
+  and Linux.
+- Made bare `crabbot service` display native Clap help, including inherited
+  global options and the `-H` help alias, instead of implicitly running status.
 - Added adaptive `revloop` review scope: uncommitted changes by default, the
   latest commit or feature branch when the tree is clean, and an explicit
   `--global` mode for repository-wide audits.

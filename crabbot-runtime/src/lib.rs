@@ -521,10 +521,14 @@ enum Command {
         command: DeliveryCommand,
     },
 
-    #[command(about = "Install, remove, and control the native service.")]
+    #[command(
+        about = "Install, remove, and control the native service.",
+        arg_required_else_help = true,
+        subcommand_required = true
+    )]
     Service {
         #[command(subcommand)]
-        command: Option<ServiceCommand>,
+        command: ServiceCommand,
     },
 
     #[command(about = "Export the local configuration and plugin lock.")]
@@ -1194,7 +1198,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Plugin { command } => plugin(command, json).await?,
         Command::Session { command } => session(command, json).await?,
         Command::Delivery { command } => delivery(command, json).await?,
-        Command::Service { command } => service(command.unwrap_or(ServiceCommand::Status), json)?,
+        Command::Service { command } => service(command, json)?,
         Command::Export(args) => export_crabfile(args, json)?,
         Command::Validate(args) => validate_crabfile(args, json)?,
         Command::Import(args) => import_crabfile(args, json)?,
@@ -3321,7 +3325,7 @@ fn keyring_ready(name: &str) -> bool {
         return false;
     }
 
-    keyring::Entry::new("dev.airscripts.crabbot", name)
+    keyring::Entry::new("it.airscript.crabbot", name)
         .ok()
         .and_then(|entry| entry.get_password().ok())
         .is_some_and(|value| !value.trim().is_empty())
@@ -7530,7 +7534,17 @@ fn service_at_with(
 fn service_at_with_mode(
     path: &Path,
     command: ServiceCommand,
+    action: impl FnMut(&Path, bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    service_at_with_status(path, command, action, service_manager_state, json)
+}
+
+fn service_at_with_status(
+    path: &Path,
+    command: ServiceCommand,
     mut action: impl FnMut(&Path, bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    mut state: impl FnMut() -> Result<ServiceState, Box<dyn std::error::Error + Send + Sync>>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
@@ -7622,22 +7636,25 @@ fn service_at_with_mode(
         }
 
         ServiceCommand::Status => {
+            let installed = path.is_file();
+            let status = if installed { state()? } else { ServiceState::NotInstalled };
+
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
+                        "name": service_name(),
                         "path": path,
-                        "status": if path.is_file() { "installed" } else { "not installed" },
+                        "status": if installed { "installed" } else { "not installed" },
+                        "service_status": status.as_str(),
                     }))?
                 );
             } else {
+                println!("Service: {}.", service_name());
+                println!("Status: {}.", status.as_str());
                 println!(
                     "Service definition: {}.",
-                    if path.is_file() {
-                        path.display().to_string()
-                    } else {
-                        "not installed".into()
-                    }
+                    if installed { path.display().to_string() } else { "not installed".into() }
                 );
             }
         }
@@ -7649,8 +7666,57 @@ fn service_at_with_mode(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceState {
+    Active,
+    Inactive,
+    Starting,
+    Stopping,
+    Failed,
+    NotInstalled,
+}
+
+impl ServiceState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Inactive => "inactive",
+            Self::Starting => "starting",
+            Self::Stopping => "stopping",
+            Self::Failed => "failed",
+            Self::NotInstalled => "not installed",
+        }
+    }
+}
+
+fn service_name() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        "Crabbot"
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        "Crabbot"
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        "Crabbot"
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        "Crabbot"
+    }
+}
+
+#[cfg(target_os = "macos")]
+const MACOS_SERVICE_LABEL: &str = "it.airscript.crabbot";
+
 fn daemon_executable() -> std::io::Result<PathBuf> {
     let current = std::env::current_exe()?;
+
     let name = if cfg!(windows) { "crabbot-daemon.exe" } else { "crabbot-daemon" };
 
     let sibling = current.parent().unwrap_or(Path::new(".")).join(name);
@@ -7999,15 +8065,10 @@ fn service_action_with(
         return Err("Service definition is not installed.".into());
     }
 
-    #[cfg(target_os = "windows")]
-    if !start && !windows_service_running()? {
-        if json {
-            println!("{}", serde_json::json!({"action": "stop", "status": "stopped"}));
-        } else {
-            println!("Service stopped.");
-        }
+    let previous = service_manager_state()?;
 
-        return Ok(());
+    if service_action_is_noop(start, previous) {
+        return service_action_message(start, Some(previous), json);
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -8058,47 +8119,171 @@ fn service_action_with(
         return Err(format!("Service action failed: {}", sentence(detail)).into());
     }
 
+    service_action_message(start, None, json)
+}
+
+fn service_action_message(
+    start: bool,
+    previous: Option<ServiceState>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let action = if start { "start" } else { "stop" };
+
+    let status = match (start, previous) {
+        (true, Some(_)) => "already active",
+        (false, Some(ServiceState::Failed)) => "failed",
+        (false, Some(ServiceState::NotInstalled)) => "not installed",
+        (false, Some(_)) => "already inactive",
+        (true, None) => "started",
+        (false, None) => "stopped",
+    };
+
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "action": if start { "start" } else { "stop" },
-                "status": if start { "started" } else { "stopped" },
+                "action": action,
+                "name": service_name(),
+                "status": status,
             }))?
         );
+    } else if start && previous.is_some() {
+        println!("Service {} is already active; no action taken.", service_name());
+    } else if previous == Some(ServiceState::Failed) {
+        println!("Service {} is failed; nothing is running to stop.", service_name());
+    } else if previous == Some(ServiceState::NotInstalled) {
+        println!("Service {} is not loaded; nothing to stop.", service_name());
+    } else if !start && previous.is_some() {
+        println!("Service {} is already inactive; nothing to stop.", service_name());
     } else {
-        let status = if start { "started" } else { "stopped" };
-
-        println!("Service {status}.");
+        println!("Service {} {status}.", service_name());
     }
 
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
-fn windows_service_running() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let output = command_output(std::process::Command::new("sc.exe").args(["query", "Crabbot"]))?;
+fn service_action_is_noop(start: bool, state: ServiceState) -> bool {
+    (start && state == ServiceState::Active)
+        || (!start
+            && matches!(
+                state,
+                ServiceState::Inactive | ServiceState::Failed | ServiceState::NotInstalled
+            ))
+}
 
-    if !output.status.success() {
-        let detail = format!(
-            "{} {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+fn service_manager_state() -> Result<ServiceState, Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = command_output(std::process::Command::new("systemctl").args([
+            "--user",
+            "is-active",
+            "crabbot.service",
+        ]))?;
 
-        let lower = detail.to_ascii_lowercase();
-
-        if detail.contains("1060") || lower.contains("does not exist") {
-            return Ok(false);
-        }
-
-        return Err(format!("Service query failed: {}", sentence(detail.trim())).into());
+        linux_service_state(
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
     }
 
-    let state = String::from_utf8_lossy(&output.stdout);
-    Ok(["RUNNING", "START_PENDING", "STOP_PENDING", "PAUSE_PENDING"]
-        .iter()
-        .any(|value| state.contains(value)))
+    #[cfg(target_os = "macos")]
+    {
+        let uid = std::process::Command::new("id").arg("-u").output()?;
+
+        if !uid.status.success() {
+            return Err("Service status query failed: could not determine the current user.".into());
+        }
+
+        let target =
+            format!("gui/{}/{MACOS_SERVICE_LABEL}", String::from_utf8_lossy(&uid.stdout).trim());
+        let output =
+            command_output(std::process::Command::new("launchctl").args(["print", &target]))?;
+
+        if !output.status.success() {
+            let detail = format!(
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            if detail.contains("Could not find service") || detail.contains("No such process") {
+                return Ok(ServiceState::NotInstalled);
+            }
+
+            return Err(format!("Service status query failed: {}", sentence(detail.trim())).into());
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout);
+
+        return Ok(if text.lines().any(|line| line.trim() == "state = running") {
+            ServiceState::Active
+        } else {
+            ServiceState::Inactive
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let output =
+            command_output(std::process::Command::new("sc.exe").args(["query", "Crabbot"]))?;
+
+        if !output.status.success() {
+            let detail = format!(
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let lower = detail.to_ascii_lowercase();
+
+            if detail.contains("1060") || lower.contains("does not exist") {
+                return Ok(ServiceState::NotInstalled);
+            }
+
+            return Err(format!("Service query failed: {}", sentence(detail.trim())).into());
+        }
+
+        let state = String::from_utf8_lossy(&output.stdout);
+
+        return Ok(if state.contains("RUNNING") {
+            ServiceState::Active
+        } else if state.contains("START_PENDING") {
+            ServiceState::Starting
+        } else if state.contains("STOP_PENDING") {
+            ServiceState::Stopping
+        } else {
+            ServiceState::Inactive
+        });
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        Err("Native service status is unsupported on this platform.".into())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_service_state(
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> Result<ServiceState, Box<dyn std::error::Error + Send + Sync>> {
+    let value = stdout.trim().to_ascii_lowercase();
+
+    match value.as_str() {
+        "active" => Ok(ServiceState::Active),
+        "activating" => Ok(ServiceState::Starting),
+        "deactivating" => Ok(ServiceState::Stopping),
+        "failed" => Ok(ServiceState::Failed),
+        "inactive" | "unknown" | "not-found" => Ok(ServiceState::Inactive),
+
+        _ if !success && stderr.trim().is_empty() => {
+            Err("Service status query failed: systemd returned no details.".into())
+        }
+
+        _ => Err(format!("Service status query failed: {}", sentence(stderr.trim())).into()),
+    }
 }
 
 fn service_path() -> PathBuf {
@@ -8117,7 +8302,7 @@ fn service_path() -> PathBuf {
 
     #[cfg(target_os = "macos")]
     {
-        user.join("Library/LaunchAgents/dev.airscripts.crabbot.plist")
+        user.join("Library/LaunchAgents").join(format!("{MACOS_SERVICE_LABEL}.plist"))
     }
 
     #[cfg(target_os = "windows")]
@@ -8158,7 +8343,8 @@ fn service_text(executable: &Path, environment: &[(String, String)]) -> String {
             .collect::<String>();
 
         format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>dev.airscripts.crabbot</string><key>ProgramArguments</key><array><string>{}</string></array><key>EnvironmentVariables</key><dict>{}</dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array><string>{}</string></array><key>EnvironmentVariables</key><dict>{}</dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n",
+            MACOS_SERVICE_LABEL,
             xml(executable),
             environment
         )
@@ -10258,10 +10444,13 @@ mod tests {
         import_crabfile_at, init_at, installed_at, isolate_at, local_session, memory_scope,
         memory_tools, model_content, plugin_binary, read_manifest, reclaim_worktrees, recover,
         recover_plugins, redact, resolve, restart_tool, revision, safe_archive, send_params,
-        send_request, service_at, service_at_with, service_environment_from, service_path_value,
-        service_text, session_at, stream_fits, tool, update_at, validate_archive, verify_archive,
-        write_debug_report_at,
+        send_request, service_at, service_at_with, service_environment_from, service_name,
+        service_path_value, service_text, session_at, stream_fits, tool, update_at,
+        validate_archive, verify_archive, write_debug_report_at,
     };
+
+    #[cfg(target_os = "macos")]
+    use super::MACOS_SERVICE_LABEL;
 
     use base64::Engine;
     use clap::{CommandFactory, Parser, error::ErrorKind};
@@ -10617,7 +10806,7 @@ mod tests {
         );
 
         assert_eq!(
-            super::command_label(&Command::Service { command: Some(ServiceCommand::Status) }),
+            super::command_label(&Command::Service { command: ServiceCommand::Status }),
             "service"
         );
 
@@ -10900,12 +11089,34 @@ mod tests {
     fn service_definition_has_a_restart_policy() {
         let text = service_text(std::path::Path::new("/tmp/crabbot"), &[]);
 
+        #[cfg(target_os = "linux")]
+
+        assert_eq!(service_name(), "Crabbot");
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(MACOS_SERVICE_LABEL, "it.airscript.crabbot");
+            assert_eq!(service_name(), "Crabbot");
+        }
+
+        #[cfg(target_os = "windows")]
+
+        assert_eq!(service_name(), "Crabbot");
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+
+        assert_eq!(service_name(), "Crabbot");
+
         assert!(text.contains("/tmp/crabbot"));
         assert!(!text.contains("serve"));
         #[cfg(target_os = "linux")]
         {
             assert!(text.contains("Restart=on-failure"));
             assert!(!text.contains("ExecStart=\\\""));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(text.contains("<key>Label</key><string>it.airscript.crabbot</string>"));
+            assert_eq!(service_path().file_name().unwrap(), "it.airscript.crabbot.plist");
         }
 
         let _ = ServiceCommand::Status;
@@ -10993,6 +11204,16 @@ mod tests {
     fn manages_service_definition() {
         let path = std::env::temp_dir().join(format!("crabbot-service-{}", std::process::id()));
         let _ = fs::remove_file(&path);
+
+        super::service_at_with_status(
+            &path,
+            ServiceCommand::Status,
+            |_, _| Ok(()),
+            || panic!("status must not query the manager without an installed definition"),
+            true,
+        )
+        .unwrap();
+
         service_at(&path, ServiceCommand::Install(super::ServiceInstall { force: false })).unwrap();
 
         assert!(path.is_file());
@@ -11001,7 +11222,24 @@ mod tests {
                 .is_err()
         );
         service_at(&path, ServiceCommand::Install(super::ServiceInstall { force: true })).unwrap();
-        service_at(&path, ServiceCommand::Status).unwrap();
+        super::service_at_with_status(
+            &path,
+            ServiceCommand::Status,
+            |_, _| Ok(()),
+            || Ok(super::ServiceState::Inactive),
+            false,
+        )
+        .unwrap();
+
+        super::service_at_with_status(
+            &path,
+            ServiceCommand::Status,
+            |_, _| Ok(()),
+            || Ok(super::ServiceState::Active),
+            true,
+        )
+        .unwrap();
+
         let mut stopped = false;
         service_at_with(
             &path,
@@ -11017,6 +11255,60 @@ mod tests {
         assert!(stopped);
         assert!(!path.exists());
         service_at(&path, ServiceCommand::Remove(super::ServiceRemove { yes: true })).unwrap();
+    }
+
+    #[test]
+    fn service_actions_report_when_no_transition_is_needed() {
+        use super::ServiceState::{Active, Failed, Inactive, NotInstalled, Starting, Stopping};
+
+        assert!(super::service_action_is_noop(true, Active));
+        assert!(!super::service_action_is_noop(true, Inactive));
+        assert!(!super::service_action_is_noop(true, Starting));
+        assert!(!super::service_action_is_noop(true, Stopping));
+        assert!(!super::service_action_is_noop(false, Active));
+        assert!(super::service_action_is_noop(false, Inactive));
+        assert!(super::service_action_is_noop(false, Failed));
+        assert!(super::service_action_is_noop(false, NotInstalled));
+        assert!(!super::service_action_is_noop(false, Starting));
+        assert!(!super::service_action_is_noop(false, Stopping));
+
+        for (start, previous) in [
+            (true, Some(Active)),
+            (false, Some(Inactive)),
+            (false, Some(Failed)),
+            (false, Some(NotInstalled)),
+            (true, None),
+            (false, None),
+        ] {
+            super::service_action_message(start, previous, false).unwrap();
+            super::service_action_message(start, previous, true).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn maps_systemd_service_states_and_errors() {
+        use super::ServiceState::{Active, Failed, Inactive, Starting, Stopping};
+
+        for (text, expected) in [
+            ("active", Active),
+            ("activating", Starting),
+            ("deactivating", Stopping),
+            ("failed", Failed),
+            ("inactive", Inactive),
+            ("unknown", Inactive),
+            ("not-found", Inactive),
+        ] {
+            assert_eq!(super::linux_service_state(false, text, "").unwrap(), expected);
+        }
+
+        assert!(super::linux_service_state(false, "", "").is_err());
+
+        let error = super::linux_service_state(false, "", "systemd is unavailable")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.to_ascii_lowercase().contains("systemd is unavailable"));
     }
 
     #[cfg(unix)]
@@ -11280,12 +11572,25 @@ mod tests {
 
         assert!(cli.json);
 
+        let error = Cli::try_parse_from(["crabbot", "service"]).unwrap_err();
+        let help = error.to_string();
+
+        assert_eq!(error.kind(), ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand);
+        assert!(help.contains("Usage: crabbot service"));
+        assert!(help.contains("status"));
+        assert!(help.contains("start"));
+        assert!(help.contains("stop"));
+        assert!(help.contains("--json"));
+        assert!(help.contains("--debug"));
+        assert!(help.contains("--verbose"));
+        assert!(help.contains("alias: -H"));
+
         let cli = Cli::try_parse_from(["crabbot", "service", "install", "--force"]).unwrap();
 
         assert!(matches!(
             cli.command,
             Command::Service {
-                command: Some(ServiceCommand::Install(super::ServiceInstall { force: true }))
+                command: ServiceCommand::Install(super::ServiceInstall { force: true })
             }
         ));
 
@@ -11294,7 +11599,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Service {
-                command: Some(ServiceCommand::Remove(super::ServiceRemove { yes: true }))
+                command: ServiceCommand::Remove(super::ServiceRemove { yes: true })
             }
         ));
 
@@ -12464,7 +12769,6 @@ mod tests {
         for command in [
             Command::Version(Output { json: true }),
             Command::Status(Output { json: true }),
-            Command::Service { command: None },
             Command::Doctor(DoctorArgs { fix: false }),
         ] {
             let result = super::run(Cli {

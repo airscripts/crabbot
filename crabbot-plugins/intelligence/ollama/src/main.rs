@@ -384,7 +384,7 @@ fn keyring(name: &str) -> Option<String> {
         return None;
     }
 
-    keyring::Entry::new("dev.airscripts.crabbot", name)
+    keyring::Entry::new("it.airscript.crabbot", name)
         .ok()?
         .get_password()
         .ok()

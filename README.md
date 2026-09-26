@@ -201,7 +201,9 @@ the native service. Existing definitions require
 `crabbot service install --force` to replace them. `crabbot service stop` and
 `crabbot service remove --yes` reverse those actions. See the
 [configuration guide](crabbot-docs/configuration.md)
-for the full `config.toml` reference and recovery behavior.
+for the full `config.toml` reference and recovery behavior. `crabbot service
+status` reports whether the service is active. On Linux it uses the user-level
+systemd manager, so use `systemctl --user status crabbot.service` for details.
 
 ### Command Sandbox
 
