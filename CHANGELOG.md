@@ -7,6 +7,13 @@ Semantic Versioning.
 
 ### Added
 
+- Split CLI help into always-available native, conditionally available native,
+  and plugin-contributed commands. The host-managed `ask` and `session`
+  commands now require an installed intelligence plugin, and `delivery`
+  requires an installed messaging plugin.
+- Prevented accidental removal of the last intelligence or messaging plugin
+  while dependent state remains; `plugin remove --yes --force` can explicitly
+  purge sessions or outbox and dead-letter deliveries tied to that capability.
 - Made workspace test and coverage runs continue after failures and summarize
   all failing packages at the end, so one broken crate does not hide later CI
   failures.

@@ -1097,6 +1097,46 @@ impl Store {
         })
     }
 
+    pub fn purge(
+        &mut self,
+        sessions: bool,
+        deliveries: bool,
+    ) -> std::io::Result<(Vec<String>, usize)> {
+        if sessions
+            && self
+                .sessions
+                .values()
+                .any(|session| session.status == "working" || session.inflight.is_some())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "A session is working; cancel it and wait before purging sessions.",
+            ));
+        }
+
+        let session_ids =
+            if sessions { self.sessions.keys().cloned().collect() } else { Vec::new() };
+
+        let delivery_count = if deliveries { self.outbox.len() + self.dead.len() } else { 0 };
+
+        if session_ids.is_empty() && delivery_count == 0 {
+            return Ok((session_ids, delivery_count));
+        }
+
+        self.change(|store| {
+            if sessions {
+                store.sessions.clear();
+            }
+
+            if deliveries {
+                store.outbox.clear();
+                store.dead.clear();
+            }
+        })?;
+
+        Ok((session_ids, delivery_count))
+    }
+
     pub fn ack(&mut self, id: &str) -> std::io::Result<()> {
         if let Some(index) = self.outbox.iter().position(|delivery| delivery.id == id) {
             self.change(|store| {

@@ -46,6 +46,7 @@ pub(crate) mod state;
 
 const NAME: &str = "crabbot";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const RUNTIME_COMMAND_OWNER: &str = "__runtime.";
 const BANNER: &str = concat!(
     "\n",
     " ██████╗ ██████╗   █████╗  ██████╗  ██████╗   ██████╗  ████████╗\n",
@@ -509,18 +510,6 @@ enum Command {
         command: PluginCommand,
     },
 
-    #[command(about = "Manage durable agent sessions.")]
-    Session {
-        #[command(subcommand)]
-        command: SessionCommand,
-    },
-
-    #[command(about = "Manage pending channel deliveries.")]
-    Delivery {
-        #[command(subcommand)]
-        command: DeliveryCommand,
-    },
-
     #[command(
         about = "Install, remove, and control the native service.",
         arg_required_else_help = true,
@@ -587,7 +576,7 @@ enum PluginCommand {
     #[command(about = "Update locked plugins.")]
     Update(Output),
     #[command(about = "Remove an installed plugin.")]
-    Remove(Name),
+    Remove(PluginRemove),
 }
 
 #[derive(Debug, Subcommand)]
@@ -616,6 +605,32 @@ enum DeliveryCommand {
     Retry(Name),
     #[command(about = "Drop a delivery without retrying it.")]
     Drop(Name),
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "session", about = "Manage durable agent sessions.")]
+struct SessionCli {
+    #[arg(long, global = true, help = "Render command output as JSON where supported.")]
+    json: bool,
+    #[arg(long, global = true, hide = true)]
+    debug: bool,
+    #[arg(long, global = true, hide = true)]
+    verbose: bool,
+    #[command(subcommand)]
+    command: SessionCommand,
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "delivery", about = "Manage pending channel deliveries.")]
+struct DeliveryCli {
+    #[arg(long, global = true, help = "Render command output as JSON where supported.")]
+    json: bool,
+    #[arg(long, global = true, hide = true)]
+    debug: bool,
+    #[arg(long, global = true, hide = true)]
+    verbose: bool,
+    #[command(subcommand)]
+    command: DeliveryCommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -737,6 +752,16 @@ struct Name {
     id: String,
     #[arg(long, help = "Confirm the operation.")]
     yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct PluginRemove {
+    #[arg(help = "Plugin identifier.")]
+    id: String,
+    #[arg(long, help = "Confirm the operation.")]
+    yes: bool,
+    #[arg(long, help = "Purge its last capability's sessions or deliveries.")]
+    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -995,7 +1020,31 @@ pub async fn cli() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    let runtime_command_args = match &cli.command {
+        Command::External(args)
+            if args
+                .first()
+                .is_some_and(|name| matches!(name.as_str(), "ask" | "session" | "delivery")) =>
+        {
+            Some(args.as_slice())
+        }
+
+        _ => None,
+    };
+
+    if let Some(args) = runtime_command_args {
+        for argument in args.iter().skip(1) {
+            match argument.as_str() {
+                "--json" => cli.json = true,
+                "--debug" => cli.debug = true,
+                "--verbose" => cli.verbose = true,
+
+                _ => {}
+            }
+        }
+    }
 
     init_logging(cli.verbose, cli.debug, cli.json);
     main_with(cli).await
@@ -1134,13 +1183,16 @@ fn command_label(command: &Command) -> &'static str {
         Command::Version(_) => "version",
         Command::Completion { .. } => "completion",
         Command::Plugin { .. } => "plugin",
-        Command::Session { .. } => "session",
-        Command::Delivery { .. } => "delivery",
         Command::Service { .. } => "service",
         Command::Export(_) => "export",
         Command::Validate(_) => "validate",
         Command::Import(_) => "import",
-        Command::External(_) => "external",
+        Command::External(args) => match args.first().map(String::as_str) {
+            Some("ask") => "ask",
+            Some("session") => "session",
+            Some("delivery") => "delivery",
+            _ => "external",
+        },
     }
 }
 
@@ -1196,13 +1248,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Version(output) => version(output.json || json),
         Command::Completion { shell } => completion(shell)?,
         Command::Plugin { command } => plugin(command, json).await?,
-        Command::Session { command } => session(command, json).await?,
-        Command::Delivery { command } => delivery(command, json).await?,
         Command::Service { command } => service(command, json)?,
         Command::Export(args) => export_crabfile(args, json)?,
         Command::Validate(args) => validate_crabfile(args, json)?,
         Command::Import(args) => import_crabfile(args, json)?,
-        Command::External(args) => plugin_command(args, json).await?,
+        Command::External(args) => external_command(args, json).await?,
     }
 
     Ok(())
@@ -1256,29 +1306,62 @@ fn print_help_with_plugins(root: &Path) {
 fn help_text_with_plugins(root: &Path) -> String {
     let mut command = Cli::command();
     let mut help = command.render_help().to_string();
-    let commands = plugin_commands(root);
-    let mut plugin_help = String::from("\nPlugin Commands:\n");
+    let commands = available_commands(root);
+
+    let conditional = commands
+        .iter()
+        .filter(|(_, owners)| {
+            owners.iter().all(|(owner, _)| owner.starts_with(RUNTIME_COMMAND_OWNER))
+        })
+        .map(|(name, owners)| (name.clone(), owners.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let plugins = commands
+        .iter()
+        .filter(|(_, owners)| {
+            owners.iter().any(|(owner, _)| !owner.starts_with(RUNTIME_COMMAND_OWNER))
+        })
+        .map(|(name, owners)| (name.clone(), owners.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let conditional_help = command_help_section("Conditional Native Commands", &conditional);
+    let plugin_help = command_help_section("Plugin Commands", &plugins);
+
+    if let Some(index) = help.find("\nOptions:") {
+        help.insert_str(index, &format!("{conditional_help}{plugin_help}"));
+    } else {
+        help.push_str(&conditional_help);
+        help.push_str(&plugin_help);
+    }
+
+    help
+}
+
+fn command_help_section(
+    title: &str,
+    commands: &BTreeMap<String, Vec<(String, CommandSpec)>>,
+) -> String {
+    let mut help = format!("\n{title}:\n");
 
     if commands.is_empty() {
-        plugin_help.push_str("  (none available)\n");
+        help.push_str("  (none available)\n");
     } else {
         let width = commands.keys().map(String::len).max().unwrap_or_default();
 
         for (name, owners) in commands {
-            let description = if owners.len() == 1 {
-                owners[0].1.description.as_str()
+            let descriptions = owners
+                .iter()
+                .map(|(_, command)| command.description.as_str())
+                .collect::<BTreeSet<_>>();
+
+            let description = if descriptions.len() == 1 {
+                descriptions.first().copied().unwrap_or_default()
             } else {
                 "conflicting registrations"
             };
 
-            plugin_help.push_str(&format!("  {name:<width$}  {description}\n"));
+            help.push_str(&format!("  {name:<width$}  {description}\n"));
         }
-    }
-
-    if let Some(index) = help.find("\nOptions:") {
-        help.insert_str(index, &plugin_help);
-    } else {
-        help.push_str(&plugin_help);
     }
 
     help
@@ -1706,48 +1789,63 @@ async fn model_at(
     }
 }
 
-async fn session(
-    command: SessionCommand,
+async fn session_command(
+    args: &[String],
+    root: &Path,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    session_at_json(with_session_json(command, json), &home(), json).await
+    let argv = std::iter::once("session".to_owned()).chain(args.iter().cloned());
+
+    let cli = match SessionCli::try_parse_from(argv) {
+        Ok(cli) => cli,
+
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp
+                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) =>
+        {
+            print!("{error}");
+            return Ok(());
+        }
+
+        Err(error) => return Err(error.into()),
+    };
+
+    let SessionCli { json: command_json, debug, verbose, command } = cli;
+    let _ = (debug, verbose);
+
+    session_at_json(command, root, json || command_json).await
 }
 
-async fn delivery(
-    command: DeliveryCommand,
+async fn delivery_command(
+    args: &[String],
+    root: &Path,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    delivery_at_json(with_delivery_json(command, json), &home(), json).await
-}
+    let argv = std::iter::once("delivery".to_owned()).chain(args.iter().cloned());
+    let cli = match DeliveryCli::try_parse_from(argv) {
+        Ok(cli) => cli,
 
-fn with_session_json(command: SessionCommand, json: bool) -> SessionCommand {
-    if !json {
-        return command;
-    }
-
-    match command {
-        SessionCommand::List(mut output) => {
-            output.json = true;
-            SessionCommand::List(output)
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp
+                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) =>
+        {
+            print!("{error}");
+            return Ok(());
         }
 
-        command => command,
-    }
-}
+        Err(error) => return Err(error.into()),
+    };
 
-fn with_delivery_json(command: DeliveryCommand, json: bool) -> DeliveryCommand {
-    if !json {
-        return command;
-    }
+    let DeliveryCli { json: command_json, debug, verbose, command } = cli;
+    let _ = (debug, verbose);
 
-    match command {
-        DeliveryCommand::List(mut output) => {
-            output.json = true;
-            DeliveryCommand::List(output)
-        }
-
-        command => command,
-    }
+    delivery_at_json(command, root, json || command_json).await
 }
 
 #[cfg(test)]
@@ -2290,6 +2388,41 @@ async fn control_at(
 
 fn sessions_at(root: &Path) -> Result<state::Store, Box<dyn std::error::Error + Send + Sync>> {
     Ok(state::Store::load(root.join("sessions.json"))?)
+}
+
+async fn purge_state_at(
+    root: &Path,
+    sessions: bool,
+    deliveries: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let request = serde_json::json!({
+        "sessions": sessions,
+        "deliveries": deliveries,
+        "yes": true,
+    });
+
+    if let Some(result) = control_at("state.purge", request, root).await? {
+        return Ok(result);
+    }
+
+    let _lock = offline_lock(root)?;
+    let (session_ids, delivery_count) = sessions_at(root)?.purge(sessions, deliveries)?;
+    let mut pending_worktrees = Vec::new();
+
+    for id in &session_ids {
+        if let Err(error) = state::remove_worktree(root, id) {
+            pending_worktrees.push(serde_json::json!({
+                "id": id,
+                "error": sentence(error.to_string()),
+            }));
+        }
+    }
+
+    Ok(serde_json::json!({
+        "sessions": session_ids.len(),
+        "deliveries": delivery_count,
+        "pending_worktrees": pending_worktrees,
+    }))
 }
 
 fn binary_at(id: &str, root: &Path) -> Option<PathBuf> {
@@ -3029,7 +3162,7 @@ fn validate_commands(
     Ok(())
 }
 
-fn plugin_commands(root: &Path) -> BTreeMap<String, Vec<(String, CommandSpec)>> {
+fn available_commands(root: &Path) -> BTreeMap<String, Vec<(String, CommandSpec)>> {
     let Ok(lock) = load_lock_at(root) else {
         return BTreeMap::new();
     };
@@ -3045,15 +3178,28 @@ fn plugin_commands(root: &Path) -> BTreeMap<String, Vec<(String, CommandSpec)>> 
         }
     }
 
-    if lock.plugins.iter().any(|(id, entry)| model_plugin_available(id, entry, root)) {
-        commands.entry("ask".into()).or_default().push((
-            "__runtime".into(),
-            CommandSpec {
-                name: "ask".into(),
-                description: "Send one prompt through an intelligence plugin.".into(),
-                interactive: false,
-            },
-        ));
+    let has_model = lock.plugins.iter().any(|(id, entry)| model_plugin_available(id, entry, root));
+
+    let has_channel = lock.plugins.iter().any(|(id, entry)| {
+        entry.capabilities.iter().any(|capability| capability == "channel")
+            && binary_at(id, root).is_some()
+    });
+
+    for (available, name, description) in [
+        (has_model, "ask", "Send one prompt through an intelligence plugin."),
+        (has_model, "session", "Manage durable agent sessions."),
+        (has_channel, "delivery", "Manage pending channel deliveries."),
+    ] {
+        if available {
+            commands.entry(name.into()).or_default().push((
+                format!("{RUNTIME_COMMAND_OWNER}{name}"),
+                CommandSpec {
+                    name: name.into(),
+                    description: description.into(),
+                    interactive: false,
+                },
+            ));
+        }
     }
 
     commands
@@ -8421,7 +8567,7 @@ async fn status_command(json: bool) -> Result<(), Box<dyn std::error::Error + Se
         entry.capabilities.iter().any(|capability| capability == "channel") && ready(&channel)
     });
 
-    let conflicts = plugin_commands(&root).values().any(|owners| owners.len() > 1);
+    let conflicts = available_commands(&root).values().any(|owners| owners.len() > 1);
     let daemon = ipc::call(&root, "status", serde_json::json!({})).await.is_ok();
     let health = if config_ok && model_ready && channel_ready && !conflicts {
         "healthy"
@@ -8495,7 +8641,7 @@ fn status_text(value: &serde_json::Value, installed: usize) -> String {
     )
 }
 
-async fn plugin_command(
+async fn external_command(
     args: Vec<String>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -8504,7 +8650,7 @@ async fn plugin_command(
     };
 
     let root = home();
-    let commands = plugin_commands(&root);
+    let commands = available_commands(&root);
     let Some(owners) = commands.get(name) else {
         print_help_with_plugins(&root);
         return Ok(());
@@ -8517,8 +8663,13 @@ async fn plugin_command(
     let (plugin, _) =
         owners.first().cloned().ok_or_else(|| format!("Plugin command {name} was not found."))?;
 
-    if name == "ask" {
-        return ask_plugin_command(&args[1..], &root).await;
+    if plugin.starts_with(RUNTIME_COMMAND_OWNER) {
+        return match name.as_str() {
+            "ask" => ask_command(&args[1..], &root).await,
+            "session" => session_command(&args[1..], &root, json).await,
+            "delivery" => delivery_command(&args[1..], &root, json).await,
+            _ => Err(format!("Unknown native command {name}.").into()),
+        };
     }
 
     if args.get(1).is_some_and(|argument| argument == "--help" || argument == "-h") {
@@ -8642,7 +8793,7 @@ async fn plugin_command(
     Ok(())
 }
 
-async fn ask_plugin_command(
+async fn ask_command(
     args: &[String],
     root: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -8828,11 +8979,22 @@ async fn plugin(
             }
 
             let id = name.id.clone();
-            let unloaded =
-                unload_at(&home(), &id).await?.is_some_and(|value| value["unloaded"] == true);
+            let root = home();
+            let lock = load_lock_at(&root)?;
+            let (purge_sessions, purge_deliveries) = last_plugin_state(&lock, &id, &root);
 
-            if let Err(error) = remove(name) {
-                if let Err(reload) = activate_at(&home(), &id).await {
+            let purged = if name.force && (purge_sessions || purge_deliveries) {
+                Some(purge_state_at(&root, purge_sessions, purge_deliveries).await?)
+            } else {
+                ensure_no_orphaned_plugin_state(&lock, &id, &root)?;
+                None
+            };
+
+            let unloaded =
+                unload_at(&root, &id).await?.is_some_and(|value| value["unloaded"] == true);
+
+            if let Err(error) = remove_at(name, &root) {
+                if let Err(reload) = activate_at(&root, &id).await {
                     return Err(format!(
                         "Plugin removal failed: {}. Runtime restoration also failed: {}.",
                         sentence(error.to_string()),
@@ -8851,12 +9013,30 @@ async fn plugin(
                         "action": "remove",
                         "id": id,
                         "status": "removed",
-                        "unloaded": unloaded
+                        "unloaded": unloaded,
+                        "purged": purged,
                     }))?
                 );
             } else {
                 if unloaded {
                     println!("Plugin {id} was unloaded from the running daemon.");
+                }
+
+                if let Some(purged) = &purged {
+                    let sessions = purged["sessions"].as_u64().unwrap_or_default();
+                    let deliveries = purged["deliveries"].as_u64().unwrap_or_default();
+
+                    if sessions > 0 || deliveries > 0 {
+                        println!(
+                            "Purged {sessions} session(s) and {deliveries} delivery record(s)."
+                        );
+                    }
+
+                    if let Some(pending) = purged["pending_worktrees"].as_array()
+                        && !pending.is_empty()
+                    {
+                        println!("Worktree cleanup is pending for {} session(s).", pending.len());
+                    }
                 }
 
                 println!("Removed {}.", id);
@@ -10181,11 +10361,15 @@ fn link_binary(source: &Path, destination: &Path) -> std::io::Result<()> {
     }
 }
 
-fn remove(name: Name) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+#[cfg(test)]
+fn remove(name: PluginRemove) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     remove_at(name, &home())
 }
 
-fn remove_at(name: Name, home_root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn remove_at(
+    name: PluginRemove,
+    home_root: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _lock = lock_at(home_root, ".plugins.lock")?;
 
     if !valid(&name.id) {
@@ -10206,6 +10390,8 @@ fn remove_at(name: Name, home_root: &Path) -> Result<(), Box<dyn std::error::Err
     if !lock.plugins.contains_key(&name.id) && !had_destination {
         return Err(format!("Plugin {} is not installed.", name.id).into());
     }
+
+    ensure_no_orphaned_plugin_state(&lock, &name.id, home_root)?;
 
     if had_destination {
         std::fs::rename(&dest, &backup)?;
@@ -10244,6 +10430,56 @@ fn remove_at(name: Name, home_root: &Path) -> Result<(), Box<dyn std::error::Err
     }
 
     Ok(())
+}
+
+fn ensure_no_orphaned_plugin_state(
+    lock: &Lock,
+    id: &str,
+    home_root: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (removes_last_model, removes_last_channel) = last_plugin_state(lock, id, home_root);
+
+    if removes_last_model && !sessions_at(home_root)?.sessions.is_empty() {
+        return Err(concat!(
+            "Cannot remove the last intelligence plugin while sessions exist. ",
+            "Delete the sessions with `crabbot session delete` first."
+        )
+        .into());
+    }
+
+    if removes_last_channel {
+        let store = sessions_at(home_root)?;
+
+        if !store.outbox.is_empty() || !store.dead.is_empty() {
+            return Err(concat!(
+                "Cannot remove the last messaging plugin while deliveries are pending or ",
+                "uncertain. Manage them with `crabbot delivery` first."
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+fn last_plugin_state(lock: &Lock, id: &str, home_root: &Path) -> (bool, bool) {
+    let Some(entry) = lock.plugins.get(id) else {
+        return (false, false);
+    };
+
+    let removes_last_model = entry.capabilities.iter().any(|capability| capability == "model")
+        && !lock.plugins.iter().any(|(other_id, entry)| {
+            other_id != id && model_plugin_available(other_id, entry, home_root)
+        });
+
+    let removes_last_channel = entry.capabilities.iter().any(|capability| capability == "channel")
+        && !lock.plugins.iter().any(|(other_id, entry)| {
+            other_id != id
+                && entry.capabilities.iter().any(|capability| capability == "channel")
+                && binary_at(other_id, home_root).is_some()
+        });
+
+    (removes_last_model, removes_last_channel)
 }
 
 fn load_lock_at(root: &Path) -> Result<Lock, Box<dyn std::error::Error + Send + Sync>> {
@@ -10434,23 +10670,23 @@ mod tests {
     use super::{
         ARCHIVE_LIMIT, BANNER, CRABFILE_VERSION, Cancellation, Cli, Command, CommandSpec,
         CompletionShell, Config, CrabPlugin, Crabfile, CrabfileExport, CrabfileImport,
-        CrabfileValidate, DeliveryCommand, DoctorArgs, Fork, Id, InitArgs, Live, Manifest, NAME,
-        Name, Output, Plugins, Process, ServiceCommand, SessionCommand, SessionDelete,
-        SessionModel, SessionNew, Sha256, Source, Stop, answer, append_memory_context, archive,
-        archive_root, archive_url, assistant, binary_at, canonical_source, changed,
-        channel_message_id, command_output_limited, commit_event, completion_name_from,
-        crabfile_output_path, daemon_lock, default_crabfile_path, delivery_at, delivery_request,
-        download, embedded, ensure_home, env_for, export_crabfile_at, generate_completion,
-        import_crabfile_at, init_at, installed_at, isolate_at, local_session, memory_scope,
-        memory_tools, model_content, plugin_binary, read_manifest, reclaim_worktrees, recover,
-        recover_plugins, redact, resolve, restart_tool, revision, safe_archive, send_params,
-        send_request, service_at, service_at_with, service_environment_from, service_name,
-        service_path_value, service_text, session_at, stream_fits, tool, update_at,
-        validate_archive, verify_archive, write_debug_report_at,
+        CrabfileValidate, DeliveryCli, DeliveryCommand, DoctorArgs, Fork, Id, InitArgs, Live,
+        Manifest, NAME, Name, Output, Plugins, Process, ServiceCommand, SessionCli, SessionCommand,
+        SessionDelete, SessionModel, SessionNew, Sha256, Source, Stop, answer,
+        append_memory_context, archive, archive_root, archive_url, assistant, binary_at,
+        canonical_source, changed, channel_message_id, command_output_limited, commit_event,
+        completion_name_from, crabfile_output_path, daemon_lock, default_crabfile_path,
+        delivery_at, delivery_request, download, embedded, ensure_home, env_for,
+        export_crabfile_at, generate_completion, import_crabfile_at, init_at, installed_at,
+        isolate_at, local_session, memory_scope, memory_tools, model_content, plugin_binary,
+        read_manifest, reclaim_worktrees, recover, recover_plugins, redact, resolve, restart_tool,
+        revision, safe_archive, send_params, send_request, service_at, service_at_with,
+        service_environment_from, service_name, service_path_value, service_text, session_at,
+        stream_fits, tool, update_at, validate_archive, verify_archive, write_debug_report_at,
     };
 
     #[cfg(target_os = "macos")]
-    use super::MACOS_SERVICE_LABEL;
+    use super::{MACOS_SERVICE_LABEL, service_path};
 
     use base64::Engine;
     use clap::{CommandFactory, Parser, error::ErrorKind};
@@ -10792,20 +11028,6 @@ mod tests {
         );
 
         assert_eq!(
-            super::command_label(&Command::Session {
-                command: SessionCommand::List(Output { json: false })
-            }),
-            "session"
-        );
-
-        assert_eq!(
-            super::command_label(&Command::Delivery {
-                command: super::DeliveryCommand::List(Output { json: false })
-            }),
-            "delivery"
-        );
-
-        assert_eq!(
             super::command_label(&Command::Service { command: ServiceCommand::Status }),
             "service"
         );
@@ -10834,20 +11056,6 @@ mod tests {
         );
 
         assert_eq!(super::command_label(&Command::External(vec!["custom".into()])), "external");
-
-        let session = SessionCommand::List(Output { json: false });
-
-        assert!(matches!(
-            super::with_session_json(session, true),
-            SessionCommand::List(Output { json: true })
-        ));
-
-        let delivery = super::DeliveryCommand::List(Output { json: false });
-
-        assert!(matches!(
-            super::with_delivery_json(delivery, true),
-            super::DeliveryCommand::List(Output { json: true })
-        ));
 
         let command = super::git_command();
 
@@ -11493,8 +11701,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn ask_is_registered_only_for_an_installed_model_plugin() {
+    #[tokio::test]
+    async fn conditional_native_commands_follow_installed_capabilities() {
         let root = test_root("ask-command");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("plugins/fake/bin")).unwrap();
@@ -11513,19 +11721,192 @@ mod tests {
                 permissions: Vec::new(),
                 secrets: Vec::new(),
                 linked: false,
-                commands: Vec::new(),
+                commands: vec![CommandSpec {
+                    name: "model-console".into(),
+                    description: "Open the model console.".into(),
+                    interactive: false,
+                }],
             },
         );
         super::save_lock_at(&root, &lock).unwrap();
 
-        assert!(!super::plugin_commands(&root).contains_key("ask"));
+        assert!(!super::available_commands(&root).contains_key("ask"));
+        assert!(!super::available_commands(&root).contains_key("session"));
+        assert!(!super::available_commands(&root).contains_key("delivery"));
+
+        let help = super::help_text_with_plugins(&root);
+        let conditional = help
+            .split("Conditional Native Commands:")
+            .nth(1)
+            .and_then(|section| section.split("Plugin Commands:").next())
+            .unwrap();
+
+        assert!(!conditional.contains("ask"));
+        assert!(!conditional.contains("session"));
+        assert!(!conditional.contains("delivery"));
 
         let binary = root.join("plugins/fake/bin").join(super::plugin_name("fake"));
         fs::write(binary, b"plugin").unwrap();
-        let commands = super::plugin_commands(&root);
+        let mut commands = super::available_commands(&root);
 
-        assert_eq!(commands["ask"][0].0, "__runtime");
+        assert_eq!(commands["ask"][0].0, "__runtime.ask");
+        assert_eq!(commands["session"][0].0, "__runtime.session");
+        assert!(!commands.contains_key("delivery"));
         assert_eq!(super::model_plugin_at(&root, Some("fake")).unwrap(), "fake");
+
+        let session_args = ["list", "--json"].map(str::to_owned);
+        super::session_command(&session_args, &root, false).await.unwrap();
+
+        lock.plugins.insert(
+            "channel".into(),
+            super::Entry {
+                source: "local".into(),
+                revision: "local".into(),
+                pinned: false,
+                default: false,
+                hash: String::new(),
+                version: "0.1.0".into(),
+                protocol: Protocol::CURRENT,
+                capabilities: vec!["channel".into()],
+                permissions: Vec::new(),
+                secrets: Vec::new(),
+                linked: false,
+                commands: Vec::new(),
+            },
+        );
+
+        super::save_lock_at(&root, &lock).unwrap();
+        let binary = root.join("plugins/channel/bin").join(super::plugin_name("channel"));
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(binary, b"plugin").unwrap();
+        commands = super::available_commands(&root);
+
+        assert_eq!(commands["delivery"][0].0, "__runtime.delivery");
+
+        let delivery_args = ["list", "--json"].map(str::to_owned);
+        super::delivery_command(&delivery_args, &root, false).await.unwrap();
+
+        let help = super::help_text_with_plugins(&root);
+        let conditional = help
+            .split("Conditional Native Commands:")
+            .nth(1)
+            .and_then(|section| section.split("Plugin Commands:").next())
+            .unwrap();
+
+        let plugin = help.split("Plugin Commands:").nth(1).unwrap();
+
+        assert!(conditional.contains("ask"));
+        assert!(conditional.contains("session"));
+        assert!(conditional.contains("delivery"));
+        assert!(!conditional.contains("model-console"));
+        assert!(plugin.contains("model-console"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn plugin_removal_preserves_state_owned_by_conditional_commands() {
+        let root = test_root("plugin-removal-state");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let entry = |capability: &str| super::Entry {
+            source: "local".into(),
+            revision: "local".into(),
+            pinned: false,
+            default: false,
+            hash: String::new(),
+            version: "0.1.0".into(),
+            protocol: Protocol::CURRENT,
+            capabilities: vec![capability.into()],
+            permissions: Vec::new(),
+            secrets: Vec::new(),
+            linked: false,
+            commands: Vec::new(),
+        };
+
+        fs::write(
+            root.join("sessions.json"),
+            r#"
+                {
+                    "sessions": {
+                        "kept": {
+                            "id": "kept",
+                            "model": "test",
+                            "messages": [],
+                            "status": "idle",
+                            "created": 0,
+                            "updated": 0
+                        }
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+
+        let mut lock = super::Lock::default();
+        lock.plugins.insert("model-one".into(), entry("model"));
+
+        assert_eq!(super::last_plugin_state(&lock, "model-one", &root), (true, false));
+
+        assert!(
+            super::ensure_no_orphaned_plugin_state(&lock, "model-one", &root)
+                .unwrap_err()
+                .to_string()
+                .contains("crabbot session delete")
+        );
+
+        fs::create_dir_all(root.join("plugins/model-two/bin")).unwrap();
+        fs::write(root.join("plugins/model-two/bin/crabbot-plugin-model-two"), "plugin").unwrap();
+        lock.plugins.insert("model-two".into(), entry("model"));
+
+        assert_eq!(super::last_plugin_state(&lock, "model-one", &root), (false, false));
+        assert!(super::ensure_no_orphaned_plugin_state(&lock, "model-one", &root).is_ok());
+
+        fs::write(
+            root.join("sessions.json"),
+            r#"
+                {
+                    "sessions": {},
+                    "outbox": [
+                        {
+                            "id": "delivery-1",
+                            "channel": "test",
+                            "chat": "chat",
+                            "text": "pending",
+                            "attempts": 0,
+                            "created": 0,
+                            "status": "pending"
+                        }
+                    ]
+                }
+            "#,
+        )
+        .unwrap();
+
+        lock.plugins.clear();
+        lock.plugins.insert("channel-one".into(), entry("channel"));
+
+        assert_eq!(super::last_plugin_state(&lock, "channel-one", &root), (false, true));
+        super::save_lock_at(&root, &lock).unwrap();
+
+        let error = super::remove_at(
+            super::PluginRemove { id: "channel-one".into(), yes: true, force: false },
+            &root,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("crabbot delivery"), "{error}");
+        assert!(super::load_lock_at(&root).unwrap().plugins.contains_key("channel-one"));
+
+        let purged = super::purge_state_at(&root, false, true).await.unwrap();
+
+        assert_eq!(purged["deliveries"], 1);
+        assert!(super::sessions_at(&root).unwrap().outbox.is_empty());
+
+        let purged = super::purge_state_at(&root, true, false).await.unwrap();
+
+        assert_eq!(purged["sessions"], 0);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -11603,25 +11984,35 @@ mod tests {
             }
         ));
 
-        let cli = Cli::try_parse_from(["crabbot", "plugin", "remove", "tools", "--yes", "--json"])
+        let cli = Cli::try_parse_from(["crabbot", "plugin", "remove", "tools", "--yes", "--force"])
             .unwrap();
-        assert!(cli.json);
 
-        let cli = Cli::try_parse_from(["crabbot", "session", "new", "main", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Plugin {
+                command: super::PluginCommand::Remove(super::PluginRemove {
+                    id,
+                    yes: true,
+                    force: true,
+                })
+            } if id == "tools"
+        ));
 
-        assert!(cli.json);
+        let session = SessionCli::try_parse_from(["session", "new", "main", "--json"]).unwrap();
 
-        let cli = Cli::try_parse_from(["crabbot", "session", "show", "main", "--json"]).unwrap();
+        assert!(session.json);
 
-        assert!(cli.json);
+        let session = SessionCli::try_parse_from(["session", "show", "main", "--json"]).unwrap();
 
-        let cli = Cli::try_parse_from(["crabbot", "session", "delete", "main", "--yes", "--json"])
-            .unwrap();
-        assert!(cli.json);
+        assert!(session.json);
 
-        let cli = Cli::try_parse_from(["crabbot", "delivery", "retry", "item", "--yes", "--json"])
-            .unwrap();
-        assert!(cli.json);
+        let session =
+            SessionCli::try_parse_from(["session", "delete", "main", "--yes", "--json"]).unwrap();
+        assert!(session.json);
+
+        let delivery =
+            DeliveryCli::try_parse_from(["delivery", "retry", "item", "--yes", "--json"]).unwrap();
+        assert!(delivery.json);
 
         let cli = Cli::try_parse_from(["crabbot", "export", "--json"]).unwrap();
 
@@ -12971,13 +13362,31 @@ mod tests {
         );
 
         assert!(update_at(&root, false).is_err());
-        super::remove_at(Name { id: "memory".into(), yes: true }, &root).unwrap();
+        super::remove_at(
+            super::PluginRemove { id: "memory".into(), yes: true, force: false },
+            &root,
+        )
+        .unwrap();
 
         assert!(super::installed_at(&root).is_empty());
         super::list_at(&root, false).unwrap();
 
-        assert!(super::remove_at(Name { id: "missing".into(), yes: false }, &root).is_err());
-        assert!(super::remove_at(Name { id: "missing".into(), yes: true }, &root).is_err());
+        assert!(
+            super::remove_at(
+                super::PluginRemove { id: "missing".into(), yes: false, force: false },
+                &root
+            )
+            .is_err()
+        );
+
+        assert!(
+            super::remove_at(
+                super::PluginRemove { id: "missing".into(), yes: true, force: false },
+                &root
+            )
+            .is_err()
+        );
+
         assert!(
             super::plugin(
                 super::PluginCommand::Install(Source {
@@ -12992,7 +13401,11 @@ mod tests {
             .is_err()
         );
 
-        assert!(super::remove(Name { id: "bad_id".into(), yes: true }).is_err());
+        assert!(
+            super::remove(super::PluginRemove { id: "bad_id".into(), yes: true, force: false })
+                .is_err()
+        );
+
         local_session(SessionCommand::List(Output { json: false }), &root).unwrap();
         let _ = fs::remove_dir_all(root);
     }

@@ -363,6 +363,46 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             json!({"items": sessions.outbox.iter().map(delivery).collect::<Vec<_>>()})
         }
 
+        "state.purge" => {
+            if request.params["yes"] != Value::Bool(true) {
+                return Ok(IpcResponse::fail(
+                    request.id,
+                    -32602,
+                    "State purge requires confirmation.",
+                ));
+            }
+
+            let purge_sessions = request.params["sessions"] == Value::Bool(true);
+            let purge_deliveries = request.params["deliveries"] == Value::Bool(true);
+
+            if !purge_sessions && !purge_deliveries {
+                return Ok(IpcResponse::fail(
+                    request.id,
+                    -32602,
+                    "State purge requires at least one state category.",
+                ));
+            }
+
+            let (session_ids, deliveries) =
+                state.sessions.lock().map_err(lock)?.purge(purge_sessions, purge_deliveries)?;
+            let mut pending_worktrees = Vec::new();
+
+            for id in &session_ids {
+                if let Err(error) = super::state::remove_worktree(&state.root, id) {
+                    pending_worktrees.push(json!({
+                        "id": id,
+                        "error": super::sentence(error.to_string()),
+                    }));
+                }
+            }
+
+            json!({
+                "sessions": session_ids.len(),
+                "deliveries": deliveries,
+                "pending_worktrees": pending_worktrees,
+            })
+        }
+
         "delivery.retry" => {
             if request.params["yes"] != Value::Bool(true) {
                 return Ok(IpcResponse::fail(
@@ -1575,6 +1615,91 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         assert!(result["worktree"]["error"].as_str().is_some());
         assert!(!state.sessions.lock().unwrap().sessions.contains_key("copy"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn purges_requested_session_and_delivery_state_atomically() {
+        let state = state_at("state-purge");
+        {
+            let mut store = state.sessions.lock().unwrap();
+            store.create("saved", "test-model").unwrap();
+            store.sessions.get_mut("saved").unwrap().status = "working".into();
+
+            store.outbox.push(crate::state::Delivery {
+                id: "pending".into(),
+                channel: "telegram".into(),
+                chat: "chat".into(),
+                private: true,
+                thread: None,
+                text: "pending message".into(),
+                attempts: 0,
+                created: 1,
+                status: crate::state::DeliveryStatus::Pending,
+                last_error: None,
+                message_id: None,
+                updated: 1,
+            });
+
+            let dead = store.outbox[0].clone();
+            store.dead.push(dead);
+
+            store.save().unwrap();
+        }
+
+        let unconfirmed = dispatch(
+            &IpcRequest::call(
+                1,
+                "secret",
+                "state.purge",
+                json!({"sessions": true, "deliveries": true}),
+            ),
+            &state,
+        )
+        .unwrap();
+
+        assert!(unconfirmed.error.is_some());
+
+        let active_session = dispatch(
+            &IpcRequest::call(
+                2,
+                "secret",
+                "state.purge",
+                json!({"sessions": true, "deliveries": true, "yes": true}),
+            ),
+            &state,
+        )
+        .unwrap_err();
+
+        assert_eq!(active_session.kind(), std::io::ErrorKind::WouldBlock);
+        {
+            let mut store = state.sessions.lock().unwrap();
+
+            assert_eq!(store.sessions.len(), 1);
+            store.sessions.get_mut("saved").unwrap().status = "idle".into();
+        }
+
+        let purged = dispatch(
+            &IpcRequest::call(
+                3,
+                "secret",
+                "state.purge",
+                json!({"sessions": true, "deliveries": true, "yes": true}),
+            ),
+            &state,
+        )
+        .unwrap()
+        .result
+        .unwrap();
+
+        assert_eq!(purged["sessions"], 1);
+        assert_eq!(purged["deliveries"], 2);
+        assert!(purged["pending_worktrees"].as_array().unwrap().is_empty());
+
+        let store = state.sessions.lock().unwrap();
+
+        assert!(store.sessions.is_empty());
+        assert!(store.outbox.is_empty());
+        assert!(store.dead.is_empty());
     }
 
     #[tokio::test]

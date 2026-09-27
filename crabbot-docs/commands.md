@@ -12,7 +12,7 @@ crabbot plugin list [--json]
 crabbot plugin install <id> [source] [--revision <rev>] [--yes] [--json]
 crabbot plugin link <id> [folder] [--revision <rev>] [--yes] [--json]
 crabbot plugin update [--json]
-crabbot plugin remove <id> [--yes] [--json]
+crabbot plugin remove <id> [--yes] [--force] [--json]
 crabbot memory <status|search|list|show|remember|edit|forget|audit|learning> [arguments...]
 crabbot session new <id> [--model <name>] [--json]
 crabbot session list [--json]
@@ -32,9 +32,12 @@ crabbot <plugin-command> [arguments...]
 ```
 
 `crabbot help` and `crabbot --help` show the command tree and Crabbot banner.
-Native commands and currently registered plugin commands are shown in separate
-lists. The plugin list is rebuilt from the installed plugin registry, so it
-includes commands added by newly installed or linked plugins.
+Always-available native commands, conditionally available native commands, and
+plugin-contributed commands are shown in separate lists. The conditional list
+is rebuilt from installed capabilities; `ask` and `session` require an
+intelligence plugin, while `delivery` requires a messaging plugin. Plugin
+commands are rebuilt from the installed plugin registry, so the list includes
+commands added by newly installed or linked plugins.
 Running `crabbot service` without a subcommand prints native service help,
 including the global options; use `crabbot service status` to inspect the
 installed service and its state.
@@ -127,12 +130,25 @@ plugin unloads its active process before removing its files. Updating plugins
 unloads and reloads only processes that were active, without restarting the
 daemon; inactive plugins stay inactive.
 
-Plugin commands are registered by installed plugins. The Pi agent plugin
-registers `crabbot code`, the TUI plugin registers `crabbot tui`, the Codex
-plugin registers `crabbot codex`, and the memory plugin registers
-`crabbot memory`. Native commands always take precedence, and duplicate plugin
-command names are rejected during installation or update. Optional commands
-are available only when their plugin is installed.
+Plugin-contributed commands are registered by installed plugins. The Pi agent
+plugin registers `crabbot code`, the TUI plugin registers `crabbot tui`, the
+Codex plugin registers `crabbot codex`, and the memory plugin registers
+`crabbot memory`. Native command names are reserved, including those whose
+availability depends on an installed capability, and duplicate plugin command
+names are rejected during installation or update. Plugin-contributed commands
+are available only when their owning plugin is installed.
+
+Removing the last installed intelligence plugin is blocked while persisted
+sessions remain; delete them with `crabbot session delete <id> --yes` first.
+Removing the last messaging plugin is blocked while outbox or dead-letter
+deliveries remain; retry or discard outbox deliveries with `crabbot delivery`
+first. To intentionally remove the last matching plugin and purge its dependent
+state, pass both `--yes` and `--force` to `crabbot plugin remove <id>`. This
+permanently deletes all sessions when removing the last intelligence plugin,
+or all outbox and dead-letter deliveries when removing the last messaging
+plugin. Session worktrees are removed too; any worktrees that cannot be removed
+are reported for later cleanup. `--force` does not purge state when another
+available plugin of the same capability remains.
 
 The memory command supports `status`, `search <text>`, `list`, `show <key>`,
 `remember <key> <text>`, `edit <key> <text>`, `forget <key>`, `audit`, and
@@ -143,11 +159,14 @@ explicit user request. `autonomous` lets it retain stable, useful facts while
 excluding secrets and sensitive inferences. These instructions do not override
 tool availability or channel policy.
 
-When an installed model plugin is available, Crabbot also registers the
-host-managed `crabbot ask` command. It accepts `--plugin <id>`, `--model
-<name>`, and prompt words, and selects a configured or available model plugin
-when `--plugin` is omitted. The command is absent when no installed model
-plugin can run, so the CLI does not advertise an unusable intelligence path.
+When an installed model plugin is available, Crabbot also exposes the
+host-managed `crabbot ask` command as a conditional native command. It accepts
+`--plugin <id>`, `--model <name>`, and prompt words, and selects a configured or
+available model plugin when `--plugin` is omitted. The command is absent when
+no installed model plugin can run, so the CLI does not advertise an unusable
+intelligence path. `session` is exposed under the same condition; `delivery`
+is exposed when an installed messaging plugin is available. These commands
+remain runtime-owned even though their availability depends on plugins.
 
 Inside the terminal client, `/help` lists controls, `/status` reports the
 authenticated daemon state, and `/approval` reports the daemon approval mode.
