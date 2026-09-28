@@ -128,10 +128,10 @@ does not require a particular intelligence or messaging plugin.
 Use `crabbot plugin list` to inspect installed capabilities. A local link
 records the canonical source and executable in `plugins.lock`; rebuild and run
 `crabbot plugin link PLUGIN_ID --yes` again to validate and hot-load your
-changes. `crabbot plugin update` also applies verified updates to the running
-daemon: it unloads and reloads only plugins that were active, without
-restarting the daemon. Review every manifest's permissions and declared secrets
-before linking community plugins.
+changes. `crabbot plugin update` previews available updates. Run
+`crabbot plugin update --yes` to apply the preview; it unloads and reloads only
+plugins that were active, without restarting the daemon. Review every
+manifest's permissions and declared secrets before linking community plugins.
 
 ## Usage
 
@@ -199,7 +199,7 @@ filters are available for Telegram and Discord.
 Use `crabbot service install` followed by `crabbot service start` to activate
 the native service. Existing definitions require
 `crabbot service install --force` to replace them. `crabbot service stop` and
-`crabbot service remove --yes` reverse those actions. See the
+`crabbot service uninstall -y` reverses those actions. See the
 [configuration guide](crabbot-docs/configuration.md)
 for the full `config.toml` reference and recovery behavior. `crabbot service
 status` reports whether the service is active. On Linux it uses the user-level
@@ -331,6 +331,8 @@ make revloop
 By default, `revloop` reviews uncommitted changes. If the working tree is clean,
 it reviews the latest commit on `main` or the complete feature branch relative
 to `main`. Use `make revloop REVLOOP_ARGS=--global` for a repository-wide audit.
+Pass multiple options as comma-separated values, for example
+`make revloop REVLOOP_ARGS=--global,--fast`.
 Use `make revloop REVLOOP_ARGS=--verbose` or
 `CRABBOT_REVLOOP_OUTPUT=verbose` when the full orchestrator and worker stream
 is useful during diagnosis. Each orchestrator pass performs a deep
@@ -348,7 +350,10 @@ verification is retried once without consuming a cycle; if it times out twice,
 revloop starts a separately logged recovery worker and re-runs focused
 verification before continuing.
 Revloop uses `gpt-6-luna` by default; set `CRABBOT_REVLOOP_MODEL` to select a
-different Codex model.
+different Codex model. Codex Fast mode is off by default. Use `--fast` or set
+`CRABBOT_REVLOOP_FAST=true` to enable it; `--no-fast` or
+`CRABBOT_REVLOOP_FAST=false` selects the standard service tier. Fast mode may
+increase credit or API usage costs.
 Before focused and complete verification, revloop applies `make spacing` so
 repository-required Rust block spacing does not become a repeated worker
 failure; this may update Rust files in the working tree.

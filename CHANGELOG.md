@@ -7,12 +7,64 @@ Semantic Versioning.
 
 ### Added
 
-- Split CLI help into always-available native, conditionally available native,
-  and plugin-contributed commands. The host-managed `ask` and `session`
+- Added toggleable Codex Fast mode for Revloop. It is off by default and can be
+  enabled with `--fast` or `CRABBOT_REVLOOP_FAST=true`.
+- Added a globally configurable Crabbot display name and improved the TUI with
+  distinct user/assistant labels, multiline input, bounded input history,
+  capability-aware command help, argument validation, and a persistent configurable statusline.
+- Organized TUI-owned state under `CRABBOT_HOME/data/plugins/tui/`, restore
+  the selected session's saved conversation on startup and session switches. Persist TUI
+  commands and their replies as well as completed model turns, including
+  command-only sessions when no intelligence plugin is installed. Added
+  `/statusline reset` to restore the built-in format. Invalid session switches
+  no longer change the displayed session. The default statusline labels model
+  and session explicitly, updates when `/session switch` changes the active
+  session, and shows `model: unset` when no intelligence plugin is installed.
+- Made `crabbot plugin update` preview the exact available plugin changes;
+  rerun it with `--yes` to apply, with unchanged plugins left untouched.
+- Reworked `crab tui` as a full-screen terminal chat with editable input,
+  scrollable conversation history, and one-shot prompt mode. Session commands
+  now work without the background runtime using a separate local TUI session store; sending
+  prompts still requires an installed intelligence plugin. Abandoned TUI
+  session reservations expire and recover automatically.
+- Added TUI session help, rename, reversible archive/restore, and confirmed
+  permanent deletion; session history is restored on switches, and the active
+  session cannot be archived or deleted. Session listing includes state,
+  model, timestamps, and message counts; repeated archive actions report the
+  existing state, and command action errors avoid redundant operation-failed
+  wording when the cause is already clear. Channel-backed sessions cannot be
+  renamed, preserving their inbound message routes.
+- Styled TUI conversation turns, system notices, and command output for easier
+  scanning. Session listings use compact two-line entries. Local command replies
+  and streamed model text use a configurable typewriter reveal; model generation
+  shows 25 rotating "The Crabbot..." progress messages, and Escape-to-interrupt
+  support that preserves partial replies.
+- Paginated TUI session listings at ten entries per page, with in-progress and
+  selected sessions first, then idle sessions by recency and archived sessions
+  last. Each page reads a fresh snapshot for independent concurrent TUI clients.
+- Reworked TUI scrolling with predictable three-line conversation wheel steps,
+  one-line input wheel steps, page-sized conversation navigation, automatic
+  follow-latest behavior, and cursor-aware input positioning.
+- Expanded the TUI and CLI plugin lists with version, health, protocol,
+  capabilities, commands, and permissions in a plain-text layout.
+- Improved TUI session listing labels and active/working state, added multiple
+  session targets and `--all` for archive, restore, and confirmed deletion, and
+  removed the `/sessions` shortcut in favor of `/session list`. The footer now
+  shows the Crabbot version and help hint at the bottom-right, while conversation
+  wrapping is cached to keep scrolling responsive. Clarified workspace scope.
+- Launch the TUI as a foreground terminal process so keyboard input is read
+  from the user's terminal rather than the plugin protocol stream. Clarified
+  that installing the TUI does not require a running background runtime. The
+  default TUI session ID is `default`. Standardized user-facing terminology
+  for the background runtime and OS service.
+  The TUI launch now receives only its configured environment and the selected
+  model plugin's declared secrets.
+- Split CLI help into native, conditional, and plugin-contributed commands.
+  The host-managed `ask` and `session`
   commands now require an installed intelligence plugin, and `delivery`
   requires an installed messaging plugin.
-- Prevented accidental removal of the last intelligence or messaging plugin
-  while dependent state remains; `plugin remove --yes --force` can explicitly
+- Prevented accidental uninstallation of the last intelligence or messaging plugin
+  while dependent state remains; `plugin uninstall -y --force` can explicitly
   purge sessions or outbox and dead-letter deliveries tied to that capability.
 - Made workspace test and coverage runs continue after failures and summarize
   all failing packages at the end, so one broken crate does not hide later CI

@@ -5,7 +5,7 @@ permissions = ["terminal"]
 
 [[commands]]
 name = "tui"
-description = "Start the terminal interface."
+description = "Open the TUI; local sessions do not require the background runtime."
 interactive = true
 
 [protocol]

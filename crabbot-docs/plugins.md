@@ -152,10 +152,13 @@ the existing plugins as protocol references.
 
 ## Install And Update Lifecycle
 
-`crabbot plugin link` is the fastest local development loop. It canonicalizes
-the source, validates the manifest, stages the executable, runs a health check,
-and records the result in `plugins.lock`. `crabbot plugin install` follows the
-same path for a Git or checksummed archive source. `crabbot plugin update`
+`crabbot plugin link` is the local development workflow: it canonicalizes the
+source, validates the manifest, stages the executable, runs a health check, and
+links the built executable into the Crabbot home (copying it if symlinks are not
+available). Rebuilding and linking again picks up local changes.
+`crabbot plugin install` accepts a Git URL, verified archive, or local source
+path, then copies the verified executable into the Crabbot home so it is
+independent of that source. `crabbot plugin update`
 repeats the process for locked entries and keeps installed files in place until
 each staged replacement passes validation.
 
@@ -165,7 +168,7 @@ available without restarting the daemon or reinstalling the core. When no
 daemon is running, it is discovered at the next daemon start. A selected model
 or channel plugin is loaded only when its required credentials are ready; an
 activation error leaves the verified plugin installed and reports the reason.
-`plugin remove` unloads an active process before deleting its files. `plugin
+`plugin uninstall` unloads an active process before deleting its files. `plugin
 update` unloads active plugin processes before replacing their files, then
 starts those plugins again through IPC. Inactive plugins remain inactive, and
 the daemon itself does not restart. Active plugins are unavailable while

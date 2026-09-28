@@ -42,8 +42,10 @@ strings. Keep its inserted blank lines between adjacent multiline statements.
 Build only the plugins you plan to use. After changing a linked plugin, rebuild
 its package and run `crabbot plugin link <id> --yes`; the host health-checks the
 staged executable and loads it into a running daemon without a restart.
-`crabbot plugin update` similarly reloads active plugins in place; it does not
-restart the daemon, and plugins that were inactive remain inactive.
+`crabbot plugin update` previews available changes. Run
+`crabbot plugin update --yes` to apply them. It reloads active plugins in
+place without restarting the daemon, and plugins that were inactive remain
+inactive.
 
 Continuous integration also checks the `x86_64-pc-windows-gnu` target from
 Linux. The job installs MinGW for native dependencies before running the
@@ -77,7 +79,7 @@ crabbot service status
 
 Use `crabbot service install --force` to replace an existing definition, and
 `crabbot service stop` before changing binaries or environment values. Use
-`crabbot service remove --yes` to unregister the definition; pending worktree
+`crabbot service uninstall -y` to unregister the definition; pending worktree
 cleanup is reported for the next daemon start.
 
 ## Session Operations

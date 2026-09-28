@@ -31,6 +31,10 @@ const NOTES: usize = 256;
 const OUTPUT: usize = 32;
 const EVENTS: usize = 256;
 
+pub fn binary_name(id: &str) -> String {
+    format!("crabbot-plugin-{id}{}", std::env::consts::EXE_SUFFIX)
+}
+
 #[derive(Clone)]
 pub struct Emitter {
     output: mpsc::Sender<Value>,
@@ -802,7 +806,7 @@ fn kill_group(group: Pid, signal: Signal) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Emitter, Process, serve_io, serve_io_events};
+    use super::{Emitter, Process, binary_name, serve_io, serve_io_events};
     #[cfg(unix)]
     use super::{external_group, getpgrp};
 
@@ -825,6 +829,14 @@ mod tests {
             capabilities: vec![Capability::Model],
             commands: vec![],
         }
+    }
+
+    #[test]
+    fn plugin_binary_names_use_the_platform_suffix() {
+        assert_eq!(
+            binary_name("model"),
+            format!("crabbot-plugin-model{}", std::env::consts::EXE_SUFFIX)
+        );
     }
 
     #[cfg(unix)]

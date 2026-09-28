@@ -16,9 +16,10 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(test))]
+use tokio::net::{TcpListener, TcpStream};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     process::Command,
     time::timeout,
 };
@@ -169,6 +170,7 @@ async fn run(request: SessionRequest, emitter: &mut Emitter) -> crabbot_core::Re
     run_pi(request, emitter, prompt, command, session_root).await
 }
 
+#[cfg(not(test))]
 async fn run_pi(
     request: SessionRequest,
     emitter: &mut Emitter,
@@ -176,6 +178,39 @@ async fn run_pi(
     command: String,
     session_root: PathBuf,
 ) -> crabbot_core::Result<String> {
+    run_pi_with_bridge(
+        request,
+        emitter,
+        prompt,
+        command,
+        session_root,
+        |emitter, token, workspace| async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|error| {
+                crabbot_core::Error::Denied(format!(
+                    "Crabbot could not bind the Pi tool bridge: {error}."
+                ))
+            })?;
+            let port = listener.local_addr()?.port();
+            let bridge = tokio::spawn(tool_bridge(listener, emitter, token, workspace));
+
+            Ok((port, bridge))
+        },
+    )
+    .await
+}
+
+async fn run_pi_with_bridge<F, Fut>(
+    request: SessionRequest,
+    emitter: &mut Emitter,
+    prompt: String,
+    command: String,
+    session_root: PathBuf,
+    prepare_bridge: F,
+) -> crabbot_core::Result<String>
+where
+    F: FnOnce(Emitter, String, PathBuf) -> Fut,
+    Fut: std::future::Future<Output = crabbot_core::Result<(u16, tokio::task::JoinHandle<()>)>>,
+{
     if let Some(session) = request.session.as_deref() {
         if !safe(session) {
             return Err(crabbot_core::Error::Denied("The coding session ID is invalid.".into()));
@@ -185,11 +220,7 @@ async fn run_pi(
     }
 
     tokio::fs::create_dir_all(&session_root).await?;
-    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|error| {
-        crabbot_core::Error::Denied(format!("Crabbot could not bind the Pi tool bridge: {error}."))
-    })?;
 
-    let address = listener.local_addr()?;
     let token = format!(
         "{}-{}",
         std::process::id(),
@@ -198,6 +229,9 @@ async fn run_pi(
             .unwrap_or_default()
             .as_nanos()
     );
+
+    let (port, bridge) =
+        prepare_bridge(emitter.clone(), token.clone(), request.workspace.clone()).await?;
 
     let mut args = vec!["--mode".into(), "rpc".into(), "--no-builtin-tools".into()];
 
@@ -209,14 +243,8 @@ async fn run_pi(
 
     let extension = session_root.join(format!("crabbot-pi-{}.ts", std::process::id()));
     tokio::fs::create_dir_all(&session_root).await?;
-    tokio::fs::write(&extension, extension_source(address.port(), &token)).await?;
+    tokio::fs::write(&extension, extension_source(port, &token)).await?;
     args.extend(["--extension".into(), extension.display().to_string()]);
-    let bridge = tokio::spawn(tool_bridge(
-        listener,
-        emitter.clone(),
-        token.clone(),
-        request.workspace.clone(),
-    ));
 
     let mut child = match Command::new(command)
         .args(args)
@@ -326,6 +354,7 @@ fn full_message_text(message: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+#[cfg(not(test))]
 async fn tool_bridge(listener: TcpListener, emitter: Emitter, token: String, workspace: PathBuf) {
     loop {
         let Ok((stream, _)) = listener.accept().await else { break };
@@ -339,6 +368,7 @@ async fn tool_bridge(listener: TcpListener, emitter: Emitter, token: String, wor
     }
 }
 
+#[cfg(not(test))]
 async fn handle_tool_call(
     stream: TcpStream,
     emitter: Emitter,
@@ -365,7 +395,7 @@ async fn handle_tool_call(
 }
 
 async fn handle_tool_call_with<F, Fut>(
-    mut stream: TcpStream,
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
     token: &str,
     workspace: &Path,
     call: F,
@@ -476,23 +506,11 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn loopback_listener() -> Option<tokio::net::TcpListener> {
-        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-            Ok(listener) => Some(listener),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
-            Err(error) => panic!("Could not bind the Pi test listener: {error}."),
-        }
-    }
-
-    async fn send_tool_request(request: Vec<u8>) -> Option<(String, Vec<u8>)> {
-        let listener = loopback_listener().await?;
-        let address = listener.local_addr().unwrap();
-
+    async fn send_tool_request(request: Vec<u8>) -> (String, Vec<u8>) {
+        let (mut client, server_stream) = tokio::io::duplex(LINE_LIMIT + 8192);
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-
             handle_tool_call_with(
-                stream,
+                server_stream,
                 "expected",
                 Path::new("/workspace"),
                 |name, args, root| async move {
@@ -507,19 +525,21 @@ mod tests {
             .await
         });
 
-        let mut client = TcpStream::connect(address).await.unwrap();
         client.write_all(&request).await.unwrap();
         client.shutdown().await.unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         let error = server.await.unwrap().err().map(|error| error.to_string()).unwrap_or_default();
 
-        Some((error, response))
+        (error, response)
     }
 
-    fn restricted_network(error: &crabbot_core::Error) -> bool {
-        let message = error.to_string().to_ascii_lowercase();
-        message.contains("operation not permitted") || message.contains("permission denied")
+    async fn no_network_bridge(
+        _emitter: Emitter,
+        _token: String,
+        _workspace: PathBuf,
+    ) -> crabbot_core::Result<(u16, tokio::task::JoinHandle<()>)> {
+        Ok((1234, tokio::spawn(std::future::pending())))
     }
 
     #[test]
@@ -571,32 +591,18 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_unauthorized_tool_bridge_requests() {
-        let Some(listener) = loopback_listener().await else {
-            return;
-        };
-
-        let address = listener.local_addr().unwrap();
-        let (sender, _) = tokio::sync::mpsc::channel(2);
-        let emitter = Emitter::new(sender);
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            handle_tool_call(stream, emitter, "expected", Path::new(".")).await
-        });
-
-        let mut client = TcpStream::connect(address).await.unwrap();
         let body = br#"{"token":"wrong","name":"read","args":{}}"#;
         let request = format!(
             "POST / HTTP/1.1\r\ncontent-length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
 
-        client.write_all(request.as_bytes()).await.unwrap();
-        client.write_all(body).await.unwrap();
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
+        let mut request = request.into_bytes();
+        request.extend_from_slice(body);
+        let (error, response) = send_tool_request(request).await;
 
+        assert!(error.is_empty());
         assert!(String::from_utf8_lossy(&response).contains("authorization failed"));
-        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -606,9 +612,7 @@ mod tests {
         let mut request = request.into_bytes();
         request.extend_from_slice(body);
 
-        let Some((error, response)) = send_tool_request(request).await else {
-            return;
-        };
+        let (error, response) = send_tool_request(request).await;
 
         assert!(error.is_empty());
         let response = String::from_utf8(response).unwrap();
@@ -629,9 +633,7 @@ mod tests {
         ];
 
         for request in requests {
-            let Some((error, _)) = send_tool_request(request).await else {
-                return;
-            };
+            let (error, _) = send_tool_request(request).await;
 
             assert!(!error.is_empty());
         }
@@ -665,22 +667,17 @@ mod tests {
             workspace: root.clone(),
         };
 
-        let text = match run_pi(
+        let text = match run_pi_with_bridge(
             request,
             &mut emitter,
             "context".into(),
             command.display().to_string(),
             sessions.clone(),
+            no_network_bridge,
         )
         .await
         {
             Ok(text) => text,
-
-            Err(error) if restricted_network(&error) => {
-                let _ = tokio::fs::remove_dir_all(root).await;
-                return;
-            }
-
             Err(error) => panic!("Pi test turn failed: {error}."),
         };
 
@@ -701,12 +698,13 @@ mod tests {
         };
 
         assert!(
-            run_pi(
+            run_pi_with_bridge(
                 request,
                 &mut emitter,
                 "context".into(),
                 "missing-pi-command".into(),
                 PathBuf::from("/tmp/crabbot-pi-sessions"),
+                no_network_bridge,
             )
             .await
             .is_err()
@@ -734,22 +732,17 @@ mod tests {
         let request =
             SessionRequest { prompt: "task".into(), session: None, workspace: root.clone() };
 
-        let text = match run_pi(
+        let text = match run_pi_with_bridge(
             request,
             &mut emitter,
             "context".into(),
             command.display().to_string(),
             root.join("sessions"),
+            no_network_bridge,
         )
         .await
         {
             Ok(text) => text,
-
-            Err(error) if restricted_network(&error) => {
-                let _ = tokio::fs::remove_dir_all(root).await;
-                return;
-            }
-
             Err(error) => panic!("Pi test turn failed: {error}."),
         };
 

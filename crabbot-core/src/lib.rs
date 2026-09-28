@@ -6,6 +6,7 @@ pub mod error;
 pub mod jsonl;
 pub mod plugin;
 pub mod policy;
+pub mod session;
 pub mod types;
 
 pub use error::{Error, Result};

@@ -1335,6 +1335,7 @@ fn intents() -> u64 {
     std::env::var("CRABBOT_DISCORD_INTENTS")
         .ok()
         .and_then(|value| value.parse().ok())
+        // GUILDS (1) + GUILD_MESSAGES (512) + DIRECT_MESSAGES (4,096) + MESSAGE_CONTENT (32,768).
         .unwrap_or(37_377)
 }
 
@@ -1942,6 +1943,7 @@ mod tests {
 
     #[test]
     fn validates_gateway_hello() {
+        // Discord heartbeat interval: 45,000 milliseconds (45 seconds).
         let message =
             Message::Text(json!({"op":10,"d":{"heartbeat_interval":45000}}).to_string().into());
 

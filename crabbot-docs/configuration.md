@@ -3,6 +3,9 @@
 Crabbot reads configuration from `config.toml` in `CRABBOT_HOME`. The home
 directory defaults to the platform application-data directory; set
 `CRABBOT_HOME` when the daemon should use a dedicated location.
+Plugin-owned persistent data is kept separately under
+`CRABBOT_HOME/data/plugins/<plugin-id>/`; agent workspaces remain the place for
+agent instructions, prompts, and other working files.
 
 Media-capable channels use `CRABBOT_MEDIA` for temporary downloaded content;
 when it is unset, media is stored under `CRABBOT_HOME/media` and expired files
@@ -12,6 +15,7 @@ session are copied under `media/pinned` and are not removed by cache cleanup.
 ## Example
 
 ```toml
+name = "Crabbot"
 update = "prompt"
 approval = "off"
 shell = false
@@ -35,6 +39,8 @@ worktree = true
 ```
 
 Unknown update and approval modes fail validation before the daemon starts.
+`name` sets the globally displayed name for Crabbot (1–64 visible characters).
+The default is `Crabbot`.
 The default update mode is `prompt`, approval is `off`, shell execution is
 disabled, and isolated Git worktrees are enabled for group turns.
 

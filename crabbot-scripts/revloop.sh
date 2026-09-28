@@ -5,6 +5,7 @@ readonly DEFAULT_MAX_CYCLES=50
 readonly DEFAULT_CLEAN_PASSES=3
 readonly DEFAULT_CODEX_TIMEOUT='60m'
 readonly DEFAULT_VERIFICATION_TIMEOUT='30m'
+readonly DEFAULT_FAST_MODE=false
 readonly EXIT_USAGE=2
 readonly EXIT_CODEX=70
 readonly EXIT_VERIFICATION=71
@@ -22,6 +23,7 @@ VERIFICATION_TIMEOUT="${CRABBOT_REVLOOP_VERIFICATION_TIMEOUT:-$DEFAULT_VERIFICAT
 OUTPUT_MODE="${CRABBOT_REVLOOP_OUTPUT:-clean}"
 MODEL="${CRABBOT_REVLOOP_MODEL:-gpt-6-luna}"
 REASONING="${CRABBOT_REVLOOP_REASONING:-high}"
+FAST_MODE="${CRABBOT_REVLOOP_FAST:-$DEFAULT_FAST_MODE}"
 GLOBAL_REVIEW=false
 
 print_error() {
@@ -38,8 +40,10 @@ print_warn() {
 
 usage() {
     printf '%s\n' \
-        'Usage: crabbot-scripts/revloop.sh [--global] [--clean|--verbose]'
+        'Usage: crabbot-scripts/revloop.sh [--global] [--clean|--verbose] [--fast|--no-fast]'
     printf '%s\n' 'Default output mode: clean.'
+    printf '%s\n' 'Default Codex Fast mode: disabled.'
+    printf '%s\n' 'Fast mode may use more Codex credits or API spend.'
     printf '%s\n' \
         'Default scope: uncommitted changes, the latest commit, or the feature branch.'
     printf '%s\n' 'Use --global for a repository-wide audit.'
@@ -47,6 +51,7 @@ usage() {
     printf '%s\n' '  CRABBOT_CODEX_HOME=~/.codex'
     printf '%s\n' '  CRABBOT_REVLOOP_MODEL=gpt-6-luna'
     printf '%s\n' '  CRABBOT_REVLOOP_REASONING=high'
+    printf '%s\n' "  CRABBOT_REVLOOP_FAST=true|false (default: $DEFAULT_FAST_MODE)"
     printf '%s\n' '  CRABBOT_REVLOOP_MAX_CYCLES=50 CRABBOT_REVLOOP_OUTPUT=clean|verbose'
     printf '%s\n' '  CRABBOT_REVLOOP_CLEAN_PASSES=3.'
     printf '%s\n' '  CRABBOT_REVLOOP_CODEX_TIMEOUT=60m.'
@@ -71,6 +76,12 @@ while (($# > 0)); do
         --verbose)
             OUTPUT_MODE='verbose'
             ;;
+        --fast)
+            FAST_MODE=true
+            ;;
+        --no-fast)
+            FAST_MODE=false
+            ;;
         --help|-h)
             usage
             exit 0
@@ -91,6 +102,23 @@ case "$OUTPUT_MODE" in
             "CRABBOT_REVLOOP_OUTPUT must be 'clean' or 'verbose'; got '$OUTPUT_MODE'."
         ;;
 esac
+
+case "$FAST_MODE" in
+    true|false)
+        ;;
+    *)
+        die "$EXIT_USAGE" \
+            "CRABBOT_REVLOOP_FAST must be 'true' or 'false'; got '$FAST_MODE'."
+        ;;
+esac
+
+if [[ "$FAST_MODE" == true ]]; then
+    CODEX_SERVICE_TIER='fast'
+    FAST_MODE_LABEL='on'
+else
+    CODEX_SERVICE_TIER='default'
+    FAST_MODE_LABEL='off'
+fi
 
 [[ -n "$MODEL" ]] || die "$EXIT_USAGE" 'CRABBOT_REVLOOP_MODEL must not be empty.'
 
@@ -266,6 +294,8 @@ run_codex() {
                 --model "$MODEL" \
                 --config 'approval_policy="never"' \
                 --config "model_reasoning_effort=\"$REASONING\"" \
+                --config "service_tier=\"$CODEX_SERVICE_TIER\"" \
+                --config "features.fast_mode=$FAST_MODE" \
                 --ephemeral \
                 --color never \
                 --output-last-message "$output_file" \
@@ -1345,9 +1375,10 @@ cycle=1
 
 print_info "Repository: $REPO_ROOT."
 print_info "State: $RUN_DIR."
-print_info "Codex home: $CRABBOT_CODEX_HOME."
+print_info "Home: $CRABBOT_CODEX_HOME."
 print_info "Model: $MODEL."
 print_info "Reasoning: $REASONING."
+print_info "Fast mode: $FAST_MODE_LABEL."
 print_info "Output mode: $OUTPUT_MODE."
 print_info "Review scope: $REVIEW_SCOPE."
 print_info "Maximum cycles: $MAX_CYCLES."

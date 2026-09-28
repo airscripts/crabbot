@@ -1,8 +1,18 @@
 # Concepts
 
 Crabbot separates the agent loop from the capabilities that make it useful.
-The daemon receives normalized events, the core executes a bounded turn, and
+The background runtime receives normalized events, the core executes a bounded turn, and
 plugins provide models, channels, storage, memory, timers, tools, or clients.
+
+## Runtime And Service Terms
+
+Use **background runtime** as the platform-neutral user-facing name for
+Crabbot's long-running host process. “Daemon” is the implementation and binary
+name used in technical contexts. A **service** is the operating system's
+registration and supervision mechanism for that process: systemd on Linux,
+launchd on macOS, or the Windows Service Control Manager. The TUI is a
+foreground client and local session work does not require the background
+runtime; features that rely on shared state or host capabilities may require it.
 
 ## Events
 

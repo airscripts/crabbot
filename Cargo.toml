@@ -39,6 +39,7 @@ publish = false
 
 [workspace.dependencies]
 base64 = "0.23"
+crossterm = "0.29"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 futures-util = { version = "0.3", features = ["sink"] }
@@ -47,6 +48,7 @@ jiff = { version = "0.2.28", default-features = false, features = ["std", "tz-sy
 keyring = { version = "4.2.0", default-features = true }
 ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

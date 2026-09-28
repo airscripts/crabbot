@@ -31,6 +31,7 @@ use crabbot_core::{
 
 use crabbot_file::save as save_file;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{
     net::TcpListener,
@@ -511,7 +512,7 @@ enum Command {
     },
 
     #[command(
-        about = "Install, remove, and control the native service.",
+        about = "Install, uninstall, and control the native service.",
         arg_required_else_help = true,
         subcommand_required = true
     )]
@@ -559,7 +560,7 @@ struct CrabfileValidate {
 struct CrabfileImport {
     #[arg(long, value_name = "PATH", help = "Read the Crabfile from PATH.")]
     path: Option<PathBuf>,
-    #[arg(long, help = "Confirm the import without prompting.")]
+    #[arg(short, long, help = "Confirm the import without prompting.")]
     yes: bool,
     #[arg(long, help = "Replace existing local state.")]
     force: bool,
@@ -573,9 +574,9 @@ enum PluginCommand {
     Install(Source),
     #[command(about = "Link a local plugin and activate it.")]
     Link(Source),
-    #[command(about = "Update locked plugins.")]
-    Update(Output),
-    #[command(about = "Remove an installed plugin.")]
+    #[command(about = "Review available plugin updates; pass -y to apply them.")]
+    Update(PluginUpdate),
+    #[command(name = "uninstall", about = "Uninstall a plugin.")]
     Remove(PluginRemove),
 }
 
@@ -637,7 +638,7 @@ struct DeliveryCli {
 enum ServiceCommand {
     #[command(about = "Install the native service definition.")]
     Install(ServiceInstall),
-    #[command(about = "Remove the native service definition.")]
+    #[command(name = "uninstall", about = "Uninstall the native service.")]
     Remove(ServiceRemove),
     #[command(about = "Show native service status.")]
     Status,
@@ -655,7 +656,7 @@ struct ServiceInstall {
 
 #[derive(Debug, Args)]
 struct ServiceRemove {
-    #[arg(long, help = "Confirm removing the service definition.")]
+    #[arg(short, long, help = "Confirm uninstalling the service.")]
     yes: bool,
 }
 
@@ -687,7 +688,7 @@ struct SessionModel {
 struct SessionDelete {
     #[arg(help = "Session identifier.")]
     id: String,
-    #[arg(long, help = "Confirm deletion without prompting.")]
+    #[arg(short, long, help = "Confirm deletion without prompting.")]
     yes: bool,
 }
 
@@ -698,10 +699,18 @@ struct Output {
 }
 
 #[derive(Debug, Args)]
+struct PluginUpdate {
+    #[arg(short, long, help = "Apply the updates listed by the preview.")]
+    yes: bool,
+    #[arg(long, help = "Render the preview or update result as JSON.")]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct InitArgs {
     #[arg(long, help = "Reset all Crabbot home data and recreate its defaults.")]
     force: bool,
-    #[arg(long, help = "Confirm the destructive reset without prompting.")]
+    #[arg(short, long, help = "Confirm the destructive reset without prompting.")]
     yes: bool,
 }
 
@@ -719,7 +728,7 @@ struct Source {
     source: Option<String>,
     #[arg(long, value_name = "REVISION", help = "Pin a Git revision.")]
     revision: Option<String>,
-    #[arg(long, help = "Confirm installation without prompting.")]
+    #[arg(short, long, help = "Confirm installation or replacement without prompting.")]
     yes: bool,
 }
 
@@ -750,7 +759,7 @@ impl Drop for SourceRoot {
 struct Name {
     #[arg(help = "Identifier.")]
     id: String,
-    #[arg(long, help = "Confirm the operation.")]
+    #[arg(short, long, help = "Confirm the operation.")]
     yes: bool,
 }
 
@@ -758,7 +767,7 @@ struct Name {
 struct PluginRemove {
     #[arg(help = "Plugin identifier.")]
     id: String,
-    #[arg(long, help = "Confirm the operation.")]
+    #[arg(short, long, help = "Confirm the operation.")]
     yes: bool,
     #[arg(long, help = "Purge its last capability's sessions or deliveries.")]
     force: bool,
@@ -785,6 +794,7 @@ struct Ask {
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
+    name: String,
     update: String,
     shell: bool,
     approval: String,
@@ -795,6 +805,7 @@ pub(crate) struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            name: "Crabbot".into(),
             update: "prompt".into(),
             shell: false,
             approval: "off".into(),
@@ -805,6 +816,13 @@ impl Default for Config {
 
 impl Config {
     fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty()
+            || self.name.len() > 64
+            || self.name.chars().any(char::is_control)
+        {
+            return Err("The Crabbot name must contain 1–64 visible characters.".into());
+        }
+
         match self.update.as_str() {
             "off" | "check" | "prompt" | "auto" => Ok(()),
             value => Err(format!("Unsupported update mode: {value}.")),
@@ -1324,7 +1342,7 @@ fn help_text_with_plugins(root: &Path) -> String {
         .map(|(name, owners)| (name.clone(), owners.clone()))
         .collect::<BTreeMap<_, _>>();
 
-    let conditional_help = command_help_section("Conditional Native Commands", &conditional);
+    let conditional_help = command_help_section("Conditional Commands", &conditional);
     let plugin_help = command_help_section("Plugin Commands", &plugins);
 
     if let Some(index) = help.find("\nOptions:") {
@@ -2430,13 +2448,8 @@ fn binary_at(id: &str, root: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    let name = if cfg!(windows) {
-        format!("crabbot-plugin-{id}.exe")
-    } else {
-        format!("crabbot-plugin-{id}")
-    };
-
-    let config = root.join("plugins").join(id).join("bin").join(&name);
+    let config =
+        root.join("plugins").join(id).join("bin").join(crabbot_core::plugin::binary_name(id));
 
     if config.is_file() {
         return Some(config);
@@ -3213,6 +3226,7 @@ fn env_for(manifest: &Manifest, config: &Config, root: &Path) -> Vec<(String, St
         "TMPDIR",
         "RUST_BACKTRACE",
         "CRABBOT_HOME",
+        "CRABBOT_NAME",
         "CRABBOT_MEDIA",
         "CRABBOT_CODEX_HOME",
         "CRABBOT_CODEX_BINARY",
@@ -3249,6 +3263,8 @@ fn env_for(manifest: &Manifest, config: &Config, root: &Path) -> Vec<(String, St
         .collect::<Vec<_>>();
 
     ensure_home(&mut values, root);
+    values.retain(|(name, _)| name != "CRABBOT_NAME");
+    values.push(("CRABBOT_NAME".into(), config.name.clone()));
     ensure_codex_home(&mut values);
 
     if manifest.id == "tools" {
@@ -3415,7 +3431,7 @@ fn updates(root: &Path, mode: &str) -> Result<(), Box<dyn std::error::Error + Se
     match mode {
         "check" => info!(plugins = %changed.join(", "), "Plugin updates are available."),
         "prompt" => info!("Plugin updates are available; run `crabbot plugin update` to review."),
-        "auto" => update_at(root, false)?,
+        "auto" => update_at(root, false, false)?,
         _ => unreachable!("update mode was validated above"),
     }
 
@@ -3442,7 +3458,7 @@ fn changed(
 }
 
 fn plugin_name(id: &str) -> String {
-    if cfg!(windows) { format!("crabbot-plugin-{id}.exe") } else { format!("crabbot-plugin-{id}") }
+    crabbot_core::plugin::binary_name(id)
 }
 
 fn plugin_binary(source: &Path, id: &str, default: bool) -> Option<PathBuf> {
@@ -3688,6 +3704,7 @@ async fn bridge_with_media(
                 .filter(|session| {
                     session.id.starts_with(&format!("{channel_id}-"))
                         && session.status != "cancelled"
+                        && !session.has_live_tui_reservation()
                         && !session.queued.is_empty()
                 })
                 .find_map(|session| {
@@ -7747,7 +7764,7 @@ fn service_at_with_status(
 
         ServiceCommand::Remove(args) => {
             if !args.yes {
-                return Err("Removing the service requires --yes.".into());
+                return Err("Uninstalling the service requires --yes.".into());
             }
 
             let installed = path.exists();
@@ -7769,13 +7786,13 @@ fn service_at_with_status(
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "action": "remove",
+                        "action": "uninstall",
                         "path": path,
-                        "status": if installed { "removed" } else { "not installed" },
+                        "status": if installed { "uninstalled" } else { "not installed" },
                     }))?
                 );
             } else if installed {
-                println!("Removed the service definition from {}.", path.display());
+                println!("Uninstalled the service from {}.", path.display());
             } else {
                 println!("No service definition was found.");
             }
@@ -8625,12 +8642,12 @@ fn capability_text(value: &serde_json::Value) -> String {
 
 fn status_text(value: &serde_json::Value, installed: usize) -> String {
     format!(
-        "{:<15}{}\n{:<15}{}\n{:<15}{}\n{:<15}{}\n{:<15}{}\n{:<15}{} installed",
+        "{:<20}{}\n{:<20}{}\n{:<20}{}\n{:<20}{}\n{:<20}{}\n{:<20}{} installed",
         "Version:",
         value["version"].as_str().unwrap_or(VERSION),
         "Health:",
         value["health"].as_str().unwrap_or("attention"),
-        "Daemon:",
+        "Background runtime:",
         value["daemon"].as_str().unwrap_or("stopped"),
         "Intelligence:",
         capability_text(&value["intelligence"]),
@@ -8673,8 +8690,7 @@ async fn external_command(
     }
 
     if args.get(1).is_some_and(|argument| argument == "--help" || argument == "-h") {
-        println!("Usage: crabbot {name} [arguments...]");
-        println!("{}", owners[0].1.description);
+        println!("{}", external_command_help(name, &owners[0].1.description));
         return Ok(());
     }
 
@@ -8686,6 +8702,10 @@ async fn external_command(
     } else {
         Config::default()
     };
+
+    if plugin == "tui" {
+        return tui_command(path, &args[1..], &root, &config).await;
+    }
 
     let mut process = launch(&root, path, &plugin, None, false, &config).await?;
     let timeout = if name == "codex" && args.get(1).is_some_and(|argument| argument == "login") {
@@ -8791,6 +8811,106 @@ async fn external_command(
     }
 
     Ok(())
+}
+
+async fn tui_command(
+    path: PathBuf,
+    args: &[String],
+    root: &Path,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let tui_manifest = verify_plugin_integrity(root, "tui", &path)?;
+
+    if !tui_manifest.commands.iter().any(|command| command.name == "tui" && command.interactive) {
+        return Err("The TUI plugin does not advertise its interactive command.".into());
+    }
+
+    let one_shot = args.iter().any(|argument| argument == "--once");
+
+    if !one_shot && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
+        return Err(
+            "The TUI needs an interactive terminal. Use `crab tui --once <prompt>` instead.".into(),
+        );
+    }
+
+    let plugin = args
+        .windows(2)
+        .find(|pair| pair[0] == "--plugin")
+        .map(|pair| pair[1].clone())
+        .or_else(|| std::env::var("CRABBOT_MODEL_PLUGIN").ok())
+        .unwrap_or_else(|| "codex".into());
+
+    let plugin_path = binary_at(&plugin, root);
+    let mut command = tokio::process::Command::new(path);
+    command
+        .env_clear()
+        .arg("--crabbot-cli")
+        .args(args)
+        .env("CRABBOT_HOME", root)
+        .env("CRABBOT_NAME", &config.name)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+
+    if let Some(plugin_path) = plugin_path {
+        let manifest = verify_plugin_integrity(root, &plugin, &plugin_path)?;
+
+        if !manifest.capabilities.iter().any(|capability| capability == "model") {
+            return Err(format!("Plugin {plugin} is not an intelligence plugin.").into());
+        }
+
+        command.envs(env_for(&manifest, config, root));
+    }
+
+    for name in ["CRABBOT_MODEL", "CRABBOT_ROOT"] {
+        if let Ok(value) = std::env::var(name) {
+            command.env(name, value);
+        }
+    }
+
+    command.env("CRABBOT_MODEL_PLUGIN", &plugin);
+
+    let status = command.status().await?;
+
+    if !status.success() {
+        return Err(format!("TUI exited with status {status}.").into());
+    }
+
+    Ok(())
+}
+
+fn verify_plugin_integrity(
+    root: &Path,
+    id: &str,
+    path: &Path,
+) -> Result<Manifest, Box<dyn std::error::Error + Send + Sync>> {
+    let manifest_path = path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("Plugin manifest path is invalid.")?
+        .join("crabbot-plugin.toml");
+
+    let manifest = read_manifest(manifest_path.parent().unwrap_or(Path::new(".")))
+        .ok_or_else(|| format!("Plugin manifest is invalid: {}.", manifest_path.display()))?;
+
+    let lock = load_lock_at(root)?;
+    let entry = lock.plugins.get(id).ok_or_else(|| format!("Plugin {id} is not locked."))?;
+
+    if manifest.id != id || digest(&manifest_path, path)? != entry.hash {
+        return Err(format!("Plugin integrity check failed: {id}.").into());
+    }
+
+    Ok(manifest)
+}
+
+fn external_command_help(name: &str, description: &str) -> String {
+    if name == "tui" {
+        return format!(
+            "{description}\n\nUsage: crab tui [OPTIONS]\n\nOptions:\n  --once <prompt>   Send one prompt without opening the full-screen interface\n  --session <id>    Select a session (default: tui)\n  --model <name>    Select the model (default: CRABBOT_MODEL or gpt-6-luna)\n  --plugin <id>     Select the intelligence plugin (default: CRABBOT_MODEL_PLUGIN or codex)\n  -h, --help        Print help"
+        );
+    }
+
+    format!("Usage: crabbot {name} [arguments...]\n{description}")
 }
 
 async fn ask_command(
@@ -8967,11 +9087,11 @@ async fn plugin(
             }
         }
 
-        PluginCommand::Update(output) => update_plugins(output.json || json).await?,
+        PluginCommand::Update(update) => update_plugins(update.yes, update.json || json).await?,
 
         PluginCommand::Remove(name) => {
             if !name.yes {
-                return Err("Removing a plugin requires --yes.".into());
+                return Err("Uninstalling a plugin requires --yes.".into());
             }
 
             if !valid(&name.id) {
@@ -8996,7 +9116,7 @@ async fn plugin(
             if let Err(error) = remove_at(name, &root) {
                 if let Err(reload) = activate_at(&root, &id).await {
                     return Err(format!(
-                        "Plugin removal failed: {}. Runtime restoration also failed: {}.",
+                        "Plugin uninstallation failed: {}. Runtime restoration also failed: {}.",
                         sentence(error.to_string()),
                         sentence(reload.to_string())
                     )
@@ -9010,16 +9130,16 @@ async fn plugin(
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "action": "remove",
+                        "action": "uninstall",
                         "id": id,
-                        "status": "removed",
+                        "status": "uninstalled",
                         "unloaded": unloaded,
                         "purged": purged,
                     }))?
                 );
             } else {
                 if unloaded {
-                    println!("Plugin {id} was unloaded from the running daemon.");
+                    println!("Plugin {id} was unloaded from the background runtime.");
                 }
 
                 if let Some(purged) = &purged {
@@ -9039,7 +9159,7 @@ async fn plugin(
                     }
                 }
 
-                println!("Removed {}.", id);
+                println!("Uninstalled {}.", id);
             }
         }
     }
@@ -9048,13 +9168,25 @@ async fn plugin(
 }
 
 fn print_activation(id: &str, value: Option<serde_json::Value>) {
+    println!("{}", activation_text(id, value));
+}
+
+fn activation_text(id: &str, value: Option<serde_json::Value>) -> String {
+    if id == "tui" {
+        return "Plugin tui is ready. Run `crab tui`; local sessions work without the background runtime."
+            .into();
+    }
+
     match value {
-        Some(value) => println!(
-            "Plugin {} {} is active in the running daemon.",
+        Some(value) => format!(
+            "Plugin {} {} is active in the background runtime.",
             value["id"].as_str().unwrap_or(id),
             value["version"].as_str().unwrap_or("unknown")
         ),
-        None => println!("Plugin {id} is installed and will load when the daemon starts."),
+
+        None => {
+            format!("Plugin {id} is installed and will load when the background runtime starts.")
+        }
     }
 }
 
@@ -9101,17 +9233,34 @@ fn active_ids(value: serde_json::Value) -> Result<Vec<String>, PluginError> {
     Ok(active)
 }
 
-async fn update_plugins(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    update_plugins_at(&home(), json).await
+async fn update_plugins(
+    yes: bool,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    update_plugins_at(&home(), yes, json).await
 }
 
 async fn update_plugins_at(
     root: &Path,
+    yes: bool,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !yes {
+        return preview_updates_at(root, json);
+    }
+
+    let previews = load_update_preview_snapshot_at(root)?;
+    let changed = previews.candidates.keys().cloned().collect::<Vec<_>>();
+
+    if changed.is_empty() {
+        return update_at_with_previews(root, json, &previews.candidates, true);
+    }
+
     let Some(active) = active_at(root).await? else {
-        return update_at(root, json);
+        return update_at_with_previews(root, json, &previews.candidates, true);
     };
+
+    let active = active.into_iter().filter(|id| changed.contains(id)).collect();
 
     let unload_root = root.to_path_buf();
     let activate_root = root.to_path_buf();
@@ -9119,6 +9268,7 @@ async fn update_plugins_at(
         root,
         json,
         active,
+        Some(&previews.candidates),
         move |id| {
             let root = unload_root.clone();
             Box::pin(async move { unload_at(&root, &id).await })
@@ -9135,6 +9285,7 @@ async fn update_live<U, A>(
     root: &Path,
     json: bool,
     active: Vec<String>,
+    previews: Option<&BTreeMap<String, UpdateCandidate>>,
     mut unload: U,
     mut activate: A,
 ) -> Result<(), PluginError>
@@ -9143,7 +9294,10 @@ where
     A: FnMut(String) -> PluginTask,
 {
     if active.is_empty() {
-        return update_at(root, json);
+        return match previews {
+            Some(previews) => update_at_with_previews(root, json, previews, true),
+            None => update_at(root, json, true),
+        };
     }
 
     let mut unloaded = Vec::with_capacity(active.len());
@@ -9175,7 +9329,11 @@ where
         }
     }
 
-    let update = update_at(root, json);
+    let update = match previews {
+        Some(previews) => update_at_with_previews(root, json, previews, true),
+        None => update_at(root, json, true),
+    };
+
     let restore = restore_plugins(&unloaded, &mut activate).await;
 
     match (update, restore.is_empty()) {
@@ -9206,7 +9364,7 @@ where
         match activate(id.clone()).await {
             Ok(Some(_)) => {}
             Ok(None) => failures.push(format!(
-                " {id} could not be reloaded because the daemon is unavailable; it will load when the daemon starts."
+                " {id} could not be reloaded because the background runtime is unavailable; it will load when the background runtime starts."
             )),
             Err(error) => failures.push(format!(
                 " {id} could not be reloaded: {}",
@@ -9218,20 +9376,64 @@ where
     if failures.is_empty() { String::new() } else { failures.join("") }
 }
 
-fn update_at(home_root: &Path, json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn update_at(
+    home_root: &Path,
+    json: bool,
+    preview_only: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if preview_only {
+        let previews = load_update_previews_at(home_root)?;
+
+        return update_at_with_previews(home_root, json, &previews, true);
+    }
+
+    update_at_with_previews(home_root, json, &BTreeMap::new(), false)
+}
+
+fn update_at_with_previews(
+    home_root: &Path,
+    json: bool,
+    previews: &BTreeMap<String, UpdateCandidate>,
+    preview_only: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _lock = lock_at(home_root, ".plugins.lock")?;
     let mut lock = load_lock_at(home_root)?;
     let mut rows = Vec::new();
     let mut failed = false;
-
     let ids = lock.plugins.keys().cloned().collect::<Vec<_>>();
 
     for id in ids {
         let previous_lock = lock.clone();
         let previous = lock.plugins.get(&id).cloned().ok_or("Plugin lock entry disappeared.")?;
-        let result = {
+        let preview_candidate = previews.get(&id);
+
+        if preview_only && preview_candidate.is_none() {
+            continue;
+        }
+
+        let inspection = if let Some(candidate) = &preview_candidate {
+            validate_update_candidate(home_root, &id, &previous, candidate)
+        } else {
             let entry = lock.plugins.get(&id).ok_or("Plugin lock entry disappeared.")?;
-            update_one(home_root, &id, entry)
+            inspect_update(home_root, &id, entry)
+        };
+
+        let result = match inspection {
+            Ok(candidate)
+                if candidate.hash == previous.hash
+                    && candidate.source_revision == previous.revision
+                    && candidate.manifest.version == previous.version =>
+            {
+                rows.push(serde_json::json!({"id": id, "status": "unchanged"}));
+                continue;
+            }
+
+            Ok(_) => {
+                let entry = lock.plugins.get(&id).ok_or("Plugin lock entry disappeared.")?;
+                update_one(home_root, &id, entry, preview_candidate)
+            }
+
+            Err(error) => Err(error),
         };
 
         match result {
@@ -9301,6 +9503,8 @@ fn update_at(home_root: &Path, json: bool) -> Result<(), Box<dyn std::error::Err
 
             if status == "updated" {
                 println!("Updated {id} to {}.", row["version"].as_str().unwrap_or("unknown"));
+            } else if status == "unchanged" {
+                println!("{id} is already up to date.");
             } else {
                 println!("Could not update {id}: {}", row["error"].as_str().unwrap_or("unknown"));
             }
@@ -9328,7 +9532,11 @@ fn update_at(home_root: &Path, json: bool) -> Result<(), Box<dyn std::error::Err
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "items": rows,
-                "status": if rows.is_empty() { "no changes" } else { "updated" },
+                "status": if rows.iter().any(|row| row["status"] == "updated") {
+                    "updated"
+                } else {
+                    "no changes"
+                },
             }))?
         );
     }
@@ -9336,11 +9544,238 @@ fn update_at(home_root: &Path, json: bool) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-fn update_one(
+fn preview_updates_at(
+    home_root: &Path,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _lock = lock_at(home_root, ".plugins.lock")?;
+    let lock = load_lock_at(home_root)?;
+    let mut updates = Vec::new();
+    let preview_root = home_root.join(".plugin-update-preview");
+
+    if preview_root.exists() {
+        std::fs::remove_dir_all(&preview_root)?;
+    }
+
+    std::fs::create_dir_all(&preview_root)?;
+    std::fs::write(preview_root.join("preview.json"), b"{}")?;
+
+    let mut errors = Vec::new();
+
+    for (id, entry) in &lock.plugins {
+        let candidate = match inspect_update(home_root, id, entry) {
+            Ok(candidate) => candidate,
+
+            Err(error) => {
+                errors.push(serde_json::json!({
+                    "id": id,
+                    "error": sentence(error.to_string())
+                }));
+                continue;
+            }
+        };
+
+        let changed = candidate.hash != entry.hash
+            || candidate.source_revision != entry.revision
+            || candidate.manifest.version != entry.version;
+
+        if changed {
+            if let Err(error) = save_update_preview_at(home_root, id, entry, &candidate) {
+                errors.push(serde_json::json!({
+                    "id": id,
+                    "error": sentence(error.to_string())
+                }));
+                continue;
+            }
+
+            updates.push(serde_json::json!({
+                "id": id,
+                "current_version": entry.version,
+                "available_version": candidate.manifest.version,
+                "current_revision": entry.revision,
+                "available_revision": candidate.source_revision,
+                "contents_changed": candidate.hash != entry.hash,
+            }));
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": if updates.is_empty() && !errors.is_empty() {
+                    "inspection_failed"
+                } else if updates.is_empty() {
+                    "up_to_date"
+                } else {
+                    "updates_available"
+                },
+                "items": updates,
+                "errors": errors,
+                "apply_command": "crabbot plugin update --yes",
+            }))?
+        );
+    } else if lock.plugins.is_empty() {
+        println!("No installed plugins to update.");
+    } else if updates.is_empty() && errors.is_empty() {
+        println!("All {} installed plugin(s) are up to date.", lock.plugins.len());
+    } else if !updates.is_empty() {
+        println!("The following plugin updates are available:");
+
+        for update in &updates {
+            let id = update["id"].as_str().unwrap_or("unknown");
+            let current = update["current_version"].as_str().unwrap_or("unknown");
+            let available = update["available_version"].as_str().unwrap_or("unknown");
+
+            let detail = if current == available {
+                " (plugin contents or source revision changed)"
+            } else {
+                ""
+            };
+
+            println!("  {id} {current} -> {available}{detail}");
+        }
+
+        println!("Run `crab plugin update --yes` to apply these updates.");
+    }
+
+    if !json {
+        for error in &errors {
+            let id = error["id"].as_str().unwrap_or("unknown");
+            let detail = error["error"].as_str().unwrap_or("unknown error");
+            println!("Could not inspect {id}: {detail}");
+        }
+    }
+
+    Ok(())
+}
+
+fn load_update_previews_at(
+    home_root: &Path,
+) -> Result<BTreeMap<String, UpdateCandidate>, Box<dyn std::error::Error + Send + Sync>> {
+    let _lock = lock_at(home_root, ".plugins.lock")?;
+    let preview_root = home_root.join(".plugin-update-preview");
+
+    if !preview_root.join("preview.json").is_file() {
+        return Err(
+            "No saved plugin update preview was found; run `crabbot plugin update` first.".into()
+        );
+    }
+
+    let lock = load_lock_at(home_root)?;
+    let mut candidates = BTreeMap::new();
+
+    for (id, entry) in &lock.plugins {
+        if let Some(candidate) = load_update_preview_at(home_root, id, entry)? {
+            candidates
+                .insert(id.clone(), validate_update_candidate(home_root, id, entry, &candidate)?);
+        }
+    }
+
+    Ok(candidates)
+}
+
+fn load_update_preview_snapshot_at(
+    home_root: &Path,
+) -> Result<UpdatePreviewSnapshot, Box<dyn std::error::Error + Send + Sync>> {
+    let _lock = lock_at(home_root, ".plugins.lock")?;
+    let preview_root = home_root.join(".plugin-update-preview");
+
+    if !preview_root.join("preview.json").is_file() {
+        return Err(
+            "No saved plugin update preview was found; run `crabbot plugin update` first.".into()
+        );
+    }
+
+    let lock = load_lock_at(home_root)?;
+    let mut candidates = BTreeMap::new();
+    let snapshot_root = (0..)
+        .find_map(|attempt| {
+            let path = home_root.join(format!(
+                ".plugin-update-apply-{}-{}-{attempt}",
+                std::process::id(),
+                now()
+            ));
+
+            match std::fs::create_dir(&path) {
+                Ok(()) => Some(Ok(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .ok_or("Could not allocate a plugin update preview snapshot.")??;
+
+    let mut snapshot = UpdatePreviewSnapshot { candidates: BTreeMap::new(), root: snapshot_root };
+
+    for (id, entry) in &lock.plugins {
+        let Some(candidate) = load_update_preview_at(home_root, id, entry)? else {
+            continue;
+        };
+
+        let candidate = validate_update_candidate(home_root, id, entry, &candidate)?;
+        let destination = snapshot.root.join(id);
+        std::fs::create_dir_all(destination.join("bin"))?;
+        std::fs::copy(
+            candidate.source_path.join("crabbot-plugin.toml"),
+            destination.join("crabbot-plugin.toml"),
+        )?;
+
+        let binary = destination.join("bin").join(plugin_name(id));
+        copy_binary(&candidate.binary, &binary)?;
+        let candidate = UpdateCandidate {
+            manifest: candidate.manifest,
+            hash: candidate.hash,
+            source_revision: candidate.source_revision,
+            base_hash: candidate.base_hash,
+            base_revision: candidate.base_revision,
+            base_version: candidate.base_version,
+            source_path: destination,
+            binary,
+        };
+
+        candidates.insert(id.clone(), validate_update_candidate(home_root, id, entry, &candidate)?);
+    }
+
+    snapshot.candidates = candidates;
+    Ok(snapshot)
+}
+
+struct UpdateCandidate {
+    manifest: Manifest,
+    hash: String,
+    source_revision: String,
+    base_hash: String,
+    base_revision: String,
+    base_version: String,
+    source_path: PathBuf,
+    binary: PathBuf,
+}
+
+struct UpdatePreviewSnapshot {
+    candidates: BTreeMap<String, UpdateCandidate>,
+    root: PathBuf,
+}
+
+impl Drop for UpdatePreviewSnapshot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct UpdatePreviewRecord {
+    base_hash: String,
+    base_revision: String,
+    base_version: String,
+    hash: String,
+    source_revision: String,
+}
+
+fn inspect_update(
     home_root: &Path,
     id: &str,
     entry: &Entry,
-) -> Result<(Manifest, String, String, Update), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<UpdateCandidate, Box<dyn std::error::Error + Send + Sync>> {
     if !valid(id) {
         return Err(format!("Invalid plugin ID: {id}.").into());
     }
@@ -9349,7 +9784,6 @@ fn update_one(
     let source = resolve(&entry.source, pin)?;
     let manifest = read_manifest(&source.path)
         .ok_or_else(|| format!("Manifest not found in {}.", source.path.display()))?;
-
     manifest.validate().map_err(|error| format!("Invalid plugin manifest: {error}"))?;
 
     if manifest.id != id {
@@ -9378,7 +9812,210 @@ fn update_one(
         return Err(format!("Binary {name} was not found; build the plugin first.").into());
     };
 
-    let source_revision = revision(&source.path);
+    Ok(UpdateCandidate {
+        manifest,
+        hash: digest(&source.path.join("crabbot-plugin.toml"), &binary)?,
+        source_revision: revision(&source.path),
+        base_hash: entry.hash.clone(),
+        base_revision: entry.revision.clone(),
+        base_version: entry.version.clone(),
+        source_path: source.path.clone(),
+        binary,
+    })
+}
+
+fn save_update_preview_at(
+    home_root: &Path,
+    id: &str,
+    entry: &Entry,
+    candidate: &UpdateCandidate,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let root = home_root.join(".plugin-update-preview");
+    let stage = root.join(format!(".{id}.stage-{}", now()));
+    let destination = root.join(id);
+
+    std::fs::create_dir_all(stage.join("bin"))?;
+    std::fs::copy(
+        candidate.source_path.join("crabbot-plugin.toml"),
+        stage.join("crabbot-plugin.toml"),
+    )?;
+
+    copy_binary(&candidate.binary, &stage.join("bin").join(plugin_name(id)))?;
+
+    let record = UpdatePreviewRecord {
+        base_hash: entry.hash.clone(),
+        base_revision: entry.revision.clone(),
+        base_version: entry.version.clone(),
+        hash: candidate.hash.clone(),
+        source_revision: candidate.source_revision.clone(),
+    };
+
+    std::fs::write(stage.join("preview.json"), serde_json::to_vec(&record)?)?;
+
+    if destination.exists() {
+        std::fs::remove_dir_all(&destination)?;
+    }
+
+    std::fs::rename(stage, destination)?;
+    Ok(())
+}
+
+fn load_update_preview_at(
+    home_root: &Path,
+    id: &str,
+    entry: &Entry,
+) -> Result<Option<UpdateCandidate>, Box<dyn std::error::Error + Send + Sync>> {
+    let root = home_root.join(".plugin-update-preview").join(id);
+    let record_path = root.join("preview.json");
+
+    if !record_path.is_file() {
+        return Ok(None);
+    }
+
+    let record: UpdatePreviewRecord = serde_json::from_slice(&std::fs::read(record_path)?)?;
+
+    if record.base_hash != entry.hash
+        || record.base_revision != entry.revision
+        || record.base_version != entry.version
+    {
+        return Err(
+            format!("The saved update preview for {id} is stale; preview updates again.").into()
+        );
+    }
+
+    let binary = root.join("bin").join(plugin_name(id));
+    let manifest = read_manifest(&root)
+        .ok_or_else(|| format!("Saved update preview for {id} has no manifest."))?;
+
+    Ok(Some(UpdateCandidate {
+        manifest,
+        hash: record.hash,
+        source_revision: record.source_revision,
+        base_hash: record.base_hash,
+        base_revision: record.base_revision,
+        base_version: record.base_version,
+        source_path: root,
+        binary,
+    }))
+}
+
+fn validate_update_candidate(
+    home_root: &Path,
+    id: &str,
+    entry: &Entry,
+    candidate: &UpdateCandidate,
+) -> Result<UpdateCandidate, Box<dyn std::error::Error + Send + Sync>> {
+    let manifest = &candidate.manifest;
+    manifest.validate().map_err(|error| format!("Invalid plugin manifest: {error}"))?;
+
+    if candidate.base_hash != entry.hash
+        || candidate.base_revision != entry.revision
+        || candidate.base_version != entry.version
+    {
+        return Err(
+            format!("The saved update preview for {id} is stale; preview updates again.").into()
+        );
+    }
+
+    if manifest.id != id || !Protocol::CURRENT.compatible(manifest.protocol) {
+        return Err(format!("Saved update preview for {id} is invalid.").into());
+    }
+
+    if manifest.capabilities != entry.capabilities
+        || manifest.permissions != entry.permissions
+        || manifest.secrets != entry.secrets
+        || manifest.commands != entry.commands
+    {
+        return Err(format!(
+            "Saved update preview for {id} changes declared capabilities or permissions."
+        )
+        .into());
+    }
+
+    validate_commands(home_root, id, &manifest.commands)?;
+
+    if !candidate.binary.is_file()
+        || digest(&candidate.source_path.join("crabbot-plugin.toml"), &candidate.binary)?
+            != candidate.hash
+    {
+        return Err(format!("Saved update preview for {id} changed; preview updates again.").into());
+    }
+
+    Ok(UpdateCandidate {
+        manifest: manifest.clone(),
+        hash: candidate.hash.clone(),
+        source_revision: candidate.source_revision.clone(),
+        base_hash: candidate.base_hash.clone(),
+        base_revision: candidate.base_revision.clone(),
+        base_version: candidate.base_version.clone(),
+        source_path: candidate.source_path.clone(),
+        binary: candidate.binary.clone(),
+    })
+}
+
+fn update_one(
+    home_root: &Path,
+    id: &str,
+    entry: &Entry,
+    preview: Option<&UpdateCandidate>,
+) -> Result<(Manifest, String, String, Update), Box<dyn std::error::Error + Send + Sync>> {
+    if !valid(id) {
+        return Err(format!("Invalid plugin ID: {id}.").into());
+    }
+
+    let resolved = if preview.is_none() {
+        let pin = entry.pinned.then_some(entry.revision.as_str());
+        Some(resolve(&entry.source, pin)?)
+    } else {
+        None
+    };
+
+    let source_path = preview
+        .map(|candidate| candidate.source_path.as_path())
+        .or_else(|| resolved.as_ref().map(|source| source.path.as_path()))
+        .ok_or("Plugin update source disappeared.")?;
+
+    let manifest = preview
+        .map(|candidate| candidate.manifest.clone())
+        .or_else(|| read_manifest(source_path))
+        .ok_or_else(|| format!("Manifest not found in {}.", source_path.display()))?;
+
+    manifest.validate().map_err(|error| format!("Invalid plugin manifest: {error}"))?;
+
+    if manifest.id != id {
+        return Err(format!("Manifest ID {} does not match {id}.", manifest.id).into());
+    }
+
+    if !Protocol::CURRENT.compatible(manifest.protocol) {
+        return Err(format!("Plugin {id} requires unsupported protocol.").into());
+    }
+
+    if manifest.capabilities != entry.capabilities
+        || manifest.permissions != entry.permissions
+        || manifest.secrets != entry.secrets
+        || manifest.commands != entry.commands
+    {
+        return Err(format!(
+            "Plugin {id} changes declared capabilities, permissions, secrets, or commands; review it with plugin link --yes."
+        )
+        .into());
+    }
+
+    validate_commands(home_root, id, &manifest.commands)?;
+
+    let name = plugin_name(id);
+    let binary = preview
+        .map(|candidate| candidate.binary.clone())
+        .or_else(|| plugin_binary(source_path, id, entry.default));
+
+    let Some(binary) = binary else {
+        return Err(format!("Binary {name} was not found; build the plugin first.").into());
+    };
+
+    let source_revision =
+        preview.map_or_else(|| revision(source_path), |item| item.source_revision.clone());
+
+    let preview_hash = preview.map(|item| item.hash.as_str());
 
     let plugins = home_root.join("plugins");
     std::fs::create_dir_all(&plugins)?;
@@ -9387,23 +10024,32 @@ fn update_one(
     let backup = plugins.join(format!(".{id}.backup-{nonce}"));
     let destination = plugins.join(id);
 
-    if std::fs::canonicalize(&destination).is_ok_and(|path| path == source.path) {
+    if std::fs::canonicalize(&destination).is_ok_and(|path| path == source_path) {
         return Err("A plugin source cannot be its managed destination.".into());
     }
 
     let had_destination = destination.exists();
     let result = (|| -> Result<(String, Update), Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(stage.join("bin"))?;
-        std::fs::copy(source.path.join("crabbot-plugin.toml"), stage.join("crabbot-plugin.toml"))?;
+        std::fs::copy(source_path.join("crabbot-plugin.toml"), stage.join("crabbot-plugin.toml"))?;
+
         let staged = stage.join("bin").join(&name);
 
-        if entry.linked && source.temp.is_none() {
+        if entry.linked
+            && preview.is_none()
+            && resolved.as_ref().is_some_and(|source| source.temp.is_none())
+        {
             link_binary(&binary, &staged)?;
         } else {
             copy_binary(&binary, &staged)?;
         }
 
         let hash = digest(&stage.join("crabbot-plugin.toml"), &staged)?;
+
+        if preview_hash.is_some_and(|expected| expected != hash) {
+            return Err("The saved plugin update candidate changed while staging.".into());
+        }
+
         let config = if home_root.join("config.toml").is_file() {
             toml::from_str(&std::fs::read_to_string(home_root.join("config.toml"))?)?
         } else {
@@ -9543,11 +10189,7 @@ fn link_at(
         return Err(format!("Plugin {} already exists; use --yes to replace it.", source.id).into());
     }
 
-    let name = if cfg!(windows) {
-        format!("crabbot-plugin-{}.exe", source.id)
-    } else {
-        format!("crabbot-plugin-{}", source.id)
-    };
+    let name = plugin_name(&source.id);
 
     let Some(binary) = plugin_binary(&root_path, &source.id, default_source) else {
         return Err(format!("Binary {name} was not found; build the plugin first.").into());
@@ -9680,12 +10322,11 @@ fn digest(
     manifest: &Path,
     binary: &Path,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    const LIMIT: u64 = 256 * 1024 * 1024;
     let mut hash = Sha256::new();
     hash.update(std::fs::read(manifest)?);
     let mut file = std::fs::File::open(binary)?;
 
-    if file.metadata()?.len() > LIMIT {
+    if file.metadata()?.len() > ARCHIVE_EXPANDED {
         return Err("Plugin binary exceeds the integrity-check size limit.".into());
     }
 
@@ -10377,7 +11018,7 @@ fn remove_at(
     }
 
     if !name.yes {
-        return Err("Removing a plugin requires --yes.".into());
+        return Err("Uninstalling a plugin requires --yes (-y).".into());
     }
 
     let mut lock = load_lock_at(home_root)?;
@@ -10441,7 +11082,7 @@ fn ensure_no_orphaned_plugin_state(
 
     if removes_last_model && !sessions_at(home_root)?.sessions.is_empty() {
         return Err(concat!(
-            "Cannot remove the last intelligence plugin while sessions exist. ",
+            "Cannot uninstall the last intelligence plugin while sessions exist. ",
             "Delete the sessions with `crabbot session delete` first."
         )
         .into());
@@ -10452,7 +11093,7 @@ fn ensure_no_orphaned_plugin_state(
 
         if !store.outbox.is_empty() || !store.dead.is_empty() {
             return Err(concat!(
-                "Cannot remove the last messaging plugin while deliveries are pending or ",
+                "Cannot uninstall the last messaging plugin while deliveries are pending or ",
                 "uncertain. Manage them with `crabbot delivery` first."
             )
             .into());
@@ -10558,11 +11199,11 @@ fn list(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn list_at(root: &Path, json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root = root.join("plugins");
+    let plugin_root = root.join("plugins");
     let mut rows = Vec::new();
 
-    if root.exists() {
-        for entry in std::fs::read_dir(root)? {
+    if plugin_root.exists() {
+        for entry in std::fs::read_dir(&plugin_root)? {
             let entry = entry?;
             let path = entry.path();
 
@@ -10573,11 +11214,14 @@ fn list_at(root: &Path, json: bool) -> Result<(), Box<dyn std::error::Error + Se
             let id = entry.file_name().to_string_lossy().into_owned();
             let manifest = read_manifest_checked(&path)
                 .map_err(|error| format!("Plugin {id} is invalid: {error}."))?;
-            rows.push(manifest);
+            let health =
+                if path.join("bin").join(plugin_name(&id)).is_file() { "ready" } else { "missing" };
+
+            rows.push(plugin_summary(&manifest, health));
         }
     }
 
-    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows.sort_by(|left: &Value, right: &Value| left["id"].as_str().cmp(&right["id"].as_str()));
 
     if json {
         println!(
@@ -10589,25 +11233,61 @@ fn list_at(root: &Path, json: bool) -> Result<(), Box<dyn std::error::Error + Se
     } else if rows.is_empty() {
         println!("No plugins installed.");
     } else {
-        for row in rows {
-            let commands =
-                row.commands.iter().map(|command| command.name.as_str()).collect::<Vec<_>>();
-
-            if commands.is_empty() {
-                println!("{} {} ({}).", row.id, row.version, row.capabilities.join(", "));
-            } else {
-                println!(
-                    "{} {} ({}, commands: {}).",
-                    row.id,
-                    row.version,
-                    row.capabilities.join(", "),
-                    commands.join(", ")
-                );
-            }
-        }
+        println!("{}", format_plugin_list(&rows));
     }
 
     Ok(())
+}
+
+fn plugin_summary(manifest: &Manifest, health: &str) -> Value {
+    serde_json::json!({
+        "id": manifest.id,
+        "version": manifest.version,
+        "protocol": manifest.protocol,
+        "capabilities": manifest.capabilities,
+        "permissions": manifest.permissions,
+        "secrets": manifest.secrets,
+        "commands": manifest.commands,
+        "status": "installed",
+        "health": health,
+    })
+}
+
+fn format_plugin_list(items: &[Value]) -> String {
+    let mut output = format!("Installed plugins ({}):", items.len());
+
+    for item in items {
+        let id = item["id"].as_str().unwrap_or("unknown");
+        let version = item["version"].as_str().unwrap_or("unknown");
+        let health = item["health"].as_str().unwrap_or("unknown");
+        let capabilities = string_list(&item["capabilities"]);
+        let permissions = string_list(&item["permissions"]);
+        let commands = item["commands"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|command| command["name"].as_str())
+            .collect::<Vec<_>>();
+        let protocol = format!(
+            "{}.{}",
+            item["protocol"]["major"].as_u64().unwrap_or_default(),
+            item["protocol"]["minor"].as_u64().unwrap_or_default()
+        );
+
+        output.push_str(&format!(
+            "\n- {id} {version}\n  health: {health}\n  protocol: {protocol}\n  capabilities: {capabilities}\n  commands: {}\n  permissions: {permissions}",
+            if commands.is_empty() { "none".into() } else { commands.join(", ") }
+        ));
+    }
+
+    output
+}
+
+fn string_list(value: &Value) -> String {
+    let values =
+        value.as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>();
+
+    if values.is_empty() { "none".into() } else { values.join(", ") }
 }
 
 fn read_manifest(root: &Path) -> Option<Manifest> {
@@ -10834,7 +11514,7 @@ mod tests {
         assert_eq!(
             super::status_text(&value, 0),
             format!(
-                "Version:       {}\nHealth:        attention\nDaemon:        stopped\nIntelligence:  configured (codex, gemini)\nMessaging:     configured (telegram, discord)\nPlugins:       0 installed",
+                "Version:            {}\nHealth:             attention\nBackground runtime: stopped\nIntelligence:       configured (codex, gemini)\nMessaging:          configured (telegram, discord)\nPlugins:            0 installed",
                 super::VERSION
             )
         );
@@ -10845,6 +11525,19 @@ mod tests {
                 "plugins": [],
             })),
             "not configured"
+        );
+    }
+
+    #[test]
+    fn tui_activation_does_not_require_the_background_runtime() {
+        assert_eq!(
+            super::activation_text("tui", None),
+            "Plugin tui is ready. Run `crab tui`; local sessions work without the background runtime."
+        );
+
+        assert_eq!(
+            super::activation_text("memory", None),
+            "Plugin memory is installed and will load when the background runtime starts."
         );
     }
 
@@ -10894,10 +11587,12 @@ mod tests {
     fn default_is_safe() {
         let config = Config::default();
 
+        assert_eq!(config.name, "Crabbot");
         assert_eq!(config.update, "prompt");
         assert!(!config.shell);
         assert_eq!(config.approval, "off");
         assert!(config.validate().is_ok());
+        assert!(Config { name: "\n".into(), ..Config::default() }.validate().is_err());
         assert!(
             Config { update: "unsafe".into(), shell: false, ..Config::default() }
                 .validate()
@@ -11736,7 +12431,7 @@ mod tests {
 
         let help = super::help_text_with_plugins(&root);
         let conditional = help
-            .split("Conditional Native Commands:")
+            .split("Conditional Commands:")
             .nth(1)
             .and_then(|section| section.split("Plugin Commands:").next())
             .unwrap();
@@ -11788,7 +12483,7 @@ mod tests {
 
         let help = super::help_text_with_plugins(&root);
         let conditional = help
-            .split("Conditional Native Commands:")
+            .split("Conditional Commands:")
             .nth(1)
             .and_then(|section| section.split("Plugin Commands:").next())
             .unwrap();
@@ -11856,9 +12551,17 @@ mod tests {
                 .contains("crabbot session delete")
         );
 
-        fs::create_dir_all(root.join("plugins/model-two/bin")).unwrap();
-        fs::write(root.join("plugins/model-two/bin/crabbot-plugin-model-two"), "plugin").unwrap();
-        lock.plugins.insert("model-two".into(), entry("model"));
+        let second_model = "second";
+        fs::create_dir_all(root.join("plugins").join(second_model).join("bin")).unwrap();
+        fs::write(
+            root.join("plugins")
+                .join(second_model)
+                .join("bin")
+                .join(super::plugin_name(second_model)),
+            "plugin",
+        )
+        .unwrap();
+        lock.plugins.insert(second_model.into(), entry("model"));
 
         assert_eq!(super::last_plugin_state(&lock, "model-one", &root), (false, false));
         assert!(super::ensure_no_orphaned_plugin_state(&lock, "model-one", &root).is_ok());
@@ -11975,7 +12678,7 @@ mod tests {
             }
         ));
 
-        let cli = Cli::try_parse_from(["crabbot", "service", "remove", "--yes"]).unwrap();
+        let cli = Cli::try_parse_from(["crabbot", "service", "uninstall", "-y"]).unwrap();
 
         assert!(matches!(
             cli.command,
@@ -11984,7 +12687,7 @@ mod tests {
             }
         ));
 
-        let cli = Cli::try_parse_from(["crabbot", "plugin", "remove", "tools", "--yes", "--force"])
+        let cli = Cli::try_parse_from(["crabbot", "plugin", "uninstall", "tools", "-y", "--force"])
             .unwrap();
 
         assert!(matches!(
@@ -11997,6 +12700,35 @@ mod tests {
                 })
             } if id == "tools"
         ));
+
+        assert!(Cli::try_parse_from(["crabbot", "plugin", "remove", "tools", "-y"]).is_err());
+        assert!(Cli::try_parse_from(["crabbot", "service", "remove", "-y"]).is_err());
+
+        let cli = Cli::try_parse_from(["crabbot", "plugin", "update", "-y"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Plugin {
+                command: super::PluginCommand::Update(super::PluginUpdate {
+                    yes: true,
+                    json: false,
+                })
+            }
+        ));
+
+        let tui_help = super::external_command_help(
+            "tui",
+            "Open the TUI; local sessions do not require the background runtime.",
+        );
+
+        assert!(tui_help.contains("Usage: crab tui [OPTIONS]"));
+        assert!(tui_help.contains("do not require the background runtime"));
+        assert!(tui_help.contains("--once <prompt>"));
+        assert!(tui_help.contains("CRABBOT_MODEL or gpt-6-luna"));
+        assert!(
+            super::external_command_help("memory", "Manage memory.")
+                .contains("Usage: crabbot memory [arguments...]")
+        );
 
         let session = SessionCli::try_parse_from(["session", "new", "main", "--json"]).unwrap();
 
@@ -12252,6 +12984,24 @@ mod tests {
 
         assert!(super::list_at(&root, true).is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn formats_plugin_inventory_as_a_plain_metadata_list() {
+        let output = super::format_plugin_list(&[serde_json::json!({
+            "id": "codex",
+            "version": "1.2.3",
+            "health": "ready",
+            "protocol": {"major": 0, "minor": 1},
+            "capabilities": ["model", "vision"],
+            "commands": [{"name": "codex"}],
+            "permissions": ["network", "process"]
+        })]);
+
+        assert_eq!(
+            output,
+            "Installed plugins (1):\n- codex 1.2.3\n  health: ready\n  protocol: 0.1\n  capabilities: model, vision\n  commands: codex\n  permissions: network, process"
+        );
     }
 
     #[test]
@@ -13157,11 +13907,9 @@ mod tests {
 
     #[tokio::test]
     async fn runs_non_interactive_commands() {
-        for command in [
-            Command::Version(Output { json: true }),
-            Command::Status(Output { json: true }),
-            Command::Doctor(DoctorArgs { fix: false }),
-        ] {
+        for command in
+            [Command::Version(Output { json: true }), Command::Status(Output { json: true })]
+        {
             let result = super::run(Cli {
                 json: false,
                 debug: false,
@@ -13173,6 +13921,9 @@ mod tests {
             .await;
             result.unwrap();
         }
+
+        let root = test_root("doctor-command");
+        super::doctor_at(&root, false, false).unwrap();
     }
 
     #[tokio::test]
@@ -13286,7 +14037,7 @@ mod tests {
             fs::set_permissions(plugin_root.join("bin").join(&memory_binary), permissions).unwrap();
         }
 
-        update_at(&root, true).unwrap();
+        update_at(&root, true, false).unwrap();
 
         assert_eq!(read_manifest(&root.join("plugins/memory")).unwrap().version, "0.2.0");
 
@@ -13296,7 +14047,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(update_at(&root, true).is_err());
+        assert!(update_at(&root, true, false).is_err());
         assert_eq!(read_manifest(&root.join("plugins/memory")).unwrap().version, "0.2.0");
         fs::write(
             plugin_root.join("crabbot-plugin.toml"),
@@ -13361,7 +14112,7 @@ mod tests {
             .is_err()
         );
 
-        assert!(update_at(&root, false).is_err());
+        assert!(update_at(&root, false, false).is_err());
         super::remove_at(
             super::PluginRemove { id: "memory".into(), yes: true, force: false },
             &root,
@@ -13586,6 +14337,32 @@ mod tests {
             );
         }
 
+        super::preview_updates_at(&root, false).unwrap();
+        let lock = super::load_lock_at(&root).unwrap();
+
+        assert_eq!(lock.plugins["memory"].version, "0.1.0");
+        assert_eq!(
+            super::load_update_previews_at(&root)
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["memory", "tools"]
+        );
+
+        let memory_source = root.join("sources/memory");
+        fs::write(
+            memory_source.join("crabbot-plugin.toml"),
+            "id = 'memory'\nversion = '0.3.0'\nprotocol = { major = 0, minor = 1 }\ncapabilities = ['memory']\n",
+        )
+        .unwrap();
+        write_test_plugin(
+            &memory_source.join("bin/crabbot-plugin-memory"),
+            "memory",
+            "memory",
+            "0.3.0",
+        );
+
         let calls = Arc::new(Mutex::new(Vec::new()));
         let unload_calls = Arc::clone(&calls);
         let mut unload = move |id: String| {
@@ -13605,10 +14382,11 @@ mod tests {
             }) as super::PluginTask
         };
 
-        super::update_live(&root, false, vec!["memory".into()], &mut unload, &mut activate)
+        super::update_live(&root, false, vec!["memory".into()], None, &mut unload, &mut activate)
             .await
             .unwrap();
         assert_eq!(*calls.lock().unwrap(), ["unload:memory", "activate:memory"]);
+        assert_eq!(super::load_lock_at(&root).unwrap().plugins["memory"].version, "0.2.0");
 
         fs::write(
             root.join("sources/memory/crabbot-plugin.toml"),
@@ -13617,9 +14395,16 @@ mod tests {
         .unwrap();
 
         assert!(
-            super::update_live(&root, false, vec!["memory".into()], &mut unload, &mut activate,)
-                .await
-                .is_err()
+            super::update_live(
+                &root,
+                false,
+                vec!["memory".into()],
+                None,
+                &mut unload,
+                &mut activate,
+            )
+            .await
+            .is_err()
         );
 
         assert_eq!(
@@ -13655,6 +14440,7 @@ mod tests {
             &root,
             false,
             vec!["memory".into(), "tools".into()],
+            None,
             &mut unload,
             &mut activate,
         )
@@ -13663,6 +14449,259 @@ mod tests {
 
         assert!(error.to_string().contains("Could not unload tools"));
         assert_eq!(*calls.lock().unwrap(), ["unload:memory", "unload:tools", "activate:memory"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn applying_preview_uses_the_candidate_captured_before_a_later_preview() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("plugin-update-preview-snapshot");
+        let _ = fs::remove_dir_all(&root);
+        super::init_at(&root).unwrap();
+
+        let source = root.join("sources/memory");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        let manifest = source.join("crabbot-plugin.toml");
+        let binary = source.join("bin/crabbot-plugin-memory");
+
+        for version in ["0.1.0", "0.2.0", "0.3.0"] {
+            fs::write(
+                &manifest,
+                format!(
+                    "id = 'memory'\nversion = '{version}'\nprotocol = {{ major = 0, minor = 1 }}\ncapabilities = ['memory']\n"
+                ),
+            )
+            .unwrap();
+            write_test_plugin(&binary, "memory", "memory", version);
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+            if version == "0.1.0" {
+                super::link_at(
+                    Source {
+                        id: "memory".into(),
+                        source: Some(source.display().to_string()),
+                        revision: None,
+                        yes: true,
+                    },
+                    true,
+                    &root,
+                )
+                .unwrap();
+            } else if version == "0.2.0" {
+                super::preview_updates_at(&root, false).unwrap();
+            } else {
+                let snapshot = super::load_update_preview_snapshot_at(&root).unwrap();
+                super::preview_updates_at(&root, false).unwrap();
+                super::update_at_with_previews(&root, true, &snapshot.candidates, true).unwrap();
+
+                assert_eq!(super::load_lock_at(&root).unwrap().plugins["memory"].version, "0.2.0");
+            }
+        }
+
+        super::preview_updates_at(&root, false).unwrap();
+        let snapshot = super::load_update_preview_snapshot_at(&root).unwrap();
+        let mut lock = super::load_lock_at(&root).unwrap();
+        lock.plugins.get_mut("memory").unwrap().version = "0.2.1".into();
+        super::save_lock_at(&root, &lock).unwrap();
+
+        let error =
+            super::update_at_with_previews(&root, true, &snapshot.candidates, true).unwrap_err();
+
+        assert!(error.to_string().contains("preview for memory is stale"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_updates_ignore_stale_saved_previews() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("plugin-update-stale-preview");
+        let _ = fs::remove_dir_all(&root);
+        super::init_at(&root).unwrap();
+
+        let source = root.join("sources/memory");
+        fs::create_dir_all(source.join("bin")).unwrap();
+
+        for version in ["0.1.0", "0.2.0"] {
+            fs::write(
+                source.join("crabbot-plugin.toml"),
+                format!(
+                    "id = 'memory'\nversion = '{version}'\nprotocol = {{ major = 0, minor = 1 }}\ncapabilities = ['memory']\n"
+                ),
+            )
+            .unwrap();
+
+            let binary = source.join("bin/crabbot-plugin-memory");
+            write_test_plugin(&binary, "memory", "memory", version);
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+            if version == "0.1.0" {
+                super::link_at(
+                    Source {
+                        id: "memory".into(),
+                        source: Some(source.display().to_string()),
+                        revision: None,
+                        yes: true,
+                    },
+                    true,
+                    &root,
+                )
+                .unwrap();
+            }
+        }
+
+        super::preview_updates_at(&root, false).unwrap();
+        super::update_at(&root, true, true).unwrap();
+
+        assert_eq!(super::load_lock_at(&root).unwrap().plugins["memory"].version, "0.2.0");
+
+        fs::write(
+            source.join("crabbot-plugin.toml"),
+            "id = 'memory'\nversion = '0.3.0'\nprotocol = { major = 0, minor = 1 }\ncapabilities = ['memory']\n",
+        )
+        .unwrap();
+
+        write_test_plugin(&source.join("bin/crabbot-plugin-memory"), "memory", "memory", "0.3.0");
+
+        super::update_at(&root, true, false).unwrap();
+
+        assert_eq!(super::load_lock_at(&root).unwrap().plugins["memory"].version, "0.3.0");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn applying_empty_preview_does_not_inspect_changed_sources() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("plugin-update-empty-preview");
+        let _ = fs::remove_dir_all(&root);
+        super::init_at(&root).unwrap();
+
+        let source = root.join("sources/memory");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(
+            source.join("crabbot-plugin.toml"),
+            "id = 'memory'\nversion = '0.1.0'\nprotocol = { major = 0, minor = 1 }\ncapabilities = ['memory']\n",
+        )
+        .unwrap();
+
+        let binary = source.join("bin/crabbot-plugin-memory");
+        write_test_plugin(&binary, "memory", "memory", "0.1.0");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        super::link_at(
+            Source {
+                id: "memory".into(),
+                source: Some(source.display().to_string()),
+                revision: None,
+                yes: true,
+            },
+            true,
+            &root,
+        )
+        .unwrap();
+
+        super::preview_updates_at(&root, false).unwrap();
+
+        assert!(super::load_update_previews_at(&root).unwrap().is_empty());
+
+        fs::write(
+            source.join("crabbot-plugin.toml"),
+            "id = 'memory'\nversion = '0.2.0'\nprotocol = { major = 0, minor = 1 }\ncapabilities = ['memory']\n",
+        )
+        .unwrap();
+        write_test_plugin(&binary, "memory", "memory", "0.2.0");
+
+        super::update_plugins_at(&root, true, false).await.unwrap();
+
+        assert_eq!(super::load_lock_at(&root).unwrap().plugins["memory"].version, "0.1.0");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn updates_inspectable_plugins_when_another_source_is_broken() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("plugin-update-broken-source");
+        let _ = fs::remove_dir_all(&root);
+        super::init_at(&root).unwrap();
+
+        for id in ["broken", "valid"] {
+            let source = root.join("sources").join(id);
+            fs::create_dir_all(source.join("bin")).unwrap();
+            fs::write(
+                source.join("crabbot-plugin.toml"),
+                format!(
+                    "id = '{id}'\nversion = '0.1.0'\nprotocol = {{ major = 0, minor = 1 }}\ncapabilities = ['tool']\n"
+                ),
+            )
+            .unwrap();
+
+            let binary = source.join(format!("bin/crabbot-plugin-{id}"));
+            write_test_plugin(&binary, id, "tool", "0.1.0");
+
+            #[cfg(unix)]
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+            super::link_at(
+                Source {
+                    id: id.into(),
+                    source: Some(source.display().to_string()),
+                    revision: None,
+                    yes: true,
+                },
+                true,
+                &root,
+            )
+            .unwrap();
+        }
+
+        super::preview_updates_at(&root, false).unwrap();
+
+        let broken_source = root.join("sources/broken");
+        fs::remove_dir_all(&broken_source).unwrap();
+
+        let valid_source = root.join("sources/valid");
+        fs::write(
+            valid_source.join("crabbot-plugin.toml"),
+            "id = 'valid'\nversion = '0.2.0'\nprotocol = { major = 0, minor = 1 }\ncapabilities = ['tool']\n",
+        )
+        .unwrap();
+
+        write_test_plugin(&valid_source.join("bin/crabbot-plugin-valid"), "valid", "tool", "0.2.0");
+
+        let error = super::updates(&root, "auto").unwrap_err();
+
+        assert!(error.to_string().contains("broken"));
+        assert_eq!(super::load_lock_at(&root).unwrap().plugins["valid"].version, "0.2.0");
+
+        fs::write(
+            valid_source.join("crabbot-plugin.toml"),
+            "id = 'valid'\nversion = '0.3.0'\nprotocol = { major = 0, minor = 1 }\ncapabilities = ['tool']\n",
+        )
+        .unwrap();
+
+        write_test_plugin(&valid_source.join("bin/crabbot-plugin-valid"), "valid", "tool", "0.3.0");
+
+        super::preview_updates_at(&root, true).unwrap();
+
+        let previews = super::load_update_previews_at(&root).unwrap();
+
+        assert_eq!(previews.keys().map(String::as_str).collect::<Vec<_>>(), ["valid"]);
+
+        super::update_plugins_at(&root, true, false).await.unwrap();
+        let lock = super::load_lock_at(&root).unwrap();
+
+        assert_eq!(lock.plugins["broken"].version, "0.1.0");
+        assert_eq!(lock.plugins["valid"].version, "0.3.0");
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -13680,18 +14719,25 @@ mod tests {
         assert!(super::active_ids(serde_json::json!({})).is_err());
         assert!(super::active_ids(serde_json::json!({"items": ["../escape"]})).is_err());
 
-        super::update_plugins_at(&root, false).await.unwrap();
+        super::update_plugins_at(&root, false, false).await.unwrap();
 
         let mut unload = |_: String| {
             Box::pin(async { Ok(Some(serde_json::json!({"unloaded": true}))) }) as super::PluginTask
         };
 
         let mut activate = |_: String| Box::pin(async { Ok(None) }) as super::PluginTask;
-        let error =
-            super::update_live(&root, false, vec!["memory".into()], &mut unload, &mut activate)
-                .await
-                .unwrap_err();
-        assert!(error.to_string().contains("daemon is unavailable"));
+        let error = super::update_live(
+            &root,
+            false,
+            vec!["memory".into()],
+            None,
+            &mut unload,
+            &mut activate,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("background runtime is unavailable"));
 
         let mut unload = |id: String| {
             Box::pin(async move {
@@ -13711,6 +14757,7 @@ mod tests {
             &root,
             false,
             vec!["memory".into(), "tools".into()],
+            None,
             &mut unload,
             &mut activate,
         )
@@ -13729,10 +14776,17 @@ mod tests {
             ) as super::PluginTask
         };
 
-        let error =
-            super::update_live(&root, false, vec!["memory".into()], &mut unload, &mut activate)
-                .await
-                .unwrap_err();
+        let error = super::update_live(
+            &root,
+            false,
+            vec!["memory".into()],
+            None,
+            &mut unload,
+            &mut activate,
+        )
+        .await
+        .unwrap_err();
+
         assert!(error.to_string().contains("activation was incomplete"));
 
         let _ = fs::remove_dir_all(root);
@@ -14679,7 +15733,6 @@ fn main() {
         {
             let mut store = sessions.lock().unwrap();
             store.create("telegram-7", "test").unwrap();
-            store.set_status("telegram-7", "working").unwrap();
             store
                 .queue(
                     "telegram-7",

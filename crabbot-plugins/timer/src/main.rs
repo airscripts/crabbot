@@ -23,6 +23,7 @@ use tokio::time::{Duration, sleep};
 const LIMIT: usize = 1_000;
 const TEXT_LIMIT: usize = 256 * 1024;
 const BYTE_LIMIT: usize = 32 * 1024 * 1024;
+// 3,600,000 milliseconds (one hour).
 const WAIT_LIMIT: u64 = 3_600_000;
 const FRAME_HEADROOM: usize = 64 * 1024;
 
@@ -712,6 +713,7 @@ mod tests {
 
     #[test]
     fn schedules_cron_in_named_zone() {
+        // 2023-11-14T22:13:20Z, in Unix seconds.
         let after = 1_700_000_000;
         let due = next("*/15 * * * *", "Europe/Rome", after).unwrap();
 

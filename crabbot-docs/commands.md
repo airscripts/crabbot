@@ -3,16 +3,16 @@
 ```text
 crabbot help
 crabbot --version
-crabbot init [--force] [--yes] [--json]
+crabbot init [--force] [-y|--yes] [--json]
 crabbot doctor [--fix] [--json]
 crabbot status [--json]
 crabbot version [--json]
 crabbot completion <bash|fish|powershell|zsh>
 crabbot plugin list [--json]
-crabbot plugin install <id> [source] [--revision <rev>] [--yes] [--json]
-crabbot plugin link <id> [folder] [--revision <rev>] [--yes] [--json]
-crabbot plugin update [--json]
-crabbot plugin remove <id> [--yes] [--force] [--json]
+crabbot plugin install <id> [source] [--revision <rev>] [-y|--yes] [--json]
+crabbot plugin link <id> [folder] [--revision <rev>] [-y|--yes] [--json]
+crabbot plugin update [-y|--yes] [--json]
+crabbot plugin uninstall <id> [-y|--yes] [--force] [--json]
 crabbot memory <status|search|list|show|remember|edit|forget|audit|learning> [arguments...]
 crabbot session new <id> [--model <name>] [--json]
 crabbot session list [--json]
@@ -20,24 +20,26 @@ crabbot session show <id> [--json]
 crabbot session fork <source> <target> [--json]
 crabbot session model <id> <model> [--json]
 crabbot session cancel <id> [--json]
-crabbot session delete <id> --yes [--json]
+crabbot session delete <id> [-y|--yes] [--json]
 crabbot delivery list [--json]
-crabbot delivery retry <id> --yes [--json]
-crabbot delivery drop <id> --yes [--json]
+crabbot delivery retry <id> [-y|--yes] [--json]
+crabbot delivery drop <id> [-y|--yes] [--json]
 crabbot export [PATH] [--path <PATH>] [--force] [--json]
 crabbot validate [--path <PATH>] [--json]
-crabbot import [--path <PATH>] --yes [--force] [--json]
-crabbot service [install [--force]|remove --yes|status|start|stop] [--json]
+crabbot import [--path <PATH>] [-y|--yes] [--force] [--json]
+crabbot service [install [--force]|uninstall [-y|--yes]|status|start|stop] [--json]
+crabbot tui [--session <id>] [--model <name>] [--plugin <id>]
+crabbot tui --once <prompt> [--session <id>] [--model <name>] [--plugin <id>]
 crabbot <plugin-command> [arguments...]
 ```
 
 `crabbot help` and `crabbot --help` show the command tree and Crabbot banner.
-Always-available native commands, conditionally available native commands, and
-plugin-contributed commands are shown in separate lists. The conditional list
-is rebuilt from installed capabilities; `ask` and `session` require an
-intelligence plugin, while `delivery` requires a messaging plugin. Plugin
-commands are rebuilt from the installed plugin registry, so the list includes
-commands added by newly installed or linked plugins.
+Native commands, conditional commands, and plugin-contributed commands are
+shown in separate lists. The conditional list is rebuilt from installed
+capabilities; `ask` and `session` require an intelligence plugin, while
+`delivery` requires a messaging plugin. Plugin commands are rebuilt from the
+installed plugin registry, so the list includes commands added by newly
+installed or linked plugins.
 Running `crabbot service` without a subcommand prints native service help,
 including the global options; use `crabbot service status` to inspect the
 installed service and its state.
@@ -91,8 +93,8 @@ logged at info level; report creation is best effort and never replaces the
 original command error.
 
 Confirmation is explicit for unattended destructive or duplicate-prone work:
-use `--yes` for plugin replacement or removal, session deletion, service
-removal, delivery retry or drop, and Crabfile import. `--force` separately
+use `--yes` or `-y` for plugin replacement or uninstall, session deletion,
+service uninstall, delivery retry or drop, and Crabfile import. `--force` separately
 permits replacing an existing imported configuration, exported Crabfile, or
 service definition. Native commands do not read stdin for these confirmations.
 Import reports a missing Crabfile with its expected path and
@@ -108,27 +110,76 @@ uses the default config and an empty plugin list. If the output Crabfile is
 already present, export stops without changing it; pass `--force` to overwrite
 that file.
 
-`crabbot status` prints aligned installation health, daemon state, intelligence
+`crabbot status` prints aligned installation health, background runtime state, intelligence
 setup, messaging setup, version, and the installed plugin count. Use `--json`
 for automation; capability fields are objects with a `status` and `plugins`
 array.
+
+`crabbot tui` opens a full-screen terminal chat with a scrollable conversation
+and an editable message box. Press Enter to send, Ctrl+O to add a line,
+Up/Down to browse input history, Page Up/Page Down to move the conversation by
+a page, and the mouse wheel to scroll the pane under the pointer. New output
+stays in view unless you have scrolled back; scrolling down to the latest output
+resumes following it. The input box follows the cursor while editing. Press
+Escape or Ctrl-C to quit. The bottom-right footer shows
+the Crabbot version and `/help` hint. `/help` lists commands available in this session;
+conditional commands appear only when their plugin capability and required
+background runtime are available. Plugin-contributed commands remain CLI
+commands and are run as `crab <command>`. `/model` shows the current model;
+`/model <id>` changes it when an intelligence plugin is installed. Configure
+the bottom line with `/statusline`, for example
+`/statusline {name} · model: {model} · session: {session}`. The built-in
+statusline labels model and session values explicitly. Supported placeholders are
+`{name}`, `{model}`, `{session}`, `{workspace}`, and `{status}`. Use
+`/statusline reset` to restore the built-in default. Custom formats are saved
+to `<CRABBOT_HOME>/data/plugins/tui/preferences.toml`. The displayed Crabbot
+name defaults to `Crabbot` and can be changed globally with `name` in
+`config.toml`.
+When no intelligence plugin is installed, the statusline shows the model as
+`unset`, regardless of the model value saved in the session.
+
+The TUI opens without the background runtime for local session work; in that
+case it stores sessions separately in
+`<CRABBOT_HOME>/data/plugins/tui/sessions.json`, which is not shared with
+daemon-backed sessions. The TUI keeps the backend it selected at startup for the
+entire session, even if daemon availability changes. The file contains session
+IDs, models, workspaces, timestamps, and conversation messages. Sending prompts
+still requires the selected intelligence plugin to be installed. `--once
+<prompt>` sends one prompt and prints the response without opening the
+full-screen interface; quote prompts containing spaces.
+The default session ID is `default`; use `--session`, `--model`, and `--plugin`
+to select a different session and model configuration.
+
+Local command replies and streamed model text appear with a brief typewriter
+reveal. During model generation, a rotating crab-themed status is shown. Press
+Escape to interrupt generation; the partial reply remains in the conversation.
+Use `/animation off` to show replies immediately, `/animation on` to restore the
+effect, and `/animation` to check its setting. The choice is saved with the TUI
+preferences.
 
 `crabbot validate` checks a Crabfile without changing local state. It uses
 `./Crabfile` by default or the path supplied with `--path`, and reports the
 first syntax or schema error. See the [Crabfile specification](crabfile.md)
 for the supported version and keys.
 
-`crabbot plugin list --json` returns an object with an `items` array. A visible
-plugin directory with a missing or invalid manifest is reported as an error so
-the inventory cannot silently hide broken installation state.
+`crabbot plugin list` shows each installed plugin as a plain-text list with its
+version, health, protocol, capabilities, commands, and permissions. The TUI's
+`/plugins` command uses the same fields and layout. `crabbot plugin list --json`
+returns the inventory in an object with an `items` array. A visible plugin
+directory with a missing or invalid manifest is reported as an error so the
+inventory cannot silently hide broken installation state.
 
 `crabbot plugin install` and `crabbot plugin link` validate and register one
-plugin at a time. When the daemon is running, it starts the new plugin
-immediately; otherwise, the next daemon start discovers it. The core artifact
-contains the CLI and daemon executables, but no plugin binaries. Removing a
-plugin unloads its active process before removing its files. Updating plugins
-unloads and reloads only processes that were active, without restarting the
-daemon; inactive plugins stay inactive.
+plugin at a time. When the background runtime is running, it starts server
+plugins immediately; otherwise, the next runtime start discovers them. The TUI
+is a foreground client and runs immediately after installation without waiting
+for the background runtime. The core artifact
+contains the CLI and daemon executables, but no plugin binaries. Uninstalling a
+plugin unloads its active process before removing its files. `crabbot plugin
+update` previews available version, source-revision, and content changes without
+changing installed plugins. Rerun `crabbot plugin update --yes` to apply that
+preview; only changed plugins are replaced, and only active plugins are
+unloaded and reloaded. Inactive plugins stay inactive.
 
 Plugin-contributed commands are registered by installed plugins. The Pi agent
 plugin registers `crabbot code`, the TUI plugin registers `crabbot tui`, the
@@ -138,14 +189,14 @@ availability depends on an installed capability, and duplicate plugin command
 names are rejected during installation or update. Plugin-contributed commands
 are available only when their owning plugin is installed.
 
-Removing the last installed intelligence plugin is blocked while persisted
+Uninstalling the last installed intelligence plugin is blocked while persisted
 sessions remain; delete them with `crabbot session delete <id> --yes` first.
-Removing the last messaging plugin is blocked while outbox or dead-letter
+Uninstalling the last messaging plugin is blocked while outbox or dead-letter
 deliveries remain; retry or discard outbox deliveries with `crabbot delivery`
-first. To intentionally remove the last matching plugin and purge its dependent
-state, pass both `--yes` and `--force` to `crabbot plugin remove <id>`. This
-permanently deletes all sessions when removing the last intelligence plugin,
-or all outbox and dead-letter deliveries when removing the last messaging
+first. To intentionally uninstall the last matching plugin and purge its dependent
+state, pass `-y --force` to `crabbot plugin uninstall <id>`. This permanently
+deletes all sessions when uninstalling the last intelligence plugin, or all
+outbox and dead-letter deliveries when uninstalling the last messaging
 plugin. Session worktrees are removed too; any worktrees that cannot be removed
 are reported for later cleanup. `--force` does not purge state when another
 available plugin of the same capability remains.
@@ -160,30 +211,55 @@ excluding secrets and sensitive inferences. These instructions do not override
 tool availability or channel policy.
 
 When an installed model plugin is available, Crabbot also exposes the
-host-managed `crabbot ask` command as a conditional native command. It accepts
+host-managed `crabbot ask` command as a conditional command. It accepts
 `--plugin <id>`, `--model <name>`, and prompt words, and selects a configured or
 available model plugin when `--plugin` is omitted. The command is absent when
 no installed model plugin can run, so the CLI does not advertise an unusable
 intelligence path. `session` is exposed under the same condition; `delivery`
-is exposed when an installed messaging plugin is available. These commands
-remain runtime-owned even though their availability depends on plugins.
+is exposed when an installed messaging plugin is available. These conditional
+commands remain runtime-owned even though their availability depends on plugins.
 
 Inside the terminal client, `/help` lists controls, `/status` reports the
 authenticated daemon state, and `/approval` reports the daemon approval mode.
 `/approvals` lists pending mutating-tool requests. Resolve one with
 `/approve <id>` or `/deny <id>`; each action is sent through authenticated
 daemon IPC and applies only to the matching pending request.
-`/sessions` lists bounded session summaries.
+`/session help` lists TUI session commands; `/session list [page]` shows ten
+bounded per-session rows per page with status, model, creation/update dates,
+and message count. Sessions being worked on and the selected session appear
+first; remaining sessions are ordered by most recent update, with archived
+sessions last. Each list command reads a fresh snapshot, so multiple TUI
+instances do not share a page cursor. The selected session is marked `active`,
+work in progress is `working`, and the model is `unset` when no intelligence
+plugin is installed.
+`/session switch <id>` resumes an existing persisted session, while
+`/session create <id>` creates and selects one. `/session rename <new-id>`
+renames the active session without losing its history; channel-backed sessions
+cannot be renamed. `/session archive <id>...`
+and `/session unarchive <id>...` archive or restore one or more inactive sessions without
+deleting it; repeating either action reports that the session is already in
+that state. Add `--all` to archive, unarchive, or delete every matching session;
+the active session is always kept for archive/delete. `/session delete <id>...`
+permanently deletes sessions and requires `-y` or `--yes`; `--all` also requires
+confirmation. Command action
+errors show the specific actionable error directly, without a redundant
+operation-failed prefix; add operation context only when the underlying error
+does not explain the failure. `/new <id>` is a shortcut for session creation.
 `/deliveries` lists pending and uncertain outbox entries; `/retry <id>` and
 `/drop <id>` apply the same explicit delivery controls as the native CLI.
-`/model <name>` changes the selected session's model, `/session <id>` resumes an
-existing persisted session, and `/new <id>` creates and selects a session.
-Completed turns are stored through authenticated daemon IPC. `/plugins` lists
+`/model <name>` changes the selected session's model.
+TUI commands and their displayed replies are also stored in the active session,
+so command-only sessions and sessions used without an intelligence plugin can
+be resumed with their visible interaction history. Completed model turns and
+these command exchanges share the session's normal bounded history. `/plugins` lists
 installed plugins. `/workspace` reports the selected workspace, `/workspace
 <path>` selects a canonical existing directory for that session, and
 `/workspace reset` returns to `CRABBOT_ROOT`. Workspace changes are persisted
 through authenticated daemon IPC and apply to later model turns in that
-session. `/clear` removes the selected session's transcript when it is idle.
+session. The workspace is the filesystem root/current working area used by
+file-oriented tools; it is separate from conversation history and is not a
+guarantee that every plugin is confined to it. `/clear` removes the selected
+session's transcript when it is idle.
 `/timer add <seconds> <text>` schedules a reminder; `/timer list` and
 `/timer remove <id>` inspect or remove reminders through authenticated daemon
 IPC. `/memory remember <key>=<value>`, `/memory list`, and `/memory forget
@@ -250,8 +326,8 @@ environment paths. If provider variables are present, their declared values
 are copied to a private service credential JSON file and the definition points
 to it; existing CRABBOT_CREDENTIALS and CRABBOT_KEYRING=1 configuration is also
 preserved. An existing definition is not replaced unless `--force` is supplied.
-`remove` requires `--yes`. `start` and `stop` activate or deactivate it through systemd-user,
-launchd, or the Windows Service Controller. remove stops or unloads the service
+`uninstall` requires `--yes` (or `-y`). `start` and `stop` activate or deactivate it through systemd-user,
+launchd, or the Windows Service Controller. Uninstall stops or unloads the service
 before deleting the definition. `status` reports both the installed definition
 and the service-manager state. On Linux this is a user service, so use
 `systemctl --user status crabbot.service` for detailed systemd output; plain

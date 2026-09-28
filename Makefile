@@ -1,6 +1,7 @@
 CARGO ?= cargo
 JOBS ?= 4
 COVERAGE_PROFILE ?= full
+comma := ,
 .DEFAULT_GOAL := help
 .PHONY: help install hooks fmt spacing clippy check test coverage build release metrics ci revloop verify
 
@@ -60,6 +61,6 @@ ci:
 	bash crabbot-ci/ci.sh
 
 revloop:
-	bash crabbot-scripts/revloop.sh $(REVLOOP_ARGS)
+	bash crabbot-scripts/revloop.sh $(subst $(comma), ,$(REVLOOP_ARGS))
 
 verify: fmt clippy check test coverage build metrics

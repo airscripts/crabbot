@@ -8,14 +8,18 @@ curl -fsSL https://raw.githubusercontent.com/airscripts/crabbot/main/install.sh 
 
 The host terminal client is available with `crabbot tui`. In an interactive
 terminal, use `/help`, `/status`, `/approval`, `/approvals`, `/approve <id>`,
-`/deny <id>`, `/sessions`, `/deliveries`, `/retry <id>`, `/drop <id>`,
-`/model <name>`, `/session <id>`, `/new <id>`,
+`/deny <id>`, `/session help`, `/session list`, `/deliveries`, `/retry <id>`,
+`/drop <id>`, `/model <name>`, `/new <id>`,
 `/plugins`, `/workspace [path|reset]`, `/timer <list|add|remove>`, `/memory
 <list|remember|forget>`, `/clear`, and `/quit`. Plain lines are sent through
 the configured model plugin. Sessions, selected models, and completed turns
-are persisted through authenticated daemon IPC. `/session <id>` resumes an
-existing session; `/new <id>` creates and selects one. `/workspace <path>`
-selects and persists a canonical existing directory for that session.
+are persisted through authenticated daemon IPC. `/session switch <id>` resumes
+an existing session; `/new <id>` creates and selects one. `/session rename`
+renames the active session without losing history. `/session archive` and
+`/session unarchive` accept multiple IDs or `--all`; `/session delete` accepts
+the same targets and requires `-y` or `--yes`. The active session is kept when
+archiving or deleting all sessions. `/workspace <path>` selects and persists a
+canonical existing directory for that session.
 `/workspace reset` uses `CRABBOT_ROOT` again. `/clear` removes the selected
 session's transcript and refuses to clear an active session.
 `/approvals` lists pending mutating-tool requests. `/approve <id>` and
@@ -27,7 +31,7 @@ remember <key>=<value>`, `/memory list`, and `/memory forget <key>` manage
 memories scoped to the selected session; explicitly entering `remember`
 authorizes a suggest-mode write.
 
-`/status`, `/sessions`, and `/plugins` use authenticated daemon state over
+`/status`, `/session list`, and `/plugins` use authenticated daemon state over
 local IPC. If the daemon is unavailable, `/plugins` falls back to the local
 installation layout for diagnostics; the host view includes whether each
 plugin binary is ready or missing.

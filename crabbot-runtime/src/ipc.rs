@@ -341,6 +341,8 @@ async fn active(request: &IpcRequest, state: &State) -> IpcResponse {
 }
 
 fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
+    state.sessions.lock().map_err(lock)?.recover_reservations()?;
+
     let result = match request.method.as_str() {
         "status" => {
             json!({
@@ -351,7 +353,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             })
         }
 
-        "plugin.list" => json!({"items": plugins(&state.home)}),
+        "plugin.list" => json!({"items": plugin_inventory(&state.home)}),
 
         "session.list" => {
             let sessions = state.sessions.lock().map_err(lock)?;
@@ -457,6 +459,54 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             json!({"id": id})
         }
 
+        "session.reserve" => {
+            let id = request.params["id"]
+                .as_str()
+                .ok_or_else(|| invalid("session.reserve.id is required."))?;
+
+            let mut sessions = state.sessions.lock().map_err(lock)?;
+            let owner = token()?;
+            sessions.reserve(id, owner.clone())?;
+            json!({"id": id, "reserved": true, "owner": owner})
+        }
+
+        "session.renew" => {
+            let id = request.params["id"]
+                .as_str()
+                .ok_or_else(|| invalid("session.renew.id is required."))?;
+            let owner = request.params["owner"]
+                .as_str()
+                .ok_or_else(|| invalid("session.renew.owner is required."))?;
+
+            let mut sessions = state.sessions.lock().map_err(lock)?;
+            sessions.renew_reservation(id, owner)?;
+            json!({"id": id, "renewed": true})
+        }
+
+        "session.release" => {
+            let id = request.params["id"]
+                .as_str()
+                .ok_or_else(|| invalid("session.release.id is required."))?;
+            let owner = request.params["owner"]
+                .as_str()
+                .ok_or_else(|| invalid("session.release.owner is required."))?;
+
+            let mut sessions = state.sessions.lock().map_err(lock)?;
+            let session =
+                sessions.sessions.get(id).ok_or_else(|| not_found("Session was not found."))?;
+
+            if session.inflight.is_some()
+                || session.status != "working"
+                || session.reservation_until.is_none()
+                || session.reservation_owner.as_deref() != Some(owner)
+            {
+                return Err(invalid("Session reservation is unavailable."));
+            }
+
+            sessions.set_status(id, "idle")?;
+            json!({"id": id, "released": true})
+        }
+
         "session.new" => {
             let id = request.params["id"]
                 .as_str()
@@ -467,7 +517,8 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             json!({"id": id})
         }
 
-        "session.append" => {
+        "session.append" | "session.append_reserved" => {
+            let reserved = request.method == "session.append_reserved";
             let id = request.params["id"]
                 .as_str()
                 .ok_or_else(|| invalid("session.append.id is required."))?;
@@ -489,11 +540,19 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             let session =
                 sessions.sessions.get(id).ok_or_else(|| not_found("Session was not found."))?;
 
-            if session.inflight.is_some() || session.status == "working" {
+            if session.inflight.is_some() || reserved != (session.status == "working") {
                 return Err(invalid("Session is already working."));
             }
 
-            sessions.append(id, message)?;
+            if reserved {
+                let owner = request.params["owner"]
+                    .as_str()
+                    .ok_or_else(|| invalid("session.append.owner is required."))?;
+                sessions.append_reserved(id, owner, message)?;
+            } else {
+                sessions.append(id, message)?;
+            }
+
             json!({"id": id, "saved": true})
         }
 
@@ -525,6 +584,37 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             json!({"id": target})
         }
 
+        "session.rename" => {
+            let source = request.params["id"]
+                .as_str()
+                .ok_or_else(|| invalid("session.rename.id is required."))?;
+
+            let target = request.params["target"]
+                .as_str()
+                .ok_or_else(|| invalid("session.rename.target is required."))?;
+
+            let mut sessions = state.sessions.lock().map_err(lock)?;
+            sessions.rename_session(source, target)?;
+
+            if let Err(error) = super::state::rename_worktree(&state.root, source, target) {
+                if let Err(rollback) = sessions.rename_session(target, source) {
+                    return Err(io::Error::other(format!(
+                        "Could not rename the session worktree ({error}); session rollback failed ({rollback})."
+                    )));
+                }
+
+                return Err(error);
+            }
+
+            let mut cancels = state.cancels.lock().map_err(lock)?;
+
+            if let Some(cancel) = cancels.remove(source) {
+                cancels.insert(target.to_owned(), cancel);
+            }
+
+            json!({"id": target, "renamed_from": source})
+        }
+
         "session.delete" => {
             let id = request.params["id"]
                 .as_str()
@@ -541,6 +631,27 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
 
             state.cancels.lock().map_err(lock)?.remove(id);
             json!({"id": id, "worktree": worktree})
+        }
+
+        "session.archive" | "session.unarchive" => {
+            let id = request.params["id"]
+                .as_str()
+                .ok_or_else(|| invalid("session archive id is required."))?;
+
+            let archived = request.method == "session.archive";
+            let mut sessions = state.sessions.lock().map_err(lock)?;
+            let current = sessions
+                .sessions
+                .get(id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Session was not found."))?;
+
+            let changed = current.archived != archived;
+
+            if changed {
+                sessions.archive_session(id, archived)?;
+            }
+
+            json!({"id": id, "archived": archived, "changed": changed})
         }
 
         "session.model" => {
@@ -604,7 +715,9 @@ pub(crate) fn summary(session: &super::state::Session) -> Value {
         "chat": short(session.chat.as_ref()),
         "thread": short(session.thread.as_ref()),
         "private": session.private,
+        "archived": session.archived,
         "status": super::clip(session.status.clone(), SUMMARY_LIMIT),
+        "messages": session.messages.len(),
         "queued": session.queued.len(),
         "inflight": session.inflight.is_some(),
         "created": session.created,
@@ -748,6 +861,14 @@ fn to_io(error: crabbot_core::Error) -> io::Error {
 }
 
 fn plugins(home: &std::path::Path) -> Vec<Value> {
+    plugin_items(home, false)
+}
+
+fn plugin_inventory(home: &std::path::Path) -> Vec<Value> {
+    plugin_items(home, true)
+}
+
+fn plugin_items(home: &std::path::Path, include_manifest: bool) -> Vec<Value> {
     let mut items = std::fs::read_dir(home.join("plugins"))
         .ok()
         .into_iter()
@@ -773,11 +894,28 @@ fn plugins(home: &std::path::Path) -> Vec<Value> {
             };
 
             let health = entry.path().join("bin").join(binary).is_file();
-            Some(json!({
-                "id": id,
-                "status": "installed",
-                "health": if health { "ready" } else { "missing" },
-            }))
+            let health = if health { "ready" } else { "missing" };
+
+            let item = if include_manifest {
+                super::read_manifest(&entry.path()).map_or_else(
+                    || {
+                        json!({
+                            "id": id,
+                            "status": "installed",
+                            "health": health,
+                        })
+                    },
+                    |manifest| super::plugin_summary(&manifest, health),
+                )
+            } else {
+                json!({
+                    "id": id,
+                    "status": "installed",
+                    "health": health,
+                })
+            };
+
+            Some(item)
         })
         .take(256)
         .collect::<Vec<_>>();
@@ -1036,6 +1174,33 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         assert_eq!(ensured.result.unwrap()["id"], "terminal");
+        let reserved = dispatch(
+            &IpcRequest::call(25, "secret", "session.reserve", json!({"id": "terminal"})),
+            &state,
+        )
+        .unwrap();
+
+        let owner = reserved.result.unwrap()["owner"].as_str().unwrap().to_owned();
+        let renewed = dispatch(
+            &IpcRequest::call(
+                29,
+                "secret",
+                "session.renew",
+                json!({"id": "terminal", "owner": owner}),
+            ),
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(renewed.result.unwrap()["renewed"], true);
+        assert!(
+            dispatch(
+                &IpcRequest::call(26, "secret", "session.reserve", json!({"id": "terminal"})),
+                &state,
+            )
+            .is_err()
+        );
+
         let message = Message {
             id: "terminal-user-1".into(),
             session: "terminal".into(),
@@ -1044,13 +1209,12 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
             content: vec![Content::Text { text: "hello".into() }],
         };
 
-        state.sessions.lock().unwrap().set_status("terminal", "cancelled").unwrap();
         let appended = dispatch(
             &IpcRequest::call(
                 23,
                 "secret",
-                "session.append",
-                json!({"id": "terminal", "message": message}),
+                "session.append_reserved",
+                json!({"id": "terminal", "owner": owner, "message": message}),
             ),
             &state,
         )
@@ -1066,7 +1230,41 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         assert_eq!(terminal["messages"][0]["content"][0]["text"], "hello");
-        assert_eq!(terminal["status"], "idle");
+        assert_eq!(terminal["status"], "working");
+        assert!(
+            dispatch(
+                &IpcRequest::call(
+                    27,
+                    "secret",
+                    "session.append",
+                    json!({
+                        "id": "terminal",
+                        "message": {
+                            "id": "terminal-user-2",
+                            "session": "terminal",
+                            "role": "user",
+                            "sender": "tui",
+                            "content": [{"type": "text", "text": "second"}]
+                        }
+                    })
+                ),
+                &state,
+            )
+            .is_err()
+        );
+
+        let released = dispatch(
+            &IpcRequest::call(
+                28,
+                "secret",
+                "session.release",
+                json!({"id": "terminal", "owner": owner}),
+            ),
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(released.result.unwrap()["released"], true);
         let invalid_message = Message {
             id: "terminal-tool-1".into(),
             session: "terminal".into(),
@@ -1289,6 +1487,180 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
     }
 
     #[test]
+    fn recovers_expired_tui_reservations_before_new_work() {
+        let state = state();
+
+        dispatch(&IpcRequest::call(1, "secret", "session.new", json!({"id": "terminal"})), &state)
+            .unwrap();
+
+        let previous = dispatch(
+            &IpcRequest::call(2, "secret", "session.reserve", json!({"id": "terminal"})),
+            &state,
+        )
+        .unwrap()
+        .result
+        .unwrap()["owner"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        state.sessions.lock().unwrap().sessions.get_mut("terminal").unwrap().reservation_until =
+            Some(0);
+
+        let response = dispatch(
+            &IpcRequest::call(3, "secret", "session.reserve", json!({"id": "terminal"})),
+            &state,
+        )
+        .unwrap();
+
+        let current = response.result.unwrap()["owner"].as_str().unwrap().to_owned();
+
+        assert_eq!(state.sessions.lock().unwrap().sessions["terminal"].status, "working");
+
+        assert!(
+            dispatch(
+                &IpcRequest::call(
+                    5,
+                    "secret",
+                    "session.release",
+                    json!({"id": "terminal", "owner": previous}),
+                ),
+                &state,
+            )
+            .is_err()
+        );
+
+        assert!(
+            dispatch(
+                &IpcRequest::call(
+                    6,
+                    "secret",
+                    "session.renew",
+                    json!({"id": "terminal", "owner": previous}),
+                ),
+                &state,
+            )
+            .is_err()
+        );
+
+        let stale_message = Message {
+            id: "stale-user-1".into(),
+            session: "terminal".into(),
+            role: Role::User,
+            sender: Some("tui".into()),
+            content: vec![Content::Text { text: "stale".into() }],
+        };
+
+        assert!(
+            dispatch(
+                &IpcRequest::call(
+                    7,
+                    "secret",
+                    "session.append_reserved",
+                    json!({"id": "terminal", "owner": previous, "message": stale_message}),
+                ),
+                &state,
+            )
+            .is_err()
+        );
+
+        {
+            let sessions = state.sessions.lock().unwrap();
+            let session = &sessions.sessions["terminal"];
+
+            assert_eq!(session.reservation_owner.as_deref(), Some(current.as_str()));
+            assert_eq!(session.status, "working");
+        }
+
+        state.sessions.lock().unwrap().create("legacy", "model").unwrap();
+
+        state.sessions.lock().unwrap().set_status("legacy", "working").unwrap();
+        state.sessions.lock().unwrap().sessions.get_mut("legacy").unwrap().updated = 0;
+
+        let response = dispatch(
+            &IpcRequest::call(4, "secret", "session.reserve", json!({"id": "legacy"})),
+            &state,
+        )
+        .unwrap();
+
+        assert!(response.result.unwrap()["owner"].as_str().is_some());
+    }
+
+    #[test]
+    fn archives_and_restores_sessions_through_ipc() {
+        let state = state_at("session-archive");
+        state.sessions.lock().unwrap().create("saved", "model").unwrap();
+
+        let renamed = dispatch(
+            &IpcRequest::call(
+                1,
+                "secret",
+                "session.rename",
+                json!({"id": "saved", "target": "renamed"}),
+            ),
+            &state,
+        )
+        .unwrap()
+        .result
+        .unwrap();
+
+        assert_eq!(renamed["renamed_from"], "saved");
+
+        let archived = dispatch(
+            &IpcRequest::call(2, "secret", "session.archive", json!({"id": "renamed"})),
+            &state,
+        )
+        .unwrap()
+        .result
+        .unwrap();
+
+        assert_eq!(archived["archived"], true);
+        assert_eq!(archived["changed"], true);
+
+        let unchanged = dispatch(
+            &IpcRequest::call(22, "secret", "session.archive", json!({"id": "renamed"})),
+            &state,
+        )
+        .unwrap()
+        .result
+        .unwrap();
+
+        assert_eq!(unchanged["archived"], true);
+        assert_eq!(unchanged["changed"], false);
+
+        let listed = dispatch(&IpcRequest::call(3, "secret", "session.list", json!({})), &state)
+            .unwrap()
+            .result
+            .unwrap();
+
+        assert_eq!(listed["items"][0]["archived"], true);
+        assert!(listed["items"][0]["created"].as_u64().is_some());
+        assert_eq!(listed["items"][0]["messages"], 0);
+
+        let restored = dispatch(
+            &IpcRequest::call(4, "secret", "session.unarchive", json!({"id": "renamed"})),
+            &state,
+        )
+        .unwrap()
+        .result
+        .unwrap();
+
+        assert_eq!(restored["archived"], false);
+        assert_eq!(restored["changed"], true);
+
+        let unchanged = dispatch(
+            &IpcRequest::call(23, "secret", "session.unarchive", json!({"id": "renamed"})),
+            &state,
+        )
+        .unwrap()
+        .result
+        .unwrap();
+
+        assert_eq!(unchanged["archived"], false);
+        assert_eq!(unchanged["changed"], false);
+    }
+
+    #[test]
     fn lists_safe_plugins_only() {
         let root = std::env::temp_dir().join(format!("crabbot-ipc-plugins-{}", std::process::id()));
         let plugin_root = root.join("plugins");
@@ -1296,16 +1668,33 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         std::fs::create_dir_all(&plugin_root).unwrap();
         std::fs::create_dir(plugin_root.join("codex")).unwrap();
         std::fs::create_dir(plugin_root.join("telegram-1")).unwrap();
+        std::fs::write(
+            plugin_root.join("codex/crabbot-plugin.toml"),
+            "id = 'codex'\nversion = '1.2.3'\nprotocol = { major = 0, minor = 1 }\ncapabilities = ['model', 'vision']\npermissions = ['network']\n[[commands]]\nname = 'codex'\ndescription = 'Run Codex.'\ninteractive = true\n",
+        )
+        .unwrap();
+
         std::fs::write(plugin_root.join("file"), "not a plugin").unwrap();
         std::fs::create_dir(plugin_root.join("Bad")).unwrap();
 
         assert_eq!(
             plugins(&root),
             vec![
-                json!({"id": "codex", "status": "installed", "health": "missing"}),
+                json!({
+                    "id": "codex",
+                    "status": "installed",
+                    "health": "missing"
+                }),
                 json!({"id": "telegram-1", "status": "installed", "health": "missing"}),
             ]
         );
+
+        let inventory = super::plugin_inventory(&root);
+
+        assert_eq!(inventory[0]["version"], "1.2.3");
+        assert_eq!(inventory[0]["capabilities"], json!(["model", "vision"]));
+        assert_eq!(inventory[0]["commands"][0]["name"], "codex");
+        assert_eq!(inventory[0]["health"], "missing");
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1573,7 +1962,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         let encoded = serde_json::to_vec(&response).unwrap();
 
         assert!(encoded.len().saturating_add(1) <= FRAME);
-        assert!(response.result.unwrap()["items"][0]["messages"].is_null());
+        assert_eq!(response.result.unwrap()["items"][0]["messages"], 100);
         let detail =
             dispatch(&IpcRequest::call(2, "secret", "session.get", json!({"id": "large"})), &state)
                 .unwrap();

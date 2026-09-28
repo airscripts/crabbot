@@ -57,7 +57,7 @@ in the initial daemon flow.
 
 The runtime keeps a live registry of verified plugin processes. `plugin install`
 and `plugin link` request authenticated IPC activation after committing the
-plugin; `plugin remove` unloads it before deleting its files. The bridge wakes
+plugin; `plugin uninstall` unloads it before deleting its files. The bridge wakes
 when a configured channel or model is added, so a daemon need not restart to
 discover it. `plugin update` unloads active plugin processes before replacing
 their files, then reloads the same active set; inactive plugins stay inactive

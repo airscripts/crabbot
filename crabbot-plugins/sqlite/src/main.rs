@@ -247,6 +247,7 @@ fn lease(db: &Connection, params: &serde_json::Value) -> crabbot_core::Result<se
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| crabbot_core::Error::Denied("lease.owner is required.".into()))?;
 
+    // TTL is in seconds; 86,400 seconds is 24 hours.
     let ttl = params["ttl"].as_u64().unwrap_or(30).clamp(1, 86_400) as i64;
     let expires = now() + ttl;
     let count = db
@@ -384,6 +385,7 @@ fn retry(db: &Connection, params: &serde_json::Value) -> crabbot_core::Result<se
 
 fn seen(db: &Connection, params: &serde_json::Value) -> crabbot_core::Result<serde_json::Value> {
     let value = key(params, "seen.key")?;
+    // TTL is in seconds; defaults to 24 hours and is capped at 30 days.
     let ttl = params["ttl"].as_u64().unwrap_or(86_400).clamp(1, 2_592_000) as i64;
     let now = now();
     db.execute("DELETE FROM seen WHERE expires <= ?1", params![now]).map_err(|error| {
@@ -426,6 +428,7 @@ mod tests {
     #[test]
     fn applies_the_actual_page_size_to_the_database_cap() {
         let db = Connection::open_in_memory().unwrap();
+        // 65,536 bytes (64 KiB), SQLite's largest supported page size.
         db.execute_batch("PRAGMA page_size = 65536;").unwrap();
         migrate(&db).unwrap();
         let page_size: i64 = db.query_row("PRAGMA page_size;", [], |row| row.get(0)).unwrap();

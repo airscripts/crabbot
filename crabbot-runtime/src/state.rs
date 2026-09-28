@@ -16,9 +16,10 @@ pub const LIMIT: usize = 100;
 const SEEN_LIMIT: usize = 10_000;
 const SEEN_KEY_LIMIT: usize = 4 * 1024;
 const BYTE_LIMIT: u64 = 32 * 1024 * 1024;
+pub const TUI_RESERVATION_TTL: u64 = crabbot_core::session::RESERVATION_TTL_SECONDS;
 
 pub fn compact_messages(messages: &mut Vec<Message>) {
-    while messages.len() > LIMIT {
+    while messages.len() > crabbot_core::session::MESSAGE_HISTORY_LIMIT {
         if !remove_oldest_message_group(messages, None) {
             break;
         }
@@ -78,6 +79,8 @@ pub struct Session {
     #[serde(default)]
     pub workspace: Option<String>,
     #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
     pub channel: Option<String>,
     #[serde(default)]
     pub chat: Option<String>,
@@ -93,6 +96,10 @@ pub struct Session {
     #[serde(default)]
     pub inflight: Option<Message>,
     #[serde(default)]
+    pub reservation_until: Option<u64>,
+    #[serde(default)]
+    pub reservation_owner: Option<String>,
+    #[serde(default)]
     pub inflight_roles: Vec<String>,
     #[serde(default)]
     pub stream_delivery: Option<String>,
@@ -101,6 +108,14 @@ pub struct Session {
     pub status: String,
     pub created: u64,
     pub updated: u64,
+}
+
+impl Session {
+    pub fn has_live_tui_reservation(&self) -> bool {
+        self.status == "working"
+            && self.inflight.is_none()
+            && !reservation_expired(self.reservation_until, self.updated, now())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -218,7 +233,11 @@ impl Store {
                 .queue_roles
                 .retain(|id, _| session.queued.iter().any(|message| &message.id == id));
 
-            if session.status == "working" || session.inflight.is_some() {
+            let tui_reservation = session.status == "working"
+                && session.inflight.is_none()
+                && session.reservation_until.is_some();
+
+            if !tui_reservation && (session.status == "working" || session.inflight.is_some()) {
                 let roles = std::mem::take(&mut session.inflight_roles);
                 session.stream_delivery = None;
 
@@ -236,6 +255,8 @@ impl Store {
                 session.phase = safe();
 
                 session.status = "interrupted".into();
+                session.reservation_until = None;
+                session.reservation_owner = None;
             }
         }
 
@@ -358,6 +379,7 @@ impl Store {
                     id,
                     model,
                     workspace: None,
+                    archived: false,
                     channel: None,
                     chat: None,
                     thread: None,
@@ -366,6 +388,8 @@ impl Store {
                     queued: Vec::new(),
                     queue_roles: BTreeMap::new(),
                     inflight: None,
+                    reservation_until: None,
+                    reservation_owner: None,
                     inflight_roles: Vec::new(),
                     stream_delivery: None,
                     phase: safe(),
@@ -389,6 +413,75 @@ impl Store {
         }
 
         Ok(())
+    }
+
+    pub fn rename_session(&mut self, source: &str, target: &str) -> std::io::Result<()> {
+        if !valid(source) || !valid(target) || source == target {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Session ID is invalid.",
+            ));
+        }
+
+        if self.sessions.contains_key(target) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "Session already exists.",
+            ));
+        }
+
+        let mut session = self.sessions.get(source).cloned().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "Session was not found.")
+        })?;
+
+        if session.channel.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "A channel-backed session cannot be renamed.",
+            ));
+        }
+
+        if session.status == "working" || session.inflight.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "A working session cannot be renamed.",
+            ));
+        }
+
+        session.id = target.to_owned();
+        session.updated = now();
+
+        for message in session.messages.iter_mut().chain(session.queued.iter_mut()) {
+            message.session = target.to_owned();
+        }
+
+        if let Some(message) = &mut session.inflight {
+            message.session = target.to_owned();
+        }
+
+        self.change(|store| {
+            store.sessions.remove(source);
+            store.sessions.insert(target.to_owned(), session);
+        })
+    }
+
+    pub fn archive_session(&mut self, id: &str, archived: bool) -> std::io::Result<()> {
+        let session = self.sessions.get(id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "Session was not found.")
+        })?;
+
+        if session.status == "working" || session.inflight.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "A working session cannot be archived.",
+            ));
+        }
+
+        self.change(|store| {
+            let session = store.sessions.get_mut(id).expect("session was checked above");
+            session.archived = archived;
+            session.updated = now();
+        })
     }
 
     pub fn route(
@@ -417,11 +510,34 @@ impl Store {
     }
 
     pub fn push(&mut self, id: &str, message: Message) -> std::io::Result<()> {
-        self.push_with_status(id, message, false)
+        self.push_with_status(id, message, false, false)
     }
 
     pub fn append(&mut self, id: &str, message: Message) -> std::io::Result<()> {
-        self.push_with_status(id, message, true)
+        self.push_with_status(id, message, true, false)
+    }
+
+    pub fn append_reserved(
+        &mut self,
+        id: &str,
+        owner: &str,
+        message: Message,
+    ) -> std::io::Result<()> {
+        let session = self.sessions.get(id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "Session was not found.")
+        })?;
+
+        if session.inflight.is_some()
+            || session.status != "working"
+            || session.reservation_owner.as_deref() != Some(owner)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Session reservation is unavailable.",
+            ));
+        }
+
+        self.push_with_status(id, message, true, true)
     }
 
     fn push_with_status(
@@ -429,6 +545,7 @@ impl Store {
         id: &str,
         message: Message,
         resume_cancelled: bool,
+        preserve_working: bool,
     ) -> std::io::Result<()> {
         if !self.sessions.contains_key(id) {
             return Err(std::io::Error::new(
@@ -448,8 +565,16 @@ impl Store {
 
             session.updated = now();
 
-            if session.status != "cancelled" || resume_cancelled {
+            if preserve_working {
+                session.status = "working".into();
+
+                if session.reservation_until.is_some() {
+                    session.reservation_until = Some(now().saturating_add(TUI_RESERVATION_TTL));
+                }
+            } else if session.status != "cancelled" || resume_cancelled {
                 session.status = "idle".into();
+                session.reservation_until = None;
+                session.reservation_owner = None;
             }
         })
     }
@@ -520,6 +645,8 @@ impl Store {
 
             if session.status == "cancelled" {
                 session.status = "idle".into();
+                session.reservation_until = None;
+                session.reservation_owner = None;
             }
 
             session.updated = now();
@@ -592,7 +719,8 @@ impl Store {
             ));
         };
 
-        if session.inflight.is_some()
+        if session.has_live_tui_reservation()
+            || session.inflight.is_some()
             || (session.status == "working"
                 && !session.queued.iter().any(|item| item.id == message.id))
         {
@@ -642,6 +770,8 @@ impl Store {
             session.stream_delivery = None;
             session.phase = safe();
             session.status = "working".into();
+            session.reservation_until = None;
+            session.reservation_owner = None;
             session.updated = now();
         })
     }
@@ -670,6 +800,8 @@ impl Store {
 
             session.phase = safe();
             session.status = status.into();
+            session.reservation_until = None;
+            session.reservation_owner = None;
             session.updated = now();
 
             if let Some(delivery_id) = delivery_id
@@ -739,6 +871,8 @@ impl Store {
 
                 session.updated = now();
                 session.status = "idle".into();
+                session.reservation_until = None;
+                session.reservation_owner = None;
                 session.inflight = None;
                 session.inflight_roles.clear();
                 session.stream_delivery = None;
@@ -910,7 +1044,92 @@ impl Store {
             }
 
             session.status = status.into();
+
+            if status != "working" {
+                session.reservation_until = None;
+                session.reservation_owner = None;
+            }
+
             session.updated = now();
+        })
+    }
+
+    pub fn reserve(&mut self, id: &str, owner: String) -> std::io::Result<()> {
+        let Some(session) = self.sessions.get(id) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Session was not found.",
+            ));
+        };
+
+        if session.inflight.is_some() || session.status == "working" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Session is already working.",
+            ));
+        }
+
+        self.change(|store| {
+            if let Some(session) = store.sessions.get_mut(id) {
+                session.status = "working".into();
+                session.reservation_until = Some(now().saturating_add(TUI_RESERVATION_TTL));
+                session.reservation_owner = Some(owner);
+                session.updated = now();
+            }
+        })
+    }
+
+    pub fn recover_reservations(&mut self) -> std::io::Result<()> {
+        let current = now();
+
+        let expired = self.sessions.values().any(|session| {
+            session.status == "working"
+                && session.inflight.is_none()
+                && reservation_expired(session.reservation_until, session.updated, current)
+        });
+
+        if !expired {
+            return Ok(());
+        }
+
+        self.change(|store| {
+            for session in store.sessions.values_mut() {
+                if session.status == "working"
+                    && session.inflight.is_none()
+                    && reservation_expired(session.reservation_until, session.updated, current)
+                {
+                    session.status = "idle".into();
+                    session.reservation_until = None;
+                    session.reservation_owner = None;
+                    session.updated = current;
+                }
+            }
+        })
+    }
+
+    pub fn renew_reservation(&mut self, id: &str, owner: &str) -> std::io::Result<()> {
+        let Some(session) = self.sessions.get(id) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Session was not found.",
+            ));
+        };
+
+        if session.status != "working"
+            || session.inflight.is_some()
+            || session.reservation_until.is_none()
+            || session.reservation_owner.as_deref() != Some(owner)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Session reservation is unavailable.",
+            ));
+        }
+
+        self.change(|store| {
+            if let Some(session) = store.sessions.get_mut(id) {
+                session.reservation_until = Some(now().saturating_add(TUI_RESERVATION_TTL));
+            }
         })
     }
 
@@ -1018,6 +1237,7 @@ impl Store {
                     id: target,
                     model: source.model,
                     workspace: source.workspace,
+                    archived: false,
                     channel: source.channel,
                     chat: source.chat,
                     thread: source.thread,
@@ -1026,6 +1246,8 @@ impl Store {
                     queued: Vec::new(),
                     queue_roles: BTreeMap::new(),
                     inflight: None,
+                    reservation_until: None,
+                    reservation_owner: None,
                     inflight_roles: Vec::new(),
                     stream_delivery: None,
                     phase: safe(),
@@ -1522,6 +1744,94 @@ pub fn remove_worktree(root: &Path, id: &str) -> std::io::Result<()> {
     }
 }
 
+pub fn rename_worktree(root: &Path, source: &str, target: &str) -> std::io::Result<()> {
+    if !valid(source) || !valid(target) || source == target {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Session ID is invalid.",
+        ));
+    }
+
+    if !root.exists() {
+        return Ok(());
+    }
+
+    let root = std::fs::canonicalize(root)?;
+    let worktrees = root.join(".crabbot/worktrees");
+    let old_path = worktrees.join(source);
+    let new_path = worktrees.join(target);
+
+    let metadata = match std::fs::symlink_metadata(&old_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "The worktree path cannot be a symbolic link.",
+        ));
+    }
+
+    match std::fs::symlink_metadata(&new_path) {
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "The target worktree already exists.",
+            ));
+        }
+
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let worktrees = std::fs::canonicalize(worktrees)?;
+    let old_path = std::fs::canonicalize(old_path)?;
+
+    if !worktrees.starts_with(&root) || !old_path.starts_with(&worktrees) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "The worktree path leaves the configured root.",
+        ));
+    }
+
+    let mut command = super::git_command();
+    command
+        .args(["-C", &root.display().to_string(), "worktree", "move"])
+        .arg(&old_path)
+        .arg(&new_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Git worktree rename exceeded the execution time limit.",
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(25));
+    };
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("Git could not rename the session worktree."))
+    }
+}
+
 fn direct() -> bool {
     true
 }
@@ -1599,6 +1909,13 @@ fn unsafe_phase() -> String {
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |value| value.as_secs())
+}
+
+fn reservation_expired(until: Option<u64>, updated: u64, current: u64) -> bool {
+    until.map_or_else(
+        || updated.saturating_add(TUI_RESERVATION_TTL) <= current,
+        |until| until <= current,
+    )
 }
 
 fn seen_now() -> u64 {
@@ -1701,6 +2018,71 @@ mod tests {
         }
 
         assert!(store.fork("main", "copy").is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn renames_sessions_and_updates_their_message_routes() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-state-rename-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let mut store = Store::load(root.join("sessions.json")).unwrap();
+        store.create("old", "local").unwrap();
+        store.push("old", message(1, "old")).unwrap();
+
+        store.rename_session("old", "new").unwrap();
+
+        assert!(!store.sessions.contains_key("old"));
+        assert_eq!(store.sessions["new"].id, "new");
+        assert_eq!(store.sessions["new"].messages[0].session, "new");
+        assert!(store.rename_session("missing", "other").is_err());
+        assert!(store.rename_session("new", "new").is_err());
+        assert!(store.rename_session("new", "../escape").is_err());
+        store.create("taken", "local").unwrap();
+
+        assert!(store.rename_session("new", "taken").is_err());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_backed_sessions_cannot_be_renamed() {
+        let root = std::env::temp_dir()
+            .join(format!("crabbot-state-rename-channel-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let mut store = Store::load(root.join("sessions.json")).unwrap();
+        store.create("telegram-123", "local").unwrap();
+        store.route("telegram-123", "telegram", "123", None, true).unwrap();
+
+        let error = store.rename_session("telegram-123", "renamed").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(store.sessions.contains_key("telegram-123"));
+        assert!(!store.sessions.contains_key("renamed"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archives_and_restores_sessions_without_deleting_them() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-state-archive-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("sessions.json");
+        let mut store = Store::load(&path).unwrap();
+        store.create("saved", "local").unwrap();
+
+        store.archive_session("saved", true).unwrap();
+
+        assert!(store.sessions["saved"].archived);
+        let mut store = Store::load(&path).unwrap();
+        store.archive_session("saved", false).unwrap();
+
+        assert!(!store.sessions["saved"].archived);
+        assert!(store.archive_session("missing", true).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1808,6 +2190,7 @@ mod tests {
                 id: "safe".into(),
                 model: "model".into(),
                 workspace: None,
+                archived: false,
                 channel: None,
                 chat: None,
                 thread: None,
@@ -1816,6 +2199,8 @@ mod tests {
                 queued: Vec::new(),
                 queue_roles: BTreeMap::new(),
                 inflight: None,
+                reservation_until: None,
+                reservation_owner: None,
                 inflight_roles: Vec::new(),
                 stream_delivery: None,
                 phase: "safe".into(),
@@ -2147,6 +2532,31 @@ mod tests {
     }
 
     #[test]
+    fn queued_events_do_not_take_over_a_live_tui_reservation() {
+        let root = std::env::temp_dir()
+            .join(format!("crabbot-state-queued-reservation-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        let path = root.join("sessions.json");
+        let mut store = Store::load(&path).unwrap();
+        store.create("main", "model").unwrap();
+        store.reserve("main", "tui-owner".into()).unwrap();
+        store.queue("main", message(7, "main")).unwrap();
+
+        let error = store
+            .begin_queued_with_roles("main", message(7, "main"), Vec::new(), "telegram")
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(store.sessions["main"].has_live_tui_reservation());
+        assert_eq!(store.sessions["main"].reservation_owner.as_deref(), Some("tui-owner"));
+        assert_eq!(store.sessions["main"].queued[0].id, "7");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn recovers_inflight_work_and_rejects_active_deletion() {
         let root =
             std::env::temp_dir().join(format!("crabbot-state-inflight-{}", std::process::id()));
@@ -2165,6 +2575,28 @@ mod tests {
         assert_eq!(recovered.sessions["main"].queued[0].id, "1");
         assert_eq!(recovered.sessions["main"].queue_roles["1"], vec!["moderator"]);
         assert!(recovered.sessions["main"].inflight.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preserves_tui_reservations_during_store_load() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-state-reservation-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("sessions.json");
+        let mut store = Store::load(&path).unwrap();
+        store.create("main", "model").unwrap();
+        store.reserve("main", "owner-token".into()).unwrap();
+
+        let mut recovered = Store::load(path).unwrap();
+
+        assert_eq!(recovered.sessions["main"].status, "working");
+        assert_eq!(recovered.sessions["main"].reservation_owner.as_deref(), Some("owner-token"));
+        recovered.append_reserved("main", "owner-token", message(2, "main")).unwrap();
+
+        assert_eq!(recovered.sessions["main"].messages[0].id, "2");
+
         let _ = std::fs::remove_dir_all(root);
     }
 
