@@ -582,7 +582,7 @@ async fn capture(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let mut child = command.spawn()?;
+    let mut child = spawn(&mut command).await?;
     let process_id = child.id();
 
     #[cfg(unix)]
@@ -640,6 +640,25 @@ async fn capture(
             ))
         }
     }
+}
+
+async fn spawn(command: &mut Command) -> std::io::Result<tokio::process::Child> {
+    const ATTEMPTS: usize = 5;
+
+    for attempt in 0..ATTEMPTS {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempt + 1 < ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            result => return result,
+        }
+    }
+
+    unreachable!("the bounded spawn loop always returns a result")
 }
 
 async fn limited<R: AsyncRead + Unpin>(mut input: R) -> std::io::Result<Vec<u8>> {
@@ -1524,6 +1543,33 @@ mod tests {
 
         assert_eq!(String::from_utf8_lossy(&output.stdout), "sandboxed");
         assert!(!root.join("host-marker").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn retries_launch_while_an_executable_is_open_for_writing() {
+        use std::{fs::OpenOptions, os::unix::fs::PermissionsExt, thread};
+
+        let root = test_root("crabbot-tools-executable-busy");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let executable = root.join("runtime");
+        fs::write(&executable, "#!/bin/sh\nprintf launched\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let writable = OpenOptions::new().write(true).open(&executable).unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            drop(writable);
+        });
+
+        let output = super::capture(super::Command::new(&executable), None, false).await.unwrap();
+        release.join().unwrap();
+
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "launched");
+
         let _ = fs::remove_dir_all(root);
     }
 

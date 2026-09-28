@@ -152,6 +152,12 @@ the existing plugins as protocol references.
 
 ## Install And Update Lifecycle
 
+When `plugin install` or `plugin link` is given an ID without a source, Crabbot
+looks for that plugin in the local `crabbot-plugins/<id>` directory or in a
+category directory such as `crabbot-plugins/intelligence/<id>`. Run the command
+from the repository root; the plugin must already be built in the workspace's
+`target/debug` directory. Otherwise, pass an explicit local path or Git URL.
+
 `crabbot plugin link` is the local development workflow: it canonicalizes the
 source, validates the manifest, stages the executable, runs a health check, and
 links the built executable into the Crabbot home (copying it if symlinks are not

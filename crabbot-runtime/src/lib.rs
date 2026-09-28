@@ -3473,9 +3473,19 @@ fn plugin_binary(source: &Path, id: &str, default: bool) -> Option<PathBuf> {
         return None;
     }
 
-    let root = source.parent()?.parent()?;
-    let binary = root.join("target/debug").join(name);
-    binary.is_file().then_some(binary)
+    let mut root = source;
+
+    while let Some(parent) = root.parent() {
+        let binary = parent.join("target/debug").join(&name);
+
+        if binary.is_file() {
+            return Some(binary);
+        }
+
+        root = parent;
+    }
+
+    None
 }
 
 fn env_nonempty(name: &str) -> bool {
@@ -10145,6 +10155,45 @@ fn link(
     link_at(source, linked, &home())
 }
 
+fn default_plugin_source(
+    plugins_root: &Path,
+    id: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let direct = plugins_root.join(id);
+
+    if direct.is_dir() {
+        return Ok(direct);
+    }
+
+    let mut matches = Vec::new();
+
+    for category in std::fs::read_dir(plugins_root)? {
+        let category = category?;
+
+        if category.file_type()?.is_dir() {
+            let candidate = category.path().join(id);
+
+            if candidate.is_dir() {
+                matches.push(candidate);
+            }
+        }
+    }
+
+    match matches.as_slice() {
+        [source] => Ok(source.clone()),
+        [] => Err(format!(
+            "Plugin {id} was not found under {}; pass a source path or Git URL.",
+            plugins_root.display()
+        )
+        .into()),
+        _ => Err(format!(
+            "Plugin {id} has multiple bundled sources under {}; pass a source path explicitly.",
+            plugins_root.display()
+        )
+        .into()),
+    }
+}
+
 fn link_at(
     source: Source,
     linked: bool,
@@ -10157,10 +10206,13 @@ fn link_at(
     }
 
     let default_source = source.source.is_none();
-    let origin = source
-        .source
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("crabbot-plugins").join(&source.id).display().to_string());
+    let origin = match source.source.clone() {
+        Some(source) => source,
+
+        None => {
+            default_plugin_source(Path::new("crabbot-plugins"), &source.id)?.display().to_string()
+        }
+    };
 
     let root = resolve(&origin, source.revision.as_deref())?;
     let root_path = root.path.clone();
@@ -12260,6 +12312,28 @@ mod tests {
         fs::write(&default_binary, "default binary").unwrap();
 
         assert_eq!(plugin_binary(&default_source, "echo", true), Some(default_binary));
+
+        let categorized_source = root.join("repo/crabbot-plugins/intelligence/codex");
+        let categorized_binary = root.join("repo/target/debug").join(super::plugin_name("codex"));
+
+        fs::create_dir_all(&categorized_source).unwrap();
+        fs::write(
+            categorized_source.join("crabbot-plugin.toml"),
+            "id = 'codex'\nversion = '0.1.0'\nprotocol = { major = 0, minor = 1 }\n",
+        )
+        .unwrap();
+        fs::write(&categorized_binary, "categorized binary").unwrap();
+
+        assert_eq!(
+            super::default_plugin_source(&root.join("repo/crabbot-plugins"), "codex").unwrap(),
+            categorized_source
+        );
+
+        assert_eq!(
+            plugin_binary(&root.join("repo/crabbot-plugins/intelligence/codex"), "codex", true),
+            Some(categorized_binary)
+        );
+
         let entry = super::Entry {
             source: plugin.display().to_string(),
             revision: String::new(),
@@ -14644,7 +14718,7 @@ mod tests {
             )
             .unwrap();
 
-            let binary = source.join(format!("bin/crabbot-plugin-{id}"));
+            let binary = source.join("bin").join(super::plugin_name(id));
             write_test_plugin(&binary, id, "tool", "0.1.0");
 
             #[cfg(unix)]
@@ -14675,7 +14749,12 @@ mod tests {
         )
         .unwrap();
 
-        write_test_plugin(&valid_source.join("bin/crabbot-plugin-valid"), "valid", "tool", "0.2.0");
+        write_test_plugin(
+            &valid_source.join("bin").join(super::plugin_name("valid")),
+            "valid",
+            "tool",
+            "0.2.0",
+        );
 
         let error = super::updates(&root, "auto").unwrap_err();
 
@@ -14688,7 +14767,12 @@ mod tests {
         )
         .unwrap();
 
-        write_test_plugin(&valid_source.join("bin/crabbot-plugin-valid"), "valid", "tool", "0.3.0");
+        write_test_plugin(
+            &valid_source.join("bin").join(super::plugin_name("valid")),
+            "valid",
+            "tool",
+            "0.3.0",
+        );
 
         super::preview_updates_at(&root, true).unwrap();
 

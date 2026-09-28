@@ -7,6 +7,9 @@ Semantic Versioning.
 
 ### Added
 
+- Resolve bundled plugin IDs from category directories such as
+  `crabbot-plugins/intelligence/codex`, so `crabbot plugin install codex` works
+  from the repository root after building the plugin.
 - Added toggleable Codex Fast mode for Revloop. It is off by default and can be
   enabled with `--fast` or `CRABBOT_REVLOOP_FAST=true`.
 - Added a globally configurable Crabbot display name and improved the TUI with

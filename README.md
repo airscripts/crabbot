@@ -177,7 +177,7 @@ set `CRABBOT_KEYRING=1`:
 
 ```sh
 export CRABBOT_CODEX_KEY=...
-crabbot plugin link codex --yes
+crabbot plugin install codex
 ```
 
 For personal Codex authentication, [install Codex CLI](https://developers.codex.com/codex/cli/)
