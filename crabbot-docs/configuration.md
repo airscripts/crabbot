@@ -7,6 +7,18 @@ Plugin-owned persistent data is kept separately under
 `CRABBOT_HOME/data/plugins/<plugin-id>/`; agent workspaces remain the place for
 agent instructions, prompts, and other working files.
 
+Read or change settings without opening the TOML file with `crab config get`
+and `crab config set KEY=VALUE`. For example, enable TUI workspace tools with
+`crab config set clients.tui=true` (the long form is
+`crab config set clients.tui.tools=true`). TOML values use normal TOML syntax,
+such as `crab config set 'approval="prompt"'` or
+`crab config set 'channels.telegram.allow=["123"]'`. The command
+validates the complete config before saving and preserves existing comments.
+The TUI tools switch is applied immediately to a running daemon for new turns;
+the TUI theme setting takes effect the next time `crab tui` starts. Other
+settings are saved and take effect the next time the daemon starts. Add
+`--force` to restart a running daemon and apply restart-required settings.
+
 Media-capable channels use `CRABBOT_MEDIA` for temporary downloaded content;
 when it is unset, media is stored under `CRABBOT_HOME/media` and expired files
 are removed during the next media request. Images accepted into a durable
@@ -36,7 +48,16 @@ allow = ["123456789012345678"]
 mention = "@crabbot"
 tools = true
 worktree = true
+
+[clients.tui]
+tools = true
+theme = true
 ```
+
+Set `[clients.tui] theme = false` to disable TUI colors and use the terminal's
+default foreground color. This can improve contrast in terminals with unusual
+foreground/background palettes. The theme is enabled by default; change it with
+`crab config set clients.tui.theme=false` and relaunch `crab tui`.
 
 Unknown update and approval modes fail validation before the daemon starts.
 `name` sets the globally displayed name for Crabbot (1–64 visible characters).
@@ -82,12 +103,25 @@ contents into each model turn alongside the persisted, bounded conversation.
 Changes to either file apply on the next turn. These files guide model behavior
 but cannot grant capabilities or override host policy.
 
-`CRABBOT_ROOT` is the workspace exposed to file and search tools. If unset, it
-defaults to `CRABBOT_HOME/workspace`; setting it selects a different root.
-Session workspace selection can further override the root for that session.
-Tool paths are canonicalized and must remain below the active root. A root by
-itself does not enable tools: channel `tools = true` and daemon approvals are
-still required, and shell remains separately disabled by default.
+Together, they share a 32 KiB context budget; excess content is truncated, so
+put the most important guidance first and keep both files concise.
+
+TUI-created session IDs use an internal `tui-` namespace. Names shown in the
+TUI omit that prefix, and channel sessions remain separately routed, so a TUI
+session named `work` does not share history with a channel conversation.
+
+`CRABBOT_ROOT` is the default workspace exposed to file and search tools. If
+unset, it defaults to `CRABBOT_HOME/workspace`; setting it selects a different
+default. A session's explicit workspace replaces that default for the session.
+Tool paths are canonicalized and confined to the active session workspace, or
+to `CRABBOT_ROOT` when no session workspace is selected. A root by itself does
+not enable tools: channel `tools = true` and daemon approvals are still
+required, and shell remains separately disabled by default.
+
+The TUI is a local client of the daemon. Its `tools` setting defaults to
+`false`; set `[clients.tui] tools = true` to expose workspace tools to TUI
+turns. The global approval mode continues to govern mutating tool calls. TUI
+is the only client with a supported client-specific setting at present.
 
 Provider and channel plugins read declared secrets from their own environment
 variables or from the JSON file named by `CRABBOT_CREDENTIALS`. The file must
@@ -149,9 +183,9 @@ All Crabbot configuration variables use the `CRABBOT_` prefix:
 | `CRABBOT_SANDBOX_RUNTIME` | Optional `docker`, `podman`, or `off` shell sandbox |
 | `CRABBOT_SANDBOX_IMAGE` | Locally available image used by the shell sandbox |
 
-The default model is `gpt-6-luna` when `CRABBOT_MODEL` is unset. When Gemini is
-selected, the Gemini plugin maps that host default to its own `gemini-3.8-flash`
-default.
+The default host model is unset when `CRABBOT_MODEL` is unset; select a model
+explicitly in the TUI or configure `CRABBOT_MODEL`. When Gemini is selected,
+the Gemini plugin maps the unset host model to its own `gemini-3.8-flash` default.
 
 Operating-system variables such as `HOME`, `USERPROFILE`, `PATH`, and
 `XDG_CONFIG_HOME` retain their platform-defined names and are not Crabbot

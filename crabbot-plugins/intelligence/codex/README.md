@@ -17,8 +17,19 @@ Codex update changes the protocol. No exact Codex CLI release is pinned;
 compatibility is determined by the app-server operations Crabbot uses. Set
 `CRABBOT_KEYRING=1` to use the `codex` operating-system keyring entry.
 
+After installation, `crabbot codex` commands and foreground TUI model requests
+can use the plugin immediately. Agent turns hosted by the background runtime
+require that runtime to be running.
+
+Discover the available operations with `crabbot codex --help`. Use
+`crabbot codex login --help` for sign-in options, `crabbot codex status` or
+`crabbot codex logout` to manage sign-in, and `crabbot codex models` to list
+account models. In the TUI, `/model help` shows model controls and
+`/model list` lists Codex models; select one with `/model set <id>`.
+
 The plugin advertises image-request support during its handshake. The HTTP
 adapter sends inline image inputs using the OpenAI-compatible chat completions
 format. The Codex adapter sends inline image inputs through the app-server
-`turn/start` protocol. Use a vision-capable selected model; Crabbot does not
-pin the Codex CLI release.
+`turn/start` protocol and negotiates the experimental API needed for workspace
+roots. Use a vision-capable selected model; Crabbot does not pin the Codex CLI
+release.

@@ -2,49 +2,85 @@
 
 mod data;
 mod date;
+#[cfg(test)]
 mod offline;
 mod ui;
 
+#[cfg(test)]
+use crabbot_core::plugin::Process;
 use crabbot_core::{
     jsonl,
-    plugin::{Process, serve_with},
+    plugin::serve_with,
     types::{
-        Capability, CommandSpec, Content, Hello, IpcRequest, IpcResponse, Message, ModelRequest,
-        Protocol, Request, Response, Role,
+        Capability, CommandSpec, Content, Hello, IpcRequest, IpcResponse, Message, Protocol,
+        Request, Response, Role,
     },
 };
 
+#[cfg(test)]
+use crabbot_core::types::ToolSpec;
 use serde_json::Value;
-use std::{future::Future, pin::Pin};
+#[cfg(test)]
+use std::sync::Arc;
+use std::{future::Future, path::PathBuf, pin::Pin};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, duplex,
 };
 
 use tokio::net::TcpStream;
+#[cfg(test)]
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 
-const DEFAULT_MODEL: &str = "gpt-6-luna";
+const DEFAULT_MODEL: &str = "unset";
 const DEFAULT_NAME: &str = "Crabbot";
 const DEFAULT_SESSION_ID: &str = "default";
-const SESSION_LIST_PAGE_SIZE: usize = 10;
+const SESSION_LIST_PAGE_SIZE: usize = 5;
+const PLUGIN_LIST_PAGE_SIZE: usize = 5;
+const STREAMING_TURN_TIMEOUT: Duration = Duration::from_secs(310);
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
 const SAVED_REPLY_LIMIT: usize = 16 * 1024;
 // 365 days (one year), expressed in seconds.
 const MAX_TIMER_DELAY_SECONDS: u64 = 31_536_000;
 
 #[tokio::main]
-async fn main() -> crabbot_core::Result<()> {
+async fn main() -> std::process::ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
 
     if args.first().is_some_and(|value| value == "--crabbot-cli") {
-        if let Some(output) = run(&args[1..]).await? {
-            println!("{output}");
-        }
+        return match run(&args[1..]).await {
+            Ok(output) => {
+                if let Some(output) = output {
+                    println!("{output}");
+                }
 
-        return Ok(());
+                std::process::ExitCode::SUCCESS
+            }
+
+            Err(error) => {
+                eprintln!("Error: {}", cli_error_message(&error));
+                std::process::ExitCode::FAILURE
+            }
+        };
     }
 
-    serve_with(hello(), call).await
+    match serve_with(hello(), call).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+
+        Err(error) => {
+            eprintln!("Error: {}", cli_error_message(&error));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn cli_error_message(error: &crabbot_core::Error) -> String {
+    match error {
+        crabbot_core::Error::Denied(message) => message.clone(),
+        _ => error.to_string(),
+    }
 }
 
 fn hello() -> Hello {
@@ -55,8 +91,7 @@ fn hello() -> Hello {
         capabilities: vec![Capability::Client],
         commands: vec![CommandSpec {
             name: "tui".into(),
-            description: "Open the TUI; local sessions do not require the background runtime."
-                .into(),
+            description: "Open the TUI; the Crabbot daemon must be running.".into(),
             interactive: true,
         }],
     }
@@ -101,10 +136,33 @@ struct EngineConfig {
     session: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
+struct ToolsProcess {
+    process: Process,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum EngineEvent {
     GenerationStarted,
+    AssistantText(String),
+    SystemText(String),
+    SystemNotice(String),
+    AssistantFinished,
     GenerationFinished { interrupted: bool },
+}
+
+type StreamingHost = fn(
+    String,
+    String,
+    Value,
+    mpsc::UnboundedSender<EngineEvent>,
+) -> Pin<Box<dyn Future<Output = crabbot_core::Result<Value>> + Send>>;
+
+#[derive(Default)]
+struct EngineEvents {
+    session: Option<mpsc::UnboundedSender<ui::SessionView>>,
+    engine: Option<mpsc::UnboundedSender<EngineEvent>>,
+    streaming_host: Option<StreamingHost>,
 }
 
 struct SessionReservation {
@@ -208,8 +266,12 @@ async fn run(args: &[String]) -> crabbot_core::Result<Option<String>> {
     let session = selected_session_id(options.session);
     let home = std::env::var("CRABBOT_HOME").unwrap_or_else(|_| ".config/crabbot".into());
 
+    require_daemon(&home).await?;
+
     if let Some(prompt) = options.once {
-        return run_once(home, plugin, model, model_override, session, prompt).await.map(Some);
+        return run_once(home, plugin, model, model_override, session, prompt, daemon_control)
+            .await
+            .map(Some);
     }
 
     let input = terminal("r")?;
@@ -220,7 +282,16 @@ async fn run(args: &[String]) -> crabbot_core::Result<Option<String>> {
 }
 
 fn selected_session_id(session: Option<String>) -> String {
-    session.unwrap_or_else(|| DEFAULT_SESSION_ID.into())
+    tui_session_id(&session.unwrap_or_else(|| DEFAULT_SESSION_ID.into()))
+}
+
+fn tui_session_id(name: &str) -> String {
+    format!("tui-{name}")
+}
+
+fn tui_session_name(id: &str) -> Option<&str> {
+    let name = id.strip_prefix("tui-")?;
+    valid_session(name).then_some(name)
 }
 
 async fn run_at(
@@ -233,40 +304,32 @@ async fn run_at(
     session: String,
 ) -> crabbot_core::Result<()> {
     let name = std::env::var("CRABBOT_NAME").unwrap_or_else(|_| DEFAULT_NAME.into());
-    let backend = select_session_backend(&home, &session, &model).await?;
-
     ui::run(
         output,
         home,
         ui::ModelOptions { plugin, model, model_override },
         session,
         name,
-        move |home, method, params| {
-            control_with_backend(backend, home, method, params, daemon_control)
-        },
+        daemon_control,
     )
     .await
 }
 
-async fn run_once(
+async fn run_once<C, F>(
     home: String,
     plugin: String,
     model: String,
     model_override: Option<String>,
     session: String,
     prompt: String,
-) -> crabbot_core::Result<String> {
-    let path = plugin_binary_path(&home, &plugin);
-
-    if !path.is_file() {
-        return Err(crabbot_core::Error::Denied(format!(
-            "Intelligence plugin {plugin} is not installed. Install a model plugin to use --once."
-        )));
-    }
-
-    let backend = select_session_backend(&home, &session, &model).await?;
-
+    host: C,
+) -> crabbot_core::Result<String>
+where
+    C: Fn(String, String, Value) -> F + Copy + Send + Sync + 'static,
+    F: Future<Output = crabbot_core::Result<Value>> + Send + 'static,
+{
     let (mut input, engine_input) = duplex(16 * 1024);
+
     let (mut output, engine_output) = duplex(64 * 1024);
     let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
     drop(interrupt_tx);
@@ -275,11 +338,8 @@ async fn run_once(
         engine_input,
         engine_output,
         EngineConfig { home, plugin, model, model_override, session },
-        move |home, method, params| {
-            control_with_backend(backend, home, method, params, daemon_control)
-        },
-        None,
-        None,
+        host,
+        EngineEvents::default(),
         interrupt_rx,
     ));
 
@@ -303,17 +363,17 @@ async fn run_with<R, W, C, F>(
     mut output: W,
     config: EngineConfig,
     host: C,
-    session_events: Option<mpsc::UnboundedSender<ui::SessionView>>,
-    engine_events: Option<mpsc::UnboundedSender<EngineEvent>>,
+    events: EngineEvents,
     mut interrupt_rx: mpsc::UnboundedReceiver<()>,
 ) -> crabbot_core::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
-    C: Fn(String, String, Value) -> F + Copy + Send + 'static,
+    C: Fn(String, String, Value) -> F + Copy + Send + Sync + 'static,
     F: Future<Output = crabbot_core::Result<Value>> + Send + 'static,
 {
     let EngineConfig { home, plugin, mut model, model_override, mut session } = config;
+    let EngineEvents { session: session_events, engine: engine_events, streaming_host } = events;
     let input = BufReader::new(input);
     let initial_session = ensure_session(&home, &session, &model, host).await?;
 
@@ -332,17 +392,33 @@ where
     let mut messages = initial_session.messages;
     let mut workspace = initial_session.workspace;
 
+    let inventory = host(home.clone(), "plugin.list".into(), serde_json::json!({}))
+        .await
+        .unwrap_or(Value::Null);
+
+    let model_plugin_available = inventory["items"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["id"] == plugin
+                && item["health"] == "ready"
+                && item["capabilities"].as_array().is_some_and(|capabilities| {
+                    capabilities.iter().any(|capability| capability == "model")
+                })
+        })
+    });
+
     let bot_name = std::env::var("CRABBOT_NAME").unwrap_or_else(|_| DEFAULT_NAME.into());
-    output
-        .write_all(format!("{bot_name} terminal. Type /help for commands.\n> ").as_bytes())
-        .await?;
+
+    if engine_events.is_some() {
+        output.write_all(b"> ").await?;
+    } else {
+        output
+            .write_all(format!("{bot_name} terminal. Type /help for commands.\n> ").as_bytes())
+            .await?;
+    }
 
     output.flush().await?;
 
-    let path = plugin_binary_path(&home, &plugin);
-    let mut process = if path.is_file() { Some(Process::start(path).await?) } else { None };
-
-    if process.is_none() {
+    if !model_plugin_available && engine_events.is_none() {
         output
             .write_all(
                 format!("No intelligence plugin is installed at {plugin}. Install one to send prompts; session commands remain available.\n> ")
@@ -357,7 +433,7 @@ where
         let mut lines = input.lines();
 
         while let Some(line) = lines.next_line().await? {
-            let line = serde_json::from_str::<String>(&line).unwrap_or(line);
+            let line = decode_terminal_input(&line);
             let line = line.trim();
 
             if line == "/quit" || line == "/exit" {
@@ -366,7 +442,7 @@ where
 
             if line == "/help" {
                 let daemon = host(home.clone(), "status".into(), serde_json::json!({})).await.is_ok();
-                let help = command_help(&home, process.is_some(), daemon);
+                let help = command_help(&home, model_plugin_available, daemon);
                 output.write_all(help.as_bytes()).await?;
                 output.flush().await?;
                 continue;
@@ -390,13 +466,25 @@ where
                 continue;
             }
 
-            if line == "/plugins" {
-                let value = match host(home.clone(), "plugin.list".into(), serde_json::json!({})).await {
-                    Ok(value) => value,
-                    Err(_) => local_plugin_list(&home),
-                };
+            if line == "/plugins" || line.starts_with("/plugins ") {
+                let text = match parse_plugin_list_page(line) {
+                    Ok(page) => {
+                        let value = match host(
+                            home.clone(),
+                            "plugin.list".into(),
+                            serde_json::json!({}),
+                        )
+                        .await
+                        {
+                            Ok(value) => value,
+                            Err(_) => local_plugin_list(&home),
+                        };
 
-                let text = format!("{}\n> ", format_plugins(&value));
+                        format!("{}\n> ", format_plugins(&value, page))
+                    }
+
+                    Err(()) => "Usage: /plugins [page].\n> ".into(),
+                };
 
                 output.write_all(text.as_bytes()).await?;
                 output.flush().await?;
@@ -472,7 +560,7 @@ where
                     Ok(page) => {
                         match host(home.clone(), "session.list".into(), serde_json::json!({})).await {
                             Ok(value) => {
-                                format_sessions(&value, &session, process.is_some(), page)
+                                format_sessions(&value, &session, model_plugin_available, page)
                             }
 
                             Err(error) => format!("{}.\n> ", sentence(error.to_string())),
@@ -498,19 +586,20 @@ where
 
                 if !valid_session(target) {
                     output.write_all(b"Session ID is invalid. Use lowercase letters, numbers, and hyphens.\n> ").await?;
-                } else if target == session {
+                } else if tui_session_name(&session) == Some(target) {
                     output.write_all(b"Session ID is unchanged.\n> ").await?;
                 } else {
                     match host(
                         home.clone(),
                         "session.rename".into(),
-                        serde_json::json!({"id": session, "target": target}),
+                        serde_json::json!({"id": session, "target": tui_session_id(target)}),
                     )
                     .await
                     {
                         Ok(_) => {
-                            output.write_all(format!("Renamed session {session} to {target}.\n> ").as_bytes()).await?;
-                            session = target.to_owned();
+                            let old_name = tui_session_name(&session).unwrap_or(&session);
+                            output.write_all(format!("Renamed session {old_name} to {target}.\n> ").as_bytes()).await?;
+                            session = tui_session_id(target);
                             let view = read_session(&home, &session, host).await?;
                             model = view.model.clone();
                             messages = view.messages.clone();
@@ -602,12 +691,11 @@ where
             }
 
             if line == "/workspace" {
-                let default_workspace = std::env::var("CRABBOT_ROOT").ok();
-                let active = workspace
-                    .as_deref()
-                    .or(default_workspace.as_deref())
-                    .unwrap_or("not configured");
-                output.write_all(format!("Current workspace: {active}\n> ").as_bytes()).await?;
+                let active = workspace_root(&home, workspace.as_deref());
+                output
+                    .write_all(format!("Current workspace: {}\n> ", active.display()).as_bytes())
+                    .await?;
+
                 output.flush().await?;
                 continue;
             }
@@ -618,7 +706,17 @@ where
                 if value.is_empty() {
                     output.write_all(b"Workspace path cannot be empty.\n> ").await?;
                 } else {
-                    let selected = (value != "reset").then_some(value);
+                    let selected = match resolve_workspace(value) {
+                        Ok(selected) => selected,
+
+                        Err(error) => {
+                            output
+                                .write_all(format!("Workspace was not changed: {error}.\n> ").as_bytes())
+                                .await?;
+                            output.flush().await?;
+                            continue;
+                        }
+                    };
 
                     match host(
                         home.clone(),
@@ -629,15 +727,14 @@ where
                     {
                         Ok(result) => {
                             workspace = result["workspace"].as_str().map(str::to_owned);
-                            let default_workspace = std::env::var("CRABBOT_ROOT").ok();
-                            let active = workspace
-                                .as_deref()
-                                .or(default_workspace.as_deref())
-                                .unwrap_or("not configured");
+                            let active = workspace_root(&home, workspace.as_deref());
                             let message = if value == "reset" {
-                                format!("Workspace reset to the configured default: {active}\n> ")
+                                format!(
+                                    "Workspace reset to the configured default: {}\n> ",
+                                    active.display()
+                                )
                             } else {
-                                format!("Workspace changed to: {active}\n> ")
+                                format!("Workspace changed to: {}\n> ", active.display())
                             };
 
                             output.write_all(message.as_bytes()).await?;
@@ -667,13 +764,50 @@ where
                 continue;
             }
 
-            if line == "/model" {
+            if line == "/model help" {
+                output.write_all(model_help().as_bytes()).await?;
+                output.flush().await?;
+                continue;
+            }
+
+            if line == "/model" || line == "/model show" {
                 output.write_all(format!("Current model: {model}.\n> ").as_bytes()).await?;
                 output.flush().await?;
                 continue;
             }
 
-            if let Some(value) = line.strip_prefix("/model ") {
+            if line == "/model list" {
+                let text = if !model_plugin_available {
+                    "The selected model plugin is unavailable.".into()
+                } else {
+                    sequence = sequence.saturating_add(1);
+
+                    match host(
+                        home.clone(),
+                        "model.list".into(),
+                        serde_json::json!({"plugin": plugin}),
+                    )
+                    .await {
+                        Ok(value) => value["text"].as_str().unwrap_or("The model plugin returned no model list.").to_owned(),
+                        Err(error) => format!("Model list failed: {}", sentence(error.to_string())),
+                    }
+                };
+
+                output.write_all(format!("{text}\n> ").as_bytes()).await?;
+                output.flush().await?;
+                continue;
+            }
+
+            if line == "/model set" {
+                output.write_all(b"Usage: /model set <id>. Use /model list to see Codex models.\n> ").await?;
+                output.flush().await?;
+                continue;
+            }
+
+            if let Some(value) = line
+                .strip_prefix("/model set ")
+                .or_else(|| line.strip_prefix("/model "))
+            {
                 let value = value.trim();
 
                 if !valid_model(value) {
@@ -711,14 +845,16 @@ where
                 if !valid_session(value) {
                     output.write_all(b"Session ID is invalid.\n> ").await?;
                 } else {
-                    match read_session(&home, value, host).await {
+                    let target = tui_session_id(value);
+
+                    match read_session(&home, &target, host).await {
                         Ok(view) => {
-                            session = value.to_owned();
+                            session = target;
                             model = view.model.clone();
                             messages = view.messages.clone();
                             workspace = view.workspace.clone();
                             output
-                                .write_all(format!("Using session {session}.\n> ").as_bytes())
+                                .write_all(format!("Using session {}.\n> ", tui_session_name(&session).unwrap_or(&session)).as_bytes())
                                 .await?;
                             send_session_view(&session_events, view);
                         }
@@ -756,19 +892,22 @@ where
                     match host(
                         home.clone(),
                         "session.new".into(),
-                        serde_json::json!({"id": value, "model": model}),
+                        serde_json::json!({"id": tui_session_id(value), "model": model}),
                     )
                     .await
                     {
                         Ok(_) => {
-                            let view = read_session(&home, value, host).await?;
-                            session = value.to_owned();
+                            let session_id = tui_session_id(value);
+                            let view = read_session(&home, &session_id, host).await?;
+                            session = session_id;
                             model = view.model.clone();
                             messages = view.messages.clone();
                             workspace = view.workspace.clone();
+
                             output
-                                .write_all(format!("Created session {session}.\n> ").as_bytes())
+                                .write_all(format!("Created session {}.\n> ", tui_session_name(&session).unwrap_or(&session)).as_bytes())
                                 .await?;
+
                             send_session_view(&session_events, view);
                         }
 
@@ -808,16 +947,22 @@ where
                 continue;
             }
 
-            let Some(active_process) = process.as_mut() else {
+            let terminal_command = line.strip_prefix('!');
+
+            if terminal_command.is_some_and(|command| command.trim().is_empty()) {
+                output.write_all(b"Usage: !<shell command>\n> ").await?;
+                output.flush().await?;
+                continue;
+            }
+
+            if model == "unset" && terminal_command.is_none() {
                 output
-                    .write_all(
-                        b"No intelligence plugin is installed. Install a model plugin to send messages; session and help commands remain available.\n> ",
-                    )
+                    .write_all(b"No model is selected. Use /model list, then /model set <id>.\n> ")
                     .await?;
 
                 output.flush().await?;
                 continue;
-            };
+            }
 
             let reservation = host(
                 home.clone(),
@@ -830,9 +975,23 @@ where
                 Ok(value) => value["owner"].as_str().map(str::to_owned),
 
                 Err(error) => {
-                    output
-                        .write_all(format!("{}\n> ", sentence(error.to_string())).as_bytes())
-                        .await?;
+                    let message = if error
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains("already working")
+                    {
+                        "Crabbot is already working in this session. Wait for the current turn to finish."
+                            .to_owned()
+                    } else {
+                        sentence(error.to_string())
+                    };
+
+                    if let Some(events) = &engine_events {
+                        let _ = events.send(EngineEvent::SystemNotice(message));
+                        output.write_all(b"> ").await?;
+                    } else {
+                        output.write_all(format!("{message}\n> ").as_bytes()).await?;
+                    }
 
                     output.flush().await?;
                     continue;
@@ -876,221 +1035,188 @@ where
             .await
             {
                 let _ = reservation.release().await;
-                output
-                    .write_all(
-                        format!("Turn was not saved: {}.\n> ", sentence(error.to_string())).as_bytes(),
-                    )
-                    .await?;
+
+                let message = format!("Turn was not saved: {}.", sentence(error.to_string()));
+
+                if let Some(events) = &engine_events {
+                    let _ = events.send(EngineEvent::SystemNotice(message));
+                    output.write_all(b"> ").await?;
+                } else {
+                    output.write_all(format!("{message}\n> ").as_bytes()).await?;
+                }
+
                 output.flush().await?;
                 continue;
             }
 
             messages.push(user);
-            let (sender, mut events) = mpsc::channel(32);
-            let request = Request::call(
-                sequence,
-                "generate",
-                serde_json::to_value(ModelRequest {
-                    model: model.clone(),
-                    workspace: workspace.clone().or_else(|| std::env::var("CRABBOT_ROOT").ok()),
-                    messages: messages.clone(),
-                    stream: true,
-                    tools: Vec::new(),
-                })?,
-            );
-            let mut streamed = String::new();
-            let response = {
-                let call = active_process.call_stream_async(request, move |note| {
-                    let sender = sender.clone();
-
-                    async move {
-                        sender.send(note).await.map_err(|_| {
-                            crabbot_core::Error::Protocol("Terminal output is unavailable.".into())
-                        })
-                    }
-                });
-
-                tokio::pin!(call);
-
-                if let Some(events) = &engine_events {
-                    let _ = events.send(EngineEvent::GenerationStarted);
-                }
-
-                let mut reservation_refresh = tokio::time::interval(Duration::from_secs(30));
-                reservation_refresh.tick().await;
-
-                loop {
-                    tokio::select! {
-                        biased;
-
-                        _ = interrupt_rx.recv(), if !interrupt_rx.is_closed() => break None,
-
-                        _ = reservation_refresh.tick() => {
-                            if host(
-                                home.clone(),
-                                "session.renew".into(),
-                                serde_json::json!({"id": session, "owner": reservation.owner}),
-                            )
-                            .await
-                            .is_err()
-                            {
-                                break None;
-                            }
-                        }
-
-                        result = &mut call => break Some(result),
-
-                        event = events.recv() => {
-                            if let Some(text) = event.and_then(stream_text) {
-                                streamed.push_str(&text);
-                                output.write_all(text.as_bytes()).await?;
-                                output.flush().await?;
-                            }
-                        }
-                    }
-                }
-            };
-
-            let Some(response) = response else {
-                while let Ok(event) = events.try_recv() {
-                    if let Some(text) = stream_text(event) {
-                        streamed.push_str(&text);
-                        output.write_all(text.as_bytes()).await?;
-                    }
-                }
-
-                let mut truncated = false;
-
-                if !streamed.is_empty() {
-                    let (saved_text, was_truncated) = saveable_reply(&streamed);
-                    truncated = was_truncated;
-
-                    let assistant = Message {
-                        id: message_id("assistant", sequence),
-                        session: session.clone(),
-                        role: Role::Assistant,
-                        sender: None,
-                        content: vec![Content::Text { text: saved_text }],
-                    };
-
-                    host(
-                        home.clone(),
-                        "session.append_reserved".into(),
-                        serde_json::json!({"id": session, "owner": reservation.owner, "message": assistant}),
-                    )
-                    .await?;
-                    messages.push(assistant);
-                }
-
-                reservation.release().await?;
-
-                if let Some(process) = process.as_mut() {
-                    process.restart().await?;
-                }
-
-                if let Some(events) = &engine_events {
-                    let _ = events.send(EngineEvent::GenerationFinished { interrupted: true });
-                }
-
-                output.write_all(b"\nGeneration interrupted.").await?;
-
-                if truncated {
-                    output.write_all(b" Only the first 16 KiB was saved.").await?;
-                }
-
-                output.write_all(b"\n> ").await?;
-                output.flush().await?;
-                continue;
-            };
-
-            let response = match response {
-                Ok(response) => response,
-
-                Err(error) => {
-                    let _ = reservation.release().await;
-                    return Err(error);
-                }
-            };
-
-            while let Ok(event) = events.try_recv() {
-                if let Some(text) = stream_text(event) {
-                    streamed.push_str(&text);
-                    output.write_all(text.as_bytes()).await?;
-                }
-            }
-
-            if let Some(error) = response.error {
-                let _ = reservation.release().await;
-                return Err(crabbot_core::Error::Denied(error.message));
-            }
-
-            let Some(value) = response.result else {
-                let _ = reservation.release().await;
-                return Err(crabbot_core::Error::Denied(
-                    "The intelligence plugin returned no result.".into(),
-                ));
-            };
-
-            let reply: crabbot_core::types::ModelReply = serde_json::from_value(value)?;
-            let (saved_text, truncated) = saveable_reply(&reply.text);
-            let assistant = Message {
-                id: message_id("assistant", sequence),
-                session: session.clone(),
-                role: Role::Assistant,
-                sender: None,
-                content: vec![Content::Text { text: saved_text }],
-            };
-
-            let saved = host(
-                home.clone(),
-                "session.append_reserved".into(),
-                serde_json::json!({"id": session, "owner": reservation.owner, "message": assistant}),
-            )
-            .await;
-            messages.push(assistant);
-
-            reservation.release().await?;
-
-            if streamed.is_empty() {
-                output.write_all(reply.text.as_bytes()).await?;
-            } else if let Some(rest) = reply.text.strip_prefix(&streamed) {
-                output.write_all(rest.as_bytes()).await?;
-            } else if !reply.text.is_empty() {
-                output.write_all(b"\n").await?;
-                output.write_all(reply.text.as_bytes()).await?;
-            }
-
-            if let Err(error) = saved {
-                output
-                    .write_all(
-                        format!("\nReply was not saved: {}.", sentence(error.to_string())).as_bytes(),
-                    )
-                    .await?;
-            }
-
-            if truncated {
-                output.write_all(b"\nOnly the first 16 KiB of the reply was saved.").await?;
-            }
-
-            output.write_all(b"\n> ").await?;
-            output.flush().await?;
 
             if let Some(events) = &engine_events {
-                let _ = events.send(EngineEvent::GenerationFinished { interrupted: false });
+                let _ = events.send(EngineEvent::GenerationStarted);
             }
+
+            let (method, params) = if terminal_command.is_some() {
+                (
+                    "session.command",
+                    serde_json::json!({"id": session, "owner": reservation.owner}),
+                )
+            } else {
+                ("session.answer", serde_json::json!({"id": session, "plugin": plugin}))
+            };
+
+            let streaming_turn = streaming_host.is_some() && engine_events.is_some();
+            let response: Pin<
+                Box<dyn Future<Output = crabbot_core::Result<Value>> + Send>,
+            > = match (streaming_host, engine_events.as_ref()) {
+                (Some(streaming_host), Some(events)) => {
+                    streaming_host(home.clone(), method.into(), params, events.clone())
+                }
+
+                _ => Box::pin(host(home.clone(), method.into(), params)),
+            };
+
+            tokio::pin!(response);
+            let (response, interrupted) = loop {
+                tokio::select! {
+                    biased;
+                    response = &mut response => break (response, false),
+
+                    incoming = lines.next_line() => {
+                        let Some(command) = incoming? else { break (Err(crabbot_core::Error::Denied("Terminal input closed during generation".into())), true) };
+
+                        let command = decode_terminal_input(&command);
+                        let command = command.trim();
+
+                        if command == "/quit" || command == "/exit" {
+                            let _ = host(home.clone(), "session.cancel".into(), serde_json::json!({"id": session})).await;
+                            break (Err(crabbot_core::Error::Denied("Generation interrupted".into())), true);
+                        }
+
+                        if command == "/approvals" || command.starts_with("/approve") || command.starts_with("/deny") {
+                            let message = resolve_turn_approval(
+                                &home,
+                                &session,
+                                &reservation.owner,
+                                command,
+                                &mut sequence,
+                                host,
+                            )
+                            .await?;
+
+                            let reported = engine_events
+                                .as_ref()
+                                .is_some_and(|events| {
+                                    events
+                                        .send(EngineEvent::SystemNotice(
+                                            message.trim_end().to_owned(),
+                                        ))
+                                        .is_ok()
+                                });
+
+                            if !reported {
+                                output.write_all(message.as_bytes()).await?;
+                                output.flush().await?;
+                            }
+
+                            continue;
+                        }
+
+                        output.write_all(b"A turn is still running. Use /approvals, /approve <id>, /deny <id>, or Esc to cancel.\n").await?;
+                        output.flush().await?;
+                    }
+
+                    _ = interrupt_rx.recv(), if !interrupt_rx.is_closed() => {
+                        let _ = host(
+                            home.clone(),
+                            "session.cancel".into(),
+                            serde_json::json!({"id": session}),
+                        ).await;
+                        break (Err(crabbot_core::Error::Denied("Generation interrupted".into())), true);
+                    }
+                }
+            };
+
+            let _ = reservation.release().await;
+
+            match response {
+                Ok(value) => {
+                    let reply = value["text"].as_str().unwrap_or_default();
+
+                    if !reply.is_empty() {
+                        output.write_all(reply.as_bytes()).await?;
+                        output.write_all(b"\n").await?;
+                    }
+                }
+
+                Err(error) => {
+                    if interrupted {
+                        output.write_all(b"Generation interrupted.\n").await?;
+                    } else {
+                        output
+                            .write_all(format!("Request failed: {}.\n", sentence(error.to_string())).as_bytes())
+                            .await?;
+                    }
+                }
+            }
+
+            if streaming_turn
+                && let Some(events) = &engine_events
+            {
+                let _ = events.send(EngineEvent::AssistantFinished);
+            }
+
+            if let Some(events) = &engine_events {
+                let _ = events.send(EngineEvent::GenerationFinished { interrupted });
+            }
+
+            output.write_all(b"> ").await?;
+            output.flush().await?;
+            continue;
+
         }
 
         Ok::<(), crabbot_core::Error>(())
     }
     .await;
 
-    let stopped = match process {
-        Some(process) => process.stop().await,
-        None => Ok(()),
-    };
-
     result?;
-    stopped
+    Ok(())
+}
+
+fn workspace_root(home: &str, session_workspace: Option<&str>) -> PathBuf {
+    session_workspace
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CRABBOT_ROOT").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(home).join("workspace"))
+}
+
+fn resolve_workspace(value: &str) -> Result<Option<String>, &'static str> {
+    let current = std::env::var_os("CRABBOT_TUI_LAUNCH_DIR").map(PathBuf::from).map_or_else(
+        || std::env::current_dir().map_err(|_| "the current directory is unavailable"),
+        Ok,
+    )?;
+
+    resolve_workspace_at(value, &current)
+}
+
+fn resolve_workspace_at(
+    value: &str,
+    current: &std::path::Path,
+) -> Result<Option<String>, &'static str> {
+    if value == "reset" {
+        return Ok(None);
+    }
+
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() { path } else { current.join(path) };
+
+    let path = path.canonicalize().map_err(|_| "the directory is unavailable")?;
+
+    if !path.is_dir() {
+        return Err("the selected path is not a directory");
+    }
+
+    Ok(Some(path.to_string_lossy().into_owned()))
 }
 
 async fn ensure_session<C, F>(
@@ -1105,7 +1231,7 @@ where
 {
     host(home.into(), "session.ensure".into(), serde_json::json!({"id": id, "model": model}))
         .await?;
-    read_session(home, id, host).await
+    read_session_with_reservation(home, id, host, true).await
 }
 
 async fn read_session<C, F>(home: &str, id: &str, host: C) -> crabbot_core::Result<ui::SessionView>
@@ -1152,7 +1278,8 @@ where
 
     let messages = serde_json::from_value(value["messages"].clone())?;
     let workspace = value["workspace"].as_str().map(str::to_owned);
-    Ok(ui::SessionView { id: id.to_owned(), model, workspace, messages })
+    let working = value["status"] == "working" || value["inflight"] == true;
+    Ok(ui::SessionView { id: id.to_owned(), model, workspace, messages, working })
 }
 
 fn send_session_view(
@@ -1217,7 +1344,7 @@ where
     C: Fn(String, String, Value) -> F + Copy,
     F: Future<Output = crabbot_core::Result<Value>>,
 {
-    let mut ids = targets.ids;
+    let mut ids = targets.ids.into_iter().map(|id| tui_session_id(&id)).collect::<Vec<_>>();
 
     if targets.all {
         let sessions =
@@ -1232,6 +1359,7 @@ where
             .as_array()
             .into_iter()
             .flatten()
+            .filter(|item| item["id"].as_str().is_some_and(|id| tui_session_name(id).is_some()))
             .filter(|item| {
                 action == "delete" || item["archived"].as_bool().unwrap_or(false) == archived
             })
@@ -1263,11 +1391,11 @@ where
 
         match host(home.to_owned(), method.into(), serde_json::json!({"id": id})).await {
             Ok(result) if action == "delete" || result["changed"] != false => {
-                completed.push(id);
+                completed.push(tui_session_name(&id).unwrap_or(&id).to_owned());
             }
 
-            Ok(_) => already.push(id),
-            Err(error) => failures.push(format!("{id}: {}", sentence(error.to_string()))),
+            Ok(_) => already.push(tui_session_name(&id).unwrap_or(&id).to_owned()),
+            Err(error) => failures.push(sentence(error.to_string())),
         }
     }
 
@@ -1310,7 +1438,10 @@ where
     }
 
     if active_skipped {
-        summary.push_str(&format!(". Kept active session {active}"));
+        summary.push_str(&format!(
+            ". Kept active session {}",
+            tui_session_name(active).unwrap_or(active)
+        ));
     }
 
     if !failures.is_empty() {
@@ -1329,12 +1460,115 @@ fn valid_model(value: &str) -> bool {
         })
 }
 
+#[cfg(test)]
+fn invalid_model_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+
+    ["invalid model", "unknown model", "model not found"]
+        .iter()
+        .any(|phrase| message.contains(phrase))
+}
+
 fn plugin_binary_path(home: &str, id: &str) -> std::path::PathBuf {
     std::path::Path::new(home)
         .join("plugins")
         .join(id)
         .join("bin")
         .join(crabbot_core::plugin::binary_name(id))
+}
+
+#[cfg(test)]
+fn read_only_tools() -> Vec<ToolSpec> {
+    [
+        (
+            "read",
+            "Read a text file inside the active workspace.",
+            serde_json::json!({"path": {"type": "string"}}),
+            vec!["path"],
+        ),
+        (
+            "list",
+            "List entries in a workspace directory.",
+            serde_json::json!({"path": {"type": "string"}}),
+            Vec::new(),
+        ),
+        (
+            "search",
+            "Search workspace text for a phrase.",
+            serde_json::json!({
+                "path": {"type": "string"},
+                "text": {"type": "string"}
+            }),
+            vec!["text"],
+        ),
+    ]
+    .into_iter()
+    .map(|(name, description, properties, required)| ToolSpec {
+        name: name.into(),
+        description: Some(description.into()),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false,
+        }),
+    })
+    .collect()
+}
+
+#[cfg(test)]
+async fn serve_read_only_tool(
+    tools: Arc<Mutex<Option<ToolsProcess>>>,
+    request: Request,
+    workspace: Option<String>,
+) -> crabbot_core::Result<Response> {
+    let Request::Call { id, method, params, .. } = request else {
+        return Err(crabbot_core::Error::Protocol("Tool requests require an ID.".into()));
+    };
+
+    if method != "host/tool" {
+        return Ok(Response::fail(id, -32601, "Method not found."));
+    }
+
+    let Some(name) =
+        params["name"].as_str().filter(|name| matches!(*name, "read" | "list" | "search"))
+    else {
+        return Ok(Response::fail(id, -32000, "Only read-only tools are available in the TUI."));
+    };
+
+    let mut arguments = params.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let Some(arguments) = arguments.as_object_mut() else {
+        return Ok(Response::fail(id, -32602, "Tool arguments must be an object."));
+    };
+
+    if let Some(workspace) = workspace {
+        arguments.insert("workspace".into(), Value::String(workspace));
+    }
+
+    let mut tools = tools.lock().await;
+    let Some(tools) = tools.as_mut() else {
+        return Ok(Response::fail(id, -32000, "The tools plugin is unavailable."));
+    };
+
+    let response =
+        tools.process.call(Request::call(id, name, Value::Object(arguments.clone()))).await?;
+
+    if let Some(error) = response.error {
+        return Ok(Response::fail(id, error.code, error.message));
+    }
+
+    let result = response.result.unwrap_or(Value::Null);
+    let text = match name {
+        "read" => result["text"].as_str().unwrap_or_default().to_owned(),
+        "list" => result["items"]
+            .as_array()
+            .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default(),
+        "search" => serde_json::to_string_pretty(&result["hits"]).unwrap_or_else(|_| "[]".into()),
+        _ => unreachable!(),
+    };
+
+    Ok(Response::ok(id, serde_json::json!({"text": text})))
 }
 
 fn has_capability(home: &str, capability: &str) -> bool {
@@ -1367,58 +1601,106 @@ fn has_capability(home: &str, capability: &str) -> bool {
 }
 
 fn command_help(home: &str, has_model: bool, daemon: bool) -> String {
-    let mut help = String::from(
-        "Commands:\n  /help                      Show commands available in this session.\n  /status                    Show whether the background runtime is running.\n  /plugins                   List installed plugins.\n  /session help              Show session commands.\n  /new <id>                  Create and switch to a session.\n  /workspace [path|reset]    Show or change this session's filesystem root.\n  /clear                     Clear this session's conversation.\n  /statusline [format|reset] Show, configure, or reset the bottom statusline.\n  /animation [on|off]        Show or configure typewriter animation.\n  /quit, /exit               Leave the TUI.\n",
-    );
+    let commands = [
+        ("/help", "Show commands available in this session."),
+        ("/status", "Show whether the background runtime is running."),
+        ("/plugins [page]", "Browse installed plugins."),
+        ("/session help", "Show session commands."),
+        ("/new <id>", "Create and switch to a session."),
+        ("/workspace [path|reset]", "Show or change this session's filesystem root."),
+        ("/clear", "Clear this session's conversation."),
+        ("/statusline [format|reset]", "Show, configure, or reset the bottom statusline."),
+        ("/animation [on|off]", "Show or configure typewriter animation."),
+        ("/quit, /exit", "Leave the TUI."),
+    ];
+
+    let mut command_rows = commands.to_vec();
+
+    if daemon {
+        command_rows.push(("!<command>", "Run a shell command directly in this session."));
+    }
+
+    let mut sections = vec![format!("Commands:\n{}", format_help_rows(&command_rows))];
     let mut conditional = Vec::new();
 
     if has_model {
-        conditional.push("  /model [id]              Show or change the model ID.");
+        conditional.push(("/model <help|list|show|set>", "Manage the selected model."));
     }
 
     if daemon && has_capability(home, "tool") {
         conditional.extend([
-            "  /approval                Show approval policy.",
-            "  /approvals               List pending tool approvals.",
-            "  /approve <id>            Approve a pending tool action.",
-            "  /deny <id>               Deny a pending tool action.",
+            ("/approval", "Show approval policy."),
+            ("/approvals", "List pending tool approvals."),
+            ("/approve <id>", "Approve a pending tool action."),
+            ("/deny <id>", "Deny a pending tool action."),
         ]);
     }
 
     if daemon && has_capability(home, "channel") {
         conditional.extend([
-            "  /deliveries              List pending channel deliveries.",
-            "  /retry <id>              Retry a delivery.",
-            "  /drop <id>               Drop a delivery.",
+            ("/deliveries", "List pending channel deliveries."),
+            ("/retry <id>", "Retry a delivery."),
+            ("/drop <id>", "Drop a delivery."),
         ]);
     }
 
     if daemon && has_capability(home, "timer") {
-        conditional.push("  /timer <list|add|remove> Manage timers.");
+        conditional.push(("/timer <list|add|remove>", "Manage timers."));
     }
 
     if daemon && has_capability(home, "memory") {
-        conditional.push("  /memory <list|remember|forget> Manage memories.");
+        conditional.push(("/memory <list|remember|forget>", "Manage memories."));
     }
 
     if !conditional.is_empty() {
-        help.push_str("\nConditional Commands (shown only when usable):\n");
-        help.push_str(&conditional.join("\n"));
-        help.push('\n');
+        sections.push(format!(
+            "Conditional commands (shown only when usable):\n{}",
+            format_help_rows(&conditional)
+        ));
     }
 
-    help.push_str(
-        "\nPlugin commands are CLI commands; run them as `crab <command>`.\nPage Up/Down scroll the conversation by a page; the mouse wheel scrolls the pane under the pointer.\nUse Ctrl+O for a new message line.\n> ",
+    sections.push(
+        "Plugin commands run in the CLI: crab <command>.\nPage Up/Down scroll the conversation; the mouse wheel scrolls the pane under the pointer. Hold Shift while dragging to select and copy text.\nCtrl+O adds a message line.".into(),
     );
-    help
+
+    format!("{}\n> ", sections.join("\n\n"))
+}
+
+fn format_help_rows(rows: &[(&str, &str)]) -> String {
+    let command_width = rows.iter().map(|(command, _)| command.len()).max().unwrap_or_default();
+
+    rows.iter()
+        .map(|(command, description)| format!("  {command:<command_width$}  {description}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn session_help() -> &'static str {
     "Session commands:\n  /session help                       Show these commands.\n  /session list [page]                List sessions, 10 per page; active first, then recent.\n  /session create <id>                Create and switch to a session.\n  /session switch <id>                Switch to a saved session.\n  /session rename <new-id>            Rename the active session.\n  /session archive <id>...|--all      Archive saved sessions.\n  /session unarchive <id>...|--all    Restore archived sessions.\n  /session delete <id>...|--all [-y]  Permanently delete sessions.\n  /new <id>                           Create and switch to a session (shortcut).\n> "
 }
 
+fn model_help() -> &'static str {
+    "Model commands:\n  /model help          Show these commands.\n  /model list          List Codex models (when Codex is selected).\n  /model show          Show the selected model.\n  /model set <id>      Select a model.\n  /model <id>          Select a model (shortcut).\n> "
+}
+
 #[cfg(test)]
 async fn local_aware(home: String, method: String, params: Value) -> crabbot_core::Result<Value> {
+    if method == "session.answer" {
+        return Ok(serde_json::json!({"text": "Reply"}));
+    }
+
+    if method == "model.list" {
+        return Ok(
+            serde_json::json!({"text": "Codex models (1):\n  gpt-test - Test model (default)"}),
+        );
+    }
+
+    if method == "plugin.list" {
+        return Ok(serde_json::json!({"items": [{
+            "id": "codex", "health": "ready", "capabilities": ["model"]
+        }]}));
+    }
+
     match control(&home, &method, params.clone()).await {
         Ok(value) => Ok(value),
 
@@ -1430,49 +1712,123 @@ async fn local_aware(home: String, method: String, params: Value) -> crabbot_cor
     }
 }
 
-#[derive(Clone, Copy)]
-enum SessionBackend {
-    Daemon,
-    Offline,
+async fn require_daemon(home: &str) -> crabbot_core::Result<()> {
+    control(home, "status", serde_json::json!({})).await.map(|_| ()).map_err(|error| match error {
+        ControlError::Unavailable(_) => crabbot_core::Error::Denied(
+            concat!(
+                "The Crabbot daemon is not running.\n",
+                "Start it with `crab service start` or run `crabbot-daemon`."
+            )
+            .into(),
+        ),
+        ControlError::Failed(error) => error,
+    })
 }
 
-async fn select_session_backend(
+fn decode_terminal_input(line: &str) -> String {
+    serde_json::from_str::<String>(line).unwrap_or_else(|_| line.to_owned())
+}
+
+async fn resolve_turn_approval<C, F>(
     home: &str,
     session: &str,
-    model: &str,
-) -> crabbot_core::Result<SessionBackend> {
-    let params = serde_json::json!({"id": session, "model": model});
-
-    match control(home, "session.ensure", params.clone()).await {
-        Ok(_) => Ok(SessionBackend::Daemon),
-
-        Err(error) if error.is_unavailable() => {
-            offline::control(home, "session.ensure", params).await?;
-            Ok(SessionBackend::Offline)
-        }
-
-        Err(error) => Err(error.into_core()),
-    }
-}
-
-async fn control_with_backend<C, F>(
-    backend: SessionBackend,
-    home: String,
-    method: String,
-    params: Value,
-    daemon: C,
-) -> crabbot_core::Result<Value>
+    owner: &str,
+    command: &str,
+    sequence: &mut u64,
+    host: C,
+) -> crabbot_core::Result<String>
 where
-    C: Fn(String, String, Value) -> F,
+    C: Fn(String, String, Value) -> F + Copy,
     F: Future<Output = crabbot_core::Result<Value>>,
 {
-    if method.starts_with("session.")
-        && let SessionBackend::Offline = backend
-    {
-        return offline::control(&home, &method, params).await;
+    if command == "/approvals" {
+        let value = host(home.to_owned(), "approval.list".into(), serde_json::json!({})).await?;
+        return Ok(format_approvals(&value));
     }
 
-    daemon(home, method, params).await
+    let (approved, supplied_id) = if command == "/approve" {
+        (true, "")
+    } else if command == "/deny" {
+        (false, "")
+    } else if let Some(id) = command.strip_prefix("/approve ") {
+        (true, id.trim())
+    } else if let Some(id) = command.strip_prefix("/deny ") {
+        (false, id.trim())
+    } else {
+        return Ok("Usage: /approve <id> or /deny <id>.\n".into());
+    };
+
+    let list = host(home.to_owned(), "approval.list".into(), serde_json::json!({})).await?;
+    let Some(items) = list["items"].as_array() else {
+        return Ok("Pending approvals: none.\n".into());
+    };
+
+    let candidates = items
+        .iter()
+        .filter(|item| {
+            if supplied_id.is_empty() {
+                item["target"]["session"] == session
+            } else {
+                item["id"].as_str() == Some(supplied_id)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let Some(item) = (candidates.len() == 1).then(|| candidates[0]) else {
+        return Ok(if candidates.is_empty() {
+            "No matching pending approval. Use /approvals to see the current requests.\n".into()
+        } else {
+            "More than one approval is pending for this session; use /approve <id> or /deny <id>.\n"
+                .into()
+        });
+    };
+
+    let id = item["id"].as_str().unwrap_or_default();
+    let result = host(
+        home.to_owned(),
+        "approval.resolve".into(),
+        serde_json::json!({"id": id, "approved": approved}),
+    )
+    .await;
+    let reply = match result {
+        Ok(_) if approved => "Approval accepted.".to_owned(),
+        Ok(_) => "Approval denied.".to_owned(),
+        Err(error) => sentence(error.to_string()),
+    };
+
+    *sequence = sequence.saturating_add(1);
+    let user = Message {
+        id: message_id("user", *sequence),
+        session: session.into(),
+        role: Role::User,
+        sender: Some("tui".into()),
+        content: vec![Content::Text { text: command.into() }],
+    };
+
+    host(
+        home.to_owned(),
+        "session.append_reserved".into(),
+        serde_json::json!({"id": session, "owner": owner, "message": user}),
+    )
+    .await?;
+
+    *sequence = sequence.saturating_add(1);
+    let assistant = Message {
+        id: message_id("system-assistant", *sequence),
+        session: session.into(),
+        role: Role::Assistant,
+        sender: None,
+        content: vec![Content::Text { text: reply.clone() }],
+    };
+
+    host(
+        home.to_owned(),
+        "session.append_reserved".into(),
+        serde_json::json!({"id": session, "owner": owner, "message": assistant}),
+    )
+    .await?;
+
+    Ok(format!("{reply}\n"))
 }
 
 async fn daemon_control(
@@ -1495,6 +1851,7 @@ impl From<crabbot_core::Error> for ControlError {
 }
 
 impl ControlError {
+    #[cfg(test)]
     fn is_unavailable(&self) -> bool {
         matches!(self, Self::Unavailable(_))
     }
@@ -1738,6 +2095,7 @@ fn message_id(role: &str, sequence: u64) -> String {
     format!("tui-{role}-{now}-{sequence}")
 }
 
+#[cfg(test)]
 fn saveable_reply(text: &str) -> (String, bool) {
     if text.len() <= SAVED_REPLY_LIMIT {
         return (text.to_owned(), false);
@@ -1752,6 +2110,7 @@ fn saveable_reply(text: &str) -> (String, bool) {
     (text[..end].to_owned(), true)
 }
 
+#[cfg(test)]
 fn stream_text(request: Request) -> Option<String> {
     let Request::Note { method, params, .. } = request else {
         return None;
@@ -1762,6 +2121,14 @@ fn stream_text(request: Request) -> Option<String> {
     }
 
     params["event"]["text"].as_str().map(str::to_owned)
+}
+
+fn final_reply_suffix<'a>(streamed: &str, final_text: &'a str) -> &'a str {
+    if streamed.is_empty() {
+        final_text
+    } else {
+        final_text.strip_prefix(streamed).unwrap_or_default()
+    }
 }
 
 fn terminal(mode: &str) -> crabbot_core::Result<std::fs::File> {
@@ -1787,6 +2154,15 @@ async fn control(
     method: &str,
     params: Value,
 ) -> std::result::Result<Value, ControlError> {
+    control_with_stream(home, method, params, None).await
+}
+
+async fn control_with_stream(
+    home: &str,
+    method: &str,
+    params: Value,
+    events: Option<mpsc::UnboundedSender<EngineEvent>>,
+) -> std::result::Result<Value, ControlError> {
     let token = tokio::fs::read_to_string(std::path::Path::new(home).join("ipc.token"))
         .await
         .map_err(unavailable_before_delivery)?;
@@ -1798,6 +2174,8 @@ async fn control(
         .map_err(|error| {
             crabbot_core::Error::Denied(format!("The daemon port is invalid: {error}."))
         })?;
+
+    let streaming_turn = matches!(method, "session.answer" | "session.command");
 
     let exchange = async {
         let stream = TcpStream::connect(("127.0.0.1", port))
@@ -1813,39 +2191,121 @@ async fn control(
                 ControlError::Failed(crabbot_core::Error::Denied(error.to_string()))
             })?;
 
-        let response: IpcResponse = jsonl::read(&mut input, jsonl::MAX)
-            .await
-            .map_err(ControlError::Failed)?
-            .ok_or_else(|| {
-                ControlError::Failed(crabbot_core::Error::Denied(
-                    "The daemon closed the IPC connection.".into(),
-                ))
-            })?;
+        let system_output = method == "session.command";
+        let mut streamed = String::new();
 
-        if !response.valid() || response.id != 1 {
-            return Err(ControlError::Failed(crabbot_core::Error::Denied(
-                "The daemon returned an invalid response.".into(),
-            )));
-        }
+        loop {
+            let response: IpcResponse = jsonl::read(&mut input, jsonl::MAX)
+                .await
+                .map_err(ControlError::Failed)?
+                .ok_or_else(|| {
+                    ControlError::Failed(crabbot_core::Error::Denied(
+                        "The daemon closed the IPC connection.".into(),
+                    ))
+                })?;
 
-        match (response.result, response.error) {
-            (Some(value), _) => Ok(value),
-
-            (_, Some(error)) => {
-                Err(ControlError::Failed(crabbot_core::Error::Denied(error.message)))
+            if !response.valid() || response.id != 1 {
+                return Err(ControlError::Failed(crabbot_core::Error::Denied(
+                    "The daemon returned an invalid response.".into(),
+                )));
             }
 
-            _ => Err(ControlError::Failed(crabbot_core::Error::Denied(
-                "The daemon returned an empty response.".into(),
-            ))),
+            if let Some(error) = response.error {
+                return Err(ControlError::Failed(crabbot_core::Error::Denied(error.message)));
+            }
+
+            let Some(value) = response.result else {
+                return Err(ControlError::Failed(crabbot_core::Error::Denied(
+                    "The daemon returned an empty response.".into(),
+                )));
+            };
+
+            if streaming_turn {
+                if value["event"] == "approval" {
+                    let id = value["id"].as_str().unwrap_or("unknown");
+                    let text = value["text"].as_str().unwrap_or("a tool action");
+                    let tool = value["tool"].as_str().unwrap_or("tool");
+                    let arguments = value["arguments"].as_str().unwrap_or("{}");
+                    let command = value["command"].as_str();
+
+                    if let Some(events) = &events {
+                        let _ = events.send(EngineEvent::SystemNotice(format_approval_notice(
+                            id, tool, arguments, command, text,
+                        )));
+                    }
+
+                    continue;
+                }
+
+                if value["event"] == "text" {
+                    if let Some(text) = value["text"].as_str() {
+                        streamed.push_str(text);
+
+                        if !text.is_empty()
+                            && let Some(events) = &events
+                        {
+                            let event = if system_output {
+                                EngineEvent::SystemText(text.to_owned())
+                            } else {
+                                EngineEvent::AssistantText(text.to_owned())
+                            };
+
+                            let _ = events.send(event);
+                        }
+                    }
+
+                    continue;
+                }
+
+                if value["done"] == true {
+                    let final_text = value["text"].as_str().unwrap_or(&streamed);
+
+                    if let Some(events) = &events {
+                        let suffix = final_reply_suffix(&streamed, final_text);
+
+                        if !suffix.is_empty() {
+                            let event = if system_output {
+                                EngineEvent::SystemText(suffix.to_owned())
+                            } else {
+                                EngineEvent::AssistantText(suffix.to_owned())
+                            };
+
+                            let _ = events.send(event);
+                        }
+
+                        return Ok(serde_json::json!({"text": ""}));
+                    }
+
+                    return Ok(serde_json::json!({"text": final_text}));
+                }
+
+                continue;
+            }
+
+            return Ok(value);
         }
     };
 
-    timeout(Duration::from_secs(5), exchange).await.map_err(|_| {
+    let wait = if streaming_turn { STREAMING_TURN_TIMEOUT } else { CONTROL_TIMEOUT };
+
+    timeout(wait, exchange).await.map_err(|_| {
         ControlError::Failed(crabbot_core::Error::Denied(
             "The daemon did not respond in time.".into(),
         ))
     })?
+}
+
+fn daemon_streaming_control(
+    home: String,
+    method: String,
+    params: Value,
+    events: mpsc::UnboundedSender<EngineEvent>,
+) -> Pin<Box<dyn Future<Output = crabbot_core::Result<Value>> + Send>> {
+    Box::pin(async move {
+        control_with_stream(&home, &method, params, Some(events))
+            .await
+            .map_err(ControlError::into_core)
+    })
 }
 
 async fn delivery_action<C, F>(home: &str, method: &str, id: &str, host: C) -> String
@@ -1867,6 +2327,36 @@ where
         Ok(value) => format!("Delivery {}.", value["status"].as_str().unwrap_or("updated")),
         Err(error) => format!("{}.", sentence(error.to_string())),
     }
+}
+
+fn format_approval_notice(
+    id: &str,
+    tool: &str,
+    arguments: &str,
+    command: Option<&str>,
+    details: &str,
+) -> String {
+    let mut message = String::from("Approval needed.");
+    message.push_str(&format!("\nTool: {tool}"));
+
+    if tool == "shell" {
+        message.push_str("\nCommand: ");
+        message.push_str(command.unwrap_or("(command unavailable)"));
+    } else {
+        message.push_str(&format!("\nArguments: {arguments}"));
+        message.push_str("\nAction: ");
+
+        let action = details
+            .trim()
+            .strip_prefix("Crabbot requests approval to ")
+            .unwrap_or(details.trim())
+            .trim_end_matches('.');
+
+        message.push_str(action);
+    }
+
+    message.push_str(&format!("\nApprove: /approve {id}\nDeny: /deny {id}"));
+    message
 }
 
 fn format_status(value: &Value) -> String {
@@ -1964,6 +2454,25 @@ fn parse_session_list_page(command: &str) -> Result<usize, ()> {
     Ok(page)
 }
 
+fn parse_plugin_list_page(command: &str) -> Result<usize, ()> {
+    let mut parts = command.split_whitespace();
+
+    if parts.next() != Some("/plugins") {
+        return Err(());
+    }
+
+    let page = match parts.next() {
+        Some(value) => value.parse::<usize>().ok().filter(|page| *page > 0).ok_or(())?,
+        None => 1,
+    };
+
+    if parts.next().is_some() {
+        return Err(());
+    }
+
+    Ok(page)
+}
+
 fn format_sessions(
     value: &Value,
     active_session: &str,
@@ -1975,6 +2484,8 @@ fn format_sessions(
     };
 
     let mut items = items.iter().filter(|item| item["id"].as_str().is_some()).collect::<Vec<_>>();
+
+    items.retain(|item| item["id"].as_str().is_some_and(|id| tui_session_name(id).is_some()));
 
     if items.is_empty() {
         return "Sessions: none.\n> ".into();
@@ -2004,7 +2515,8 @@ fn format_sessions(
     let end = (start + SESSION_LIST_PAGE_SIZE).min(total);
     let sessions = items[start..end]
         .iter()
-        .filter_map(|item| {
+        .enumerate()
+        .filter_map(|(index, item)| {
             let id = item["id"].as_str()?;
             let state = SessionState::from_item(item, active_session);
             let status = state.label();
@@ -2014,8 +2526,6 @@ fn format_sessions(
             } else {
                 "unset"
             };
-
-            let marker = state.marker();
 
             let mut details = vec![format!("model: {model}")];
 
@@ -2028,10 +2538,18 @@ fn format_sessions(
             }
 
             if let Some(messages) = item["messages"].as_u64() {
-                details.push(format!("{messages} messages"));
+                details.push(format!("messages: {messages}"));
             }
 
-            Some(format!("{marker} {id} · {status}\n  {}", details.join(" · ")))
+            Some((index, format!("{} | {status}", tui_session_name(id).unwrap_or(id)), details))
+        })
+        .collect::<Vec<_>>();
+
+    let session_count = sessions.len();
+    let sessions = sessions
+        .into_iter()
+        .map(|(index, label, details)| {
+            format_tree_entry(&label, &details, index + 1 == session_count)
         })
         .collect::<Vec<_>>();
 
@@ -2039,10 +2557,10 @@ fn format_sessions(
         "Sessions: none.\n> ".into()
     } else {
         format!(
-            "Sessions ({}-{} of {total}, page {page}/{pages}):\n{}\n> ",
+            "Sessions | {}–{} of {total} | page {page}/{pages}:\n{}\n> ",
             start + 1,
             end,
-            sessions.join("\n")
+            sessions.join("\n\n")
         )
     }
 }
@@ -2081,14 +2599,6 @@ impl<'a> SessionState<'a> {
             (false, false, false) => 2,
         }
     }
-
-    fn marker(&self) -> &'static str {
-        match self.label() {
-            "active" | "working" => "*",
-            "archived" => "-",
-            _ => "o",
-        }
-    }
 }
 
 fn format_session_archive(id: &str, archived: bool, changed: bool) -> String {
@@ -2103,7 +2613,7 @@ fn format_session_archive(id: &str, archived: bool, changed: bool) -> String {
     format!("{action} session {id}.")
 }
 
-fn format_plugins(value: &Value) -> String {
+fn format_plugins(value: &Value, page: usize) -> String {
     let Some(items) = value["items"].as_array() else {
         return "No plugins installed.".into();
     };
@@ -2112,9 +2622,21 @@ fn format_plugins(value: &Value) -> String {
         return "No plugins installed.".into();
     }
 
-    let mut output = format!("Installed plugins ({}):", items.len());
+    let mut items = items.iter().collect::<Vec<_>>();
+    items.sort_by_key(|item| item["id"].as_str().unwrap_or("unknown"));
 
-    for item in items {
+    let total = items.len();
+    let pages = total.div_ceil(PLUGIN_LIST_PAGE_SIZE);
+
+    if page == 0 || page > pages {
+        return format!("Page {page} is out of range; plugins have {pages} pages.");
+    }
+
+    let start = (page - 1) * PLUGIN_LIST_PAGE_SIZE;
+    let end = (start + PLUGIN_LIST_PAGE_SIZE).min(total);
+    let mut output = format!("Plugins | {}–{} of {total} | page {page}/{pages}:", start + 1, end);
+
+    for (index, item) in items[start..end].iter().enumerate() {
         let id = item["id"].as_str().unwrap_or("unknown");
         let version = item["version"].as_str().unwrap_or("unknown");
         let health = item["health"].as_str().unwrap_or("unknown");
@@ -2136,12 +2658,39 @@ fn format_plugins(value: &Value) -> String {
 
         let commands = if commands.is_empty() { "none".into() } else { commands.join(", ") };
 
+        let separator = if index == 0 { "\n" } else { "\n\n" };
+
+        let metadata = [
+            format!("health: {health}"),
+            format!("capabilities: {capabilities}"),
+            format!("protocol: {protocol}"),
+            format!("commands: {commands}"),
+            format!("permissions: {permissions}"),
+        ];
+
         output.push_str(&format!(
-            "\n- {id} {version}\n  health: {health}\n  protocol: {protocol}\n  capabilities: {capabilities}\n  commands: {commands}\n  permissions: {permissions}"
+            "{separator}{}",
+            format_tree_entry(&format!("{id} | v{version}"), &metadata, index + 1 == end - start)
         ));
     }
 
     output
+}
+
+fn format_tree_entry(label: &str, metadata: &[String], is_last: bool) -> String {
+    let root_branch = if is_last { "└─" } else { "├─" };
+
+    let child_prefix = if is_last { "   " } else { "│  " };
+
+    let mut lines = vec![format!("{root_branch} {label}")];
+
+    lines.extend(metadata.iter().enumerate().map(|(index, detail)| {
+        let branch = if index + 1 == metadata.len() { "└─" } else { "├─" };
+
+        format!("{child_prefix}{branch} {detail}")
+    }));
+
+    lines.join("\n")
 }
 
 fn format_string_list(value: &Value) -> String {
@@ -2223,8 +2772,12 @@ fn format_deliveries(value: &Value) -> String {
 }
 
 fn sentence(value: String) -> String {
-    let value = value.trim();
-    let value = value.strip_prefix("Denied: ").unwrap_or(value);
+    let mut value = value.trim();
+
+    while let Some(message) = value.strip_prefix("Denied: ") {
+        value = message.trim();
+    }
+
     let value = value.trim_end_matches('.');
     let value = value.replace("Session was not found", "Session not found");
 
@@ -2246,13 +2799,28 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
+    fn persists_message_timestamps_as_utc_epoch_milliseconds() {
+        let before =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+
+        let id = super::message_id("user", 4);
+        let after =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+
+        let timestamp = id.split('-').nth(2).unwrap().parse::<u128>().unwrap();
+
+        assert!(timestamp >= before && timestamp <= after);
+        assert!(id.ends_with("-4"));
+    }
+
+    #[test]
     fn describes_client_capability() {
         let hello = super::hello();
 
         assert_eq!(hello.id, "tui");
         assert_eq!(hello.capabilities, vec![crabbot_core::types::Capability::Client]);
         assert_eq!(hello.commands[0].name, "tui");
-        assert!(hello.commands[0].description.contains("do not require the background runtime"));
+        assert!(hello.commands[0].description.contains("daemon must be running"));
     }
 
     #[test]
@@ -2289,13 +2857,22 @@ mod tests {
 
     #[test]
     fn defaults_to_the_default_session_and_keeps_explicit_selection() {
-        assert_eq!(super::selected_session_id(None), "default");
-        assert_eq!(super::selected_session_id(Some("work".into())), "work");
+        assert_eq!(super::selected_session_id(None), "tui-default");
+        assert_eq!(super::selected_session_id(Some("work".into())), "tui-work");
     }
 
     #[test]
-    fn defaults_generation_to_the_documented_model() {
-        assert_eq!(super::DEFAULT_MODEL, "gpt-6-luna");
+    fn does_not_assume_a_provider_model_by_default() {
+        assert_eq!(super::DEFAULT_MODEL, "unset");
+    }
+
+    #[test]
+    fn suggests_model_selection_only_for_model_errors() {
+        assert!(super::invalid_model_error("Invalid model: gpt-missing"));
+        assert!(super::invalid_model_error("model not found"));
+        assert!(!super::invalid_model_error(
+            "runtimeWorkspaceRoots requires experimentalApi capability"
+        ));
     }
 
     #[test]
@@ -2320,13 +2897,14 @@ mod tests {
     async fn bulk_session_actions_preserve_the_active_session() {
         let targets = super::parse_session_targets("--all", false).unwrap();
         let result =
-            super::apply_session_action("/tmp", "archive", targets, "other", mock_control).await;
+            super::apply_session_action("/tmp", "archive", targets, "tui-other", mock_control)
+                .await;
 
         assert_eq!(result, "Archived session saved.");
 
         let targets = super::parse_session_targets("--all -y", true).unwrap();
         let result =
-            super::apply_session_action("/tmp", "delete", targets, "saved", mock_control).await;
+            super::apply_session_action("/tmp", "delete", targets, "tui-saved", mock_control).await;
 
         assert_eq!(result, "No sessions were deleted. Kept active session saved.");
     }
@@ -2351,9 +2929,9 @@ mod tests {
         assert!(basic.contains("/session help"));
         assert!(!basic.contains("/model [id]"));
         assert!(!basic.contains("/deliveries"));
-        assert!(basic.contains("Plugin commands are CLI commands"));
-        assert!(basic.contains("Page Up/Down scroll the conversation by a page"));
-        assert!(basic.contains("Use Ctrl+O for a new message line."));
+        assert!(basic.contains("Plugin commands run in the CLI: crab <command>."));
+        assert!(basic.contains("Page Up/Down scroll the conversation"));
+        assert!(basic.contains("Ctrl+O adds a message line."));
         assert!(!basic.contains("Shift+Enter"));
 
         let description_columns = basic
@@ -2372,6 +2950,15 @@ mod tests {
         assert_eq!(description_columns.len(), 2);
         assert_eq!(description_columns[0], description_columns[1]);
 
+        let model_commands = super::command_help("missing-home", true, false);
+
+        assert!(model_commands.contains("/model <help|list|show|set>"));
+        assert!(model_commands.contains("/plugins [page]"));
+        assert!(model_commands.contains("Conditional commands (shown only when usable):"));
+        assert!(model_commands.contains("\n\nPlugin commands run in the CLI:"));
+        assert!(!model_commands.contains("`crab"));
+        assert!(super::model_help().contains("/model list"));
+
         let sessions = super::session_help();
 
         assert!(sessions.contains("/session archive <id>...|--all"));
@@ -2380,6 +2967,27 @@ mod tests {
         assert!(sessions.contains("/session delete <id>...|--all [-y]"));
         assert!(sessions.contains("/new <id>"));
         assert!(!sessions.contains("/sessions"));
+    }
+
+    #[test]
+    fn conditional_command_descriptions_share_one_indented_column() {
+        let rows = super::format_help_rows(&[
+            ("/model <help|list|show|set>", "Manage the selected model."),
+            ("/approval", "Show approval policy."),
+            ("/approvals", "List pending tool approvals."),
+        ]);
+
+        let descriptions =
+            ["Manage the selected model.", "Show approval policy.", "List pending tool approvals."];
+
+        let description_columns = rows
+            .lines()
+            .zip(descriptions)
+            .map(|(line, description)| line.find(description).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(description_columns[0], description_columns[1]);
+        assert_eq!(description_columns[1], description_columns[2]);
     }
 
     #[test]
@@ -2455,6 +3063,42 @@ mod tests {
     }
 
     #[test]
+    fn formats_live_approval_with_exact_shell_command_and_separate_actions() {
+        assert_eq!(
+            super::format_approval_notice(
+                "approval-1",
+                "shell",
+                "{\"command\":\"rm foo\"}",
+                Some("rm foo"),
+                "Crabbot requests approval to run this shell command: rm foo.",
+            ),
+            "Approval needed.\nTool: shell\nCommand: rm foo\nApprove: /approve approval-1\nDeny: /deny approval-1"
+        );
+
+        assert_eq!(
+            super::format_approval_notice(
+                "approval-3",
+                "shell",
+                "{\"command\":\"rm foo.\"}",
+                Some("rm foo."),
+                "Crabbot requests approval to run this shell command: rm foo..",
+            ),
+            "Approval needed.\nTool: shell\nCommand: rm foo.\nApprove: /approve approval-3\nDeny: /deny approval-3"
+        );
+
+        assert_eq!(
+            super::format_approval_notice(
+                "approval-2",
+                "write",
+                "{\"path\":\"foo\"}",
+                None,
+                "Crabbot requests approval to write to foo..",
+            ),
+            "Approval needed.\nTool: write\nArguments: {\"path\":\"foo\"}\nAction: write to foo\nApprove: /approve approval-2\nDeny: /deny approval-2"
+        );
+    }
+
+    #[test]
     fn formats_pending_approvals() {
         let value = json!({
             "items": [{
@@ -2482,7 +3126,7 @@ mod tests {
         let text = super::format_sessions(
             &serde_json::json!({
                 "items": [{
-                    "id": "one",
+                    "id": "tui-one",
                     "model": "provider/model",
                     "status": "idle",
                     "created": 1735776000,
@@ -2490,15 +3134,30 @@ mod tests {
                     "messages": 3
                 }]
             }),
-            "one",
+            "tui-one",
             true,
             1,
         );
 
         assert_eq!(
             text,
-            "Sessions (1-1 of 1, page 1/1):\n* one · active\n  model: provider/model · created: 2025-01-02 · updated: 2025-01-03 · 3 messages\n> "
+            "Sessions | 1–1 of 1 | page 1/1:\n└─ one | active\n   ├─ model: provider/model\n   ├─ created: 2025-01-02\n   ├─ updated: 2025-01-03\n   └─ messages: 3\n> "
         );
+
+        let multiple = super::format_sessions(
+            &serde_json::json!({
+                "items": [
+                    {"id": "tui-one", "status": "idle"},
+                    {"id": "tui-two", "status": "idle"}
+                ]
+            }),
+            "tui-one",
+            false,
+            1,
+        );
+
+        assert!(multiple.contains("page 1/1:\n├─ one | active"));
+        assert!(multiple.contains("│  └─ model: unset\n\n└─ two | idle"));
 
         assert_eq!(
             super::format_sessions(&serde_json::json!({"items": [{}]}), "", false, 1),
@@ -2508,13 +3167,13 @@ mod tests {
         assert_eq!(
             super::format_sessions(
                 &serde_json::json!({
-                    "items": [{"id": "old", "status": "idle", "archived": true}]
+                    "items": [{"id": "tui-old", "status": "idle", "archived": true}]
                 }),
                 "",
                 false,
                 1
             ),
-            "Sessions (1-1 of 1, page 1/1):\n- old · archived\n  model: unset\n> "
+            "Sessions | 1–1 of 1 | page 1/1:\n└─ old | archived\n   └─ model: unset\n> "
         );
 
         assert_eq!(
@@ -2550,36 +3209,41 @@ mod tests {
     fn paginates_sessions_with_working_and_active_sessions_first() {
         let value = serde_json::json!({
             "items": [
-                {"id": "active", "status": "idle", "updated": 1},
-                {"id": "working", "status": "working", "updated": 2},
-                {"id": "idle-old", "status": "idle", "updated": 3},
-                {"id": "idle-new", "status": "idle", "updated": 30},
-                {"id": "archived", "status": "idle", "archived": true, "updated": 100},
-                {"id": "idle-04", "status": "idle", "updated": 4},
-                {"id": "idle-05", "status": "idle", "updated": 5},
-                {"id": "idle-06", "status": "idle", "updated": 6},
-                {"id": "idle-07", "status": "idle", "updated": 7},
-                {"id": "idle-08", "status": "idle", "updated": 8},
-                {"id": "idle-09", "status": "idle", "updated": 9},
+                {"id": "tui-active", "status": "idle", "updated": 1},
+                {"id": "tui-working", "status": "working", "updated": 2},
+                {"id": "tui-idle-old", "status": "idle", "updated": 3},
+                {"id": "tui-idle-new", "status": "idle", "updated": 30},
+                {"id": "tui-archived", "status": "idle", "archived": true, "updated": 100},
+                {"id": "tui-idle-04", "status": "idle", "updated": 4},
+                {"id": "tui-idle-05", "status": "idle", "updated": 5},
+                {"id": "tui-idle-06", "status": "idle", "updated": 6},
+                {"id": "tui-idle-07", "status": "idle", "updated": 7},
+                {"id": "tui-idle-08", "status": "idle", "updated": 8},
+                {"id": "tui-idle-09", "status": "idle", "updated": 9},
             ]
         });
 
-        let first_page = super::format_sessions(&value, "active", false, 1);
-        let working_position = first_page.find("working · working").unwrap();
-        let active_position = first_page.find("active · active").unwrap();
-        let recent_position = first_page.find("idle-new · idle").unwrap();
-        let older_position = first_page.find("idle-old · idle").unwrap();
+        let first_page = super::format_sessions(&value, "tui-active", false, 1);
+        let working_position = first_page.find("working | working").unwrap();
+        let active_position = first_page.find("active | active").unwrap();
+        let recent_position = first_page.find("idle-new | idle").unwrap();
 
         assert!(working_position < active_position);
         assert!(active_position < recent_position);
-        assert!(recent_position < older_position);
-        assert!(first_page.contains("Sessions (1-10 of 11, page 1/2):"));
-        assert!(!first_page.contains("archived · archived"));
+        assert!(first_page.contains("idle-new | idle"));
+        assert!(first_page.contains("Sessions | 1–5 of 11 | page 1/3:"));
+        assert!(!first_page.contains("archived | archived"));
 
-        let second_page = super::format_sessions(&value, "active", false, 2);
+        let second_page = super::format_sessions(&value, "tui-active", false, 2);
 
-        assert!(second_page.contains("Sessions (11-11 of 11, page 2/2):"));
-        assert!(second_page.contains("archived · archived"));
+        assert!(second_page.contains("Sessions | 6–10 of 11 | page 2/3:"));
+        assert!(second_page.contains("idle-old | idle"));
+        assert!(!second_page.contains("archived | archived"));
+
+        let third_page = super::format_sessions(&value, "tui-active", false, 3);
+
+        assert!(third_page.contains("Sessions | 11–11 of 11 | page 3/3:"));
+        assert!(third_page.contains("archived | archived"));
     }
 
     #[test]
@@ -2589,6 +3253,25 @@ mod tests {
         assert!(super::parse_session_list_page("/session list 0").is_err());
         assert!(super::parse_session_list_page("/session list next").is_err());
         assert!(super::parse_session_list_page("/session list 2 extra").is_err());
+    }
+
+    #[test]
+    fn parses_plugin_list_pages_and_rejects_invalid_input() {
+        assert_eq!(super::parse_plugin_list_page("/plugins"), Ok(1));
+        assert_eq!(super::parse_plugin_list_page("/plugins 3"), Ok(3));
+        assert!(super::parse_plugin_list_page("/plugins 0").is_err());
+        assert!(super::parse_plugin_list_page("/plugins next").is_err());
+        assert!(super::parse_plugin_list_page("/plugins 2 extra").is_err());
+    }
+
+    #[test]
+    fn decodes_json_encoded_live_turn_commands() {
+        assert_eq!(
+            super::decode_terminal_input(r#""/approve 0123456789abcdef01234567""#),
+            "/approve 0123456789abcdef01234567"
+        );
+
+        assert_eq!(super::decode_terminal_input("/approvals"), "/approvals");
     }
 
     #[test]
@@ -2617,19 +3300,46 @@ mod tests {
     #[test]
     fn formats_plugins() {
         assert_eq!(
-            super::format_plugins(&serde_json::json!({
-                "items": [{
-                    "id": "codex",
-                    "version": "1.2.3",
-                    "health": "ready",
-                    "protocol": {"major": 0, "minor": 1},
-                    "capabilities": ["model", "vision"],
-                    "commands": [{"name": "codex"}],
-                    "permissions": ["network", "process"]
-                }]
-            })),
-            "Installed plugins (1):\n- codex 1.2.3\n  health: ready\n  protocol: 0.1\n  capabilities: model, vision\n  commands: codex\n  permissions: network, process"
+            super::format_plugins(
+                &serde_json::json!({
+                    "items": [{
+                        "id": "codex",
+                        "version": "1.2.3",
+                        "health": "ready",
+                        "protocol": {"major": 0, "minor": 1},
+                        "capabilities": ["model", "vision"],
+                        "commands": [{"name": "codex"}],
+                        "permissions": ["network", "process"]
+                    }]
+                }),
+                1
+            ),
+            "Plugins | 1–1 of 1 | page 1/1:\n└─ codex | v1.2.3\n   ├─ health: ready\n   ├─ capabilities: model, vision\n   ├─ protocol: 0.1\n   ├─ commands: codex\n   └─ permissions: network, process"
         );
+
+        let items = (0..9)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("plugin-{index:02}"),
+                    "version": "1.0.0",
+                    "health": "ready"
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let inventory = serde_json::json!({"items": items});
+        let first_page = super::format_plugins(&inventory, 1);
+        let second_page = super::format_plugins(&inventory, 2);
+
+        assert!(first_page.contains("Plugins | 1–5 of 9 | page 1/2:"));
+        assert!(first_page.contains("├─ plugin-00"));
+        assert!(first_page.contains("page 1/2:\n├─ plugin-00"));
+        assert!(first_page.contains("│  └─ permissions: none\n\n├─ plugin-01"));
+        assert!(!first_page.contains("plugin-05"));
+        assert!(second_page.contains("Plugins | 6–9 of 9 | page 2/2:"));
+        assert!(second_page.contains("└─ plugin-08"));
+        assert!(!second_page.contains("plugin-00"));
+        assert!(super::format_plugins(&inventory, 3).contains("plugins have 2 pages"));
     }
 
     #[test]
@@ -2670,11 +3380,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn resolves_pending_approvals_during_a_daemon_turn_and_saves_the_interaction() {
+        let mut sequence = 0;
+        let response = super::resolve_turn_approval(
+            "/tmp/crabbot",
+            "telegram-7",
+            "reservation",
+            "/approve",
+            &mut sequence,
+            mock_control,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response, "Approval accepted.\n");
+        assert_eq!(sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn resolves_an_id_specific_approval_from_live_turn_input() {
+        let mut sequence = 0;
+        let command = super::decode_terminal_input(r#""/approve 0123456789abcdef01234567""#);
+        let response = super::resolve_turn_approval(
+            "/tmp/crabbot",
+            "telegram-7",
+            "reservation",
+            &command,
+            &mut sequence,
+            mock_control,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response, "Approval accepted.\n");
+        assert_eq!(sequence, 2);
+    }
+
     #[test]
     fn sentence_capitalizes_errors() {
         assert_eq!(super::sentence("connection failed.".into()), "Connection failed");
 
         assert_eq!(super::sentence("Denied: Session was not found.".into()), "Session not found");
+
+        assert_eq!(
+            super::sentence("Denied: Denied: Codex request failed.".into()),
+            "Codex request failed"
+        );
 
         assert_eq!(
             super::sentence("Denied: Session already exists.".into()),
@@ -2688,6 +3440,7 @@ mod tests {
         params: serde_json::Value,
     ) -> crabbot_core::Result<serde_json::Value> {
         if [
+            "session.answer",
             "session.ensure",
             "session.new",
             "session.append",
@@ -2702,6 +3455,10 @@ mod tests {
         ]
         .contains(&method.as_str())
         {
+            if method == "session.answer" {
+                return Ok(json!({"text": "Reply"}));
+            }
+
             if method == "session.reserve" {
                 return Ok(json!({"id": params["id"], "owner": "mock-reservation-owner"}));
             }
@@ -2746,11 +3503,19 @@ mod tests {
                 }]
             })),
 
+            "plugin.list" => Ok(json!({
+                "items": [{"id": "codex", "health": "ready", "capabilities": ["model"]}]
+            })),
+
+            "model.list" => Ok(json!({
+                "text": "Codex models (1):\n  gpt-test - Test model (default)"
+            })),
+
             "approval.resolve" => Ok(json!({"resolved": true, "approved": params["approved"]})),
             // The fixture uses 2025-01-02 and 2025-01-03 UTC timestamps in Unix seconds.
             "session.list" => Ok(json!({
                 "items": [{
-                    "id": "saved",
+                    "id": "tui-saved",
                     "model": "provider/model",
                     "status": "idle",
                     "created": 1735776000,
@@ -2764,7 +3529,7 @@ mod tests {
             })),
 
             "session.archive" | "session.unarchive" => {
-                if method == "session.unarchive" && params["id"] == "missing" {
+                if method == "session.unarchive" && params["id"] == "tui-missing" {
                     Err(crabbot_core::Error::Denied("Session was not found.".into()))
                 } else {
                     Ok(json!({"id": params["id"], "changed": true}))
@@ -2773,6 +3538,19 @@ mod tests {
 
             _ => Err(crabbot_core::Error::Denied("Method not found.".into())),
         }
+    }
+
+    async fn delayed_answer_control(
+        home: String,
+        method: String,
+        params: serde_json::Value,
+    ) -> crabbot_core::Result<serde_json::Value> {
+        if method == "session.answer" {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            return Ok(json!({"text": "late reply"}));
+        }
+
+        super::local_aware(home, method, params).await
     }
 
     #[test]
@@ -2794,6 +3572,194 @@ mod tests {
         );
     }
 
+    #[test]
+    fn final_reply_does_not_repeat_or_replace_text_already_streamed() {
+        assert_eq!(super::final_reply_suffix("Hello", "Hello world"), " world");
+        assert_eq!(super::final_reply_suffix("Hello world", "Hello world"), "");
+        assert_eq!(super::final_reply_suffix("Hello", "A duplicated final reply"), "");
+        assert_eq!(super::final_reply_suffix("", "Non-streamed reply"), "Non-streamed reply");
+    }
+
+    #[test]
+    fn tui_advertises_only_read_only_workspace_tools() {
+        let names = super::read_only_tools().into_iter().map(|tool| tool.name).collect::<Vec<_>>();
+
+        assert_eq!(names, ["read", "list", "search"]);
+    }
+
+    #[test]
+    fn workspace_defaults_to_the_home_workspace_and_honors_session_selection() {
+        assert_eq!(
+            super::workspace_root("/tmp/crabbot-home", None),
+            super::PathBuf::from("/tmp/crabbot-home/workspace")
+        );
+
+        assert_eq!(
+            super::workspace_root("/tmp/crabbot-home", Some("/work/project")),
+            super::PathBuf::from("/work/project")
+        );
+    }
+
+    #[test]
+    fn relative_workspace_paths_resolve_against_the_tui_launch_directory() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-tui-workspace-{}", std::process::id()));
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        assert_eq!(
+            super::resolve_workspace_at(".", &project).unwrap(),
+            Some(project.canonicalize().unwrap().to_string_lossy().into_owned())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tui_refuses_mutating_tool_calls_even_without_a_tool_process() {
+        let response = super::serve_read_only_tool(
+            std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            crabbot_core::types::Request::call(
+                1,
+                "host/tool",
+                serde_json::json!({"name": "write", "args": {"path": "file", "text": "x"}}),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(response.error.unwrap().message.contains("Only read-only tools"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tui_routes_read_only_tool_calls_to_the_installed_tools_plugin() {
+        let script = concat!(
+            "while IFS= read -r line; do\n",
+            "id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+            "case \"$line\" in\n",
+            "*'\"method\":\"hello\"'*) printf '%s\\n' ",
+            "'{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol\":{\"major\":0,\"minor\":1},\"id\":\"tools\",\"version\":\"0.1.0\",\"capabilities\":[\"tool\"]}}' ;;\n",
+            "*'\"method\":\"list\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"items\":[\"Cargo.toml\",\"src\"]}}\\n' \"$id\" ;;\n",
+            "*'\"method\":\"shutdown\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"ok\":true}}\\n' \"$id\"; exit 0 ;;\n",
+            "esac\n",
+            "done\n",
+        );
+
+        let process =
+            crabbot_core::plugin::Process::start_with("sh", ["-c", script]).await.unwrap();
+
+        let tools =
+            std::sync::Arc::new(tokio::sync::Mutex::new(Some(super::ToolsProcess { process })));
+
+        let response = super::serve_read_only_tool(
+            std::sync::Arc::clone(&tools),
+            crabbot_core::types::Request::call(
+                7,
+                "host/tool",
+                json!({"name": "list", "args": {"path": "."}}),
+            ),
+            Some("/workspace/project".into()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.result.unwrap()["text"], "Cargo.toml\nsrc");
+
+        if let Some(tools) = tools.lock().await.take() {
+            tools.process.stop().await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_turn_uses_workspace_tools_without_repeating_the_final_reply() {
+        use std::{fs, os::unix::fs::PermissionsExt, time::SystemTime};
+        use tokio::io::duplex;
+
+        let nonce = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("crabbot-tui-tools-{nonce}"));
+        let codex = root.join("plugins/codex/bin/crabbot-plugin-codex");
+        let tools = root.join("plugins/tools/bin/crabbot-plugin-tools");
+        fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        fs::create_dir_all(tools.parent().unwrap()).unwrap();
+
+        let codex_script = r#"#!/bin/sh
+while IFS= read -r line; do
+    request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    case "$line" in
+        *'"method":"hello"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"codex","version":"0.1.0","capabilities":["model"]}}'
+            ;;
+        *'"method":"generate"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":71,"method":"host/tool","params":{"name":"list","args":{"path":"."}}}'
+            IFS= read -r tool_reply
+            case "$tool_reply" in *Cargo.toml*src*) ;; *) exit 42 ;; esac
+            printf '%s\n' '{"jsonrpc":"2.0","method":"event","params":{"event":{"kind":"text","text":"Directory entries: Cargo.toml, src."}}}'
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"text":"Cargo.toml, src.","stop":"stop","events":[]}}\n' "$request_id"
+            ;;
+        *'"method":"shutdown"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$request_id"
+            exit 0
+            ;;
+    esac
+done
+"#;
+
+        let tools_script = r#"#!/bin/sh
+while IFS= read -r line; do
+    request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    case "$line" in
+        *'"method":"hello"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"tools","version":"0.1.0","capabilities":["tool"]}}'
+            ;;
+        *'"method":"list"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"items":["Cargo.toml","src"]}}\n' "$request_id"
+            ;;
+        *'"method":"shutdown"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$request_id"
+            exit 0
+            ;;
+    esac
+done
+"#;
+        fs::write(&codex, codex_script).unwrap();
+        fs::write(&tools, tools_script).unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&tools, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (mut input_tx, input_rx) = duplex(1024);
+        input_tx.write_all(b"List the current directory\n/quit\n").await.unwrap();
+        drop(input_tx);
+        let (output_tx, mut output_rx) = duplex(16 * 1024);
+        let (interrupt_tx, interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(interrupt_tx);
+
+        let engine = super::run_with(
+            input_rx,
+            output_tx,
+            super::EngineConfig {
+                home: root.display().to_string(),
+                plugin: "codex".into(),
+                model: "gpt-test".into(),
+                model_override: None,
+                session: "default".into(),
+            },
+            super::local_aware,
+            super::EngineEvents::default(),
+            interrupt_rx,
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine).await.unwrap().unwrap();
+        let mut output = String::new();
+        output_rx.read_to_string(&mut output).await.unwrap();
+
+        assert_eq!(output.matches("Reply").count(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn runs_commands_and_model_turn() {
@@ -2807,9 +3773,11 @@ mod tests {
         fs::write(
             &binary,
             r#"#!/bin/sh
+
 while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc":"2.0","method":"event","params":{"event":{"kind":"text","text":"Reply"}}}'; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"text":"Reply","stop":"stop","events":[]}}' ;; *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"codex","version":"0.1.0","capabilities":["model"]}}' ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;; esac; done"#,
         )
         .unwrap();
+
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
         let input_path = root.join("input");
         let output_path = root.join("output");
@@ -2821,6 +3789,7 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
             ),
         )
         .unwrap();
+
         let input = tokio::fs::File::from_std(fs::File::open(&input_path).unwrap());
         let output = tokio::fs::File::from_std(fs::File::create(&output_path).unwrap());
         let (interrupt_tx, interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2836,8 +3805,7 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
                 session: "default".into(),
             },
             mock_control,
-            None,
-            None,
+            super::EngineEvents::default(),
             interrupt_rx,
         );
 
@@ -2850,10 +3818,18 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
         assert!(text.contains("Pending approvals:"));
         assert!(text.contains("Approval accepted."));
         assert!(text.contains("Approval denied."));
-        assert!(text.contains("Installed plugins (1):\n- codex unknown\n  health: ready"));
+        assert!(text.contains(
+            "Plugins | 1–1 of 1 | page 1/1:\n└─ codex | vunknown\n   ├─ health: ready\n   ├─ capabilities: model\n   ├─ protocol: 0.0\n   ├─ commands: none\n   └─ permissions: none"
+        ));
+
         assert!(text.contains("Created session two."));
         assert!(text.contains("Created session test-one."));
-        assert!(text.contains("Sessions (1-1 of 1, page 1/1):\no saved · idle\n  model: provider/model · created: 2025-01-02 · updated: 2025-01-03 · 2 messages"));
+        assert!(text.contains(concat!(
+            "Sessions | 1–1 of 1 | page 1/1:\n└─ saved | idle\n",
+            "   ├─ model: provider/model\n   ├─ created: 2025-01-02\n",
+            "   ├─ updated: 2025-01-03\n   └─ messages: 2"
+        )));
+
         assert!(text.contains("Using session one."));
         assert!(text.contains("Renamed session one to renamed."));
         assert!(text.contains("Archived session two."));
@@ -2878,11 +3854,187 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
             None,
             "once".into(),
             "hello once".into(),
+            mock_control,
         )
         .await
         .unwrap();
 
         assert_eq!(one_shot, "Reply");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn keeps_the_session_engine_alive_after_a_model_error() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        use tokio::io::duplex;
+
+        let root =
+            std::env::temp_dir().join(format!("crabbot-tui-model-error-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&root);
+
+        let binary = root.join("plugins/codex/bin/crabbot-plugin-codex");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+count=0
+while IFS= read -r line; do
+    request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    case "$line" in
+        *'"method":"generate"'*)
+            count=$((count + 1))
+            if [ "$count" -eq 1 ]; then
+                printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"Denied: Codex rejected thread/start: Invalid model"}}\n' "$request_id"
+            else
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"text":"Recovered reply","stop":"stop","events":[]}}\n' "$request_id"
+            fi
+            ;;
+        *'"method":"hello"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"codex","version":"0.1.0","capabilities":["model"]}}'
+            ;;
+        *shutdown*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$request_id"
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+        crate::local_aware(
+            root.display().to_string(),
+            "session.ensure".into(),
+            serde_json::json!({"id": "default", "model": "gpt-test"}),
+        )
+        .await
+        .unwrap();
+
+        let (mut input_tx, input_rx) = duplex(1024);
+        input_tx.write_all(b"first\nsecond\n/quit\n").await.unwrap();
+        drop(input_tx);
+        let (output_tx, mut output_rx) = duplex(16 * 1024);
+        let (interrupt_tx, interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(interrupt_tx);
+
+        let engine = super::run_with(
+            input_rx,
+            output_tx,
+            super::EngineConfig {
+                home: root.display().to_string(),
+                plugin: "codex".into(),
+                model: "gpt-test".into(),
+                model_override: None,
+                session: "default".into(),
+            },
+            super::local_aware,
+            super::EngineEvents::default(),
+            interrupt_rx,
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine).await.unwrap().unwrap();
+
+        let mut output = String::new();
+        output_rx.read_to_string(&mut output).await.unwrap();
+
+        assert_eq!(output.matches("Reply").count(), 2);
+        assert!(!output.contains("The session engine is no longer running"));
+
+        let session =
+            super::read_session(&root.display().to_string(), "default", super::local_aware)
+                .await
+                .unwrap();
+
+        assert_eq!(session.messages.len(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_subcommands_list_show_and_select_models() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        use tokio::io::duplex;
+
+        let root =
+            std::env::temp_dir().join(format!("crabbot-tui-model-list-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&root);
+
+        let binary = root.join("plugins/codex/bin/crabbot-plugin-codex");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+    request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    case "$line" in
+        *models*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"text":"Codex models (1):\\n  gpt-test - Test model (default)"}}\n' "$request_id"
+            ;;
+        *hello*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"codex","version":"0.1.0","capabilities":["model"]}}'
+            ;;
+        *shutdown*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$request_id"
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+        crate::local_aware(
+            root.display().to_string(),
+            "session.ensure".into(),
+            serde_json::json!({"id": "default", "model": "unset"}),
+        )
+        .await
+        .unwrap();
+
+        let (mut input_tx, input_rx) = duplex(1024);
+        input_tx
+            .write_all(b"/model help\n/model show\n/model list\n/model set gpt-test\n/quit\n")
+            .await
+            .unwrap();
+
+        drop(input_tx);
+        let (output_tx, mut output_rx) = duplex(16 * 1024);
+        let (interrupt_tx, interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(interrupt_tx);
+
+        let engine = super::run_with(
+            input_rx,
+            output_tx,
+            super::EngineConfig {
+                home: root.display().to_string(),
+                plugin: "codex".into(),
+                model: "unset".into(),
+                model_override: None,
+                session: "default".into(),
+            },
+            super::local_aware,
+            super::EngineEvents::default(),
+            interrupt_rx,
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine).await.unwrap().unwrap();
+
+        let mut output = String::new();
+        output_rx.read_to_string(&mut output).await.unwrap();
+
+        assert!(output.contains("Model commands:"));
+        assert!(output.contains("Current model: unset."));
+        assert!(output.contains("gpt-test - Test model (default)"));
+        assert!(output.contains("Using model gpt-test."));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2895,6 +4047,7 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
 
         let root =
             std::env::temp_dir().join(format!("crabbot-tui-interrupt-{}", std::process::id()));
+
         let _ = fs::remove_dir_all(&root);
         let binary = root.join("plugins/codex/bin/crabbot-plugin-codex");
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
@@ -2904,6 +4057,7 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
 while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc":"2.0","method":"event","params":{"event":{"kind":"text","text":"Partial"}}}'; sleep 30; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"text":"Partial answer","stop":"stop","events":[]}}' ;; *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"codex","version":"0.1.0","capabilities":["model"]}}' ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;; esac; done"#,
         )
         .unwrap();
+
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
 
         let (mut input_tx, input_rx) = duplex(4096);
@@ -2922,9 +4076,8 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
                 model_override: None,
                 session: "default".into(),
             },
-            super::local_aware,
-            None,
-            Some(engine_event_tx),
+            delayed_answer_control,
+            super::EngineEvents { engine: Some(engine_event_tx), ..super::EngineEvents::default() },
             interrupt_rx,
         ));
 
@@ -2938,17 +4091,6 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
         let mut output = Vec::new();
         let mut buffer = [0_u8; 256];
 
-        while !String::from_utf8_lossy(&output).contains("Partial") {
-            let count = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                output_rx.read(&mut buffer),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            output.extend_from_slice(&buffer[..count]);
-        }
-
         interrupt_tx.send(()).unwrap();
 
         while !String::from_utf8_lossy(&output).contains("Generation interrupted.") {
@@ -2959,11 +4101,11 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
             .await
             .unwrap()
             .unwrap();
+
             output.extend_from_slice(&buffer[..count]);
         }
 
-        assert!(String::from_utf8_lossy(&output).contains("Partial"));
-        assert!(!String::from_utf8_lossy(&output).contains("Partial answer"));
+        assert!(!String::from_utf8_lossy(&output).contains("late reply"));
         assert_eq!(
             engine_event_rx.recv().await,
             Some(super::EngineEvent::GenerationFinished { interrupted: true })
@@ -2981,8 +4123,7 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
             .await
             .unwrap();
 
-        assert_eq!(saved.messages.len(), 2);
-        assert_eq!(saved.messages[1].content[0].render(), "Partial");
+        assert_eq!(saved.messages.len(), 1);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3010,11 +4151,10 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
                 plugin: "missing-model".into(),
                 model: "small".into(),
                 model_override: None,
-                session: "offline".into(),
+                session: "tui-offline".into(),
             },
             super::local_aware,
-            None,
-            None,
+            super::EngineEvents::default(),
             interrupt_rx,
         );
 
@@ -3028,40 +4168,78 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
         result.unwrap();
 
         assert!(text.contains("No intelligence plugin is installed"));
-        assert!(text.contains("* offline · active\n  model: unset · created:"));
+        assert!(text.contains("└─ offline | active\n   ├─ model: unset\n   ├─ created:"));
         assert!(super::data::plugin_file(&root, "tui", "sessions.json").is_file());
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn keeps_the_offline_session_backend_when_daemon_becomes_available() {
+    async fn interactive_engine_omits_the_transcript_startup_banner() {
+        let root = std::env::temp_dir().join(format!("crabbot-tui-banner-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (mut input_writer, input_reader) = tokio::io::duplex(1024);
+        input_writer.write_all(b"/quit\n").await.unwrap();
+        drop(input_writer);
+        let (output_writer, mut output_reader) = tokio::io::duplex(1024);
+        let (engine_event_tx, _engine_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (interrupt_tx, interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(interrupt_tx);
+
+        let engine = super::run_with(
+            input_reader,
+            output_writer,
+            super::EngineConfig {
+                home: root.display().to_string(),
+                plugin: "missing-model".into(),
+                model: "unset".into(),
+                model_override: None,
+                session: "default".into(),
+            },
+            super::local_aware,
+            super::EngineEvents { engine: Some(engine_event_tx), ..super::EngineEvents::default() },
+            interrupt_rx,
+        );
+
+        let output = async {
+            let mut output = String::new();
+            output_reader.read_to_string(&mut output).await.unwrap();
+            output
+        };
+
+        let (result, output) = tokio::join!(engine, output);
+        result.unwrap();
+
+        assert!(!output.contains("terminal. Type /help"));
+        assert!(!output.contains("No intelligence plugin is installed"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn requires_the_daemon_for_the_session_backend() {
         let root = std::env::temp_dir().join(format!("crabbot-tui-backend-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let home = root.display().to_string();
-        let backend = super::select_session_backend(&home, "offline", "small").await.unwrap();
+        let error = super::require_daemon(&home).await.unwrap_err();
 
-        async fn available_daemon(
-            _home: String,
-            _method: String,
-            _params: serde_json::Value,
-        ) -> crabbot_core::Result<serde_json::Value> {
-            Ok(serde_json::json!({"items": [{"id": "daemon"}]}))
-        }
-
-        let sessions = super::control_with_backend(
-            backend,
-            home,
-            "session.list".into(),
-            serde_json::json!({}),
-            available_daemon,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(sessions["items"][0]["id"], "offline");
+        assert!(error.to_string().contains("daemon is not running"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn formats_denied_cli_errors_without_debug_wrappers() {
+        let error = crabbot_core::Error::Denied(
+            "The Crabbot daemon is not running.\nStart it with `crab service start`.".into(),
+        );
+
+        assert_eq!(
+            super::cli_error_message(&error),
+            "The Crabbot daemon is not running.\nStart it with `crab service start`."
+        );
     }
 
     #[tokio::test]
@@ -3097,8 +4275,7 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
                 session: "saved".into(),
             },
             super::local_aware,
-            None,
-            None,
+            super::EngineEvents::default(),
             interrupt_rx,
         );
 

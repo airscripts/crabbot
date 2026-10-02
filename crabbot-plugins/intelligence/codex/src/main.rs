@@ -10,7 +10,8 @@ use crabbot_core::{
 
 use futures_util::{Stream, StreamExt};
 use serde_json::json;
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use tokio::sync::Mutex;
 
 mod codex;
 
@@ -24,6 +25,8 @@ async fn main() -> crabbot_core::Result<()> {
         .build()
         .map_err(|error| crabbot_core::Error::Denied(format!("OpenAI client failed: {error}.")))?;
 
+    let codex_session = Arc::new(Mutex::new(codex::session()));
+
     serve_events(
         Hello {
             protocol: Protocol { major: 0, minor: 1 },
@@ -32,22 +35,33 @@ async fn main() -> crabbot_core::Result<()> {
             capabilities: vec![Capability::Model, Capability::Vision],
             commands: vec![CommandSpec {
                 name: "codex".into(),
-                description: "Manage Codex ChatGPT sign-in.".into(),
+                description: "Manage Codex sign-in and list available models.".into(),
                 interactive: false,
             }],
         },
         move |request, emitter| {
             let client = client.clone();
-            async move { generate(&client, request, emitter).await }
+            let codex_session = Arc::clone(&codex_session);
+            async move { generate_with_session(&client, request, emitter, codex_session).await }
         },
     )
     .await
 }
 
+#[cfg(test)]
 async fn generate(
     client: &reqwest::Client,
     request: Request,
     emitter: Emitter,
+) -> crabbot_core::Result<Option<Response>> {
+    generate_with_session(client, request, emitter, Arc::new(Mutex::new(codex::session()))).await
+}
+
+async fn generate_with_session(
+    client: &reqwest::Client,
+    request: Request,
+    emitter: Emitter,
+    codex_session: Arc<Mutex<codex::Session>>,
 ) -> crabbot_core::Result<Option<Response>> {
     let (id, method, params) = match request {
         Request::Call { id, method, params, .. } => (id, method, params),
@@ -65,7 +79,7 @@ async fn generate(
 
     let input: ModelRequest = serde_json::from_value(params)?;
     let Some(key) = credential()? else {
-        return codex::generate(id, input, emitter).await;
+        return codex_session.lock().await.generate(id, input, emitter).await;
     };
 
     let base = std::env::var("CRABBOT_CODEX_BASE_URL")

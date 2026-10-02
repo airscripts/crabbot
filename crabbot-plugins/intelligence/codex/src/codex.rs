@@ -10,14 +10,18 @@ use serde_json::{Value, json};
 use tokio::{
     io::BufReader,
     process::{Child, ChildStdin, ChildStdout, Command},
-    time::{Instant, timeout, timeout_at},
+    time::{Instant, MissedTickBehavior, timeout, timeout_at},
 };
 
 const BODY: usize = jsonl::MAX / 2;
 const TOOLS: usize = 16;
-const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+const STREAM_EVENTS: usize = 200;
+// App-server startup and control requests may take up to one minute.
+const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 const TURN_TIMEOUT: Duration = Duration::from_secs(115);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(890);
+
+const COMMAND_HELP: &str = "Manage Codex sign-in and models.\n\nUsage: crab codex <COMMAND>\n\nCommands:\n  login [--device]  Sign in to your Codex account.\n  status            Show whether Codex is signed in.\n  logout            Sign out of Codex.\n  models            List models available to this Codex account.\n  help              Show this help.\n\nRun `crab codex <command> --help` for command-specific help.";
 
 pub async fn command(params: &Value, mut emitter: Emitter) -> crabbot_core::Result<String> {
     command_with(params, &mut emitter, binary(), codex_home()).await
@@ -37,18 +41,32 @@ async fn command_with(
     }
 
     let command = args.first().and_then(Value::as_str).unwrap_or_default();
+
+    if command.is_empty() || matches!(command, "help" | "--help" | "-h") {
+        return Ok(COMMAND_HELP.into());
+    }
+
+    if args.iter().skip(1).filter_map(Value::as_str).any(|value| matches!(value, "--help" | "-h")) {
+        return Ok(subcommand_help(command));
+    }
+
+    let valid = match command {
+        "login" => args.len() == 1 || (args.len() == 2 && args[1] == "--device"),
+        "status" | "logout" => args.len() == 1,
+        "models" => args.len() == 1,
+        _ => false,
+    };
+
+    if !valid {
+        return Err(denied(&format!("Invalid Codex command.\n\n{COMMAND_HELP}")));
+    }
+
     let mut server = Server::start_with(binary, home).await?;
     server.initialize().await?;
 
     match command {
         "login" => {
-            let device = match args.get(1).and_then(Value::as_str) {
-                None => false,
-                Some("--device") => true,
-                Some(_) => return Err(denied("Use crabbot codex login [--device].")),
-            };
-
-            login(&mut server, device, emitter).await
+            login(&mut server, args.get(1).is_some_and(|value| value == "--device"), emitter).await
         }
 
         "status" if args.len() == 1 => {
@@ -66,8 +84,67 @@ async fn command_with(
             Ok("Codex signed out.".into())
         }
 
-        _ => Err(denied("Use crabbot codex login [--device], status, or logout.")),
+        "models" => models_list(&mut server).await,
+
+        _ => Err(denied("Invalid Codex command.")),
     }
+}
+
+fn subcommand_help(command: &str) -> String {
+    match command {
+        "login" => "Sign in to your Codex account.\n\nUsage: crab codex login [--device]\n\nOptions:\n  --device  Use device-code sign-in for a headless host.\n  -h, --help  Show this help.".into(),
+        "status" => "Show whether Codex is signed in.\n\nUsage: crab codex status\n\nOptions:\n  -h, --help  Show this help.".into(),
+        "logout" => "Sign out of Codex.\n\nUsage: crab codex logout\n\nOptions:\n  -h, --help  Show this help.".into(),
+        "models" => "List models available to this Codex account.\n\nUsage: crab codex models\n\nOptions:\n  -h, --help  Show this help.".into(),
+        _ => format!("Unknown Codex command: {command}.\n\n{COMMAND_HELP}"),
+    }
+}
+
+async fn models_list(server: &mut Server) -> crabbot_core::Result<String> {
+    let mut cursor = None;
+    let mut models = Vec::new();
+
+    for _ in 0..10 {
+        let mut params = json!({"limit": 100, "includeHidden": false});
+
+        if let Some(cursor) = cursor.take() {
+            params["cursor"] = json!(cursor);
+        }
+
+        let page = server.call("model/list", params).await?;
+
+        if let Some(items) = page["data"].as_array() {
+            models.extend(items.iter().filter_map(|item| {
+                let id = item["id"].as_str()?;
+                let display = item["displayName"].as_str().unwrap_or(id);
+                let default = item["isDefault"] == true;
+
+                Some(if default {
+                    format!("  {id} - {display} (default)")
+                } else {
+                    format!("  {id} - {display}")
+                })
+            }));
+        }
+
+        cursor = page["nextCursor"].as_str().map(str::to_owned);
+
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    if models.is_empty() {
+        return Ok("No Codex models are available for this account.".into());
+    }
+
+    let mut output = format!("Codex models ({}):\n{}", models.len(), models.join("\n"));
+
+    if cursor.is_some() {
+        output.push_str("\nOnly the first 1000 models are shown.");
+    }
+
+    Ok(output)
 }
 
 async fn login(
@@ -140,23 +217,51 @@ async fn login(
     }
 }
 
-pub async fn generate(
-    id: u64,
-    input: ModelRequest,
-    emitter: Emitter,
-) -> crabbot_core::Result<Option<Response>> {
-    generate_with(id, input, emitter, binary(), codex_home()).await
+pub fn session() -> Session {
+    Session::new(binary(), codex_home())
 }
 
-async fn generate_with(
+pub struct Session {
+    binary: OsString,
+    home: Option<PathBuf>,
+    server: Option<Server>,
+}
+
+impl Session {
+    pub fn new(binary: OsString, home: Option<PathBuf>) -> Self {
+        Self { binary, home, server: None }
+    }
+
+    pub async fn generate(
+        &mut self,
+        id: u64,
+        input: ModelRequest,
+        emitter: Emitter,
+    ) -> crabbot_core::Result<Option<Response>> {
+        if self.server.is_none() {
+            let mut server = Server::start_with(self.binary.clone(), self.home.clone()).await?;
+
+            server.initialize().await?;
+
+            self.server = Some(server);
+        }
+
+        let result = generate_on(self.server.as_mut().unwrap(), id, input, emitter).await;
+
+        if result.is_err() {
+            self.server.take();
+        }
+
+        result
+    }
+}
+
+async fn generate_on(
+    server: &mut Server,
     id: u64,
     input: ModelRequest,
     mut emitter: Emitter,
-    binary: OsString,
-    home: Option<PathBuf>,
 ) -> crabbot_core::Result<Option<Response>> {
-    let mut server = Server::start_with(binary, home).await?;
-    server.initialize().await?;
     let account = server.call("account/read", json!({})).await?;
 
     if account["account"].is_null() {
@@ -168,6 +273,7 @@ async fn generate_with(
     let root = workspace(input.workspace.as_deref())?;
     let root = root.to_string_lossy().into_owned();
     let instructions = instructions(&input.messages)?;
+    let tool_guidance = tool_guidance(&input.tools);
     let thread = server
         .call(
             "thread/start",
@@ -180,7 +286,7 @@ async fn generate_with(
                 "sandbox": "read-only",
                 "dynamicTools": tools,
                 "developerInstructions": format!(
-                    "Use only declared Crabbot tools for workspace operations. Never claim that an operation succeeded until a Crabbot tool confirms it.\n\n{instructions}"
+                    "{tool_guidance}\nNever claim an operation succeeded until a Crabbot tool confirms it. Do not suggest shell commands such as `cat` or `grep` as a substitute for declared tools.\n\n{instructions}"
                 ),
                 "config": {
                     "features": {
@@ -242,12 +348,25 @@ async fn generate_with(
     Ok(Some(response))
 }
 
+fn tool_guidance(tools: &[ToolSpec]) -> String {
+    if tools.is_empty() {
+        return "No Crabbot workspace tools are declared for this turn. Do not claim to have inspected workspace files or claim a tool call failed; explain that workspace tools were not provided.".into();
+    }
+
+    let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join(", ");
+
+    format!(
+        "These Crabbot tools are declared and available for this turn: {names}. File paths must remain inside the active workspace; prefer workspace-relative paths. For workspace questions, call the relevant declared tool; do not claim tools are unavailable unless an actual tool call returns an error. Issue at most one mutating tool call in a response, then wait for its result before deciding whether another change is needed. If a tool call fails, explain its error and do not repeat the same call unchanged. After a tool confirms success, do not repeat that operation through another tool, such as using shell to redo a successful file write."
+    )
+}
+
 fn dynamic_tools(tools: &[ToolSpec]) -> crabbot_core::Result<Vec<Value>> {
     if tools.len() > TOOLS {
         return Err(denied("Crabbot supplied too many tools to Codex."));
     }
 
     let mut names = std::collections::BTreeSet::new();
+
     tools
         .iter()
         .map(|tool| {
@@ -373,11 +492,26 @@ struct Server {
     input: BufReader<ChildStdout>,
     output: ChildStdin,
     next: u64,
+    failed_tool_calls: BTreeSet<String>,
+}
+
+fn tool_call_key(name: &str, args: &Value) -> crabbot_core::Result<String> {
+    serde_json::to_string(&(name, args))
+        .map_err(|_| denied("Codex tool arguments could not be fingerprinted."))
+}
+
+fn tool_call_failed(
+    failed: &BTreeSet<String>,
+    name: &str,
+    args: &Value,
+) -> crabbot_core::Result<bool> {
+    Ok(failed.contains(&tool_call_key(name, args)?))
 }
 
 impl Server {
     async fn start_with(binary: OsString, home: Option<PathBuf>) -> crabbot_core::Result<Self> {
         check_version(&binary, home.as_deref()).await?;
+
         let mut command = Command::new(&binary);
         command
             .args(["app-server", "--stdio"])
@@ -413,7 +547,13 @@ impl Server {
         let stdout =
             child.stdout.take().ok_or_else(|| denied("Codex app-server output is unavailable."))?;
 
-        Ok(Self { child, input: BufReader::new(stdout), output, next: 1 })
+        Ok(Self {
+            child,
+            input: BufReader::new(stdout),
+            output,
+            next: 1,
+            failed_tool_calls: BTreeSet::new(),
+        })
     }
 
     async fn initialize(&mut self) -> crabbot_core::Result<()> {
@@ -423,6 +563,9 @@ impl Server {
                 "clientInfo": {
                     "name": "crabbot",
                     "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "experimentalApi": true
                 }
             }),
         )
@@ -466,7 +609,20 @@ impl Server {
                 }
 
                 if value.get("error").is_some_and(|error| !error.is_null()) {
-                    return Err(denied("Codex app-server rejected a request."));
+                    let message = value["error"]["message"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|message| !message.is_empty())
+                        .map(|message| message.chars().take(300).collect::<String>());
+
+                    let code = value["error"]["code"].as_i64();
+                    let error = match (message, code) {
+                        (Some(message), _) => format!("Codex rejected {method}: {message}"),
+                        (None, Some(code)) => format!("Codex rejected {method} (error {code})."),
+                        (None, None) => format!("Codex rejected {method}."),
+                    };
+
+                    return Err(denied(&error));
                 }
 
                 return value
@@ -490,13 +646,29 @@ impl Server {
         allowed: &BTreeSet<String>,
         emitter: &mut Emitter,
     ) -> crabbot_core::Result<String> {
+        self.turn_with_interval(thread, turn, allowed, emitter, Duration::from_millis(500)).await
+    }
+
+    async fn turn_with_interval(
+        &mut self,
+        thread: &str,
+        turn: &str,
+        allowed: &BTreeSet<String>,
+        emitter: &mut Emitter,
+        interval: Duration,
+    ) -> crabbot_core::Result<String> {
+        self.failed_tool_calls.clear();
+
         let deadline = Instant::now() + TURN_TIMEOUT;
 
         let mut text = String::new();
         let mut pending = String::new();
+        let mut message_item: Option<String> = None;
         let mut calls = 0_usize;
         let mut notices = 0_usize;
-        let mut ticker = tokio::time::interval(Duration::from_millis(80));
+        let mut stream_events = 0_usize;
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         ticker.tick().await;
 
         loop {
@@ -508,7 +680,7 @@ impl Server {
                 }
 
                 _ = ticker.tick(), if !pending.is_empty() => {
-                    emit(&mut pending, emitter).await?;
+                    emit(&mut pending, &mut stream_events, emitter).await?;
                     continue;
                 }
             };
@@ -533,11 +705,15 @@ impl Server {
                 }
 
                 if let Some(delta) = value["params"]["delta"].as_str() {
-                    append(delta, &mut text, &mut pending)?;
+                    if let Some(item_id) = value["params"]["itemId"].as_str() {
+                        if message_item.as_deref().is_some_and(|previous| previous != item_id) {
+                            append("\n\n", &mut text, &mut pending)?;
+                        }
 
-                    if pending.len() >= 128 {
-                        emit(&mut pending, emitter).await?;
+                        message_item = Some(item_id.to_owned());
                     }
+
+                    append(delta, &mut text, &mut pending)?;
                 }
             } else if value["method"] == "turn/completed" {
                 if value["params"]["threadId"] != thread {
@@ -554,7 +730,7 @@ impl Server {
                     text = final_text;
                 }
 
-                emit(&mut pending, emitter).await?;
+                emit(&mut pending, &mut stream_events, emitter).await?;
                 return Ok(text);
             } else if value.get("id").is_some() {
                 calls = calls.saturating_add(1);
@@ -592,10 +768,19 @@ impl Server {
 
         let params = &request["params"];
         let name = params["tool"].as_str().unwrap_or_default();
-        let response =
-            emitter.call("host/tool", json!({"name": name, "args": params["arguments"]})).await?;
+        let args = &params["arguments"];
+        let key = tool_call_key(name, args)?;
+
+        if tool_call_failed(&self.failed_tool_calls, name, args)? {
+            return Err(denied(
+                "Codex stopped because the same tool call failed earlier in this turn. Check the tool error and workspace before retrying.",
+            ));
+        }
+
+        let response = emitter.call("host/tool", json!({"name": name, "args": args})).await?;
 
         let (success, output) = if let Some(error) = response.error {
+            self.failed_tool_calls.insert(key);
             (false, error.message)
         } else {
             let value = response.result.unwrap_or(Value::Null);
@@ -641,9 +826,18 @@ impl Drop for Server {
 }
 
 fn final_text(turn: &Value) -> Option<String> {
-    turn["items"].as_array()?.iter().rev().find_map(|item| {
-        (item["type"] == "agentMessage").then(|| item["text"].as_str().map(str::to_owned))?
-    })
+    let messages = turn["items"]
+        .as_array()?
+        .iter()
+        .filter_map(|item| {
+            (item["type"] == "agentMessage")
+                .then(|| item["text"].as_str())
+                .flatten()
+                .filter(|text| !text.is_empty())
+        })
+        .collect::<Vec<_>>();
+
+    (!messages.is_empty()).then(|| messages.join("\n\n"))
 }
 
 fn tool_denial(
@@ -683,9 +877,18 @@ fn append(part: &str, text: &mut String, pending: &mut String) -> crabbot_core::
     Ok(())
 }
 
-async fn emit(pending: &mut String, emitter: &mut Emitter) -> crabbot_core::Result<()> {
+async fn emit(
+    pending: &mut String,
+    events: &mut usize,
+    emitter: &mut Emitter,
+) -> crabbot_core::Result<()> {
     if !pending.is_empty() {
-        emitter.event(json!({"kind": "text", "text": std::mem::take(pending)})).await?;
+        let text = std::mem::take(pending);
+
+        if *events < STREAM_EVENTS {
+            emitter.event(json!({"kind": "text", "text": text})).await?;
+            *events += 1;
+        }
     }
 
     Ok(())
@@ -799,9 +1002,12 @@ fn workspace(value: Option<&str>) -> crabbot_core::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Server, check_version, command_with, dynamic_tools, final_text, generate_with,
-        instructions, prompt, tool_denial, valid_rpc, version_reported, workspace,
+        Server, check_version, command_with, dynamic_tools, final_text, instructions, prompt,
+        tool_call_failed, tool_call_key, tool_denial, tool_guidance, valid_rpc, version_reported,
+        workspace,
     };
+
+    use std::time::Duration;
 
     use crabbot_core::types::{Content, Message, ModelRequest, Role, ToolSpec};
     use serde_json::json;
@@ -846,6 +1052,41 @@ mod tests {
     }
 
     #[test]
+    fn describes_only_tools_declared_for_the_turn() {
+        let tool = ToolSpec {
+            name: "read".into(),
+            description: Some("Read a workspace file.".into()),
+            schema: json!({"type": "object"}),
+        };
+
+        let guidance = tool_guidance(&[tool]);
+
+        assert!(guidance.contains("read"));
+        assert!(guidance.contains("declared and available"));
+        assert!(guidance.contains("unless an actual tool call returns an error"));
+        assert!(guidance.contains("After a tool confirms success"));
+        assert!(guidance.contains("at most one mutating tool call in a response"));
+
+        let guidance = tool_guidance(&[]);
+
+        assert!(guidance.contains("No Crabbot workspace tools are declared"));
+        assert!(!guidance.contains("declared and available"));
+    }
+
+    #[test]
+    fn detects_repeated_failed_tool_calls_by_name_and_arguments() {
+        let args = json!({"path": "outside.txt", "text": "data"});
+        let mut failed = std::collections::BTreeSet::new();
+
+        assert!(!tool_call_failed(&failed, "write", &args).unwrap());
+        failed.insert(tool_call_key("write", &args).unwrap());
+
+        assert!(tool_call_failed(&failed, "write", &args).unwrap());
+        assert!(!tool_call_failed(&failed, "write", &json!({"path": "inside.txt"})).unwrap());
+        assert!(!tool_call_failed(&failed, "read", &args).unwrap());
+    }
+
+    #[test]
     fn preserves_role_context_without_exposing_attachment_paths() {
         let messages = vec![
             Message {
@@ -885,7 +1126,7 @@ mod tests {
             ]
         });
 
-        assert_eq!(final_text(&turn).as_deref(), Some("Final."));
+        assert_eq!(final_text(&turn).as_deref(), Some("Earlier.\n\nFinal."));
         assert_eq!(final_text(&json!({"items": []})), None);
     }
 
@@ -920,6 +1161,94 @@ mod tests {
 
         assert!(error.contains("Install Codex CLI"));
         assert!(error.contains("CRABBOT_CODEX_BINARY"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shows_codex_command_help_without_starting_the_cli() {
+        let path =
+            std::env::temp_dir().join(format!("crabbot-codex-no-cli-{}", std::process::id()));
+
+        let (output, _) = mpsc::channel(1);
+        let mut emitter = crate::Emitter::new(output);
+
+        let help = command_with(
+            &json!({"name": "codex", "args": ["--help"]}),
+            &mut emitter,
+            path.as_os_str().to_owned(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(help.contains("login [--device]"));
+        assert!(help.contains("models            List models"));
+        assert!(!help.contains("models list"));
+
+        let help = command_with(
+            &json!({"name": "codex", "args": ["login", "--help"]}),
+            &mut emitter,
+            path.as_os_str().to_owned(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(help.contains("Usage: crab codex login [--device]"));
+
+        let help = command_with(
+            &json!({"name": "codex", "args": ["models", "--help"]}),
+            &mut emitter,
+            path.as_os_str().to_owned(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(help.contains("Usage: crab codex models"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lists_models_and_explains_app_server_rejections() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir()
+            .join(format!("crabbot-codex-models-{}-{nonce}", std::process::id()));
+
+        let script = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    printf '%s\n' 'codex-cli 99.0.0'
+    exit 0
+fi
+while IFS= read -r line; do
+    case "$line" in
+        *initialize*)
+            case "$line" in
+                *'"experimentalApi":true'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+                *) printf '%s\n' '{"id":1,"error":{"code":-32602,"message":"experimentalApi capability is required"}}' ;;
+            esac
+            ;;
+        *model/list*) printf '%s\n' '{"id":2,"result":{"data":[{"id":"gpt-test","displayName":"Test model","isDefault":true}],"nextCursor":null}}' ;;
+        *thread/start*) printf '%s\n' '{"id":3,"error":{"code":-32602,"message":"Invalid model: gpt-unknown"}}' ;;
+    esac
+done
+"#;
+
+        write_binary(&path, script).unwrap();
+        let mut server = Server::start_with(path.as_os_str().to_owned(), None).await.unwrap();
+        server.initialize().await.unwrap();
+
+        let listing = super::models_list(&mut server).await.unwrap();
+        assert!(listing.contains("gpt-test - Test model (default)"));
+
+        let error = server.call("thread/start", json!({})).await.unwrap_err().to_string();
+        assert!(error.contains("thread/start"));
+        assert!(error.contains("Invalid model: gpt-unknown"));
+
+        drop(server);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -975,7 +1304,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn negotiates_and_streams_an_app_server_turn() {
+    async fn coalesces_a_long_app_server_stream_within_the_event_budget() {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -983,18 +1312,53 @@ mod tests {
             std::env::temp_dir().join(format!("crabbot-codex-{}-{nonce}", std::process::id()));
 
         let script = r#"#!/bin/sh
+
 if [ "$1" = "--version" ]; then
     printf '%s\n' 'codex-cli 99.0.0'
     exit 0
 fi
+
 while IFS= read -r line; do
     case "$line" in
         *initialize*) printf '%s\n' '{"id":1,"result":{}}' ;;
+
         *thread/start*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-1"}}}' ;;
         *turn/start*)
             printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-1"}}}'
-            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"Hello","itemId":"item-1","threadId":"thread-1","turnId":"turn-1"}}'
-            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed","items":[{"id":"item-1","type":"agentMessage","text":"Hello"}]}}}'
+            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"First ","itemId":"item-1","threadId":"thread-1","turnId":"turn-1"}}'
+            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"answer.","itemId":"item-1","threadId":"thread-1","turnId":"turn-1"}}'
+            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"Second ","itemId":"item-2","threadId":"thread-1","turnId":"turn-1"}}'
+            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"answer.","itemId":"item-2","threadId":"thread-1","turnId":"turn-1"}}'
+            i=0
+
+            while [ "$i" -lt 300 ]; do
+                printf '%s' '{"method":"item/agentMessage/delta","params":{"delta":"'
+                j=0
+
+                while [ "$j" -lt 128 ]; do
+                    printf 'x'
+                    j=$((j + 1))
+                done
+
+                printf '%s\n' '","itemId":"item-2","threadId":"thread-1","turnId":"turn-1"}}'
+                sleep 0.005
+                i=$((i + 1))
+            done
+
+            printf '%s' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed","items":[{"id":"item-1","type":"agentMessage","text":"First answer."},{"id":"item-2","type":"agentMessage","text":"Second answer.'
+            i=0
+
+            while [ "$i" -lt 300 ]; do
+                j=0
+
+                while [ "$j" -lt 128 ]; do
+                    printf 'x'
+                    j=$((j + 1))
+                done
+
+                i=$((i + 1))
+            done
+            printf '%s\n' '"}]}}}'
             ;;
     esac
 done
@@ -1010,22 +1374,35 @@ done
         let turn =
             server.call("turn/start", json!({"threadId": thread["thread"]["id"]})).await.unwrap();
 
-        let (output, mut events) = mpsc::channel(8);
+        let (output, mut events) = mpsc::channel(256);
         let mut emitter = crate::Emitter::new(output);
         let text = server
-            .turn(
+            .turn_with_interval(
                 thread["thread"]["id"].as_str().unwrap(),
                 turn["turn"]["id"].as_str().unwrap(),
                 &std::collections::BTreeSet::new(),
                 &mut emitter,
+                Duration::from_millis(1),
             )
             .await
             .unwrap();
 
-        assert_eq!(text, "Hello");
-        let event = events.try_recv().unwrap();
+        let expected = format!("First answer.\n\nSecond answer.{}", "x".repeat(38_400));
 
-        assert_eq!(event["params"]["event"]["text"], "Hello");
+        assert_eq!(text, expected);
+
+        let mut streamed = String::new();
+
+        let mut event_count = 0;
+
+        while let Ok(event) = events.try_recv() {
+            event_count += 1;
+            streamed.push_str(event["params"]["event"]["text"].as_str().unwrap());
+        }
+
+        assert!(event_count <= super::STREAM_EVENTS);
+        assert!(streamed.len() < expected.len());
+        assert!(expected.starts_with(&streamed));
         drop(server);
         let _ = std::fs::remove_file(path);
     }
@@ -1045,18 +1422,21 @@ done
         let script = r#"#!/bin/sh
 
 if [ "$1" = "--version" ]; then
+    printf 'x\n' >> "$0.versions"
     printf '%s\n' 'codex-cli 99.0.0'
     exit 0
 fi
 
 while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$0.requests"
+    id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
     case "$line" in
-        *initialize*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+        *\"method\":\"initialize\"*) printf 'x\n' >> "$0.initialized"; printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
 
-        *account/read*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt"}}}' ;;
-        *thread/start*) printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"thread":{"id":"thread-1"}}}' ;;
+        *account/read*) printf '{"jsonrpc":"2.0","id":%s,"result":{"account":{"type":"chatgpt"}}}\n' "$id" ;;
+        *thread/start*) printf 'x\n' >> "$0.threads"; printf '{"jsonrpc":"2.0","id":%s,"result":{"thread":{"id":"thread-1"}}}\n' "$id" ;;
         *turn/start*)
-            printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"turn-1"}}}'
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"turn":{"id":"turn-1"}}}\n' "$id"
             printf '%s\n' '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"Hello","itemId":"item-1","threadId":"thread-1","turnId":"turn-1"}}'
             printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed","items":[{"id":"item-1","type":"agentMessage","text":"Hello"}]}}}'
             ;;
@@ -1067,41 +1447,78 @@ done
         write_binary(&binary, script).unwrap();
 
         let (output, mut events) = mpsc::channel(8);
-        let emitter = crate::Emitter::new(output);
-        let response = generate_with(
-            9,
-            ModelRequest {
-                model: "codex-model".into(),
-                workspace: Some(root.display().to_string()),
-                messages: vec![Message {
-                    id: "user".into(),
-                    session: "session".into(),
-                    role: Role::User,
-                    sender: None,
-                    content: vec![Content::Text { text: "Hello".into() }],
-                }],
+        let mut session = super::Session::new(binary.as_os_str().to_owned(), None);
 
-                stream: true,
-                tools: vec![ToolSpec {
-                    name: "read".into(),
-                    description: Some("Read a workspace file.".into()),
-                    schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
-                }],
-            },
-            emitter,
-            binary.as_os_str().to_owned(),
-            None,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        for id in [9, 10] {
+            let response = session
+                .generate(
+                    id,
+                    ModelRequest {
+                        model: "codex-model".into(),
+                        workspace: Some(root.display().to_string()),
+                        messages: vec![Message {
+                            id: "user".into(),
+                            session: "session".into(),
+                            role: Role::User,
+                            sender: None,
+                            content: vec![Content::Text { text: "Hello".into() }],
+                        }],
 
-        assert_eq!(response.id, 9);
-        let reply: crabbot_core::types::ModelReply =
-            serde_json::from_value(response.result.unwrap()).unwrap();
+                        stream: true,
+                        tools: vec![ToolSpec {
+                            name: "read".into(),
+                            description: Some("Read a workspace file.".into()),
+                            schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                        }],
+                    },
+                    crate::Emitter::new(output.clone()),
+                )
+                .await
+                .unwrap()
+                .unwrap();
 
-        assert_eq!(reply.text, "Hello");
+            assert_eq!(response.id, id);
+            let reply: crabbot_core::types::ModelReply =
+                serde_json::from_value(response.result.unwrap()).unwrap();
+
+            assert_eq!(reply.text, "Hello");
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.initialized", binary.display()))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.versions", binary.display()))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.threads", binary.display()))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+
+        assert!(
+            std::fs::read_to_string(format!("{}.requests", binary.display())).unwrap().contains(
+                "do not claim tools are unavailable unless an actual tool call returns an error"
+            )
+        );
+
         assert_eq!(events.try_recv().unwrap()["params"]["event"]["text"], "Hello");
+        let _ = std::fs::remove_file(format!("{}.initialized", binary.display()));
+        let _ = std::fs::remove_file(format!("{}.versions", binary.display()));
+        let _ = std::fs::remove_file(format!("{}.threads", binary.display()));
+        let _ = std::fs::remove_file(format!("{}.requests", binary.display()));
         let _ = std::fs::remove_file(binary);
         let _ = std::fs::remove_dir_all(root);
     }

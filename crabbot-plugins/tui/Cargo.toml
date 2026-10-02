@@ -11,6 +11,7 @@ crossterm.workspace = true
 crabbot-core = { path = "../../crabbot-core" }
 crabbot-file = { path = "../../crabbot-libs/file" }
 getrandom.workspace = true
+jiff.workspace = true
 ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true

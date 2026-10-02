@@ -6,7 +6,7 @@ secrets = ["CRABBOT_CODEX_KEY"]
 
 [[commands]]
 name = "codex"
-description = "Manage Codex ChatGPT sign-in."
+description = "Manage Codex sign-in and list available models."
 interactive = false
 
 [protocol]

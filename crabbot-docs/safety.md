@@ -13,7 +13,8 @@ before installation.
 
 ## Tools
 
-File operations stay below `CRABBOT_ROOT` after canonicalization. Symlinked
+File operations stay below the active session workspace after canonicalization,
+or below `CRABBOT_ROOT` when a session has not selected a workspace. Symlinked
 instructions, traversal, dangling write links, and worktree paths outside the
 active workspace are rejected. Shell commands require both `shell = true` and
 an approval decision, and output and execution time are bounded.

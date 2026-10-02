@@ -24,6 +24,14 @@ pub(super) fn format_date(timestamp: u64) -> Option<String> {
     Some(date.format())
 }
 
+pub(super) fn format_datetime(timestamp: u64) -> Option<String> {
+    let timestamp = i64::try_from(timestamp).ok()?;
+    let timestamp = jiff::Timestamp::from_second(timestamp).ok()?;
+    let zoned = timestamp.to_zoned(jiff::tz::TimeZone::system());
+
+    Some(zoned.strftime("%Y-%m-%d at %H:%M").to_string())
+}
+
 fn civil_date_from_unix_days(days_since_unix_epoch: i64) -> CivilDate {
     let days_since_civil_epoch = days_since_unix_epoch + DAYS_BEFORE_UNIX_EPOCH;
     let era = days_since_civil_epoch / DAYS_PER_ERA;
@@ -73,5 +81,14 @@ mod tests {
         assert_eq!(format_date(1_704_067_199).as_deref(), Some("2023-12-31")); // 2023-12-31 UTC.
         assert_eq!(format_date(1_704_067_200).as_deref(), Some("2024-01-01")); // 2024-01-01 UTC.
         assert!(format_date(u64::MAX).is_some());
+    }
+
+    #[test]
+    fn separates_local_date_and_time_with_at() {
+        let formatted = super::format_datetime(1_709_164_800).unwrap();
+        let (date, time) = formatted.split_once(" at ").unwrap();
+
+        assert_eq!(date.len(), 10);
+        assert_eq!(time.len(), 5);
     }
 }

@@ -2,12 +2,16 @@ CARGO ?= cargo
 JOBS ?= 4
 COVERAGE_PROFILE ?= full
 comma := ,
-.DEFAULT_GOAL := help
-.PHONY: help install hooks fmt spacing clippy check test coverage build release metrics ci revloop verify
+.DEFAULT_GOAL := all
+.PHONY: all help install hooks fmt spacing clippy check test coverage build release metrics ci revloop verify
+
+all: build
+	$(MAKE) install
 
 help:
 	@printf '%s\n' 'Crabbot development targets:'
-	@printf '%s\n' '  install   Install the crabbot, crab, and crabbot-daemon binaries'
+	@printf '%s\n' '  all       Build the workspace, then install the CLI and daemon (default)'
+	@printf '%s\n' '  install   Install the crabbot, crab, and crabbot-daemon binaries only'
 	@printf '%s\n' '  hooks     Install Lefthook git hooks'
 	@printf '%s\n' '  fmt       Check Rust formatting and spacing'
 	@printf '%s\n' '  spacing   Apply Rust block spacing'
@@ -23,8 +27,8 @@ help:
 	@printf '%s\n' '  verify    Run the complete local quality workflow'
 
 install:
-	$(CARGO) install --path crabbot --force
-	$(CARGO) install --path crabbot-daemon --force
+	$(CARGO) install --path crabbot --locked --force
+	$(CARGO) install --path crabbot-daemon --locked --force
 
 hooks:
 	lefthook install

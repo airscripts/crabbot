@@ -5,12 +5,13 @@ crabbot help
 crabbot --version
 crabbot init [--force] [-y|--yes] [--json]
 crabbot doctor [--fix] [--json]
+crabbot config get [<key>] [--json]
+crabbot config set <key=value> [--force] [--json]
 crabbot status [--json]
 crabbot version [--json]
 crabbot completion <bash|fish|powershell|zsh>
 crabbot plugin list [--json]
-crabbot plugin install <id> [source] [--revision <rev>] [-y|--yes] [--json]
-crabbot plugin link <id> [folder] [--revision <rev>] [-y|--yes] [--json]
+crabbot plugin install <id>... [--source <path-or-url>] [--revision <rev>] [--link] [-y|--yes] [--json]
 crabbot plugin update [-y|--yes] [--json]
 crabbot plugin uninstall <id> [-y|--yes] [--force] [--json]
 crabbot memory <status|search|list|show|remember|edit|forget|audit|learning> [arguments...]
@@ -120,8 +121,9 @@ and an editable message box. Press Enter to send, Ctrl+O to add a line,
 Up/Down to browse input history, Page Up/Page Down to move the conversation by
 a page, and the mouse wheel to scroll the pane under the pointer. New output
 stays in view unless you have scrolled back; scrolling down to the latest output
-resumes following it. The input box follows the cursor while editing. Press
-Escape or Ctrl-C to quit. The bottom-right footer shows
+resumes following it. The input box follows the cursor while editing. Hold Shift
+while dragging to select and copy transcript text; the mouse wheel remains
+available for scrolling. Press Escape or Ctrl-C to quit. The bottom-right footer shows
 the Crabbot version and `/help` hint. `/help` lists commands available in this session;
 conditional commands appear only when their plugin capability and required
 background runtime are available. Plugin-contributed commands remain CLI
@@ -138,15 +140,12 @@ name defaults to `Crabbot` and can be changed globally with `name` in
 When no intelligence plugin is installed, the statusline shows the model as
 `unset`, regardless of the model value saved in the session.
 
-The TUI opens without the background runtime for local session work; in that
-case it stores sessions separately in
-`<CRABBOT_HOME>/data/plugins/tui/sessions.json`, which is not shared with
-daemon-backed sessions. The TUI keeps the backend it selected at startup for the
-entire session, even if daemon availability changes. The file contains session
-IDs, models, workspaces, timestamps, and conversation messages. Sending prompts
-still requires the selected intelligence plugin to be installed. `--once
-<prompt>` sends one prompt and prints the response without opening the
-full-screen interface; quote prompts containing spaces.
+The daemon must be running before opening the TUI or using `--once`; start it
+with `crab service start` or run `crabbot-daemon` in the foreground. Both modes
+use daemon-managed model turns, tools, approvals, and the shared session store.
+The TUI refuses to start when the daemon is unavailable. `--once <prompt>` sends
+one prompt and prints the response without opening the full-screen interface;
+quote prompts containing spaces.
 The default session ID is `default`; use `--session`, `--model`, and `--plugin`
 to select a different session and model configuration.
 
@@ -157,6 +156,30 @@ Use `/animation off` to show replies immediately, `/animation on` to restore the
 effect, and `/animation` to check its setting. The choice is saved with the TUI
 preferences.
 
+The conversation uses the available screen without an outer frame. Crabbot
+replies appear in rounded orange bubbles on the left, while your messages appear
+in rounded green bubbles on the right; the input border uses matching rounded
+corners. Saved user and assistant messages show UTC timestamps, and generation
+status includes elapsed time.
+When Codex emits multiple assistant messages in one turn, each is separated
+from the next by a blank line.
+The TUI uses the daemon's shared tool and approval policy. Tool access is
+disabled for TUI sessions unless `[clients.tui] tools = true` is set in
+`config.toml`; when enabled, the global `approval` mode still governs mutating
+tools. Tool paths remain confined to the active session workspace. On exit, the
+input title shows that Crabbot is waiting for the daemon turn to stop.
+During generation, normal messages are disabled; you can begin typing `/` to
+enter an approval command even from an empty input, and Escape remains available.
+Prefix a line with `!` to invoke the daemon's shell directly
+in the active session workspace. This requires `shell = true`, but does not
+require the Tools plugin or an approval prompt because the command is explicitly
+entered by you. The daemon reads this setting at startup, so restart it after
+changing the value. If shell is disabled, the TUI reports the config file used
+by the running daemon and keeps that System response in the session history.
+You remain the sender of both command types; their local replies and shell
+output appear as neutral gray System entries, while intelligence responses
+remain attributed to Crabbot.
+
 `crabbot validate` checks a Crabfile without changing local state. It uses
 `./Crabfile` by default or the path supplied with `--path`, and reports the
 first syntax or schema error. See the [Crabfile specification](crabfile.md)
@@ -164,19 +187,26 @@ for the supported version and keys.
 
 `crabbot plugin list` shows each installed plugin as a plain-text list with its
 version, health, protocol, capabilities, commands, and permissions. The TUI's
-`/plugins` command uses the same fields and layout. `crabbot plugin list --json`
+`/plugins [page]` command presents the same metadata in compact, paginated entries.
+`crabbot plugin list --json`
 returns the inventory in an object with an `items` array. A visible plugin
 directory with a missing or invalid manifest is reported as an error so the
 inventory cannot silently hide broken installation state.
 
-`crabbot plugin install` and `crabbot plugin link` validate and register one
-plugin at a time. When the background runtime is running, it starts server
-plugins immediately; otherwise, the next runtime start discovers them. The TUI
-is a foreground client and runs immediately after installation without waiting
-for the background runtime. The core artifact
-contains the CLI and daemon executables, but no plugin binaries. Uninstalling a
-plugin unloads its active process before removing its files. `crabbot plugin
-update` previews available version, source-revision, and content changes without
+`crabbot plugin install` accepts multiple IDs and validates and registers each
+plugin independently. Use `--source` and `--revision` only when installing one
+plugin from an explicit source. By default, installation copies plugin binaries;
+`--link` instead links a local build for development. Linked plugins can be
+rebuilt in place without reinstalling; restart the daemon with
+`crab service restart` to load the rebuilt executable. The linked source and
+manifest must remain at their recorded paths. When the background
+runtime is running, it starts server plugins immediately; otherwise, the next
+runtime start discovers them. Installation prints one success summary, followed
+by separate runtime guidance for plugins that need the daemon. The TUI also
+requires the daemon to be running before it can open. The core artifact contains
+the CLI and daemon executables, but no plugin binaries. Uninstalling a plugin
+unloads its active process before removing its files. `crabbot plugin update`
+previews available version, source-revision, and content changes without
 changing installed plugins. Rerun `crabbot plugin update --yes` to apply that
 preview; only changed plugins are replaced, and only active plugins are
 unloaded and reloaded. Inactive plugins stay inactive.
@@ -224,6 +254,8 @@ authenticated daemon state, and `/approval` reports the daemon approval mode.
 `/approvals` lists pending mutating-tool requests. Resolve one with
 `/approve <id>` or `/deny <id>`; each action is sent through authenticated
 daemon IPC and applies only to the matching pending request.
+When an approval picker is open, Left/Right selects Approve or Deny and Enter
+submits that choice.
 `/session help` lists TUI session commands; `/session list [page]` shows ten
 bounded per-session rows per page with status, model, creation/update dates,
 and message count. Sessions being worked on and the selected session appear
@@ -232,6 +264,12 @@ sessions last. Each list command reads a fresh snapshot, so multiple TUI
 instances do not share a page cursor. The selected session is marked `active`,
 work in progress is `working`, and the model is `unset` when no intelligence
 plugin is installed.
+TUI windows following the same session refresh its persisted transcript
+automatically once per second. A submitted user message appears in
+other windows while its turn is running; the assistant reply appears when the
+daemon saves it at turn completion. Other windows also show the shared working
+state and prevent another chat message until that turn finishes; approval
+commands remain available.
 `/session switch <id>` resumes an existing persisted session, while
 `/session create <id>` creates and selects one. `/session rename <new-id>`
 renames the active session without losing its history; channel-backed sessions
@@ -247,7 +285,12 @@ operation-failed prefix; add operation context only when the underlying error
 does not explain the failure. `/new <id>` is a shortcut for session creation.
 `/deliveries` lists pending and uncertain outbox entries; `/retry <id>` and
 `/drop <id>` apply the same explicit delivery controls as the native CLI.
-`/model <name>` changes the selected session's model.
+`/model help` shows model controls. With Codex selected, `/model list` lists
+account models; `/model show` inspects the selected model, and `/model set <id>`
+changes it. `/model <id>` remains a shortcut. The TUI does not assume a
+provider-specific model by default. If a selected model is rejected, the failed
+request is shown without closing the session, so the model can be corrected and
+the prompt retried.
 TUI commands and their displayed replies are also stored in the active session,
 so command-only sessions and sessions used without an intelligence plugin can
 be resumed with their visible interaction history. Completed model turns and
@@ -326,10 +369,12 @@ environment paths. If provider variables are present, their declared values
 are copied to a private service credential JSON file and the definition points
 to it; existing CRABBOT_CREDENTIALS and CRABBOT_KEYRING=1 configuration is also
 preserved. An existing definition is not replaced unless `--force` is supplied.
-`uninstall` requires `--yes` (or `-y`). `start` and `stop` activate or deactivate it through systemd-user,
-launchd, or the Windows Service Controller. Uninstall stops or unloads the service
-before deleting the definition. `status` reports both the installed definition
-and the service-manager state. On Linux this is a user service, so use
+`uninstall` requires `--yes` (or `-y`). `start` and `stop` activate or deactivate
+it through systemd-user, launchd, or the Windows Service Controller. `restart`
+restarts it through the native service manager without uninstalling or disabling
+the service. Uninstall stops or unloads the service before deleting the
+definition. `status` reports both the installed definition and the
+service-manager state. On Linux this is a user service, so use
 `systemctl --user status crabbot.service` for detailed systemd output; plain
 `systemctl status crabbot.service` checks the separate system-wide manager.
 Repeated `start` and `stop` commands report when the service is already in the

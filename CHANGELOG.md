@@ -7,9 +7,106 @@ Semantic Versioning.
 
 ### Added
 
+- Refresh shared TUI session transcripts and working status across multiple
+  windows; prevent conflicting turns and report a busy session as System.
+- Let explicitly linked plugins pass integrity checks after their local binary
+  is rebuilt in place, while still requiring the recorded symlink target and
+  manifest to match. A daemon restart loads rebuilt plugin executables.
+- Add the shared `CRAB.md` and `CLAW.md` system context to TUI model turns, matching
+  CLI and messaging-channel turns. Give both starter templates practical defaults
+  for personality, communication, uncertainty, context, permissions, sensitive
+  actions, and task workflow. Document their shared 32 KiB context budget and
+  truncation behavior in the starter files and configuration guide.
+- Keep the TUI palette to the terminal's default foreground, orange accents, and gray shades;
+  render live generation status and list headings in orange.
+- Show TUI slash and `!` command replies as neutral gray System entries, expose
+  pending tool approvals as actionable notices, and disable new chat messages
+  while a turn is active. Allow `/` approval commands to be typed from an empty
+  input during a turn and decode them correctly before resolving approvals.
+  Render live approval confirmations as System entries while keeping the
+  resumed model reply under Crabbot. Format approval notices with the tool,
+  exact command or arguments, action summary, and highlighted `/approve` and
+  `/deny` commands. Show per-plugin install progress and daemon guidance only
+  when installed plugins need the daemon; omit redundant active-plugin status.
+  Suppress stray punctuation-only stream fragments immediately after approval.
+  Use aligned left-side role rails for transcript messages and slash/approval
+  pickers, add a horizontally navigable approval picker, and show slash-command
+  suggestions above a prompt. Give transcript messages a little more separation
+  and visually distinguish actor names from their subdued timestamps. Report
+  interrupted turns as System and reveal local message timestamps on hover as
+  “Actor, YYYY-MM-DD at HH:MM”.
+  Use the statusline gray for System messages, and improve command help and
+  paginated session/plugin lists with five entries per page and tree-formatted
+  metadata, replacing status diamonds with connected tree branches. Add streamed
+  `!<command>`
+  execution through the daemon's configured shell without requiring the general
+  Tools plugin. Keep streamed message rails fixed while preserving typewriter
+  animation.
+- Resolve TUI workspace paths from the launch directory, show the active workspace by basename,
+  display local message times, use a neutral user-message foreground, and align command help rows.
+  Add `[clients.tui] theme = false` to render TUI content with the terminal's default foreground.
+
+- Add validated `crab config get/set` commands, live-apply the TUI tools setting,
+  and support restarting a running daemon with `--force` for other changes.
+- Namespace TUI sessions separately from channel conversations while keeping
+  the internal prefix out of displayed session names.
+- Require the daemon for interactive and one-shot TUI use. Route TUI model turns
+  through the shared daemon executor and approval/tool policy, with TUI tool
+  access disabled unless `[clients.tui] tools = true` is explicitly configured.
+- Show a concise two-line startup message when `crab tui` is run without the
+  required daemon.
+- Summarize plugin installations with progress and a success count; show
+  runtime guidance only for plugins that are not active yet. Format TUI command errors as
+  readable messages instead of Rust debug wrappers.
+- Keep user and assistant turns visually separate when fast replies complete,
+  and reveal daemon-streamed TUI responses as they arrive.
+- Avoid replacing a local command reply with a stale session snapshot while its
+  output is streaming or being revealed.
+- Let an explicitly selected session workspace replace the default tool root for
+  that session, while keeping every tool operation confined to the selected
+  directory. Use `CRABBOT_ROOT` when no session workspace is selected.
+- Return daemon-hosted read and list results in the `text` field expected by
+  intelligence plugins, so workspace tool output is available to the model.
+- Advertise shell to intelligence providers only when `shell = true`, reject
+  undeclared tool calls before approval, and execute at most one mutating tool
+  call from each model response before asking the model to continue. Direct
+  Codex not to repeat a completed file operation through another tool.
+- Treat an active TUI reservation as a valid mutation lease for approval-aware
+  tool calls, and allow up to one minute for Codex app-server control requests.
+- Persist TUI message times as UTC Unix-epoch milliseconds and render them in
+  the local timezone on each computer.
+- Add `crab service restart` to restart the installed daemon through its native
+  service manager without changing whether the service is enabled.
+- Persist streamed TUI replies in the daemon before acknowledging turn
+  completion, so a client switch or exit cannot lose them. Place padded
+  speaker/date titles inside rounded message borders.
+- Keep shell-disabled `!` command diagnostics in session history and identify
+  the config file used by the running daemon. Align command-picker descriptions
+  after the longest command.
+- Move production session state to `data/sessions/` with a global index,
+  opaque-keyed session records, client state, and separate delivery records.
+  Import legacy daemon and offline TUI sessions on first daemon startup while
+  retaining source files and preferring existing daemon sessions on collisions.
+
+- Allow installing or linking multiple bundled plugins in one command, with
+  `plugin install --link` retaining the local development workflow. Reuse the
+  Codex app-server between turns and clarify that declared workspace tools
+  should be used before reporting them unavailable.
+- Add Codex subcommand help and account model listing with the concise
+  `crab codex models` command; negotiate the experimental app-server API needed
+  for workspace roots and clarify foreground availability. Keep the TUI session
+  usable after provider failures, coalesce long streamed replies, and stop
+  streaming updates safely before the plugin event budget is exhausted while
+  retaining the complete final reply. Stop a turn if Codex repeats an identical
+  tool call after it failed, and make workspace confinement explicit in tool
+  guidance. Show model-selection guidance only for invalid-model errors.
 - Resolve bundled plugin IDs from category directories such as
   `crabbot-plugins/intelligence/codex`, so `crabbot plugin install codex` works
   from the repository root after building the plugin.
+- Pass the documented default workspace root to the tools plugin when no
+  `CRABBOT_ROOT` override is configured, so plugin installation health checks
+  can complete their protocol handshake. The daemon supplies the active session
+  workspace to TUI tool calls, and the tools plugin confines operations to it.
 - Added toggleable Codex Fast mode for Revloop. It is off by default and can be
   enabled with `--fast` or `CRABBOT_REVLOOP_FAST=true`.
 - Added a globally configurable Crabbot display name and improved the TUI with
@@ -26,9 +123,9 @@ Semantic Versioning.
 - Made `crabbot plugin update` preview the exact available plugin changes;
   rerun it with `--yes` to apply, with unchanged plugins left untouched.
 - Reworked `crab tui` as a full-screen terminal chat with editable input,
-  scrollable conversation history, and one-shot prompt mode. Session commands
-  now work without the background runtime using a separate local TUI session store; sending
-  prompts still requires an installed intelligence plugin. Abandoned TUI
+  scrollable conversation history, and one-shot prompt mode. The TUI uses the
+  daemon-managed session store, tools, and approvals; opening it requires the
+  background runtime. Abandoned TUI
   session reservations expire and recover automatically.
 - Added TUI session help, rename, reversible archive/restore, and confirmed
   permanent deletion; session history is restored on switches, and the active
@@ -42,6 +139,15 @@ Semantic Versioning.
   and streamed model text use a configurable typewriter reveal; model generation
   shows 25 rotating "The Crabbot..." progress messages, and Escape-to-interrupt
   support that preserves partial replies.
+- Removed the transcript-wide frame, added left-aligned orange Crabbot bubbles
+  and right-aligned green user bubbles with rounded corners, and rounded the
+  input border to match. Saved user and assistant messages show UTC timestamps,
+  and generation status includes elapsed time. When the `tools` plugin is
+  installed, the TUI gives intelligence plugins confined `read`, `list`, and
+  `search` tools; mutating
+  tools remain unavailable in this direct interactive path. Consecutive Codex
+  assistant message items are separated by a blank line, and final model text
+  no longer duplicates text already streamed.
 - Paginated TUI session listings at ten entries per page, with in-progress and
   selected sessions first, then idle sessions by recency and archived sessions
   last. Each page reads a fresh snapshot for independent concurrent TUI clients.
@@ -55,6 +161,8 @@ Semantic Versioning.
   removed the `/sessions` shortcut in favor of `/session list`. The footer now
   shows the Crabbot version and help hint at the bottom-right, while conversation
   wrapping is cached to keep scrolling responsive. Clarified workspace scope.
+- Kept long words intact when wrapping TUI bubbles, hid only soft-wrap-leading
+  spaces in the display, and showed an exit notice while the engine shuts down.
 - Launch the TUI as a foreground terminal process so keyboard input is read
   from the user's terminal rather than the plugin protocol stream. Clarified
   that installing the TUI does not require a running background runtime. The

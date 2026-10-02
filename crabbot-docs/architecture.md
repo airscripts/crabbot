@@ -12,10 +12,12 @@ while Core remains independent of the Runtime and external providers.
 Crabbot is organized into six layers:
 
 1. `crabbot` is the user-facing CLI. It handles local commands and uses
-   authenticated local JSON-RPC IPC when a command needs the daemon.
+   authenticated local JSON-RPC IPC when a command needs the daemon. The TUI
+   requires this same daemon runtime for turns and session state.
 2. `crabbot-daemon` is the long-running service entrypoint. It starts the
    runtime and keeps the agent, state, bridges, and plugin processes alive.
-3. `crabbot-runtime` is the host layer shared by the CLI and daemon. It
+3. `crabbot-runtime` is the host layer shared by the CLI, daemon, and TUI's
+   daemon-mediated turns. It
    owns configuration, persistence, lifecycle, installation and updates,
    session orchestration, channel bridges, and local IPC.
 4. `crabbot-core` is the provider-neutral agent foundation. It owns normalized
@@ -45,6 +47,20 @@ calls and returned values. Only CLI-to-Daemon IPC and Runtime-to-Plugin
 JSON-RPC cross process boundaries. Plugins do not connect to Core at runtime;
 they implement the contracts Core defines and communicate through Runtime.
 
+The TUI is a terminal client, not a second agent runtime. It submits turns over
+authenticated local IPC; the daemon selects the model plugin, applies tool and
+approval policy, executes tools, and persists every interaction. Terminal
+rendering, typewriter reveal, and scroll state remain inside the TUI plugin.
+TUI tool use is explicitly opt-in with `[clients.tui] tools = true` and remains
+subject to the global approval mode.
+
+Session data is stored under `CRABBOT_HOME/data/sessions/`: `index.json` is the
+global catalog, `records/` contains opaque-keyed session records,
+`state/clients/` contains runtime client state, and `state/deliveries/` contains
+the delivery index and records. Existing root `sessions.json` and offline TUI
+session data are imported on first daemon startup, with the daemon's copy taking
+precedence on ID collisions; source files are retained.
+
 The core is useful without plugins: `version`, `init`, `doctor`, `status`, and plugin
 management still work. A model plugin handles `generate` with a normalized
 `ModelRequest` and returns a `ModelReply`. The host is responsible for policy,
@@ -56,7 +72,7 @@ are explicit extension seams; only model, channel, and tool routing is enabled
 in the initial daemon flow.
 
 The runtime keeps a live registry of verified plugin processes. `plugin install`
-and `plugin link` request authenticated IPC activation after committing the
+and `plugin install` request authenticated IPC activation after committing the
 plugin; `plugin uninstall` unloads it before deleting its files. The bridge wakes
 when a configured channel or model is added, so a daemon need not restart to
 discover it. `plugin update` unloads active plugin processes before replacing

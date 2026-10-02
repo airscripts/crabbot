@@ -105,20 +105,16 @@ crabbot help
 crab --version
 ```
 
-`make install` is an equivalent repository-local shortcut. Re-run both
-`cargo install --path ... --locked --force` commands after changing
-Rust source.
-
 ### Local Plugins
 
-Build only the plugin you want to use. The default link source is the matching
-directory under `crabbot-plugins/`, so run these commands from the repository
-root or pass an absolute source path:
+Build only the plugins you want to use. Without `--source`, plugin IDs resolve
+to matching directories under `crabbot-plugins/`, so run these commands from
+the repository root or pass an absolute source path:
 
 ```sh
 cargo build -p crabbot-plugin-PLUGIN_ID --locked
 crabbot init
-crabbot plugin link PLUGIN_ID --yes
+crabbot plugin install PLUGIN_ID --link --yes
 crabbot doctor
 ```
 
@@ -127,8 +123,10 @@ does not require a particular intelligence or messaging plugin.
 
 Use `crabbot plugin list` to inspect installed capabilities. A local link
 records the canonical source and executable in `plugins.lock`; rebuild and run
-`crabbot plugin link PLUGIN_ID --yes` again to validate and hot-load your
-changes. `crabbot plugin update` previews available updates. Run
+`crabbot plugin install PLUGIN_ID --link --yes` again to validate and hot-load
+your changes. Install several bundled plugins with one command, for example
+`crabbot plugin install codex tui tools`. `crabbot plugin update` previews
+available updates. Run
 `crabbot plugin update --yes` to apply the preview; it unloads and reloads only
 plugins that were active, without restarting the daemon. Review every
 manifest's permissions and declared secrets before linking community plugins.
@@ -197,9 +195,10 @@ require an explicit allowlist; mention, owner, admin, member, topic, and thread
 filters are available for Telegram and Discord.
 
 Use `crabbot service install` followed by `crabbot service start` to activate
-the native service. Existing definitions require
-`crabbot service install --force` to replace them. `crabbot service stop` and
-`crabbot service uninstall -y` reverses those actions. See the
+the native service. Use `crabbot service restart` after changing a plugin or
+daemon configuration. Existing definitions require
+`crabbot service install --force` to replace them. `crabbot service stop`
+deactivates the service, and `crabbot service uninstall -y` removes it. See the
 [configuration guide](crabbot-docs/configuration.md)
 for the full `config.toml` reference and recovery behavior. `crabbot service
 status` reports whether the service is active. On Linux it uses the user-level
@@ -267,6 +266,12 @@ crabbot-scripts/              packaging, release, metrics, checks, and review au
 ```
 
 ## Development
+
+`make` is a developer shortcut: it builds the full workspace, including plugin
+binaries, then installs the `crabbot`/`crab` CLI and `crabbot-daemon` from this
+checkout. `make install` installs only the CLI and daemon. Neither command
+installs or refreshes copied plugins, or initializes Crabbot's home; do those
+separately when needed. Re-run `make` after changing Rust source.
 
 Local development requires Rust 1.89 or newer, Cargo, Git, a working C
 compiler for native dependencies, and

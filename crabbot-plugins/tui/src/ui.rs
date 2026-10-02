@@ -21,19 +21,20 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget, Wrap},
+    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Widget, Wrap},
 };
 
 use std::{
     collections::VecDeque,
     fs::File,
+    ops::Range,
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tokio::{
@@ -45,16 +46,21 @@ use tokio::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+const ACCENT_COLOR: Color = Color::Rgb(255, 140, 0);
 const TRANSCRIPT_LIMIT: usize = 512 * 1024;
 const INTERACTION_LIMIT: usize = 12 * 1024;
 const INPUT_HISTORY_LIMIT: usize = 100;
 const INPUT_MAX_ROWS: usize = 5;
+const COMPOSER_GAP_ROWS: u16 = 1;
+const MESSAGE_GAP_ROWS: usize = 2;
+const GENERATION_FRAME_INTERVAL: Duration = Duration::from_millis(40);
 const TYPEWRITER_INTERVAL: Duration = Duration::from_millis(16);
+const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const TYPEWRITER_BACKLOG: usize = 96;
 const TYPEWRITER_BURST: usize = 2;
 const TYPEWRITER_CATCHUP_BURST: usize = 12;
-const DEFAULT_STATUSLINE: &str = "{name} · model: {model} · session: {session} · {workspace}";
-const LEGACY_DEFAULT_STATUSLINE: &str = "{name} · {model} · {session} · {workspace}";
+const DEFAULT_STATUSLINE: &str = "{name} | model: {model} | session: {session} | {workspace}";
+const LEGACY_DEFAULT_STATUSLINE: &str = "{name} | {model} | {session} | {workspace}";
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -87,24 +93,35 @@ struct App {
     history_index: Option<usize>,
     history_draft: String,
     transcript_scroll: ScrollState,
+    mouse_position: Option<(u16, u16)>,
     input_scroll: ScrollState,
     input_cursor_needs_visibility: bool,
     input_area: Option<Rect>,
+    command_selection: usize,
+    approval_selection: usize,
+    command_options: Vec<(&'static str, &'static str)>,
     status: String,
     session: String,
     model: String,
     model_available: bool,
     workspace: String,
+    default_workspace: String,
     name: String,
     statusline: String,
     statusline_changed: bool,
     statusline_reset: bool,
     preferences_path: PathBuf,
     typewriter: bool,
+    theme_enabled: bool,
     generation_active: bool,
+    session_working: bool,
+    generation_started: Option<Instant>,
     generation_message: &'static str,
+    exiting: bool,
     interrupt_requested: bool,
     reply_pending: bool,
+    reply_system: bool,
+    approval_reply_pending: bool,
     pending_model: Option<String>,
     pending_workspace: Option<Option<String>>,
     pending_clear: bool,
@@ -118,6 +135,9 @@ struct TranscriptLayout {
     generation: u64,
     width: u16,
     rows: Vec<Line<'static>>,
+    message_rows: Vec<Range<usize>>,
+    hovered_message: Option<usize>,
+    hovered_rows: Option<Vec<Line<'static>>>,
 }
 
 struct TranscriptViewport<'a> {
@@ -216,6 +236,7 @@ struct PendingInteraction {
     session: String,
     input: String,
     output: String,
+    system: bool,
 }
 
 struct SavedInteraction {
@@ -223,6 +244,7 @@ struct SavedInteraction {
     input: String,
     output: String,
     sequence: u64,
+    system: bool,
 }
 
 pub(super) struct ModelOptions {
@@ -259,6 +281,7 @@ where
 
     let initial_session = load_session(&home, &session, host).await?;
     let model_available = crate::has_capability(&home, "model");
+    let command_options = command_options(&home, model_available);
     let mut terminal = Terminal::new(CrosstermBackend::new(output.try_clone()?))?;
     let _guard = TerminalGuard::enter(output)?;
     execute!(terminal.backend_mut(), terminal::Clear(terminal::ClearType::All))?;
@@ -275,6 +298,7 @@ where
 
     let statusline = upgraded_statusline(&preferences.statusline);
     let typewriter = preferences.typewriter;
+    let theme_enabled = std::env::var("CRABBOT_TUI_THEME").as_deref() != Ok("off");
 
     let engine_model = model.clone();
     let (session_tx, mut session_rx) = mpsc::unbounded_channel();
@@ -292,8 +316,11 @@ where
             session,
         },
         host,
-        Some(session_tx),
-        Some(engine_event_tx),
+        crate::EngineEvents {
+            session: Some(session_tx),
+            engine: Some(engine_event_tx),
+            streaming_host: Some(crate::daemon_streaming_control),
+        },
         interrupt_rx,
     ));
 
@@ -317,17 +344,24 @@ where
         }
     });
 
+    let default_workspace = crate::workspace_root(&home, None).display().to_string();
+    let workspace = initial_session.workspace.clone().unwrap_or_else(|| default_workspace.clone());
+
     let mut app = App {
         status: "Ready".into(),
         transcript: render_messages(&initial_session.messages, &name),
         session: initial_session.id,
         model: display_model(&initial_session.model, model_available),
         model_available,
-        workspace: initial_session.workspace.unwrap_or_default(),
+        command_options,
+        workspace,
+        session_working: initial_session.working,
+        default_workspace,
         name,
         statusline,
         preferences_path,
         typewriter,
+        theme_enabled,
         generation_message: random_generation_message(),
         ..App::default()
     };
@@ -337,6 +371,11 @@ where
     let mut session_events_open = true;
     let mut engine_events_open = true;
     let mut quit = false;
+    let mut session_refresh = tokio::time::interval(SESSION_REFRESH_INTERVAL);
+    let mut generation_refresh = tokio::time::interval(GENERATION_FRAME_INTERVAL);
+    generation_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    session_refresh.tick().await;
+    generation_refresh.tick().await;
 
     while !quit {
         terminal.draw(|frame| draw(frame, &mut app))?;
@@ -389,12 +428,15 @@ where
                             interaction.session = session.id.clone();
                         }
 
-                        app.status = format!("Session {}", session.id);
+                        app.status = format!("Session {}", session_display_name(&session.id));
 
                         if renamed {
                             app.session = session.id;
                             app.model = display_model(&session.model, app.model_available);
-                            app.workspace = session.workspace.unwrap_or_default();
+
+                            app.workspace = session
+                                .workspace
+                                .unwrap_or_else(|| app.default_workspace.clone());
                         } else {
                             app.restore_session(session);
 
@@ -408,23 +450,49 @@ where
                 }
             }
 
+            _ = session_refresh.tick(), if !app.generation_active => {
+                let session_id = app.session.clone();
+
+                if let Ok(session) = load_session_snapshot(&home, &session_id, host).await {
+                    app.refresh_session(session);
+                }
+            }
+
             event = engine_event_rx.recv(), if engine_events_open => {
                 match event {
                     Some(crate::EngineEvent::GenerationStarted) => {
                         app.generation_active = true;
+                        app.generation_started = Some(Instant::now());
                         app.interrupt_requested = false;
                         app.generation_message = random_generation_message();
                     }
 
                     Some(crate::EngineEvent::GenerationFinished { interrupted }) => {
-                        app.generation_active = false;
-                        app.reply_pending = false;
-                        app.interrupt_requested = false;
-                        app.status = if interrupted { "Generation interrupted" } else { "Ready" }.into();
+                        app.finish_generation(interrupted);
 
                         for interaction in app.take_persistable_interactions() {
                             persist_interaction(&home, interaction, host).await?;
                         }
+                    }
+
+                    Some(crate::EngineEvent::AssistantText(text)) => {
+                        let interactions = app.push_assistant_output(text);
+
+                        for interaction in interactions {
+                            persist_interaction(&home, interaction, host).await?;
+                        }
+                    }
+
+                    Some(crate::EngineEvent::SystemText(text)) => {
+                        app.push_system_output(&text);
+                    }
+
+                    Some(crate::EngineEvent::SystemNotice(text)) => {
+                        app.push_system(&text);
+                    }
+
+                    Some(crate::EngineEvent::AssistantFinished) => {
+                        app.finish_streamed_interactions();
                     }
 
                     None => engine_events_open = false,
@@ -435,12 +503,17 @@ where
                 app.reveal_next();
             }
 
+            _ = generation_refresh.tick(), if app.generation_active => {
+                // Keep the waiting-message glow moving smoothly.
+            }
+
             result = output_rx.read(&mut buffer), if !engine_finished => {
                 match result {
                     Ok(0) => {
                         engine_finished = true;
                         app.generation_active = false;
                         app.reply_pending = false;
+                        app.reply_system = false;
                         app.pending_model = None;
                         app.pending_workspace = None;
                         app.pending_clear = false;
@@ -474,16 +547,8 @@ where
                     }
 
                     Ok(count) => {
-                        if app.reply_pending {
-                            let speaker = app.name.clone();
-                            app.push_label(&speaker);
-                            app.reply_pending = false;
-                        }
-
                         let text = String::from_utf8_lossy(&buffer[..count]).into_owned();
-                        let interactions = app.capture_interaction_output(&text);
-                        app.observe_context_output(&text);
-                        app.push_output(text);
+                        let interactions = app.push_assistant_output(text);
 
                         for interaction in interactions {
                             persist_interaction(&home, interaction, host).await?;
@@ -514,12 +579,55 @@ where
     }
 
     if !engine_finished {
+        app.exiting = true;
+        terminal.draw(|frame| draw(frame, &mut app))?;
         let _ = command_tx.write_all(b"/quit\n").await;
-        let _ = timeout(Duration::from_secs(2), &mut engine).await;
 
-        if !engine.is_finished() {
+        if timeout(Duration::from_secs(2), &mut engine).await.is_err() {
             engine.abort();
+            let _ = engine.await;
         }
+
+        while let Ok(event) = engine_event_rx.try_recv() {
+            match event {
+                crate::EngineEvent::AssistantText(text) => {
+                    let interactions = app.push_assistant_output(text);
+
+                    for interaction in interactions {
+                        persist_interaction(&home, interaction, host).await?;
+                    }
+                }
+
+                crate::EngineEvent::SystemText(text) => app.push_system_output(&text),
+
+                crate::EngineEvent::AssistantFinished => {
+                    app.finish_streamed_interactions();
+                }
+
+                crate::EngineEvent::SystemNotice(text) => app.push_system(&text),
+
+                crate::EngineEvent::GenerationStarted => {}
+
+                crate::EngineEvent::GenerationFinished { .. } => {}
+            }
+        }
+
+        loop {
+            let count = output_rx.read(&mut buffer).await?;
+
+            if count == 0 {
+                break;
+            }
+
+            let text = String::from_utf8_lossy(&buffer[..count]).into_owned();
+            let interactions = app.push_assistant_output(text);
+
+            for interaction in interactions {
+                persist_interaction(&home, interaction, host).await?;
+            }
+        }
+
+        app.finish_streamed_interactions();
     }
 
     cancelled.store(true, Ordering::Relaxed);
@@ -533,11 +641,15 @@ where
     C: Fn(String, String, serde_json::Value) -> F,
     F: std::future::Future<Output = Result<serde_json::Value>>,
 {
-    let value = host(home.to_owned(), "session.get".into(), serde_json::json!({"id": id})).await?;
+    load_session_snapshot(home, id, host).await
+}
 
-    if value["status"] == "working" || value["inflight"] == true {
-        return Err(crabbot_core::Error::Denied("Session is already working.".into()));
-    }
+async fn load_session_snapshot<C, F>(home: &str, id: &str, host: C) -> Result<SessionView>
+where
+    C: Fn(String, String, serde_json::Value) -> F,
+    F: std::future::Future<Output = Result<serde_json::Value>>,
+{
+    let value = host(home.to_owned(), "session.get".into(), serde_json::json!({"id": id})).await?;
 
     let model = value["model"]
         .as_str()
@@ -547,8 +659,9 @@ where
 
     let messages = serde_json::from_value(value["messages"].clone())?;
     let workspace = value["workspace"].as_str().map(str::to_owned);
+    let working = value["status"] == "working" || value["inflight"] == true;
 
-    Ok(SessionView { id: id.to_owned(), model, workspace, messages })
+    Ok(SessionView { id: id.to_owned(), model, workspace, messages, working })
 }
 
 async fn persist_interaction<C, F>(home: &str, interaction: SavedInteraction, host: C) -> Result<()>
@@ -571,7 +684,13 @@ where
         let text = bounded_interaction_text(text);
         let session = interaction.session.clone();
         let message = Message {
-            id: crate::message_id(&format!("interaction-{role_name}"), interaction.sequence),
+            id: crate::message_id(
+                &format!(
+                    "{}interaction-{role_name}",
+                    if interaction.system && role_name == "assistant" { "system-" } else { "" }
+                ),
+                interaction.sequence,
+            ),
             session: session.clone(),
             role,
             sender,
@@ -608,6 +727,7 @@ pub(super) struct SessionView {
     pub(super) model: String,
     pub(super) workspace: Option<String>,
     pub(super) messages: Vec<Message>,
+    pub(super) working: bool,
 }
 
 fn display_model(model: &str, model_available: bool) -> String {
@@ -626,11 +746,18 @@ fn render_messages(messages: &[Message], name: &str) -> String {
     let mut transcript = String::new();
 
     for message in messages {
+        let timestamp = message_timestamp(&message.id);
+        let terminal_system = message.id.starts_with("tui-system-");
         let label = match &message.role {
-            Role::User => "You",
-            Role::Assistant => name,
-            Role::Tool => message.sender.as_deref().unwrap_or("Tool"),
-            Role::System => "System",
+            Role::Assistant if terminal_system => format_role_label("System", timestamp.as_deref()),
+            Role::User => format_role_label("You", timestamp.as_deref()),
+            Role::Assistant => format_role_label(name, timestamp.as_deref()),
+
+            Role::Tool => {
+                format_role_label(message.sender.as_deref().unwrap_or("Tool"), timestamp.as_deref())
+            }
+
+            Role::System => format_role_label("System", timestamp.as_deref()),
         };
 
         let body = message
@@ -645,13 +772,42 @@ fn render_messages(messages: &[Message], name: &str) -> String {
             continue;
         }
 
-        transcript.push_str(label);
+        transcript.push_str(&label);
         transcript.push('\n');
         transcript.push_str(&body);
         transcript.push_str("\n\n");
     }
 
     transcript
+}
+
+fn format_role_label(label: &str, timestamp: Option<&str>) -> String {
+    timestamp.map_or_else(|| label.to_owned(), |timestamp| format!("{label} | {timestamp}"))
+}
+
+fn message_timestamp(id: &str) -> Option<String> {
+    let (timestamp, digits) = id.split('-').find_map(|part| {
+        (part.len() >= 13 && part.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| part.parse::<u128>().ok().map(|timestamp| (timestamp, part.len())))
+            .flatten()
+    })?;
+
+    let seconds = match digits {
+        19.. => timestamp / 1_000_000_000,
+        16..=18 => timestamp / 1_000_000,
+        13..=15 => timestamp / 1_000,
+        _ => return None,
+    };
+
+    super::date::format_datetime(u64::try_from(seconds).ok()?)
+}
+
+fn current_timestamp() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+
+    super::date::format_datetime(seconds).unwrap_or_else(|| "time unavailable".into())
 }
 
 const GENERATION_MESSAGES: &[&str] = &[
@@ -690,6 +846,16 @@ fn random_generation_message() -> &'static str {
     GENERATION_MESSAGES[seed % GENERATION_MESSAGES.len()]
 }
 
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
+}
+
 fn is_escape(event: &Event) -> bool {
     matches!(event, Event::Key(key) if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc)
 }
@@ -712,6 +878,148 @@ fn interrupt_generation(
     true
 }
 
+const TUI_COMMANDS: &[(&str, &str)] = &[
+    ("/help", "Show commands available in this session."),
+    ("/status", "Show whether the background runtime is running."),
+    ("/plugins", "Browse installed plugins."),
+    ("/session help", "Show session commands."),
+    ("/session list", "List saved sessions."),
+    ("/session create <id>", "Create and switch to a session."),
+    ("/session switch <id>", "Switch to a saved session."),
+    ("/session rename <id>", "Rename the active session."),
+    ("/new <id>", "Create and switch to a session."),
+    ("/workspace", "Show or change this session's filesystem root."),
+    ("/clear", "Clear this session's conversation."),
+    ("/statusline", "Show, configure, or reset the statusline."),
+    ("/animation", "Show or configure typewriter animation."),
+    ("/quit", "Leave the TUI."),
+];
+
+fn command_options(home: &str, has_model: bool) -> Vec<(&'static str, &'static str)> {
+    let mut commands = TUI_COMMANDS.to_vec();
+
+    if has_model {
+        commands.push(("/model <help|list|show|set>", "Manage the selected model."));
+    }
+
+    if crate::has_capability(home, "tool") {
+        commands.extend([
+            ("/approvals", "List pending tool approvals."),
+            ("/approve <id>", "Approve a pending tool action."),
+            ("/deny <id>", "Deny a pending tool action."),
+        ]);
+    }
+
+    if crate::has_capability(home, "channel") {
+        commands.extend([
+            ("/deliveries", "List pending channel deliveries."),
+            ("/retry <id>", "Retry a channel delivery."),
+            ("/drop <id>", "Drop a channel delivery."),
+        ]);
+    }
+
+    if crate::has_capability(home, "timer") {
+        commands.push(("/timer <list|add|remove>", "Manage timers."));
+    }
+
+    if crate::has_capability(home, "memory") {
+        commands.push(("/memory <list|remember|forget>", "Manage memories."));
+    }
+
+    commands
+}
+
+fn command_suggestions(
+    input: &str,
+    commands: &[(&'static str, &'static str)],
+) -> Option<Vec<(&'static str, &'static str)>> {
+    if !input.starts_with('/') || input.contains('\n') {
+        return None;
+    }
+
+    let matches = commands
+        .iter()
+        .copied()
+        .filter(|(command, _)| command.starts_with(input))
+        .collect::<Vec<_>>();
+
+    let exact_command_exists = matches.iter().any(|(command, _)| *command == input);
+
+    (!matches.is_empty() && (!exact_command_exists || input == "/")).then_some(matches)
+}
+
+fn approval_prompts(transcript: &str) -> Option<Vec<String>> {
+    let mut requests = Vec::new();
+
+    for line in transcript.lines() {
+        if let Some(id) = line.strip_prefix("Approve: /approve ") {
+            requests.push(id.trim().to_owned());
+        } else if matches!(line, "Approval accepted." | "Approval denied.") && !requests.is_empty()
+        {
+            requests.remove(0);
+        }
+    }
+
+    (!requests.is_empty()).then_some(requests)
+}
+
+fn approval_summary(transcript: &str, id: &str) -> Option<String> {
+    let lines = transcript.lines().collect::<Vec<_>>();
+
+    let approval_line =
+        lines.iter().rposition(|line| *line == format!("Approve: /approve {id}"))?;
+
+    lines[..approval_line].iter().rev().take(4).find_map(|line| {
+        line.strip_prefix("Command: ")
+            .or_else(|| line.strip_prefix("Action: "))
+            .or_else(|| line.strip_prefix("Tool: "))
+            .map(str::to_owned)
+    })
+}
+
+fn approval_picker(
+    id: &str,
+    summary: Option<String>,
+    selected: usize,
+    theme_enabled: bool,
+) -> Vec<Line<'static>> {
+    let command = if selected == 0 { "/approve" } else { "/deny" };
+
+    let title_style =
+        if theme_enabled { Style::default().fg(Color::DarkGray) } else { Style::default() };
+
+    let title = Line::styled(" Approval needed ", title_style);
+    let details = Line::raw(format!("  {}", summary.unwrap_or_else(|| format!("Request {id}"))));
+
+    let choices = Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            if selected == 0 { "[Approve]" } else { " Approve " },
+            if selected == 0 && theme_enabled {
+                Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD)
+            } else if selected == 0 {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+        ),
+        Span::raw("   "),
+        Span::styled(
+            if selected == 1 { "[Deny]" } else { " Deny " },
+            if selected == 1 && theme_enabled {
+                Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD)
+            } else if selected == 1 {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+        ),
+        Span::raw(format!("   ←/→ move | Enter: {command} {id}")),
+    ]);
+
+    vec![title, details, choices]
+}
+
 async fn handle_event<W>(
     event: Event,
     app: &mut App,
@@ -725,16 +1033,87 @@ where
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             app.input_cursor_needs_visibility = true;
 
+            if let Some(approvals) = approval_prompts(&app.transcript) {
+                match key.code {
+                    KeyCode::Left => {
+                        app.approval_selection = 0;
+                        return Ok(false);
+                    }
+
+                    KeyCode::Right => {
+                        app.approval_selection = 1;
+                        return Ok(false);
+                    }
+
+                    KeyCode::Up | KeyCode::Down => return Ok(false),
+
+                    KeyCode::Enter if let Some(id) = approvals.first() => {
+                        let command = if app.approval_selection == 0 { "approve" } else { "deny" };
+
+                        app.input = format!("/{command} {id}").chars().collect();
+                        app.cursor = app.input.len();
+                    }
+
+                    KeyCode::Esc => return Ok(false),
+
+                    _ => {}
+                }
+            }
+
+            if let Some(suggestions) =
+                command_suggestions(&app.input.iter().collect::<String>(), &app.command_options)
+            {
+                match key.code {
+                    KeyCode::Up => {
+                        app.command_selection = app.command_selection.saturating_sub(1);
+                        return Ok(false);
+                    }
+
+                    KeyCode::Down => {
+                        app.command_selection = app
+                            .command_selection
+                            .saturating_add(1)
+                            .min(suggestions.len().saturating_sub(1));
+                        return Ok(false);
+                    }
+
+                    KeyCode::Enter => {
+                        if let Some((command, _)) = suggestions.get(app.command_selection) {
+                            app.input = command.chars().collect();
+                            app.cursor = app.input.len();
+                            app.input_scroll.follow_latest();
+                            return Ok(false);
+                        }
+                    }
+
+                    _ => {}
+                }
+            }
+
             match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                     return Ok(true);
                 }
 
                 KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.input.insert(app.cursor, '\n');
-                    app.cursor += 1;
-                    app.input_scroll.follow_latest();
-                    app.history_index = None;
+                    if !app.session_working || app.input.first() == Some(&'/') {
+                        app.input.insert(app.cursor, '\n');
+                        app.cursor += 1;
+                        app.input_scroll.follow_latest();
+                        app.history_index = None;
+                    }
+                }
+
+                KeyCode::Char(character)
+                    if (app.generation_active || app.session_working)
+                        && app.input.first() != Some(&'/')
+                        && character != '/' =>
+                {
+                    app.status = if app.generation_active {
+                        "A response is running; use approval commands or Esc to interrupt.".into()
+                    } else {
+                        "This session is busy; wait for Crabbot's turn to finish.".into()
+                    };
                 }
 
                 KeyCode::Char(character) => {
@@ -745,10 +1124,12 @@ where
                 }
 
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    app.input.insert(app.cursor, '\n');
-                    app.cursor += 1;
-                    app.input_scroll.follow_latest();
-                    app.history_index = None;
+                    if !app.session_working || app.input.first() == Some(&'/') {
+                        app.input.insert(app.cursor, '\n');
+                        app.cursor += 1;
+                        app.input_scroll.follow_latest();
+                        app.history_index = None;
+                    }
                 }
 
                 KeyCode::Backspace if app.cursor > 0 => {
@@ -794,12 +1175,38 @@ where
                 }
 
                 KeyCode::Enter => {
-                    if !app.pending_interactions.is_empty() {
-                        app.status = "Wait for the current response to finish.".into();
+                    let line = app.input.iter().collect::<String>();
+
+                    let command = line.trim();
+                    let is_live_control =
+                        matches!(command, "/approvals" | "/approve" | "/deny" | "/quit" | "/exit")
+                            || command.starts_with("/approve ")
+                            || command.starts_with("/deny ")
+                            || command == "/animation"
+                            || command.starts_with("/animation ")
+                            || command == "/statusline"
+                            || command.starts_with("/statusline ");
+
+                    if (app.generation_active
+                        || app.session_working
+                        || !app.pending_interactions.is_empty())
+                        && !is_live_control
+                    {
+                        app.status = if app.generation_active {
+                            "A response is still running. Use /approvals, /approve, /deny, or Esc."
+                                .into()
+                        } else {
+                            "Crabbot is working in this session. Wait for the turn to finish."
+                                .into()
+                        };
+
+                        if !app.generation_active {
+                            app.push_system(&app.status.clone());
+                        }
+
                         return Ok(false);
                     }
 
-                    let line = app.input.iter().collect::<String>();
                     app.input.clear();
                     app.cursor = 0;
                     app.input_scroll.follow_latest();
@@ -820,7 +1227,14 @@ where
                     app.push_user(&line);
                     app.remember_input(&line);
 
-                    if let Some(model) = line.strip_prefix("/model ").map(str::trim)
+                    if let Some(model) = line
+                        .strip_prefix("/model set ")
+                        .or_else(|| {
+                            line.strip_prefix("/model ").filter(|value| {
+                                !matches!(value.trim(), "help" | "list" | "show" | "set")
+                            })
+                        })
+                        .map(str::trim)
                         && crate::valid_model(model)
                     {
                         app.pending_model = Some(model.to_owned());
@@ -829,8 +1243,7 @@ where
                     if let Some(workspace) = line.strip_prefix("/workspace ").map(str::trim)
                         && !workspace.is_empty()
                     {
-                        app.pending_workspace =
-                            Some((workspace != "reset").then(|| workspace.to_owned()));
+                        app.pending_workspace = crate::resolve_workspace(workspace).ok();
                     }
 
                     if line == "/clear" {
@@ -839,8 +1252,9 @@ where
 
                     if let Some(workspace) = line.strip_prefix("/workspace ").map(str::trim)
                         && !workspace.is_empty()
+                        && let Ok(workspace) = crate::resolve_workspace(workspace)
                     {
-                        app.workspace = selected_workspace(workspace);
+                        app.workspace = workspace.unwrap_or_else(|| app.default_workspace.clone());
                     }
 
                     if line == "/statusline" {
@@ -924,49 +1338,63 @@ where
                     }
 
                     if line == "/quit" || line == "/exit" {
+                        app.exiting = true;
                         return Ok(true);
                     }
 
                     if !engine_finished {
                         command_tx.write_all(serde_json::to_string(&line)?.as_bytes()).await?;
                         command_tx.write_all(b"\n").await?;
-                        app.reply_pending = true;
+
+                        if !app.generation_active {
+                            app.reply_pending = true;
+                            app.reply_system = line.starts_with('/') || line.starts_with('!');
+                        }
                     } else {
                         app.push_bot("The session engine is no longer running.".into());
                     }
                 }
 
-                KeyCode::Esc if app.input.is_empty() => return Ok(true),
+                KeyCode::Esc if app.input.is_empty() => {
+                    app.exiting = true;
+                    return Ok(true);
+                }
 
                 _ => {}
             }
         }
 
-        Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                if app
-                    .input_area
-                    .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
-                {
-                    app.input_scroll.scroll_up(1);
-                } else {
-                    app.transcript_scroll.scroll_up(3);
-                }
-            }
+        Event::Mouse(mouse) => {
+            app.mouse_position = Some((mouse.column, mouse.row));
 
-            MouseEventKind::ScrollDown => {
-                if app
-                    .input_area
-                    .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
-                {
-                    app.input_scroll.scroll_down(1);
-                } else {
-                    app.transcript_scroll.scroll_down(3);
-                }
-            }
+            match mouse.kind {
+                MouseEventKind::Moved | MouseEventKind::Drag(_) => {}
 
-            _ => {}
-        },
+                MouseEventKind::ScrollUp => {
+                    if app
+                        .input_area
+                        .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
+                    {
+                        app.input_scroll.scroll_up(1);
+                    } else {
+                        app.transcript_scroll.scroll_up(3);
+                    }
+                }
+
+                MouseEventKind::ScrollDown => {
+                    if app
+                        .input_area
+                        .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
+                    {
+                        app.input_scroll.scroll_down(1);
+                    } else {
+                        app.transcript_scroll.scroll_down(3);
+                    }
+                }
+
+                _ => {}
+            }
+        }
 
         _ => {}
     }
@@ -976,9 +1404,29 @@ where
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let input_text = app.input.iter().collect::<String>();
-    let input_content_rows = wrapped_rows(&input_text, frame.area().width.saturating_sub(4));
+    let padded_input = input_text
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| if index == 0 { format!("|> {line}") } else { line.to_owned() })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let input_content_rows = wrapped_rows(&padded_input, frame.area().width);
     let input_rows = input_content_rows.clamp(1, INPUT_MAX_ROWS);
     app.input_scroll.set_extent(input_content_rows, input_rows);
+
+    let approvals = approval_prompts(&app.transcript).unwrap_or_default();
+    let suggestions = command_suggestions(&input_text, &app.command_options);
+    let popup_rows = if !approvals.is_empty() {
+        3
+    } else {
+        suggestions.as_ref().map_or(0, |items| items.len().min(7) as u16)
+    };
+
+    let is_working = app.generation_active || app.session_working;
+    let composer_gap = if is_working { 0 } else { COMPOSER_GAP_ROWS };
+
+    let picker_gap = if popup_rows > 0 { COMPOSER_GAP_ROWS } else { 0 };
 
     if app.input_cursor_needs_visibility {
         let (_, cursor_row) = input_cursor_position(&app.input, app.cursor, frame.area().width);
@@ -992,95 +1440,265 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
+            Constraint::Length(composer_gap),
+            Constraint::Length(popup_rows),
+            Constraint::Length(picker_gap),
             Constraint::Length(input_rows as u16 + 2),
             Constraint::Length(1),
         ])
         .split(frame.area());
 
-    let transcript_width = areas[0].width.saturating_sub(2);
-    let content_height = areas[0].height.saturating_sub(2);
-    let indicator_height = u16::from(app.generation_active);
+    let transcript_width = areas[0].width;
+    let content_height = areas[0].height;
+    let indicator_height = if is_working { content_height.min(2) } else { 0 };
+
     let transcript_height = content_height.saturating_sub(indicator_height) as usize;
     let layout_is_current = app.transcript_layout.as_ref().is_some_and(|layout| {
         layout.generation == app.transcript_generation && layout.width == transcript_width
     });
 
     if !layout_is_current {
+        let (mut rows, message_rows) =
+            wrap_transcript_layout(&app.transcript, &app.name, transcript_width, None);
+
+        if !app.theme_enabled {
+            strip_transcript_colors(&mut rows);
+        }
+
         app.transcript_layout = Some(TranscriptLayout {
             generation: app.transcript_generation,
             width: transcript_width,
-            rows: wrap_transcript(&app.transcript, &app.name, transcript_width),
+            rows,
+            message_rows,
+            hovered_message: None,
+            hovered_rows: None,
         });
     }
 
-    let rows = &app.transcript_layout.as_ref().expect("layout was refreshed").rows;
+    let statusline_text = render_statusline(app);
+    let footer_style =
+        if app.theme_enabled { Style::default().fg(Color::DarkGray) } else { Style::default() };
+
+    let layout = app.transcript_layout.as_mut().expect("layout was refreshed");
+    let hovered_message = hovered_message_at(
+        app.mouse_position,
+        Rect::new(areas[0].x, areas[0].y, areas[0].width, transcript_height as u16),
+        app.transcript_scroll.offset,
+        &layout.message_rows,
+    );
+
+    if layout.hovered_message != hovered_message {
+        layout.hovered_rows = hovered_message.map(|message| {
+            let (mut rows, _) =
+                wrap_transcript_layout(&app.transcript, &app.name, transcript_width, Some(message));
+
+            if !app.theme_enabled {
+                strip_transcript_colors(&mut rows);
+            }
+
+            rows
+        });
+
+        layout.hovered_message = hovered_message;
+    }
+
+    let rows = layout.hovered_rows.as_deref().unwrap_or(&layout.rows);
     app.transcript_scroll.set_extent(rows.len(), transcript_height);
     let start = app.transcript_scroll.offset;
     let end = start.saturating_add(transcript_height).min(rows.len());
     let visible_rows = &rows[start..end];
     let transcript = TranscriptViewport { rows: visible_rows };
-    let conversation = Block::default().borders(Borders::ALL).title("Conversation");
 
-    let input = Paragraph::new(input_text)
-        .scroll((input_scroll, 0))
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title("Message  ·  Enter send  ·  Esc quit"));
+    let input =
+        Paragraph::new(padded_input).scroll((input_scroll, 0)).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .border_type(BorderType::Plain)
+                .borders(Borders::TOP | Borders::BOTTOM)
+                .title(if app.exiting {
+                    "Exiting Crabbot… | Please wait "
+                } else if app.generation_active {
+                    "Approval commands only  |  /approvals  |  /approve <id>  |  Esc interrupt "
+                } else if app.session_working {
+                    "Session busy  |  /approvals  |  /approve <id>  |  /deny <id> "
+                } else {
+                    "Message  |  Enter send  |  Esc quit "
+                }),
+        );
 
-    let footer_text = format!("{} v{} · /help for commands", app.name, env!("CARGO_PKG_VERSION"));
+    let footer_text = format!("{} v{} | /help for commands", app.name, env!("CARGO_PKG_VERSION"));
 
     let footer_width = UnicodeWidthStr::width(footer_text.as_str()).min(u16::MAX as usize) as u16;
 
     let footer_areas = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(footer_width)])
-        .split(areas[2]);
+        .split(areas[5]);
 
-    let statusline =
-        Paragraph::new(render_statusline(app)).style(Style::default().fg(Color::DarkGray));
+    let statusline = Paragraph::new(statusline_text).style(footer_style);
 
-    let footer = Paragraph::new(footer_text)
-        .alignment(Alignment::Right)
-        .style(Style::default().fg(Color::DarkGray));
+    let footer = Paragraph::new(footer_text).alignment(Alignment::Right).style(footer_style);
 
-    frame.render_widget(conversation, areas[0]);
     frame.render_widget(
         transcript,
-        Rect::new(
-            areas[0].x.saturating_add(1),
-            areas[0].y.saturating_add(1),
-            areas[0].width.saturating_sub(2),
-            transcript_height.min(u16::MAX as usize) as u16,
-        ),
+        Rect::new(areas[0].x, areas[0].y, areas[0].width, transcript_height as u16),
     );
 
-    if app.generation_active && content_height > 0 {
-        let indicator = if app.interrupt_requested { "Stopping…" } else { "Esc to interrupt" };
+    if is_working && content_height > 0 {
+        let text = if app.generation_active {
+            let indicator =
+                if app.interrupt_requested { "Stopping…" } else { "Esc to interrupt" };
 
-        let text = format!("{}  ·  {indicator}", app.generation_message);
-        let line = Line::styled(text, Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM));
+            let elapsed = app
+                .generation_started
+                .map(|started| format_elapsed(started.elapsed()))
+                .unwrap_or_else(|| "0s".into());
+
+            format!("{}  |  {indicator}  |  {elapsed}", app.generation_message)
+        } else {
+            "Crabbot is working in this session  |  waiting for the turn to finish".into()
+        };
+
+        let elapsed = app.generation_started.map_or_else(
+            || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+            },
+            |started| started.elapsed(),
+        );
+        let line = generation_status_line(&text, elapsed);
 
         let indicator_area = Rect::new(
-            areas[0].x.saturating_add(1),
-            areas[0].y.saturating_add(areas[0].height.saturating_sub(2)),
-            areas[0].width.saturating_sub(2),
+            areas[0].x,
+            areas[0].y.saturating_add(areas[0].height.saturating_sub(1)),
+            areas[0].width,
             1,
         );
         frame.render_widget(Paragraph::new(line), indicator_area);
     }
 
-    frame.render_widget(input, areas[1]);
+    if popup_rows > 0 {
+        let popup_area = areas[2];
+
+        if !approvals.is_empty() {
+            let summary = approval_summary(&app.transcript, &approvals[0]);
+            let rows =
+                approval_picker(&approvals[0], summary, app.approval_selection, app.theme_enabled);
+
+            let rail_style = if app.theme_enabled {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+
+            let rows = rows
+                .into_iter()
+                .map(|mut row| {
+                    row.spans.insert(0, Span::styled("▌ ", rail_style));
+                    row
+                })
+                .collect::<Vec<_>>();
+
+            let popup = Paragraph::new(rows);
+            frame.render_widget(popup, popup_area);
+        } else if let Some(suggestions) = suggestions {
+            let selected = app.command_selection.min(suggestions.len().saturating_sub(1));
+            app.command_selection = selected;
+            let first = selected.saturating_sub(6);
+
+            let command_width = app
+                .command_options
+                .iter()
+                .map(|(command, _)| UnicodeWidthStr::width(*command))
+                .max()
+                .unwrap_or(26)
+                .max(26);
+
+            let items = suggestions
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(7)
+                .map(|(index, (command, description))| {
+                    let style = if index == selected && app.theme_enabled {
+                        Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD)
+                    } else if index == selected {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+
+                    let rail_style = if app.theme_enabled {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default()
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        Span::styled("▌ ", rail_style),
+                        Span::styled(format!("{command:<command_width$}  "), style),
+                        Span::styled(
+                            *description,
+                            if app.theme_enabled {
+                                Style::default().fg(Color::DarkGray)
+                            } else {
+                                Style::default()
+                            },
+                        ),
+                    ]))
+                })
+                .collect::<Vec<_>>();
+
+            let popup = List::new(items);
+            frame.render_widget(popup, popup_area);
+        }
+    }
+
+    frame.render_widget(input, areas[4]);
     frame.render_widget(statusline, footer_areas[0]);
     frame.render_widget(footer, footer_areas[1]);
 
-    let input_area = areas[1];
+    let input_area = areas[4];
     app.input_area = Some(input_area);
-    let (cursor_x, cursor_y) = input_cursor_position(&app.input, app.cursor, input_area.width);
-    frame.set_cursor_position((
-        input_area.x.saturating_add(1).saturating_add(cursor_x),
-        input_area.y.saturating_add(1).saturating_add(
-            cursor_y.saturating_sub(input_scroll).min(input_rows.saturating_sub(1) as u16),
-        ),
-    ));
+
+    if !is_working {
+        let (cursor_x, cursor_y) = input_cursor_position(&app.input, app.cursor, input_area.width);
+
+        frame.set_cursor_position((
+            input_area.x.saturating_add(3).saturating_add(cursor_x),
+            input_area.y.saturating_add(1).saturating_add(
+                cursor_y.saturating_sub(input_scroll).min(input_rows.saturating_sub(1) as u16),
+            ),
+        ));
+    }
+}
+
+fn generation_status_line(text: &str, elapsed: Duration) -> Line<'static> {
+    let (message, suffix) = text.split_once("  |  ").unwrap_or((text, ""));
+    let base_style = Style::default().fg(ACCENT_COLOR);
+    let chars = message.chars().collect::<Vec<_>>();
+    let phase = (elapsed.as_millis() / 40) as usize;
+    let glow_center = phase as isize % (chars.len() + 32) as isize - 16;
+
+    let mut spans = chars
+        .into_iter()
+        .enumerate()
+        .map(|(index, character)| {
+            let distance = (index as isize - glow_center).unsigned_abs();
+            let green = if distance <= 16 { 140 + (45 * (16 - distance) / 16) as u8 } else { 140 };
+
+            let color = Color::Rgb(255, green, 0);
+            let style = if distance <= 16 { Style::default().fg(color) } else { base_style };
+
+            Span::styled(character.to_string(), style)
+        })
+        .collect::<Vec<_>>();
+
+    if !suffix.is_empty() {
+        spans.push(Span::styled(format!("  |  {suffix}"), base_style));
+    }
+
+    Line::from(spans)
 }
 
 fn wrapped_rows(text: &str, width: u16) -> usize {
@@ -1117,7 +1735,7 @@ fn wrapped_rows(text: &str, width: u16) -> usize {
 }
 
 fn input_cursor_position(input: &[char], cursor: usize, width: u16) -> (u16, u16) {
-    let width = width.saturating_sub(2).max(1) as usize;
+    let width = width.saturating_sub(3).max(1) as usize;
     let mut row = 0_usize;
     let mut column = 0_usize;
 
@@ -1174,19 +1792,30 @@ fn validate_statusline(value: &str) -> std::result::Result<String, &'static str>
     Ok(value.to_owned())
 }
 
-fn selected_workspace(value: &str) -> String {
-    if value == "reset" { String::new() } else { value.to_owned() }
-}
-
 fn render_statusline(app: &App) -> String {
-    let workspace = if app.workspace.is_empty() { "workspace: unset" } else { &app.workspace };
+    let workspace = workspace_label(&app.workspace);
 
     app.statusline
         .replace("{name}", &app.name)
         .replace("{model}", &app.model)
-        .replace("{session}", &app.session)
-        .replace("{workspace}", workspace)
+        .replace("{session}", session_display_name(&app.session))
+        .replace("{workspace}", &workspace)
         .replace("{status}", &app.status)
+}
+
+fn workspace_label(path: &str) -> String {
+    if path.is_empty() {
+        return "workspace: unset".into();
+    }
+
+    let workspace_path = PathBuf::from(path);
+    let name = workspace_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path);
+
+    format!("workspace: {name}")
 }
 
 fn save_preferences(
@@ -1200,19 +1829,336 @@ fn save_preferences(
     crabbot_file::save(path, content).map_err(crabbot_core::Error::from)
 }
 
+#[cfg(test)]
 fn wrap_transcript(transcript: &str, name: &str, width: u16) -> Vec<Line<'static>> {
+    wrap_transcript_layout(transcript, name, width, None).0
+}
+
+fn wrap_transcript_layout(
+    transcript: &str,
+    name: &str,
+    width: u16,
+    hovered_message: Option<usize>,
+) -> (Vec<Line<'static>>, Vec<Range<usize>>) {
     if width == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     if transcript.is_empty() {
-        return vec![Line::styled(
-            "No messages in this session yet.",
-            Style::default().fg(Color::DarkGray),
-        )];
+        return (
+            vec![Line::styled(
+                "No messages in this session yet.",
+                Style::default().fg(Color::DarkGray),
+            )],
+            Vec::new(),
+        );
     }
 
-    transcript.lines().flat_map(|line| wrap_transcript_line(line, name, width as usize)).collect()
+    let width = width as usize;
+    let mut rows = Vec::new();
+    let mut message_rows = Vec::new();
+    let lines = transcript.lines().collect::<Vec<_>>();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let line = lines[index];
+
+        if let Some((title, is_user, is_system)) = message_title(line, name) {
+            index += 1;
+            let body_start = index;
+
+            while index < lines.len() && message_title(lines[index], name).is_none() {
+                index += 1;
+            }
+
+            let mut body_end = index;
+
+            while body_end > body_start && lines[body_end - 1].is_empty() {
+                body_end -= 1;
+            }
+
+            let message_index = message_rows.len();
+            let start = rows.len();
+            rows.extend(wrap_rail_message(
+                title,
+                &lines[body_start..body_end],
+                name,
+                width,
+                is_user,
+                is_system,
+                hovered_message == Some(message_index),
+            ));
+            message_rows.push(start..rows.len());
+
+            if index < lines.len() {
+                rows.extend((0..MESSAGE_GAP_ROWS).map(|_| Line::raw("")));
+
+                while index < lines.len() && lines[index].is_empty() {
+                    index += 1;
+                }
+            }
+
+            continue;
+        }
+
+        rows.extend(wrap_transcript_line(line, name, width));
+        index += 1;
+    }
+
+    (rows, message_rows)
+}
+
+fn hovered_message_at(
+    position: Option<(u16, u16)>,
+    area: Rect,
+    scroll_offset: usize,
+    message_rows: &[Range<usize>],
+) -> Option<usize> {
+    let (column, row) = position?;
+
+    if !area.contains((column, row).into()) {
+        return None;
+    }
+
+    let transcript_row = scroll_offset.saturating_add(usize::from(row.saturating_sub(area.y)));
+
+    message_rows.iter().position(|rows| rows.contains(&transcript_row))
+}
+
+fn strip_transcript_colors(rows: &mut [Line<'static>]) {
+    for row in rows {
+        for span in &mut row.spans {
+            span.style = Style { fg: None, bg: None, underline_color: None, ..span.style };
+        }
+    }
+}
+
+fn message_title<'a>(line: &'a str, name: &str) -> Option<(&'a str, bool, bool)> {
+    if line == "You" || line.starts_with("You | ") {
+        Some((line, true, false))
+    } else if line == "System" || line.starts_with("System | ") {
+        Some((line, false, true))
+    } else if line == name || line.starts_with(&format!("{name} | ")) {
+        Some((line, false, false))
+    } else {
+        None
+    }
+}
+
+fn actor_heading(
+    title: &str,
+    is_user: bool,
+    is_system: bool,
+    show_timestamp: bool,
+) -> Vec<(String, Style)> {
+    let (actor, timestamp) = title.split_once(" | ").unwrap_or((title, ""));
+
+    let actor_color = if is_system {
+        Color::DarkGray
+    } else if is_user {
+        Color::Reset
+    } else {
+        ACCENT_COLOR
+    };
+
+    let actor_style = if is_user {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(actor_color).add_modifier(Modifier::BOLD)
+    };
+
+    let actor_style = actor_style.add_modifier(Modifier::ITALIC);
+    let metadata_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+
+    let mut heading = vec![(actor.to_owned(), actor_style)];
+
+    if show_timestamp && !timestamp.is_empty() {
+        heading.push((format!(", {timestamp}"), metadata_style));
+    }
+
+    heading
+}
+
+fn wrap_rail_message(
+    title: &str,
+    body: &[&str],
+    name: &str,
+    width: usize,
+    is_user: bool,
+    is_system: bool,
+    show_timestamp: bool,
+) -> Vec<Line<'static>> {
+    if width < 5 {
+        let (actor, timestamp) = title.split_once(" | ").unwrap_or((title, ""));
+        let heading = if show_timestamp && !timestamp.is_empty() {
+            format!("{actor}, {timestamp}")
+        } else {
+            actor.to_owned()
+        };
+
+        let mut rows = wrap_transcript_line(&heading, name, width);
+        rows.extend(body.iter().flat_map(|line| wrap_transcript_line(line, name, width)));
+        return rows;
+    }
+
+    let heading = actor_heading(title, is_user, is_system, show_timestamp);
+    let heading_text = heading.iter().map(|(text, _)| text.as_str()).collect::<String>();
+    let message_width = max_message_width(&heading_text, width);
+    let content_width = message_width.saturating_sub(2).max(1);
+
+    let rail_style = if is_system {
+        Color::DarkGray
+    } else if is_user {
+        Color::Reset
+    } else {
+        ACCENT_COLOR
+    };
+
+    let rail_style = Style::default().fg(rail_style);
+    let mut rows = Vec::new();
+
+    let mut message_rows = wrap_styled_segments(&heading, content_width);
+    message_rows
+        .extend(body.iter().flat_map(|line| wrap_transcript_line(line, name, content_width)));
+
+    for line in message_rows {
+        let mut spans = vec![Span::styled("▌ ", rail_style)];
+        spans.extend(line.spans);
+        rows.push(Line::from(spans));
+    }
+
+    rows
+}
+
+fn max_message_width(title: &str, width: usize) -> usize {
+    let title_width = UnicodeWidthStr::width(title);
+    let available = if width >= 32 { width.saturating_mul(4) / 5 } else { width };
+
+    available.max(title_width.saturating_add(2).min(width))
+}
+
+struct TranscriptLineBuilder {
+    width: usize,
+    columns: usize,
+    just_wrapped: bool,
+    rows: Vec<Line<'static>>,
+    spans: Vec<Span<'static>>,
+    fragment: String,
+    fragment_style: Style,
+}
+
+impl TranscriptLineBuilder {
+    fn new(width: usize) -> Self {
+        Self {
+            width: width.max(1),
+            columns: 0,
+            just_wrapped: false,
+            rows: Vec::new(),
+            spans: Vec::new(),
+            fragment: String::new(),
+            fragment_style: Style::default(),
+        }
+    }
+
+    fn push(&mut self, text: &str, style: Style) {
+        for grapheme in text.graphemes(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+
+            if self.columns > 0 && self.columns + grapheme_width > self.width {
+                self.finish_row();
+            }
+
+            if !self.fragment.is_empty() && style != self.fragment_style {
+                self.flush_fragment();
+            }
+
+            self.fragment_style = style;
+            self.fragment.push_str(grapheme);
+            self.columns += grapheme_width;
+            self.just_wrapped = false;
+
+            if self.columns >= self.width {
+                self.finish_row();
+            }
+        }
+    }
+
+    fn flush_fragment(&mut self) {
+        if !self.fragment.is_empty() {
+            self.spans.push(Span::styled(std::mem::take(&mut self.fragment), self.fragment_style));
+        }
+    }
+
+    fn finish_row(&mut self) {
+        self.flush_fragment();
+        self.rows.push(Line::from(std::mem::take(&mut self.spans)));
+        self.columns = 0;
+        self.just_wrapped = true;
+    }
+
+    fn finish(mut self) -> Vec<Line<'static>> {
+        self.flush_fragment();
+
+        if !self.spans.is_empty() || self.rows.is_empty() {
+            self.rows.push(Line::from(self.spans));
+        }
+
+        self.rows
+    }
+}
+
+fn wrap_styled_segments(segments: &[(String, Style)], width: usize) -> Vec<Line<'static>> {
+    let mut builder = TranscriptLineBuilder::new(width);
+    let mut spaces = Vec::<(String, Style)>::new();
+    let mut word = Vec::<(String, Style)>::new();
+
+    let flush_word = |builder: &mut TranscriptLineBuilder,
+                      spaces: &mut Vec<(String, Style)>,
+                      word: &mut Vec<(String, Style)>| {
+        if word.is_empty() {
+            return;
+        }
+
+        let spaces_width =
+            spaces.iter().map(|(text, _)| UnicodeWidthStr::width(text.as_str())).sum::<usize>();
+        let word_width =
+            word.iter().map(|(text, _)| UnicodeWidthStr::width(text.as_str())).sum::<usize>();
+
+        if builder.just_wrapped {
+            spaces.clear();
+        } else if builder.columns > 0 && builder.columns + spaces_width + word_width > builder.width
+        {
+            builder.finish_row();
+            spaces.clear();
+        } else {
+            for (text, style) in spaces.drain(..) {
+                builder.push(&text, style);
+            }
+        }
+
+        for (text, style) in word.drain(..) {
+            builder.push(&text, style);
+        }
+    };
+
+    for (text, style) in segments {
+        for grapheme in text.graphemes(true) {
+            if grapheme.chars().all(char::is_whitespace) {
+                flush_word(&mut builder, &mut spaces, &mut word);
+                spaces.push((grapheme.to_owned(), *style));
+            } else {
+                word.push((grapheme.to_owned(), *style));
+            }
+        }
+    }
+
+    flush_word(&mut builder, &mut spaces, &mut word);
+
+    for (text, style) in spaces {
+        builder.push(&text, style);
+    }
+
+    builder.finish()
 }
 
 fn wrap_transcript_line(line: &str, name: &str, width: usize) -> Vec<Line<'static>> {
@@ -1220,88 +2166,100 @@ fn wrap_transcript_line(line: &str, name: &str, width: usize) -> Vec<Line<'stati
         return vec![Line::raw("")];
     }
 
-    let mut segments = if line == "You" {
-        vec![
-            ("> ".to_owned(), Style::default().fg(Color::DarkGray)),
-            (line.to_owned(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        ]
-    } else if line == name {
-        vec![
-            ("# ".to_owned(), Style::default().fg(Color::Cyan)),
-            (line.to_owned(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        ]
-    } else if line == "System" {
-        vec![
-            ("! ".to_owned(), Style::default().fg(Color::Yellow)),
-            (line.to_owned(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        ]
+    let segments = if line == "You" || line.starts_with("You | ") {
+        vec![(line.to_owned(), Style::default().add_modifier(Modifier::BOLD))]
+    } else if line.starts_with(&format!("{name} | ")) || line == name {
+        vec![(line.to_owned(), Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD))]
+    } else if line == "System" || line.starts_with("System | ") {
+        vec![(line.to_owned(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))]
     } else if let Some((command, description)) = help_command_segments(line) {
-        vec![
-            (command.to_owned(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            (description.to_owned(), Style::default().fg(Color::DarkGray)),
-        ]
+        return wrap_help_command(command, description, width);
     } else if line == "Commands:"
         || line.starts_with("Conditional Commands")
+        || line.starts_with("Conditional commands")
         || line == "Session commands:"
         || line == "Sessions:"
+        || line.starts_with("Sessions | ")
+        || line.starts_with("Plugins | ")
     {
-        vec![(line.to_owned(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]
+        vec![(line.to_owned(), Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD))]
     } else if line.starts_with("* ") {
-        vec![(line.to_owned(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))]
+        vec![(line.to_owned(), Style::default().add_modifier(Modifier::BOLD))]
     } else if line.starts_with("o ") {
         vec![(line.to_owned(), Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD))]
-    } else if line.starts_with("- ") {
+    } else if line.starts_with("- ") || line.starts_with("– ") {
         vec![(line.to_owned(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))]
     } else if line.starts_with("Error:") || line.starts_with("Session not found") {
-        vec![(line.to_owned(), Style::default().fg(Color::Red))]
+        vec![(line.to_owned(), Style::default().fg(ACCENT_COLOR))]
+    } else if let Some((label, value)) = line.split_once(": ")
+        && matches!(label, "Tool" | "Arguments" | "Command" | "Action" | "Approve" | "Deny")
+    {
+        let value_style = match label {
+            "Tool" => Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD),
+            "Action" => Style::default(),
+            _ => Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD),
+        };
+
+        vec![
+            (format!("{label}: "), Style::default().fg(Color::DarkGray)),
+            (value.to_owned(), value_style),
+        ]
     } else if line.starts_with("Crabbot terminal.") {
         vec![(line.to_owned(), Style::default().fg(Color::DarkGray))]
     } else {
         vec![(line.to_owned(), Style::default())]
     };
 
-    let width = width.max(1);
-    let mut rows = Vec::new();
-    let mut spans = Vec::new();
-    let mut fragment = String::new();
-    let mut fragment_style = Style::default();
-    let mut columns = 0;
+    wrap_styled_segments(&segments, width)
+}
 
-    for (text, style) in segments.drain(..) {
-        for grapheme in text.graphemes(true) {
-            let grapheme_width = UnicodeWidthStr::width(grapheme);
+fn wrap_help_command(command: &str, description: &str, width: usize) -> Vec<Line<'static>> {
+    let command_style = Style::default().add_modifier(Modifier::BOLD);
+    let description_style = Style::default().fg(Color::DarkGray);
+    let gap_width = description.chars().take_while(|character| character.is_whitespace()).count();
 
-            if columns > 0 && columns + grapheme_width > width {
-                if !fragment.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut fragment), fragment_style));
-                }
+    let indent = UnicodeWidthStr::width(command).saturating_add(gap_width);
 
-                rows.push(Line::from(std::mem::take(&mut spans)));
-                columns = 0;
-            }
+    if indent >= width {
+        return wrap_styled_segments(
+            &[(command.to_owned(), command_style), (description.to_owned(), description_style)],
+            width,
+        );
+    }
 
-            if !fragment.is_empty() && style != fragment_style {
-                spans.push(Span::styled(std::mem::take(&mut fragment), fragment_style));
-            }
+    let description = description.trim_start();
+    let mut rows = vec![Line::from(vec![
+        Span::styled(command.to_owned(), command_style),
+        Span::styled(" ".repeat(gap_width), description_style),
+    ])];
 
-            fragment_style = style;
-            fragment.push_str(grapheme);
-            columns += grapheme_width;
+    let mut row_width = indent;
 
-            if columns >= width {
-                spans.push(Span::styled(std::mem::take(&mut fragment), fragment_style));
-                rows.push(Line::from(std::mem::take(&mut spans)));
-                columns = 0;
-            }
+    for word in description.split_whitespace() {
+        let word_width = UnicodeWidthStr::width(word);
+
+        if row_width > indent && row_width.saturating_add(1).saturating_add(word_width) <= width {
+            rows.last_mut()
+                .expect("help row exists")
+                .spans
+                .push(Span::styled(format!(" {word}"), description_style));
+
+            row_width += word_width + 1;
+        } else if row_width == indent && indent.saturating_add(word_width) <= width {
+            rows.last_mut()
+                .expect("help row exists")
+                .spans
+                .push(Span::styled(word.to_owned(), description_style));
+
+            row_width += word_width;
+        } else {
+            rows.push(Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(word.to_owned(), description_style),
+            ]));
+
+            row_width = indent.saturating_add(word_width);
         }
-    }
-
-    if !fragment.is_empty() {
-        spans.push(Span::styled(fragment, fragment_style));
-    }
-
-    if !spans.is_empty() || rows.is_empty() {
-        rows.push(Line::from(spans));
     }
 
     rows
@@ -1310,7 +2268,7 @@ fn wrap_transcript_line(line: &str, name: &str, width: usize) -> Vec<Line<'stati
 fn help_command_segments(line: &str) -> Option<(&str, &str)> {
     let trimmed = line.trim_start();
 
-    if !trimmed.starts_with('/') {
+    if !trimmed.starts_with('/') && !trimmed.starts_with("!<") {
         return None;
     }
 
@@ -1319,6 +2277,7 @@ fn help_command_segments(line: &str) -> Option<(&str, &str)> {
         .match_indices("  ")
         .map(|(index, _)| indent + 1 + index)
         .find(|index| *index > indent + 1)
+        .or_else(|| line.find("> ").map(|index| index + 1))
         .or_else(|| {
             line.starts_with("  /statusline ")
                 .then(|| line.find("] ").map(|index| index + 1))
@@ -1369,6 +2328,20 @@ impl Drop for TerminalGuard {
 }
 
 impl App {
+    fn finish_generation(&mut self, interrupted: bool) {
+        self.generation_active = false;
+        self.generation_started = None;
+        self.interrupt_requested = false;
+        self.reply_pending = false;
+        self.reply_system = false;
+        self.approval_reply_pending = false;
+        self.status = if interrupted { "Generation interrupted" } else { "Ready" }.into();
+
+        if interrupted {
+            self.push_system("Generation interrupted.");
+        }
+    }
+
     fn take_persistable_interactions(&mut self) -> Vec<SavedInteraction> {
         if self.generation_active || self.reply_pending {
             return Vec::new();
@@ -1382,6 +2355,7 @@ impl App {
             session: self.session.clone(),
             input: input.to_owned(),
             output: String::new(),
+            system: input.starts_with('/') || input.starts_with('!'),
         });
     }
 
@@ -1445,6 +2419,12 @@ impl App {
         completed
     }
 
+    fn finish_streamed_interactions(&mut self) {
+        self.reply_pending = false;
+        self.pending_interactions.clear();
+        self.completed_interactions.clear();
+    }
+
     fn saved_interaction(&self, mut interaction: PendingInteraction) -> SavedInteraction {
         if interaction.input.starts_with("/session rename ")
             && let Some(target) = interaction
@@ -1461,16 +2441,49 @@ impl App {
             input: interaction.input,
             output: interaction.output.trim_matches('\n').to_owned(),
             sequence: self.interaction_sequence,
+            system: interaction.system,
         }
     }
 
     fn restore_session(&mut self, session: SessionView) {
         self.session = session.id;
         self.model = display_model(&session.model, self.model_available);
-        self.workspace = session.workspace.unwrap_or_default();
+        self.workspace = session.workspace.unwrap_or_else(|| self.default_workspace.clone());
+        self.session_working = session.working;
         self.transcript = render_messages(&session.messages, &self.name);
         self.invalidate_transcript_layout();
         self.transcript_scroll.follow_latest();
+    }
+
+    fn refresh_session(&mut self, session: SessionView) {
+        // A snapshot can lag behind locally streamed output until its delimiter is saved.
+        if self.generation_active
+            || self.reply_pending
+            || !self.pending_interactions.is_empty()
+            || !self.completed_interactions.is_empty()
+            || !self.reveal_queue.is_empty()
+        {
+            return;
+        }
+
+        let transcript = render_messages(&session.messages, &self.name);
+        let model = display_model(&session.model, self.model_available);
+        let workspace = session.workspace.unwrap_or_else(|| self.default_workspace.clone());
+        self.session_working = session.working;
+
+        if self.session != session.id
+            || self.model != model
+            || self.workspace != workspace
+            || self.transcript != transcript
+        {
+            self.restore_session(SessionView {
+                id: session.id,
+                model: session.model,
+                workspace: Some(workspace),
+                messages: session.messages,
+                working: session.working,
+            });
+        }
     }
 
     fn observe_context_output(&mut self, value: &str) {
@@ -1502,9 +2515,13 @@ impl App {
         if let Some(workspace) = self.pending_workspace.clone()
             && (self.context_output.contains("Workspace changed to:")
                 || self.context_output.contains("Workspace reset to the configured default:")
-                || self.context_output.contains("Current workspace:"))
+                || self.context_output.contains("Current workspace:")
+                || self.context_output.contains("Workspace was not changed:"))
         {
-            self.workspace = workspace.unwrap_or_default();
+            if !self.context_output.contains("Workspace was not changed:") {
+                self.workspace = workspace.unwrap_or_else(|| self.default_workspace.clone());
+            }
+
             self.pending_workspace = None;
         }
 
@@ -1521,8 +2538,10 @@ impl App {
     }
 
     fn push_output(&mut self, value: String) {
-        let value = normalize_output(value);
+        self.show_output(normalize_output(value));
+    }
 
+    fn show_output(&mut self, value: String) {
         if self.typewriter {
             for grapheme in value.graphemes(true) {
                 if self.reveal_bytes.saturating_add(grapheme.len()) > TRANSCRIPT_LIMIT {
@@ -1595,14 +2614,81 @@ impl App {
     }
 
     fn push_bot(&mut self, value: String) {
-        let speaker = self.name.clone();
-        self.push_label(&speaker);
+        if self.pending_interactions.back().is_some_and(|interaction| interaction.system) {
+            self.push_system_label();
+        } else {
+            self.push_assistant_label();
+        }
+
         self.push_output(value);
     }
 
+    fn push_assistant_output(&mut self, value: String) -> Vec<SavedInteraction> {
+        if self.approval_reply_pending {
+            self.approval_reply_pending = false;
+
+            if value.trim() == "." {
+                return Vec::new();
+            }
+        }
+
+        let value =
+            if self.reply_pending { value.trim_start_matches('\n').to_owned() } else { value };
+
+        if self.reply_pending {
+            if self.reply_system {
+                self.push_system_label();
+            } else {
+                self.push_assistant_label();
+            }
+
+            self.reply_pending = false;
+        }
+
+        let interactions = self.capture_interaction_output(&value);
+        self.observe_context_output(&value);
+        self.push_output(value);
+
+        interactions
+    }
+
     fn push_user(&mut self, value: &str) {
-        self.push_label("You");
+        let label = format_role_label("You", Some(&current_timestamp()));
+        self.push_label(&label);
         self.append_visible(&normalize_output(format!("{value}\n")));
+    }
+
+    fn push_system(&mut self, value: &str) {
+        self.push_system_label();
+        self.append_visible(&normalize_output(format!("{value}\n")));
+
+        if self.generation_active {
+            self.reply_pending = true;
+            self.reply_system = false;
+            self.approval_reply_pending = value == "Approval accepted.";
+        }
+    }
+
+    fn push_system_output(&mut self, value: &str) {
+        if self.reply_pending {
+            self.push_system_label();
+            self.reply_pending = false;
+        }
+
+        let value = normalize_output(value.to_owned());
+        let _ = self.capture_interaction_output(&value);
+        self.observe_context_output(&value);
+        self.show_output(value);
+    }
+
+    fn push_system_label(&mut self) {
+        let label = format_role_label("System", Some(&current_timestamp()));
+        self.push_label(&label);
+    }
+
+    fn push_assistant_label(&mut self) {
+        let label = format_role_label(&self.name, Some(&current_timestamp()));
+        self.push_label(&label);
     }
 
     fn push_label(&mut self, label: &str) {
@@ -1663,20 +2749,362 @@ impl App {
     }
 }
 
+fn session_display_name(id: &str) -> &str {
+    id.strip_prefix("tui-").unwrap_or(id)
+}
+
 fn normalize_output(value: String) -> String {
     value.replace("\n> ", "\n").trim_start_matches("> ").trim_end_matches("> ").to_owned()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+    use unicode_width::UnicodeWidthStr;
+
     use super::{
         App, DEFAULT_STATUSLINE, GENERATION_MESSAGES, INPUT_HISTORY_LIMIT, ScrollState,
-        TuiPreferences, draw, handle_event, input_cursor_position, interrupt_generation,
-        render_statusline, save_preferences, validate_statusline, wrapped_rows,
+        TuiPreferences, draw, generation_status_line, handle_event, input_cursor_position,
+        interrupt_generation, render_statusline, save_preferences, validate_statusline,
+        wrapped_rows,
     };
 
+    #[test]
+    fn assistant_text_stays_separate_when_generation_finishes_before_pipe_output() {
+        let mut app = App { name: "Crabbot".into(), reply_pending: true, ..App::default() };
+
+        app.push_user("Hey there!");
+        app.generation_active = false;
+        app.push_assistant_output("Hey! What can I help you with?".into());
+
+        let user = app.transcript.find("Hey there!").unwrap();
+        let assistant = app.transcript.find("Crabbot |").unwrap();
+
+        assert!(assistant > user);
+        assert!(app.transcript[assistant..].contains("Hey! What can I help you with?"));
+        assert!(!app.reply_pending);
+    }
+
+    #[test]
+    fn streamed_completion_keeps_the_visible_reply_without_client_side_reappending() {
+        let mut app = App { name: "Crabbot".into(), reply_pending: true, ..App::default() };
+        app.begin_interaction("Tell me about this project.");
+        app.push_user("Tell me about this project.");
+        app.push_assistant_output("It is a Rust workspace.".into());
+
+        app.finish_streamed_interactions();
+
+        assert!(app.transcript.contains("It is a Rust workspace."));
+        assert!(app.pending_interactions.is_empty());
+        assert!(app.completed_interactions.is_empty());
+        assert!(!app.reply_pending);
+    }
+
+    #[test]
+    fn live_approval_notice_stays_system_and_following_model_reply_is_crabbot() {
+        let mut app = App {
+            name: "Crabbot".into(),
+            generation_active: true,
+            reply_pending: true,
+            ..App::default()
+        };
+
+        app.push_assistant_output("I’ll create the file.".into());
+        app.push_system("Approval needed.");
+        app.begin_interaction("/approve abc");
+        app.push_user("/approve abc");
+        app.push_system("Approval accepted.");
+        app.push_assistant_output("\n\nCreated the empty file foo.".into());
+
+        let first_assistant = app.transcript.find("Crabbot |").unwrap();
+        let approval = app.transcript.find("System |").unwrap();
+        let accepted = app.transcript.find("Approval accepted.").unwrap();
+        let assistant = app.transcript.rfind("Crabbot |").unwrap();
+        let result = app.transcript.find("Created the empty file foo.").unwrap();
+
+        assert!(first_assistant < approval);
+        assert!(approval < accepted);
+        assert!(accepted < assistant);
+        assert!(assistant < result);
+        assert!(!app.transcript.contains("\n\nCreated the empty file foo."));
+    }
+
+    #[test]
+    fn hides_orphan_period_before_the_reply_after_an_approval() {
+        let mut app = App { generation_active: true, reply_pending: true, ..App::default() };
+
+        app.push_system("Approval accepted.");
+        app.push_assistant_output(".".into());
+        app.push_assistant_output("\n\nCreated the empty file foo.".into());
+
+        assert!(!app.transcript.contains("\n.\n"));
+        assert!(app.transcript.contains("Created the empty file foo."));
+    }
+
+    #[test]
+    fn terminal_command_stream_keeps_system_role_and_typewriter_animation() {
+        let mut app = App {
+            name: "Crabbot".into(),
+            reply_pending: true,
+            reply_system: true,
+            typewriter: true,
+            ..App::default()
+        };
+
+        app.begin_interaction("!pwd");
+        app.push_user("!pwd");
+        app.push_system_output("/work");
+        app.push_system_output("space\n");
+
+        assert_eq!(app.reveal_queue.iter().cloned().collect::<String>(), "/workspace\n");
+        app.reveal_all();
+
+        assert!(app.transcript.contains("System | "));
+        assert!(!app.transcript.contains("Crabbot | "));
+        assert!(app.transcript.contains("/workspace"));
+        assert!(app.reveal_queue.is_empty());
+    }
+
+    #[test]
+    fn approval_prompt_parser_drops_resolved_requests_in_order() {
+        let transcript = "System | now\nApproval needed.\nApprove: /approve first\nDeny: /deny first\n\
+            Approval needed.\nApprove: /approve second\nDeny: /deny second\nApproval accepted.";
+
+        assert_eq!(super::approval_prompts(transcript), Some(vec!["second".into()]));
+        assert_eq!(
+            super::approval_prompts("Approval needed.\nApprove: /approve id"),
+            Some(vec!["id".into()])
+        );
+
+        assert_eq!(
+            super::approval_prompts(
+                "Approval accepted.\nApproval denied.\nApproval needed.\n\
+                 Approve: /approve current"
+            ),
+            Some(vec!["current".into()])
+        );
+
+        assert_eq!(super::approval_prompts("Approval accepted."), None);
+    }
+
+    #[tokio::test]
+    async fn command_picker_fills_composer_without_submitting() {
+        let (mut command_tx, mut command_rx) = duplex(1024);
+        let mut app = App {
+            input: vec!['/'],
+            cursor: 1,
+            command_options: super::TUI_COMMANDS.to_vec(),
+            ..App::default()
+        };
+
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(app.input.iter().collect::<String>(), "/help");
+        assert!(app.transcript.is_empty());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                command_rx.read(&mut [0; 32]),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_picker_submits_the_selected_decision() {
+        let (mut command_tx, mut command_rx) = duplex(1024);
+        let mut app = App {
+            generation_active: true,
+            transcript: "System | now\nApproval needed.\nTool: shell\nCommand: touch foo\n\
+                Approve: /approve approval-1\nDeny: /deny approval-1\n"
+                .into(),
+            ..App::default()
+        };
+
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(app.approval_selection, 1);
+
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let mut bytes = [0; 128];
+        let count = command_rx.read(&mut bytes).await.unwrap();
+
+        assert_eq!(&bytes[..count], b"\"/deny approval-1\"\n");
+
+        app.approval_selection = 1;
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(app.approval_selection, 0);
+
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let count = command_rx.read(&mut bytes).await.unwrap();
+
+        assert_eq!(&bytes[..count], b"\"/approve approval-1\"\n");
+    }
+
+    #[test]
+    fn draws_full_width_command_and_approval_pickers_above_the_prompt() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut app = App {
+            input: vec!['/'],
+            cursor: 1,
+            command_options: super::TUI_COMMANDS.to_vec(),
+            ..App::default()
+        };
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let commands = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(commands.contains("Show commands available"));
+        assert!(commands.contains("/help"));
+        assert!(commands.contains("|> /"));
+        assert!(commands.contains("▌ "));
+        assert!(!commands.contains("╭"));
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let input_row = rows.iter().position(|row| row.contains("Message")).unwrap();
+
+        assert!(input_row > 0);
+        assert!(rows[input_row - 1].trim().is_empty());
+
+        app.generation_active = true;
+        app.transcript = "System | now\nApproval needed.\nTool: shell\nCommand: touch foo\n\
+            Approve: /approve approval-1\nDeny: /deny approval-1\n"
+            .into();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let approval = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(approval.contains("Approval needed"));
+        assert!(approval.contains("touch foo"));
+        assert!(approval.contains("[Approve]"));
+        assert!(approval.contains("/approve approval-1"));
+        assert!(approval.contains("←/→ move"));
+        assert!(approval.contains("▌ "));
+        assert!(!approval.contains("╭"));
+
+        let buffer = terminal.backend().buffer();
+        let input_area = app.input_area.unwrap();
+        let gap_row = input_area.y - super::COMPOSER_GAP_ROWS;
+
+        assert!((0..buffer.area.width).all(|x| buffer[(x, gap_row)].symbol() == " "));
+
+        app.generation_active = false;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let approval = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(approval.contains("Approval needed"));
+        assert!(approval.contains("[Approve]"));
+    }
+
+    #[test]
+    fn command_picker_keeps_descriptions_clear_of_long_commands() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let mut app = App {
+            input: vec!['/'],
+            cursor: 1,
+            command_options: vec![
+                ("/help", "Show commands."),
+                ("/model <help|list|show|set>", "Manage the selected model."),
+            ],
+            ..App::default()
+        };
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("/model <help|list|show|set>  Manage the selected model."));
+    }
+
+    #[test]
+    fn streamed_messages_keep_their_role_rail_fixed() {
+        let mut app = App { name: "Crabbot".into(), typewriter: true, ..App::default() };
+        app.begin_interaction("!ls");
+        app.push_bot("a long command output that should not resize while it is revealed".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let first_rail = app.transcript_layout.as_ref().unwrap().rows[0].spans[0].content.clone();
+
+        app.reveal_next();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(first_rail, "▌ ");
+        assert_eq!(app.transcript_layout.as_ref().unwrap().rows[0].spans[0].content, "▌ ");
+
+        while !app.reveal_queue.is_empty() {
+            app.reveal_next();
+        }
+    }
+
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect, style::Color};
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect, style::Color, text::Line};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     #[test]
@@ -1697,7 +3125,7 @@ mod tests {
 
         assert_eq!(
             render_statusline(&app),
-            "Crabbot · model: unset · session: default · workspace: unset"
+            "Crabbot | model: unset | session: default | workspace: unset"
         );
     }
 
@@ -1728,11 +3156,50 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_generation_is_reported_by_system() {
+        let mut app = App { generation_active: true, reply_pending: true, ..App::default() };
+
+        app.finish_generation(true);
+
+        assert!(app.transcript.contains("System | "));
+        assert!(app.transcript.contains("Generation interrupted."));
+        assert!(!app.transcript.contains("Crabbot | "));
+        assert!(!app.reply_pending);
+    }
+
+    #[test]
+    fn live_system_and_crabbot_headers_include_local_time() {
+        let mut system = App { reply_pending: true, reply_system: true, ..App::default() };
+        system.push_system_output("command output");
+
+        let mut assistant = App { reply_pending: true, ..App::default() };
+        assistant.push_assistant_output("Reply".into());
+
+        for transcript in [&system.transcript, &assistant.transcript] {
+            let header = transcript.lines().next().unwrap();
+
+            assert!(header.contains(" | "));
+            assert!(header.contains(" at "));
+        }
+    }
+
+    #[test]
+    fn saved_message_timestamps_support_milliseconds_and_nanoseconds() {
+        let milliseconds = super::message_timestamp("tui-user-1700000000000-1");
+        let nanoseconds = super::message_timestamp("tui-assistant-1700000000000000000-1");
+
+        assert_eq!(nanoseconds, milliseconds);
+        assert!(nanoseconds.is_some());
+    }
+
+    #[test]
     fn drawing_generation_status_shows_the_phrase_and_interrupt_key() {
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         let mut app = App {
             generation_active: true,
             generation_message: "The Crabbot is scuttling toward an answer...",
+            transcript: "Crabbot | now\nWorking on it.".into(),
+            theme_enabled: true,
             ..App::default()
         };
 
@@ -1748,6 +3215,79 @@ mod tests {
 
         assert!(rendered.contains(app.generation_message));
         assert!(rendered.contains("Esc to interrupt"));
+
+        let row_text = |row: usize| {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .skip(row * 80)
+                .take(80)
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+
+        let status_row =
+            (0..12).find(|row| row_text(*row).contains(app.generation_message)).unwrap();
+
+        assert!(row_text(status_row - 1).trim().is_empty());
+        assert!(row_text(status_row + 1).contains("Approval commands only"));
+        let input_area = app.input_area.unwrap();
+
+        assert_eq!(terminal.backend().buffer()[(input_area.x, input_area.y)].symbol(), "A");
+
+        let phrase_start = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "T")
+            .expect("generation phrase is rendered");
+
+        assert!(matches!(
+            phrase_start.fg,
+            Color::Rgb(255, green, 0) if (140..=185).contains(&green)
+        ));
+
+        assert!(!terminal.backend().cursor_visible());
+
+        app.generation_active = false;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let input_area = app.input_area.unwrap();
+        let (cursor_x, cursor_y) = input_cursor_position(&app.input, app.cursor, input_area.width);
+
+        assert!(terminal.backend().cursor_visible());
+        terminal.backend_mut().assert_cursor_position((
+            input_area.x.saturating_add(3).saturating_add(cursor_x),
+            input_area.y.saturating_add(1).saturating_add(cursor_y),
+        ));
+    }
+
+    #[test]
+    fn generation_status_glow_moves_across_the_message_only() {
+        let text = "The Crabbot is thinking...  |  Esc to interrupt  |  2s";
+        let first = generation_status_line(text, Duration::from_secs(1));
+        let later = generation_status_line(text, Duration::from_secs(3));
+        let bright = Color::Rgb(255, 185, 0);
+        let bright_positions = |line: &Line<'_>| {
+            line.spans
+                .iter()
+                .enumerate()
+                .filter_map(|(index, span)| (span.style.fg == Some(bright)).then_some(index))
+                .collect::<Vec<_>>()
+        };
+
+        assert_ne!(bright_positions(&first), bright_positions(&later));
+        assert!(first.spans.iter().all(|span| matches!(
+            span.style.fg,
+            Some(Color::Rgb(255, green, 0)) if (140..=185).contains(&green)
+        )));
+
+        assert_eq!(first.spans.iter().map(|span| span.content.as_ref()).collect::<String>(), text);
+        assert_eq!(later.spans.iter().map(|span| span.content.as_ref()).collect::<String>(), text);
+        assert!(later.spans.last().unwrap().style.fg == Some(super::ACCENT_COLOR));
     }
 
     #[test]
@@ -1826,17 +3366,290 @@ mod tests {
     }
 
     #[test]
-    fn transcript_uses_role_styles_and_separates_turns() {
+    fn transcript_uses_left_rails_and_separates_turns() {
         let rows = super::wrap_transcript(
             "You\nhello\n\nCrabbot\nNo intelligence plugin is installed.",
             "Crabbot",
             40,
         );
 
-        assert!(rows[0].spans.iter().any(|span| span.content == "> "));
-        assert!(rows[2].spans.is_empty());
-        assert!(rows[3].spans.iter().any(|span| span.content == "# "));
-        assert_eq!(rows[4].spans[0].style.fg, None);
+        let row_text =
+            |row: &Line<'_>| row.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+
+        assert!(row_text(&rows[0]).starts_with("▌ "));
+        assert!(rows.iter().any(|row| row_text(row).contains("You")));
+        assert!(rows.iter().any(|row| row_text(row).contains("Crabbot")));
+        assert!(rows.iter().any(|row| row_text(row).contains("No intelligence plugin")));
+        assert!(rows.iter().any(|row| row.spans.is_empty()));
+        assert!(!rows.iter().any(|row| {
+            row.spans
+                .iter()
+                .any(|span| span.content.starts_with("> ") || span.content.starts_with("# "))
+        }));
+    }
+
+    #[test]
+    fn transcript_uses_role_colored_rails_on_the_left() {
+        let rows =
+            super::wrap_transcript("You | now\nHello\n\nCrabbot | now\nHi there.", "Crabbot", 50);
+        let row_text =
+            |row: &Line<'_>| row.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        let user_top = row_text(&rows[0]);
+        let assistant_header = rows.iter().find(|row| row_text(row).contains("Crabbot")).unwrap();
+
+        assert!(user_top.starts_with("▌ "));
+        assert!(assistant_header.spans[0].content.starts_with("▌"));
+        assert!(rows.iter().any(|row| row_text(row).starts_with("▌ ")));
+        let user_title = rows[0].spans.iter().find(|span| span.content == "You").unwrap();
+        let assistant_title = rows
+            .iter()
+            .flat_map(|row| row.spans.iter())
+            .find(|span| span.content == "Crabbot")
+            .unwrap();
+        assert_eq!(user_title.style.fg, None);
+        assert_eq!(assistant_title.style.fg, Some(super::ACCENT_COLOR));
+        assert!(user_title.style.add_modifier.contains(super::Modifier::ITALIC));
+        assert!(assistant_title.style.add_modifier.contains(super::Modifier::ITALIC));
+        assert!(!row_text(assistant_header).contains("now"));
+        let user_body_row = rows.iter().position(|row| row_text(row).contains("Hello")).unwrap();
+        let assistant_row = rows.iter().position(|row| row_text(row).contains("Crabbot")).unwrap();
+
+        assert_eq!(assistant_row - user_body_row - 1, super::MESSAGE_GAP_ROWS);
+        let system = super::wrap_transcript("System | now\nA status update.", "Crabbot", 50);
+        let system_text = system.iter().map(row_text).collect::<String>();
+
+        assert!(system_text.contains("System"));
+        assert!(!system_text.contains("now"));
+        assert!(!system_text.contains("NOTICE"));
+        assert_eq!(rows[0].spans[0].style.fg, Some(Color::Reset));
+        assert_eq!(assistant_header.spans[0].style.fg, Some(super::ACCENT_COLOR));
+    }
+
+    #[test]
+    fn message_timestamps_appear_only_on_the_hovered_message() {
+        let transcript = "You | 2026-10-01 at 12:26\nping\n\nCrabbot | 2026-10-01 at 12:27\npong";
+        let row_text =
+            |row: &Line<'_>| row.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        let rows = super::wrap_transcript_layout(transcript, "Crabbot", 80, None).0;
+        let visible = rows.iter().map(row_text).collect::<String>();
+
+        assert!(visible.contains("You"));
+        assert!(visible.contains("Crabbot"));
+        assert!(!visible.contains("2026-10-01"));
+
+        let hovered = super::wrap_transcript_layout(transcript, "Crabbot", 80, Some(1)).0;
+        let hovered = hovered.iter().map(row_text).collect::<String>();
+
+        assert!(!hovered.contains("You, 2026-10-01"));
+        assert!(hovered.contains("Crabbot, 2026-10-01 at 12:27"));
+
+        let header = super::wrap_transcript_layout(transcript, "Crabbot", 80, Some(1))
+            .0
+            .into_iter()
+            .find(|row| row.spans.iter().any(|span| span.content == "Crabbot"))
+            .unwrap();
+
+        let actor = header.spans.iter().find(|span| span.content == "Crabbot").unwrap();
+        let timestamp =
+            header.spans.iter().find(|span| span.content.starts_with(", 2026-10-01")).unwrap();
+
+        assert_eq!(actor.style.fg, Some(super::ACCENT_COLOR));
+        assert!(actor.style.add_modifier.contains(super::Modifier::BOLD | super::Modifier::ITALIC));
+        assert_eq!(timestamp.style.fg, Some(Color::DarkGray));
+        assert!(timestamp.style.add_modifier.contains(super::Modifier::ITALIC));
+        assert!(!timestamp.style.add_modifier.contains(super::Modifier::BOLD));
+    }
+
+    #[test]
+    fn hover_coordinates_map_to_visible_message_rows_only() {
+        let area = Rect::new(5, 3, 40, 8);
+        let message_rows = [2..5, 7..9];
+
+        assert_eq!(super::hovered_message_at(Some((6, 3)), area, 2, &message_rows), Some(0));
+        assert_eq!(super::hovered_message_at(Some((6, 8)), area, 2, &message_rows), Some(1));
+        assert_eq!(super::hovered_message_at(Some((6, 6)), area, 2, &message_rows), None);
+        assert_eq!(super::hovered_message_at(Some((50, 3)), area, 2, &message_rows), None);
+        assert_eq!(super::hovered_message_at(None, area, 2, &message_rows), None);
+    }
+
+    #[tokio::test]
+    async fn moving_the_mouse_over_and_away_from_a_message_toggles_its_timestamp() {
+        let (mut command_tx, _) = duplex(1024);
+        let mut app = App {
+            transcript: "Crabbot | 2026-10-01 at 12:27\npong".into(),
+            name: "Crabbot".into(),
+            ..App::default()
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+
+        handle_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Crabbot, 2026-10-01 at 12:27"));
+
+        let input_area = app.input_area.unwrap();
+
+        handle_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: input_area.x,
+                row: input_area.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Crabbot"));
+        assert!(!rendered.contains("2026-10-01"));
+    }
+
+    #[test]
+    fn monochrome_transcript_clears_foreground_and_background_colors() {
+        let mut rows = super::wrap_transcript("You\nhello", "Crabbot", 40);
+
+        super::strip_transcript_colors(&mut rows);
+
+        assert!(rows.iter().flat_map(|row| &row.spans).all(|span| {
+            span.style.fg.is_none()
+                && span.style.bg.is_none()
+                && span.style.underline_color.is_none()
+        }));
+    }
+
+    #[test]
+    fn wrapped_help_descriptions_hang_indent_under_the_description_column() {
+        let line = "  /workspace [path|reset]  Show or change this session's filesystem root.";
+        let (command, description) = super::help_command_segments(line).unwrap();
+        let rows = super::wrap_help_command(command, description, 40);
+        let indent = UnicodeWidthStr::width(command)
+            + description.chars().take_while(|character| character.is_whitespace()).count();
+
+        let continuation = rows.get(1).unwrap();
+        let continuation_text =
+            continuation.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+
+        assert_eq!(
+            continuation_text.chars().take_while(|character| *character == ' ').count(),
+            indent
+        );
+    }
+
+    #[test]
+    fn transcript_wraps_at_word_boundaries_and_hides_soft_wrap_spaces() {
+        let rows = super::wrap_transcript_line("alpha workspace beta", "Crabbot", 9);
+        let row_text =
+            |row: &Line<'_>| row.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        let rendered = rows.iter().map(row_text).collect::<Vec<_>>();
+
+        assert_eq!(rendered, ["alpha", "workspace", "beta"]);
+        assert!(rendered.iter().all(|row| !row.starts_with(' ')));
+    }
+
+    #[test]
+    fn exit_feedback_is_visible_during_shutdown() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let mut app = App { exiting: true, ..App::default() };
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Exiting Crabbot… | Please wait"));
+    }
+
+    #[test]
+    fn transcript_rails_continue_across_message_paragraphs() {
+        let rows = super::wrap_transcript(
+            "You | now\nFirst paragraph.\n\nSecond paragraph.\n\nCrabbot | now\nReply.",
+            "Crabbot",
+            60,
+        );
+        let second_paragraph = rows
+            .iter()
+            .position(|row| row.spans.iter().any(|span| span.content == "Second paragraph."));
+
+        let paragraph_gap = second_paragraph.unwrap().saturating_sub(1);
+
+        assert!(rows[paragraph_gap].spans.iter().any(|span| span.content == "▌ "));
+    }
+
+    #[test]
+    fn labels_saved_messages_with_their_recorded_times_and_role_rails() {
+        let messages = [
+            crabbot_core::types::Message {
+                id: "tui-user-1709164800000-1".into(),
+                session: "work".into(),
+                role: crabbot_core::types::Role::User,
+                sender: None,
+                content: vec![crabbot_core::types::Content::Text { text: "List files".into() }],
+            },
+            crabbot_core::types::Message {
+                id: "tui-assistant-1709164860000-1".into(),
+                session: "work".into(),
+                role: crabbot_core::types::Role::Assistant,
+                sender: None,
+                content: vec![crabbot_core::types::Content::Text { text: "Done.".into() }],
+            },
+        ];
+
+        let transcript = super::render_messages(&messages, "Crabbot");
+
+        let user_time = crate::date::format_datetime(1_709_164_800).unwrap();
+        let assistant_time = crate::date::format_datetime(1_709_164_860).unwrap();
+
+        assert!(transcript.contains(&format!("You | {user_time}\nList files")));
+        assert!(transcript.contains(&format!("Crabbot | {assistant_time}\nDone.")));
+
+        let rows = super::wrap_transcript(&transcript, "Crabbot", 50);
+
+        assert!(rows.iter().any(|row| row.spans.iter().any(|span| span.content == "▌ ")));
+        assert!(rows.iter().any(|row| row.spans.iter().any(|span| span.content == "▌ ")));
+    }
+
+    #[test]
+    fn elapsed_generation_time_is_compact_and_human_readable() {
+        assert_eq!(super::format_elapsed(std::time::Duration::from_secs(9)), "9s");
+        assert_eq!(super::format_elapsed(std::time::Duration::from_secs(62)), "1m 02s");
     }
 
     #[test]
@@ -1852,20 +3665,54 @@ mod tests {
     }
 
     #[test]
-    fn statusline_help_command_and_description_use_distinct_colors() {
+    fn help_commands_and_descriptions_use_distinct_colors() {
         let row = super::wrap_transcript_line(
             "  /statusline [format|reset]   Show, configure, or reset the bottom statusline.",
             "Crabbot",
             100,
         );
 
-        assert!(row[0].spans.iter().any(|span| {
-            span.content.contains("/statusline") && span.style.fg == Some(Color::Green)
-        }));
+        assert!(
+            row[0]
+                .spans
+                .iter()
+                .any(|span| { span.content.contains("/statusline") && span.style.fg.is_none() })
+        );
+
+        let rendered = row[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+
+        assert!(rendered.contains("Show, configure"));
+        assert!(row[0].spans.iter().skip(1).all(|span| span.style.fg == Some(Color::DarkGray)));
+
+        let row = super::wrap_transcript_line(
+            "  /model <help|list|show|set> Manage the selected model.",
+            "Crabbot",
+            100,
+        );
 
         assert!(row[0].spans.iter().any(|span| {
-            span.content.contains("Show, configure") && span.style.fg == Some(Color::DarkGray)
+            span.content.contains("/model <help|list|show|set>") && span.style.fg.is_none()
         }));
+
+        let rendered = row[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+
+        assert!(rendered.contains("Manage the selected model"));
+        assert!(row[0].spans.iter().skip(1).all(|span| span.style.fg == Some(Color::DarkGray)));
+
+        let row = super::wrap_transcript_line(
+            "  !<command>  Run a shell command directly.",
+            "Crabbot",
+            80,
+        );
+
+        assert!(
+            row[0]
+                .spans
+                .iter()
+                .any(|span| { span.content.contains("!<command>") && span.style.fg.is_none() })
+        );
+
+        assert!(row[0].spans.iter().skip(1).all(|span| span.style.fg == Some(Color::DarkGray)));
     }
 
     #[test]
@@ -1880,12 +3727,29 @@ mod tests {
     }
 
     #[test]
+    fn statusline_shows_workspace_label_and_only_its_basename() {
+        let app = App {
+            name: "Crabbot".into(),
+            model: "unset".into(),
+            session: "default".into(),
+            workspace: "/home/airscript/repos/personal/crabbot".into(),
+            statusline: DEFAULT_STATUSLINE.into(),
+            ..App::default()
+        };
+
+        assert_eq!(
+            render_statusline(&app),
+            "Crabbot | model: unset | session: default | workspace: crabbot"
+        );
+    }
+
+    #[test]
     fn restores_session_context_with_the_correct_model_label() {
         let mut app = App {
             name: "Ada".into(),
             session: "old".into(),
             model: "old-model".into(),
-            statusline: "{name} · {model} · {session}".into(),
+            statusline: "{name} | {model} | {session}".into(),
             model_available: false,
             ..App::default()
         };
@@ -1898,13 +3762,14 @@ mod tests {
             model: crate::DEFAULT_MODEL.into(),
             workspace: Some("/work".into()),
             messages: Vec::new(),
+            working: false,
         });
 
         assert_eq!(app.session, "fresh");
         assert_eq!(app.model, "unset");
         assert_eq!(app.workspace, "/work");
         assert!(app.transcript_scroll.follow_end);
-        assert_eq!(render_statusline(&app), "Ada · unset · fresh");
+        assert_eq!(render_statusline(&app), "Ada | unset | fresh");
 
         app.model_available = true;
         app.restore_session(super::SessionView {
@@ -1912,11 +3777,86 @@ mod tests {
             model: "provider/model".into(),
             workspace: None,
             messages: Vec::new(),
+            working: false,
         });
 
         assert_eq!(app.model, "provider/model");
         assert!(app.workspace.is_empty());
-        assert_eq!(render_statusline(&app), "Ada · provider/model · configured");
+        assert_eq!(render_statusline(&app), "Ada | provider/model | configured");
+    }
+
+    #[test]
+    fn refreshes_a_shared_session_snapshot_without_requiring_a_manual_reload() {
+        let mut app = App {
+            name: "Crabbot".into(),
+            session: "shared".into(),
+            model: "model".into(),
+            default_workspace: "/work".into(),
+            ..App::default()
+        };
+
+        app.refresh_session(super::SessionView {
+            id: "shared".into(),
+            model: "model".into(),
+            workspace: Some("/work".into()),
+            messages: vec![crabbot_core::types::Message {
+                id: "new-user-message".into(),
+                session: "shared".into(),
+                role: crabbot_core::types::Role::User,
+                sender: Some("tui".into()),
+                content: vec![crabbot_core::types::Content::Text {
+                    text: "message from the other TUI".into(),
+                }],
+            }],
+            working: true,
+        });
+
+        assert!(app.transcript.contains("message from the other TUI"));
+        assert!(app.session_working);
+    }
+
+    #[test]
+    fn shared_session_refresh_does_not_replace_an_animating_local_reply() {
+        let mut app = App {
+            name: "Crabbot".into(),
+            session: "shared".into(),
+            model: "model".into(),
+            typewriter: true,
+            reply_pending: true,
+            reply_system: true,
+            ..App::default()
+        };
+
+        let reply = "Commands:\n  /status  Show runtime status.\n";
+
+        app.begin_interaction("/help");
+        app.push_user("/help");
+        let completed = app.push_assistant_output(format!("{reply}> "));
+
+        assert_eq!(completed.len(), 1);
+        assert!(app.transcript.contains("System | "));
+
+        for _ in 0..4 {
+            app.reveal_next();
+            let transcript = app.transcript.clone();
+            let queued = app.reveal_queue.len();
+
+            app.refresh_session(super::SessionView {
+                id: "shared".into(),
+                model: "model".into(),
+                workspace: None,
+                messages: Vec::new(),
+                working: false,
+            });
+
+            assert_eq!(app.transcript, transcript);
+            assert_eq!(app.reveal_queue.len(), queued);
+        }
+
+        app.reveal_all();
+
+        assert!(app.transcript.contains("Commands:"));
+        assert!(app.transcript.contains("Show runtime status."));
     }
 
     #[test]
@@ -1925,7 +3865,8 @@ mod tests {
 
         app.push_bot("Created session temp.\n".into());
 
-        assert_eq!(app.transcript, "Crabbot\nCreated session temp.\n");
+        assert!(app.transcript.starts_with("Crabbot | "));
+        assert!(app.transcript.ends_with("\nCreated session temp.\n"));
 
         app.restore_session(super::SessionView {
             id: "work".into(),
@@ -1938,15 +3879,22 @@ mod tests {
                 sender: None,
                 content: vec![crabbot_core::types::Content::Text { text: "Previous reply".into() }],
             }],
+            working: false,
         });
 
         app.push_bot("Using session work.\n".into());
 
-        assert_eq!(app.transcript, "Crabbot\nPrevious reply\n\nCrabbot\nUsing session work.\n");
+        assert!(app.transcript.contains("Crabbot\nPrevious reply"));
+        assert!(app.transcript.ends_with("Using session work.\n"));
+        assert!(
+            super::wrap_transcript(&app.transcript, "Crabbot", 80)
+                .iter()
+                .any(|row| row.spans.iter().any(|span| span.content == "▌ "))
+        );
     }
 
     #[test]
-    fn renders_a_bordered_conversation_and_message_box() {
+    fn renders_an_unboxed_conversation_and_horizontal_prompt() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App {
@@ -1970,17 +3918,37 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.contains("Conversation"));
+        assert!(!rendered.contains("Conversation"));
         assert!(!rendered.contains("Agent"));
         assert!(rendered.contains("Welcome"));
         assert!(rendered.contains("Message"));
-        assert!(rendered.contains("next"));
+        assert!(rendered.contains("|> next"));
+        assert!(rendered.contains("Esc quit ─"));
+
+        let buffer = terminal.backend().buffer();
+        let input_area = app.input_area.unwrap();
+        let gap_row = input_area.y - super::COMPOSER_GAP_ROWS;
+
+        assert_eq!(buffer[(input_area.x, input_area.y)].symbol(), "M");
+        assert!((0..buffer.area.width).all(|x| buffer[(x, gap_row)].symbol() == " "));
+
         assert!(
-            rendered
-                .contains(&format!("Crabbot v{} · /help for commands", env!("CARGO_PKG_VERSION")))
+            (input_area.x..input_area.x + input_area.width)
+                .any(|x| buffer[(x, input_area.y)].symbol() == "─")
         );
 
-        assert!(!rendered.contains("Ready · /help for commands"));
+        assert_eq!(buffer[(input_area.x, input_area.y + input_area.height - 1)].symbol(), "─");
+        assert!((input_area.y..input_area.y + input_area.height).all(|y| {
+            buffer[(input_area.x, y)].symbol() != "│"
+                && buffer[(input_area.x + input_area.width - 1, y)].symbol() != "│"
+        }));
+
+        assert!(
+            rendered
+                .contains(&format!("Crabbot v{} | /help for commands", env!("CARGO_PKG_VERSION")))
+        );
+
+        assert!(!rendered.contains("Ready | /help for commands"));
 
         app.push_output("Again".into());
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -2027,12 +3995,12 @@ mod tests {
         crate::local_aware(
             home.clone(),
             "session.ensure".into(),
-            serde_json::json!({"id": "work", "model": "model-work"}),
+            serde_json::json!({"id": "tui-work", "model": "model-work"}),
         )
         .await
         .unwrap();
 
-        let mut app = App { session: "work".into(), model_available: false, ..App::default() };
+        let mut app = App { session: "tui-work".into(), model_available: false, ..App::default() };
         app.begin_interaction("/status");
 
         assert!(app.capture_interaction_output("Background runtime: ").is_empty());
@@ -2055,16 +4023,18 @@ mod tests {
         let saved = app.finish_interactions().pop().unwrap();
         super::persist_interaction(&home, saved, crate::local_aware).await.unwrap();
 
-        let session = super::load_session(&home, "work", crate::local_aware).await.unwrap();
+        let session = super::load_session(&home, "tui-work", crate::local_aware).await.unwrap();
         let transcript = super::render_messages(&session.messages, "Crabbot");
 
         assert_eq!(session.messages.len(), 6);
-        assert!(transcript.contains("You\n/status"));
-        assert!(transcript.contains("Crabbot\nBackground runtime: stopped."));
-        assert!(transcript.contains("You\nhello without a model"));
-        assert!(transcript.contains("Crabbot\nNo intelligence plugin is installed."));
-        assert!(transcript.contains("You\n/session missing"));
-        assert!(transcript.contains("Crabbot\nError: Session was not found."));
+        assert!(transcript.contains("You | "));
+        assert!(transcript.contains("System | "));
+        assert!(transcript.contains("/status"));
+        assert!(transcript.contains("Background runtime: stopped."));
+        assert!(transcript.contains("hello without a model"));
+        assert!(transcript.contains("No intelligence plugin is installed."));
+        assert!(transcript.contains("/session missing"));
+        assert!(transcript.contains("Error: Session was not found."));
 
         let bounded =
             super::bounded_interaction_text(&format!("{}é", "x".repeat(super::INTERACTION_LIMIT)));
@@ -2099,6 +4069,142 @@ mod tests {
 
         assert!(saved.output.ends_with("[history entry truncated]"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn active_turn_rejects_chat_and_shows_command_reply_as_system() {
+        let (mut command_tx, mut command_rx) = duplex(1024);
+        let mut app = App { generation_active: true, ..App::default() };
+        app.input = "please wait".chars().collect();
+        app.cursor = app.input.len();
+
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(app.input.iter().collect::<String>(), "please wait");
+        assert!(app.transcript.is_empty());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                command_rx.read(&mut [0; 32]),
+            )
+            .await
+            .is_err()
+        );
+
+        app.input.clear();
+        app.cursor = 0;
+
+        for character in "/approvals".chars() {
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                &mut app,
+                &mut command_tx,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let mut submitted = [0; 32];
+        let count = command_rx.read(&mut submitted).await.unwrap();
+
+        assert_eq!(&submitted[..count], b"\"/approvals\"\n");
+        assert!(app.transcript.contains("You | "));
+        assert!(!app.transcript.contains("System | "));
+
+        app.push_system("Pending approvals: none.");
+
+        assert!(app.transcript.contains("System | "));
+    }
+
+    #[tokio::test]
+    async fn shared_working_session_locks_chat_and_reports_the_state_as_system() {
+        let (mut command_tx, mut command_rx) = duplex(1024);
+        let mut app = App { session_working: true, ..App::default() };
+        app.input = "hello from the second TUI".chars().collect();
+        app.cursor = app.input.len();
+
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(app.input.iter().collect::<String>(), "hello from the second TUI");
+        assert!(app.transcript.contains("System | "));
+        assert!(app.transcript.contains("Crabbot is working in this session."));
+        assert!(!app.transcript.contains("You | "));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                command_rx.read(&mut [0; 32]),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn system_rail_uses_the_statusline_gray() {
+        let rows = super::wrap_transcript("System | now\nApproval needed.", "Crabbot", 60);
+        let title = rows[0].spans.iter().find(|span| span.content == "System").unwrap();
+        let rail = rows[0].spans.iter().find(|span| span.content == "▌ ").unwrap();
+
+        assert_eq!(title.style.fg, Some(Color::DarkGray));
+        assert_eq!(rail.style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn approval_actions_and_command_are_highlighted() {
+        for line in [
+            "Tool: shell",
+            "Arguments: {\"command\":\"rm foo\"}",
+            "Command: rm foo",
+            "Approve: /approve id",
+            "Deny: /deny id",
+        ] {
+            let row = super::wrap_transcript_line(line, "Crabbot", 80);
+
+            assert_eq!(row[0].spans.len(), 2);
+            assert_eq!(row[0].spans[0].style.fg, Some(Color::DarkGray));
+            assert!(row[0].spans[1].style.add_modifier.contains(ratatui::style::Modifier::BOLD));
+
+            let expected = super::ACCENT_COLOR;
+
+            assert_eq!(row[0].spans[1].style.fg, Some(expected));
+        }
+    }
+
+    #[test]
+    fn tree_listings_use_branch_connectors_instead_of_status_glyphs() {
+        let entry = super::super::format_tree_entry(
+            "codex | v1.0.0",
+            &["health: ready".into(), "permissions: none".into()],
+            false,
+        );
+
+        assert_eq!(entry, "├─ codex | v1.0.0\n│  ├─ health: ready\n│  └─ permissions: none");
+        assert!(!entry.contains('◆'));
+        assert!(!entry.contains('◇'));
     }
 
     #[tokio::test]
@@ -2234,7 +4340,8 @@ mod tests {
         let count = command_rx.read(&mut submitted).await.unwrap();
 
         assert_eq!(&submitted[..count], b"\"/help\"\n");
-        assert!(app.transcript.contains("You\n/help"));
+        assert!(app.transcript.contains("You | "));
+        assert!(app.transcript.contains("/help"));
         assert_eq!(app.capture_interaction_output("Help response.\n> ").len(), 1);
 
         let backend = TestBackend::new(80, 24);
@@ -2530,7 +4637,7 @@ mod tests {
         crate::offline::control(
             &home,
             "session.ensure",
-            serde_json::json!({"id": "work", "model": "model-work"}),
+            serde_json::json!({"id": "tui-work", "model": "model-work"}),
         )
         .await
         .unwrap();
@@ -2545,10 +4652,10 @@ mod tests {
                 &home,
                 "session.append",
                 serde_json::json!({
-                    "id": "work",
+                    "id": "tui-work",
                     "message": {
                         "id": format!("message-{index}"),
-                        "session": "work",
+                        "session": "tui-work",
                         "role": role,
                         "sender": sender,
                         "content": [{"kind": "text", "text": content}]
@@ -2579,11 +4686,10 @@ mod tests {
                 plugin: "missing-model".into(),
                 model: "model-main".into(),
                 model_override: None,
-                session: "main".into(),
+                session: "tui-main".into(),
             },
             crate::local_aware,
-            Some(session_tx),
-            None,
+            crate::EngineEvents { session: Some(session_tx), ..crate::EngineEvents::default() },
             interrupt_rx,
         ));
 
@@ -2597,7 +4703,7 @@ mod tests {
         result.unwrap().unwrap();
 
         let mut app = App {
-            session: "main".into(),
+            session: "tui-main".into(),
             model: "model-main".into(),
             model_available: true,
             statusline: "{session}".into(),
@@ -2607,10 +4713,14 @@ mod tests {
         app.name = "Crabbot".into();
         app.restore_session(session_rx.recv().await.unwrap());
 
-        assert_eq!(app.session, "work");
+        assert_eq!(app.session, "tui-work");
         assert_eq!(app.model, "model-work");
         assert!(app.transcript.contains("You\nsaved history message 0"));
-        assert!(app.transcript.contains("Crabbot\nsaved history message 19"));
+        assert!(app.transcript.contains("saved history message 19"));
+        assert!(super::wrap_transcript(&app.transcript, "Crabbot", 60).iter().any(|row| {
+            row.spans.iter().any(|span| span.content.contains("saved history message 19"))
+        }));
+
         assert!(super::wrap_transcript(&app.transcript, "Crabbot", 60).len() > 10);
         assert!(output.contains("Using session work."));
         assert!(output.contains("Session not found"));
@@ -2640,6 +4750,7 @@ mod tests {
             model: crate::DEFAULT_MODEL.into(),
             workspace: None,
             messages: Vec::new(),
+            working: false,
         });
 
         assert_eq!(app.model, "unset");
@@ -2654,7 +4765,7 @@ mod tests {
         assert!(validate_statusline("line\nnext").is_err());
         assert!(validate_statusline("{name").is_err());
         assert!(validate_statusline(&"x".repeat(121)).is_err());
-        assert_eq!(input_cursor_position(&['a', 'b', 'c', 'd'], 4, 6), (0, 1));
+        assert_eq!(input_cursor_position(&['a', 'b', 'c', 'd'], 4, 6), (1, 1));
         assert_eq!(input_cursor_position(&['界'], 1, 8), (2, 0));
     }
 

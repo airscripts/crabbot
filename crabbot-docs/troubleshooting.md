@@ -29,9 +29,11 @@ an unauthorized event.
 
 ## Tools Are Unavailable
 
-The default tool root is `CRABBOT_HOME/workspace`; set `CRABBOT_ROOT` to use a
-different existing workspace. Confirm that the channel has `tools = true`. The
-daemon must also use `approval = "prompt"` for inline
+The default tool workspace is `CRABBOT_HOME/workspace`; set `CRABBOT_ROOT` to
+choose another default, or select a session workspace with `/workspace <path>`.
+File operations are confined to that selected directory. Confirm that the
+TUI has `[clients.tui] tools = true`, or that the messaging channel has
+`tools = true`. Mutating tools also require `approval = "prompt"` for inline
 confirmation or `approval = "auto"` for unattended approval. Shell execution
 requires the separate `shell = true` setting and the configured approval mode.
 

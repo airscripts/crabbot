@@ -27,11 +27,14 @@ a compatible Codex CLI using the [official Codex CLI setup guide](https://develo
 then run:
 
 ```sh
+crabbot codex --help
 crabbot codex login
 ```
 
 For a headless host, use `crabbot codex login --device`. Check or clear the
 Codex-owned sign-in with `crabbot codex status` or `crabbot codex logout`.
+Use `crabbot codex login --help` for login options and `crabbot codex models` to
+see model IDs available to the signed-in account.
 The default Codex home is the user's standard `.codex` directory; set
 `CRABBOT_CODEX_HOME` to use another profile. Crabbot does not read, persist, or
 pass Codex OAuth tokens to the Codex HTTP client.

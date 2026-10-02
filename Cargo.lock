@@ -765,6 +765,7 @@ dependencies = [
  "crabbot-file",
  "crossterm",
  "getrandom 0.4.3",
+ "jiff",
  "ratatui",
  "serde",
  "serde_json",
@@ -815,6 +816,7 @@ dependencies = [
  "subtle",
  "tokio",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2984,6 +2986,7 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.4",
 ]
 

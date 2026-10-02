@@ -496,6 +496,8 @@ enum Command {
     Init(InitArgs),
     #[command(about = "Check configuration, plugins, credentials, and local state.")]
     Doctor(DoctorArgs),
+    #[command(about = "Read or update Crabbot configuration.")]
+    Config(ConfigArgs),
     #[command(about = "Show installation and daemon health.")]
     Status(Output),
     #[command(about = "Print the Crabbot version.")]
@@ -570,10 +572,8 @@ struct CrabfileImport {
 enum PluginCommand {
     #[command(about = "List installed plugins.")]
     List(Output),
-    #[command(about = "Install and activate a plugin.")]
-    Install(Source),
-    #[command(about = "Link a local plugin and activate it.")]
-    Link(Source),
+    #[command(about = "Install and activate one or more plugins.")]
+    Install(PluginInstall),
     #[command(about = "Review available plugin updates; pass -y to apply them.")]
     Update(PluginUpdate),
     #[command(name = "uninstall", about = "Uninstall a plugin.")]
@@ -646,6 +646,44 @@ enum ServiceCommand {
     Start,
     #[command(about = "Stop the native service.")]
     Stop,
+    #[command(about = "Restart the native service.")]
+    Restart,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+#[derive(Debug, Args)]
+#[command(arg_required_else_help = true, subcommand_required = true)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    #[command(about = "Show all settings or one setting.")]
+    Get(ConfigGet),
+    #[command(about = "Set one setting using KEY=VALUE.")]
+    Set(ConfigSet),
+}
+
+#[derive(Debug, Args)]
+struct ConfigGet {
+    #[arg(value_name = "KEY", help = "Dotted setting name, such as clients.tui.tools.")]
+    key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ConfigSet {
+    #[arg(value_name = "KEY=VALUE", help = "Dotted key and TOML value to set.")]
+    assignment: String,
+    #[arg(long, help = "Restart the running daemon to apply restart-required settings.")]
+    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -664,7 +702,7 @@ struct ServiceRemove {
 struct SessionNew {
     #[arg(help = "Session identifier.")]
     id: String,
-    #[arg(long, default_value = "gpt-6-luna", help = "Model identifier.")]
+    #[arg(long, default_value = "unset", help = "Model identifier.")]
     model: String,
 }
 
@@ -722,12 +760,26 @@ struct DoctorArgs {
 
 #[derive(Debug, Args)]
 struct Source {
-    #[arg(help = "Plugin identifier.")]
     id: String,
-    #[arg(help = "Local path, Git URL, or verified archive.")]
     source: Option<String>,
-    #[arg(long, value_name = "REVISION", help = "Pin a Git revision.")]
     revision: Option<String>,
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct PluginInstall {
+    #[arg(value_name = "ID", required = true, num_args = 1..)]
+    ids: Vec<String>,
+    #[arg(
+        long,
+        value_name = "SOURCE",
+        help = "Use a local path, Git URL, or verified archive (one plugin only)."
+    )]
+    source: Option<String>,
+    #[arg(long, value_name = "REVISION", help = "Pin the selected Git source revision.")]
+    revision: Option<String>,
+    #[arg(long, help = "Link a local build instead of copying its executable.")]
+    link: bool,
     #[arg(short, long, help = "Confirm installation or replacement without prompting.")]
     yes: bool,
 }
@@ -784,7 +836,7 @@ struct Id {
 struct Ask {
     #[arg(long, help = "Intelligence plugin identifier.")]
     plugin: Option<String>,
-    #[arg(long, default_value = "gpt-6-luna", help = "Model identifier.")]
+    #[arg(long, default_value = "unset", help = "Model identifier.")]
     model: String,
     #[arg(help = "Prompt words.")]
     prompt: Vec<String>,
@@ -800,6 +852,8 @@ pub(crate) struct Config {
     approval: String,
     #[serde(default)]
     channels: BTreeMap<String, ChannelConfig>,
+    #[serde(default)]
+    clients: BTreeMap<String, ClientConfig>,
 }
 
 impl Default for Config {
@@ -810,12 +864,36 @@ impl Default for Config {
             shell: false,
             approval: "off".into(),
             channels: BTreeMap::new(),
+            clients: BTreeMap::new(),
         }
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ClientConfig {
+    #[serde(default)]
+    tools: bool,
+    #[serde(default = "default_tui_theme")]
+    theme: bool,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self { tools: false, theme: true }
+    }
+}
+
+fn default_tui_theme() -> bool {
+    true
+}
+
 impl Config {
     fn validate(&self) -> Result<(), String> {
+        if self.clients.keys().any(|id| !valid(id)) {
+            return Err("Client IDs must contain lowercase letters, digits, or hyphens.".into());
+        }
+
         if self.name.trim().is_empty()
             || self.name.len() > 64
             || self.name.chars().any(char::is_control)
@@ -1197,6 +1275,7 @@ fn command_label(command: &Command) -> &'static str {
     match command {
         Command::Init(_) => "init",
         Command::Doctor(_) => "doctor",
+        Command::Config(_) => "config",
         Command::Status(_) => "status",
         Command::Version(_) => "version",
         Command::Completion { .. } => "completion",
@@ -1262,6 +1341,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match cli.command {
         Command::Init(args) => init(args.force, args.yes, json)?,
         Command::Doctor(args) => doctor(args.fix, json)?,
+        Command::Config(args) => config_command(args.command, &home(), json).await?,
         Command::Status(output) => status_command(output.json || json).await?,
         Command::Version(output) => version(output.json || json),
         Command::Completion { shell } => completion(shell)?,
@@ -2404,8 +2484,207 @@ async fn control_at(
     }
 }
 
+async fn config_command(
+    command: ConfigCommand,
+    root: &Path,
+    json: bool,
+) -> Result<(), PluginError> {
+    let path = root.join("config.toml");
+
+    match command {
+        ConfigCommand::Get(args) => {
+            let text = std::fs::read_to_string(&path)?;
+            let config: toml::Value = toml::from_str(&text)?;
+            let value = args.key.as_deref().map_or(Some(&config), |key| {
+                key.split('.').try_fold(&config, |value, part| value.get(part))
+            });
+
+            let Some(value) = value else {
+                return Err("Configuration key was not found.".into());
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(value)?);
+            } else if let Some(key) = args.key {
+                println!("{key} = {}", value);
+            } else {
+                print!("{}", toml::to_string_pretty(&config)?);
+            }
+        }
+
+        ConfigCommand::Set(args) => {
+            let (key, raw_value) = args
+                .assignment
+                .split_once('=')
+                .ok_or("Use KEY=VALUE, for example clients.tui.tools=true.")?;
+
+            let key = match key.trim() {
+                "clients.tui" => "clients.tui.tools",
+                key => key,
+            };
+
+            let raw_value = raw_value.trim();
+            let parts = key.split('.').collect::<Vec<_>>();
+
+            if parts.is_empty()
+                || parts.iter().any(|part| {
+                    part.is_empty()
+                        || !part.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || byte == b'_'
+                                || byte == b'-'
+                        })
+                })
+            {
+                return Err("Configuration key is invalid.".into());
+            }
+
+            let value = raw_value.parse::<toml_edit::Value>()?;
+            let mut document = std::fs::read_to_string(&path)?.parse::<toml_edit::DocumentMut>()?;
+
+            let mut table = document.as_table_mut();
+
+            for part in &parts[..parts.len() - 1] {
+                if !table.contains_key(part) {
+                    table[*part] = toml_edit::Item::Table(toml_edit::Table::new());
+                }
+
+                table = table[*part]
+                    .as_table_mut()
+                    .ok_or_else(|| format!("{part} is not a configuration table."))?;
+            }
+
+            table[parts[parts.len() - 1]] = toml_edit::Item::Value(value);
+            let rendered = document.to_string();
+            let config: Config = toml::from_str(&rendered)?;
+            config.validate().map_err(|error| -> PluginError { error.into() })?;
+            secure(&path, rendered.as_bytes())?;
+
+            let hot = key == "clients.tui.tools";
+            let next_launch = key == "clients.tui.theme";
+            let applied = if hot {
+                control_at(
+                    "config.client.set",
+                    serde_json::json!({"client": "tui", "tools": config.clients.get("tui").is_some_and(|client| client.tools)}),
+                    root,
+                )
+                .await?
+                .is_some()
+            } else {
+                false
+            };
+
+            let restarted = if !hot && !next_launch && args.force {
+                restart_daemon(root).await?
+            } else {
+                false
+            };
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "key": key,
+                        "value": raw_value,
+                        "saved": true,
+                        "applied": applied,
+                        "restarted": restarted,
+                        "restart_required": !hot && !next_launch && !restarted,
+                    }))?
+                );
+            } else if applied {
+                println!("Updated {key}; the running daemon will use it for new turns.");
+            } else if restarted {
+                println!("Updated {key}; the daemon was restarted to apply it.");
+            } else if hot {
+                println!("Updated {key}; it will apply when the daemon starts.");
+            } else if next_launch {
+                println!("Updated {key}; it will apply the next time you run `crab tui`.");
+            } else {
+                println!("Updated {key}; restart the daemon to apply this setting.");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn restart_daemon(root: &Path) -> Result<bool, PluginError> {
+    if service_path().is_file() && service_manager_state()? == ServiceState::Active {
+        #[cfg(target_os = "linux")]
+        let result = std::process::Command::new("systemctl")
+            .args(["--user", "restart", "crabbot.service"])
+            .status()?;
+
+        #[cfg(target_os = "macos")]
+        let result = {
+            let uid = std::process::Command::new("id").arg("-u").output()?;
+            let uid = String::from_utf8_lossy(&uid.stdout).trim().to_owned();
+            std::process::Command::new("launchctl")
+                .args(["kickstart", "-k", &format!("gui/{uid}/{MACOS_SERVICE_LABEL}")])
+                .status()?
+        };
+
+        #[cfg(target_os = "windows")]
+        let result = {
+            let stopped =
+                std::process::Command::new("sc.exe").args(["stop", "Crabbot"]).status()?;
+
+            if !stopped.success() {
+                return Err("Could not stop the Crabbot service.".into());
+            }
+
+            std::process::Command::new("sc.exe").args(["start", "Crabbot"]).status()?
+        };
+
+        if !result.success() {
+            return Err("Could not restart the Crabbot service.".into());
+        }
+
+        return Ok(true);
+    }
+
+    if control_at("shutdown", serde_json::json!({}), root).await?.is_none() {
+        return Ok(false);
+    }
+
+    let mut stopped = false;
+
+    for _ in 0..100 {
+        if control_at("status", serde_json::json!({}), root).await?.is_none() {
+            stopped = true;
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    if !stopped {
+        return Err("The daemon did not stop; refusing to start a second instance.".into());
+    }
+
+    let executable = daemon_executable()?;
+    std::process::Command::new(executable)
+        .env("CRABBOT_HOME", root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    for _ in 0..100 {
+        if control_at("status", serde_json::json!({}), root).await?.is_some() {
+            return Ok(true);
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err("Daemon did not become ready after restart.".into())
+}
+
 fn sessions_at(root: &Path) -> Result<state::Store, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(state::Store::load(root.join("sessions.json"))?)
+    Ok(state::Store::load(root.join("data/sessions/index.json"))?)
 }
 
 async fn purge_state_at(
@@ -2733,7 +3012,7 @@ async fn serve_at(root: &Path) -> Result<(), Box<dyn std::error::Error + Send + 
     let channel_id = std::env::var("CRABBOT_CHANNEL").unwrap_or_else(|_| "telegram".into());
 
     let model_id = std::env::var("CRABBOT_MODEL_PLUGIN").unwrap_or_else(|_| "codex".into());
-    let model = std::env::var("CRABBOT_MODEL").unwrap_or_else(|_| "gpt-6-luna".into());
+    let model = std::env::var("CRABBOT_MODEL").unwrap_or_else(|_| "unset".into());
     serve_inner(root, &channel_id, &model_id, &model, false).await
 }
 
@@ -2755,7 +3034,7 @@ async fn serve_inner(
 
     updates(root, &config.update)?;
 
-    let loaded = state::Store::load(root.join("sessions.json"))?;
+    let loaded = state::Store::load(root.join("data/sessions/index.json"))?;
     let workspace = workspace_root_at(root);
     reclaim_worktrees(&workspace, &loaded);
     let sessions = Arc::new(Mutex::new(loaded));
@@ -2780,6 +3059,9 @@ async fn serve_inner(
         pending: Arc::clone(&pending),
         plugins: plugins.clone(),
         config: config.clone(),
+        tui_tools: Arc::new(std::sync::atomic::AtomicBool::new(
+            config.clients.get("tui").is_some_and(|client| client.tools),
+        )),
         channel: channel_id.to_owned(),
         model: model_id.to_owned(),
     });
@@ -2829,6 +3111,7 @@ async fn serve_inner(
         Arc::clone(&cancels),
         config.channels,
         approval_mode,
+        config.shell,
         root.to_owned(),
         media_root_at(root),
         pending,
@@ -3007,11 +3290,7 @@ async fn launch(
             .get(expected)
             .ok_or_else(|| format!("Plugin {expected} is not locked."))?;
 
-        let actual = digest(&manifest_path, &path)?;
-
-        if actual != entry.hash {
-            return Err(format!("Plugin {expected} failed its launch integrity check.").into());
-        }
+        verify_plugin_binary(expected, entry, &manifest_path, &path)?;
 
         let mut locked_capabilities = entry.capabilities.clone();
         locked_capabilities.sort();
@@ -3268,6 +3547,7 @@ fn env_for(manifest: &Manifest, config: &Config, root: &Path) -> Vec<(String, St
     ensure_codex_home(&mut values);
 
     if manifest.id == "tools" {
+        ensure_root(&mut values, root);
         values.push(("CRABBOT_SHELL".into(), if config.shell { "on" } else { "off" }.into()));
 
         for name in ["CRABBOT_SANDBOX_RUNTIME", "CRABBOT_SANDBOX_IMAGE"] {
@@ -3289,6 +3569,12 @@ fn env_for(manifest: &Manifest, config: &Config, root: &Path) -> Vec<(String, St
 fn ensure_home(values: &mut Vec<(String, String)>, root: &Path) {
     if !values.iter().any(|(name, _)| name == "CRABBOT_HOME") {
         values.push(("CRABBOT_HOME".into(), root.display().to_string()));
+    }
+}
+
+fn ensure_root(values: &mut Vec<(String, String)>, home_root: &Path) {
+    if !values.iter().any(|(name, _)| name == "CRABBOT_ROOT") {
+        values.push(("CRABBOT_ROOT".into(), home_root.join("workspace").display().to_string()));
     }
 }
 
@@ -3600,6 +3886,7 @@ async fn bridge(
         cancels,
         channels,
         approval_mode,
+        false,
         home.clone(),
         media_root_at(&home),
         Arc::new(AsyncMutex::new(approval::Gate::new()?)),
@@ -3622,6 +3909,7 @@ async fn bridge_with_media(
     cancels: Arc<Mutex<BTreeMap<String, Arc<Cancellation>>>>,
     channels: BTreeMap<String, ChannelConfig>,
     approval_mode: ApprovalMode,
+    shell_enabled: bool,
     home_root: PathBuf,
     media_root: PathBuf,
     approvals: Arc<AsyncMutex<approval::Gate>>,
@@ -4310,6 +4598,7 @@ async fn bridge_with_media(
                     workspace.as_deref(),
                     &media_root,
                     tools_allowed(&channel_policy, &event, &chat, approval_mode.enabled()),
+                    shell_enabled,
                     approval_mode,
                     Arc::clone(&approvals),
                     &turn_cancel,
@@ -4332,7 +4621,7 @@ async fn bridge_with_media(
 
                         Some(notice) = stream_rx.recv() => {
                             match notice {
-                                StreamNotice::Approval { chat: approval_chat, thread: approval_thread, text, approve, deny, deadline } => {
+                                StreamNotice::Approval { chat: approval_chat, thread: approval_thread, text, approve, deny, deadline, .. } => {
                                     if let Err(error) = wait_approval(
                                         &channel,
                                         channel_id,
@@ -6210,43 +6499,63 @@ async fn wait_approval(
     }
 }
 
-fn tools() -> Vec<ToolSpec> {
-    [
+fn tools(shell_enabled: bool) -> Vec<ToolSpec> {
+    let mut definitions = vec![
         ("read", "Read a text file.", &["path"] as &[&str]),
-        ("write", "Write a text file with approval.", &["path", "text"]),
+        (
+            "write",
+            "Write a text file with approval. Paths must remain inside the active workspace; use workspace-relative paths.",
+            &["path", "text"],
+        ),
         ("list", "List workspace entries.", &["path"]),
         ("search", "Search workspace text.", &["path", "text"]),
         ("patch", "Apply an approved Git patch.", &["text"]),
         ("git", "Inspect or manage approved Git worktrees.", &["args"]),
-        ("shell", "Run an approved shell command.", &["command"]),
-    ]
-    .into_iter()
-    .map(|(name, description, required)| {
-        let properties = required
-            .iter()
-            .map(|key| {
-                let value = match *key {
-                    "path" | "text" | "command" => serde_json::json!({"type": "string"}),
-                    "args" => serde_json::json!({"type": "array", "items": {"type": "string"}}),
-                    _ => serde_json::json!({}),
-                };
+    ];
 
-                ((*key).to_owned(), value)
-            })
-            .collect::<serde_json::Map<_, _>>();
+    if shell_enabled {
+        definitions.push(("shell", "Run an approved shell command.", &["command"]));
+    }
 
-        ToolSpec {
-            name: name.into(),
-            description: Some(description.into()),
-            schema: serde_json::json!({
-                "type": "object",
-                "properties": properties,
-                "required": required,
-                "additionalProperties": false,
-            }),
-        }
-    })
-    .collect()
+    definitions
+        .into_iter()
+        .map(|(name, description, required)| {
+            let properties = required
+                .iter()
+                .map(|key| {
+                    let value = match *key {
+                        "path" | "text" | "command" => serde_json::json!({"type": "string"}),
+                        "args" => serde_json::json!({"type": "array", "items": {"type": "string"}}),
+                        _ => serde_json::json!({}),
+                    };
+
+                    ((*key).to_owned(), value)
+                })
+                .collect::<serde_json::Map<_, _>>();
+
+            ToolSpec {
+                name: name.into(),
+                description: Some(description.into()),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": false,
+                }),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tool_availability_tests {
+    use super::tools;
+
+    #[test]
+    fn shell_is_only_declared_when_enabled() {
+        assert!(!tools(false).iter().any(|tool| tool.name == "shell"));
+        assert!(tools(true).iter().any(|tool| tool.name == "shell"));
+    }
 }
 
 fn memory_tools() -> Vec<ToolSpec> {
@@ -6347,6 +6656,9 @@ enum StreamNotice {
     Approval {
         chat: String,
         thread: Option<String>,
+        tool: String,
+        arguments: String,
+        command: Option<String>,
         text: String,
         approve: String,
         deny: String,
@@ -6532,6 +6844,7 @@ async fn answer(
     workspace: Option<&Path>,
     media_root: &Path,
     tools_enabled: bool,
+    shell_enabled: bool,
     approval_mode: ApprovalMode,
     approvals: Arc<AsyncMutex<approval::Gate>>,
     cancel: &Cancellation,
@@ -6553,7 +6866,8 @@ async fn answer(
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let tool_plugin = plugins.find(Capability::Tool).await;
     let memory_plugin = plugins.find(Capability::Memory).await;
-    let mut specs = if tool_plugin.is_some() && tools_enabled { tools() } else { Vec::new() };
+    let mut specs =
+        if tool_plugin.is_some() && tools_enabled { tools(shell_enabled) } else { Vec::new() };
 
     if memory_plugin.is_some() && tools_enabled {
         specs.extend(memory_tools());
@@ -6688,6 +7002,7 @@ async fn answer(
 
         let mut parsed: ModelReply = serde_json::from_value(value)?;
         merge_stream(&mut parsed, notes);
+        keep_one_mutation(&mut parsed.events);
         parsed.text = clip(parsed.text, TEXT_LIMIT);
         tokens = tokens.saturating_add(parsed.input.unwrap_or_default());
         tokens = tokens.saturating_add(parsed.output.unwrap_or_default());
@@ -6730,6 +7045,10 @@ async fn answer(
 
                 continue;
             };
+
+            if !specs.iter().any(|tool| tool.name == *name) {
+                return Err(format!("The model requested unavailable tool `{name}`.").into());
+            }
 
             if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= TOOL_CALLS {
                 return Err("The turn exceeded its tool-call limit.".into());
@@ -7003,6 +7322,21 @@ fn mutating(name: &str, args: &serde_json::Value) -> bool {
     }
 }
 
+fn keep_one_mutation(events: &mut Vec<Event>) {
+    let Some(index) = events
+        .iter()
+        .position(|event| matches!(event, Event::Tool { name, args, .. } if mutating(name, args)))
+    else {
+        return;
+    };
+
+    if let Some(next) = events.iter().enumerate().skip(index + 1).find_map(|(index, event)| {
+        matches!(event, Event::Tool { name, args, .. } if mutating(name, args)).then_some(index)
+    }) {
+        events.truncate(next);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn tool(
     plugins: &Plugins,
@@ -7129,6 +7463,9 @@ async fn execute_tool(
                 .send(StreamNotice::Approval {
                     chat: chat.into(),
                     thread: thread.map(str::to_owned),
+                    tool: name.into(),
+                    arguments: clip(args.to_string(), 512),
+                    command: args["command"].as_str().map(|command| clip(command.into(), 1_000)),
                     text,
                     approve: challenge.approve.clone(),
                     deny: challenge.deny,
@@ -7311,7 +7648,7 @@ async fn host_tool(
         }
     };
 
-    Ok(Response::ok(id, serde_json::json!({"output": output})))
+    Ok(Response::ok(id, serde_json::json!({"text": output})))
 }
 
 async fn restart_tool(plugins: &Plugins, id: &str) {
@@ -7427,9 +7764,7 @@ fn doctor_at(
 
         let manifest = root.join("plugins").join(id).join("crabbot-plugin.toml");
 
-        if digest(&manifest, &binary)? != entry.hash {
-            return Err(format!("Plugin integrity check failed: {id}.").into());
-        }
+        verify_plugin_binary(id, entry, &manifest, &binary)?;
     }
 
     let healthy = doctor_healthy(
@@ -7693,13 +8028,18 @@ fn service_at_json(
     command: ServiceCommand,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    service_at_with_mode(path, command, |path, start| service_action_with(path, start, json), json)
+    service_at_with_mode(
+        path,
+        command,
+        |path, action| service_action_with(path, action, json),
+        json,
+    )
 }
 
 fn service_at_with(
     path: &Path,
     command: ServiceCommand,
-    mut action: impl FnMut(&Path, bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    mut action: impl FnMut(&Path, ServiceAction) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     service_at_with_mode(path, command, &mut action, false)
 }
@@ -7707,7 +8047,7 @@ fn service_at_with(
 fn service_at_with_mode(
     path: &Path,
     command: ServiceCommand,
-    action: impl FnMut(&Path, bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    action: impl FnMut(&Path, ServiceAction) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     service_at_with_status(path, command, action, service_manager_state, json)
@@ -7716,7 +8056,7 @@ fn service_at_with_mode(
 fn service_at_with_status(
     path: &Path,
     command: ServiceCommand,
-    mut action: impl FnMut(&Path, bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    mut action: impl FnMut(&Path, ServiceAction) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     mut state: impl FnMut() -> Result<ServiceState, Box<dyn std::error::Error + Send + Sync>>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -7780,7 +8120,7 @@ fn service_at_with_status(
             let installed = path.exists();
 
             if installed {
-                action(path, false)?;
+                action(path, ServiceAction::Stop)?;
             }
 
             #[cfg(target_os = "windows")]
@@ -7832,8 +8172,16 @@ fn service_at_with_status(
             }
         }
 
-        ServiceCommand::Start => action(path, true)?,
-        ServiceCommand::Stop => action(path, false)?,
+        ServiceCommand::Start => action(path, ServiceAction::Start)?,
+        ServiceCommand::Stop => action(path, ServiceAction::Stop)?,
+
+        ServiceCommand::Restart => {
+            if !path.is_file() {
+                return Err("Service definition is not installed.".into());
+            }
+
+            action(path, ServiceAction::Restart)?;
+        }
     }
 
     Ok(())
@@ -8224,14 +8572,14 @@ fn windows_service_remove() -> Result<(), Box<dyn std::error::Error + Send + Syn
 
 fn service_action(
     path: &Path,
-    start: bool,
+    action: ServiceAction,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    service_action_with(path, start, false)
+    service_action_with(path, action, false)
 }
 
 fn service_action_with(
     path: &Path,
-    start: bool,
+    action: ServiceAction,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !path.is_file() {
@@ -8240,41 +8588,90 @@ fn service_action_with(
 
     let previous = service_manager_state()?;
 
-    if service_action_is_noop(start, previous) {
-        return service_action_message(start, Some(previous), json);
+    if let Some(start) = service_action_start(action)
+        && service_action_is_noop(start, previous)
+    {
+        return service_action_message(action, Some(previous), json);
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        let _ = start;
+        let _ = action;
         return Err("Native service actions are unsupported on this platform.".into());
     }
 
     #[cfg(target_os = "linux")]
-    let (program, args): (&str, Vec<String>) = if start {
-        (
+    let (program, args): (&str, Vec<String>) = match action {
+        ServiceAction::Start => (
             "systemctl",
             vec!["--user".into(), "enable".into(), "--now".into(), "crabbot.service".into()],
-        )
-    } else {
-        (
+        ),
+        ServiceAction::Stop => (
             "systemctl",
             vec!["--user".into(), "disable".into(), "--now".into(), "crabbot.service".into()],
-        )
+        ),
+
+        ServiceAction::Restart => {
+            ("systemctl", vec!["--user".into(), "restart".into(), "crabbot.service".into()])
+        }
     };
 
     #[cfg(target_os = "macos")]
-    let (program, args): (&str, Vec<String>) = if start {
-        ("launchctl", vec!["load".into(), "-w".into(), path.display().to_string()])
-    } else {
-        ("launchctl", vec!["unload".into(), "-w".into(), path.display().to_string()])
+    let (program, args): (&str, Vec<String>) = match action {
+        ServiceAction::Start => {
+            ("launchctl", vec!["load".into(), "-w".into(), path.display().to_string()])
+        }
+
+        ServiceAction::Stop => {
+            ("launchctl", vec!["unload".into(), "-w".into(), path.display().to_string()])
+        }
+
+        ServiceAction::Restart => {
+            let uid = command_output(std::process::Command::new("id").arg("-u"))?;
+
+            if !uid.status.success() {
+                return Err("Service restart failed: could not determine the current user.".into());
+            }
+
+            let domain = format!("gui/{}", String::from_utf8_lossy(&uid.stdout).trim());
+
+            if previous == ServiceState::NotInstalled {
+                ("launchctl", vec!["bootstrap".into(), domain, path.display().to_string()])
+            } else {
+                (
+                    "launchctl",
+                    vec![
+                        "kickstart".into(),
+                        "-k".into(),
+                        format!("{domain}/{MACOS_SERVICE_LABEL}"),
+                    ],
+                )
+            }
+        }
     };
 
     #[cfg(target_os = "windows")]
-    let (program, args): (&str, Vec<String>) = if start {
-        ("sc.exe", vec!["start".into(), "Crabbot".into()])
-    } else {
-        ("sc.exe", vec!["stop".into(), "Crabbot".into()])
+    let (program, args): (&str, Vec<String>) = match action {
+        ServiceAction::Start => ("sc.exe", vec!["start".into(), "Crabbot".into()]),
+        ServiceAction::Stop => ("sc.exe", vec!["stop".into(), "Crabbot".into()]),
+        ServiceAction::Restart
+            if matches!(
+                previous,
+                ServiceState::Active | ServiceState::Starting | ServiceState::Stopping
+            ) =>
+        {
+            (
+                "powershell.exe",
+                vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    "Restart-Service -Name 'Crabbot' -Force -ErrorAction Stop".into(),
+                ],
+            )
+        }
+
+        ServiceAction::Restart => ("sc.exe", vec!["start".into(), "Crabbot".into()]),
     };
 
     let output = command_output(std::process::Command::new(program).args(args))?;
@@ -8292,47 +8689,60 @@ fn service_action_with(
         return Err(format!("Service action failed: {}", sentence(detail)).into());
     }
 
-    service_action_message(start, None, json)
+    service_action_message(action, None, json)
 }
 
 fn service_action_message(
-    start: bool,
+    action: ServiceAction,
     previous: Option<ServiceState>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let action = if start { "start" } else { "stop" };
+    let action_name = match action {
+        ServiceAction::Start => "start",
+        ServiceAction::Stop => "stop",
+        ServiceAction::Restart => "restart",
+    };
 
-    let status = match (start, previous) {
-        (true, Some(_)) => "already active",
-        (false, Some(ServiceState::Failed)) => "failed",
-        (false, Some(ServiceState::NotInstalled)) => "not installed",
-        (false, Some(_)) => "already inactive",
-        (true, None) => "started",
-        (false, None) => "stopped",
+    let status = match (action, previous) {
+        (ServiceAction::Start, Some(_)) => "already active",
+        (ServiceAction::Stop, Some(ServiceState::Failed)) => "failed",
+        (ServiceAction::Stop, Some(ServiceState::NotInstalled)) => "not installed",
+        (ServiceAction::Stop, Some(_)) => "already inactive",
+        (ServiceAction::Start, None) => "started",
+        (ServiceAction::Stop, None) => "stopped",
+        (ServiceAction::Restart, _) => "restarted",
     };
 
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "action": action,
+                "action": action_name,
                 "name": service_name(),
                 "status": status,
             }))?
         );
-    } else if start && previous.is_some() {
+    } else if action == ServiceAction::Start && previous.is_some() {
         println!("Service {} is already active; no action taken.", service_name());
-    } else if previous == Some(ServiceState::Failed) {
+    } else if action == ServiceAction::Stop && previous == Some(ServiceState::Failed) {
         println!("Service {} is failed; nothing is running to stop.", service_name());
-    } else if previous == Some(ServiceState::NotInstalled) {
+    } else if action == ServiceAction::Stop && previous == Some(ServiceState::NotInstalled) {
         println!("Service {} is not loaded; nothing to stop.", service_name());
-    } else if !start && previous.is_some() {
+    } else if action == ServiceAction::Stop && previous.is_some() {
         println!("Service {} is already inactive; nothing to stop.", service_name());
     } else {
         println!("Service {} {status}.", service_name());
     }
 
     Ok(())
+}
+
+fn service_action_start(action: ServiceAction) -> Option<bool> {
+    match action {
+        ServiceAction::Start => Some(true),
+        ServiceAction::Stop => Some(false),
+        ServiceAction::Restart => None,
+    }
 }
 
 fn service_action_is_noop(start: bool, state: ServiceState) -> bool {
@@ -8814,11 +9224,7 @@ async fn external_command(
 
     let value = response.result.ok_or("Plugin command returned no result.")?;
 
-    if let Some(text) = value.as_str() {
-        println!("{text}");
-    } else {
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    }
+    println!("{}", external_command_output(&value, json)?);
 
     Ok(())
 }
@@ -8829,6 +9235,8 @@ async fn tui_command(
     root: &Path,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    require_tui_daemon(root).await?;
+
     let tui_manifest = verify_plugin_integrity(root, "tui", &path)?;
 
     if !tui_manifest.commands.iter().any(|command| command.name == "tui" && command.interactive) {
@@ -8851,6 +9259,7 @@ async fn tui_command(
         .unwrap_or_else(|| "codex".into());
 
     let plugin_path = binary_at(&plugin, root);
+    let launch_directory = std::env::current_dir()?;
     let mut command = tokio::process::Command::new(path);
     command
         .env_clear()
@@ -8858,6 +9267,11 @@ async fn tui_command(
         .args(args)
         .env("CRABBOT_HOME", root)
         .env("CRABBOT_NAME", &config.name)
+        .env("CRABBOT_TUI_LAUNCH_DIR", launch_directory)
+        .env(
+            "CRABBOT_TUI_THEME",
+            if config.clients.get("tui").is_none_or(|client| client.theme) { "on" } else { "off" },
+        )
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
@@ -8889,6 +9303,18 @@ async fn tui_command(
     Ok(())
 }
 
+async fn require_tui_daemon(root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if control_at("status", serde_json::json!({}), root).await?.is_none() {
+        return Err(concat!(
+            "The Crabbot daemon is not running.\n",
+            "Start it with `crab service start` or run `crabbot-daemon`."
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
 fn verify_plugin_integrity(
     root: &Path,
     id: &str,
@@ -8906,21 +9332,95 @@ fn verify_plugin_integrity(
     let lock = load_lock_at(root)?;
     let entry = lock.plugins.get(id).ok_or_else(|| format!("Plugin {id} is not locked."))?;
 
-    if manifest.id != id || digest(&manifest_path, path)? != entry.hash {
+    if manifest.id != id {
+        return Err(format!("Plugin integrity check failed: {id}.").into());
+    }
+
+    verify_plugin_binary(id, entry, &manifest_path, path)?;
+
+    let mut capabilities = manifest.capabilities.clone();
+    capabilities.sort();
+    let mut locked_capabilities = entry.capabilities.clone();
+    locked_capabilities.sort();
+
+    if capabilities != locked_capabilities {
+        return Err(format!("Plugin integrity check failed: {id}.").into());
+    }
+
+    let mut commands = manifest.commands.clone();
+    commands.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut locked_commands = entry.commands.clone();
+    locked_commands.sort_by(|left, right| left.name.cmp(&right.name));
+
+    if commands != locked_commands {
         return Err(format!("Plugin integrity check failed: {id}.").into());
     }
 
     Ok(manifest)
 }
 
+fn verify_plugin_binary(
+    id: &str,
+    entry: &Entry,
+    manifest: &Path,
+    binary: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let valid = if entry.linked {
+        let metadata = std::fs::symlink_metadata(binary)?;
+        let source = entry.source.strip_prefix("file://").unwrap_or(&entry.source);
+        let source = source.split('#').next().unwrap_or(source);
+        let source_root = std::fs::canonicalize(source)?;
+        let expected = plugin_binary(&source_root, id, entry.default)
+            .ok_or_else(|| format!("Linked plugin source is unavailable: {id}."))?;
+
+        let actual = std::fs::canonicalize(binary)?;
+        let expected = std::fs::canonicalize(expected)?;
+        let source_manifest = std::fs::read(source_root.join("crabbot-plugin.toml"))?;
+        let installed_manifest = std::fs::read(manifest)?;
+
+        metadata.file_type().is_symlink()
+            && actual == expected
+            && source_manifest == installed_manifest
+    } else {
+        digest(manifest, binary)? == entry.hash
+    };
+
+    if !valid {
+        return Err(format!("Plugin integrity check failed: {id}.").into());
+    }
+
+    Ok(())
+}
+
 fn external_command_help(name: &str, description: &str) -> String {
     if name == "tui" {
         return format!(
-            "{description}\n\nUsage: crab tui [OPTIONS]\n\nOptions:\n  --once <prompt>   Send one prompt without opening the full-screen interface\n  --session <id>    Select a session (default: tui)\n  --model <name>    Select the model (default: CRABBOT_MODEL or gpt-6-luna)\n  --plugin <id>     Select the intelligence plugin (default: CRABBOT_MODEL_PLUGIN or codex)\n  -h, --help        Print help"
+            "{description}\n\nUsage: crab tui [OPTIONS]\n\nOptions:\n  --once <prompt>   Send one prompt without opening the full-screen interface\n  --session <id>    Select a session (default: tui)\n  --model <name>    Select the model (default: CRABBOT_MODEL or unset)\n  --plugin <id>     Select the intelligence plugin (default: CRABBOT_MODEL_PLUGIN or codex)\n  -h, --help        Print help"
+        );
+    }
+
+    if name == "codex" {
+        return format!(
+            "{description}\n\nUsage: crab codex <COMMAND>\n\nCommands:\n  login [--device]  Sign in to your Codex account.\n  status            Show whether Codex is signed in.\n  logout            Sign out of Codex.\n  models            List models available to this Codex account.\n  help              Show this help.\n\nRun `crab codex <command> --help` for command-specific help."
         );
     }
 
     format!("Usage: crabbot {name} [arguments...]\n{description}")
+}
+
+fn external_command_output(
+    value: &Value,
+    json: bool,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if json {
+        return Ok(serde_json::to_string_pretty(value)?);
+    }
+
+    if let Some(text) = value.as_str().or_else(|| value["text"].as_str()) {
+        return Ok(text.to_owned());
+    }
+
+    Ok(serde_json::to_string_pretty(value)?)
 }
 
 async fn ask_command(
@@ -9057,43 +9557,106 @@ async fn plugin(
     match command {
         PluginCommand::List(output) => list(output.json || json)?,
 
-        PluginCommand::Install(source) => {
-            let manifest = link(source, false)?;
-            let activation = activate_at(&home(), &manifest.id).await?;
+        PluginCommand::Install(install) => {
+            let (linked, sources) = plugin_sources(install)?;
+            let root = home();
+            let mut installed = Vec::new();
+            let mut errors = Vec::new();
+            let mut activations = Vec::new();
+            let requested = sources.len();
+
+            for (index, source) in sources.into_iter().enumerate() {
+                let id = source.id.clone();
+
+                if !json {
+                    println!("Installing plugin {id} ({}/{requested})...", index + 1);
+                }
+
+                match link(source, linked) {
+                    Ok(manifest) => match activate_at(&root, &manifest.id).await {
+                        Ok(activation) => {
+                            let state = if activation.is_some() { "active" } else { "deferred" };
+
+                            if !json && requested > 1 {
+                                println!(
+                                    "Installed plugin {} {} successfully.",
+                                    manifest.id, manifest.version
+                                );
+                            }
+
+                            activations.push((manifest.id.clone(), activation));
+
+                            installed.push(serde_json::json!({
+                                "id": manifest.id,
+                                "version": manifest.version,
+                                "activation": state,
+                                "linked": linked
+                            }));
+                        }
+
+                        Err(error) => {
+                            errors.push(serde_json::json!({"id": id, "error": error.to_string()}));
+                        }
+                    },
+
+                    Err(error) => {
+                        errors.push(serde_json::json!({"id": id, "error": error.to_string()}));
+                    }
+                }
+            }
 
             if json {
+                let failed = errors.len();
+                let total = installed.len() + failed;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "action": "install",
-                        "id": manifest.id,
-                        "version": manifest.version,
-                        "activation": if activation.is_some() { "active" } else { "deferred" }
+                        "items": &installed,
+                        "errors": &errors
                     }))?
                 );
-            } else {
-                println!("Installed {} {}.", manifest.id, manifest.version);
-                print_activation(&manifest.id, activation);
-            }
-        }
 
-        PluginCommand::Link(source) => {
-            let manifest = link(source, true)?;
-            let activation = activate_at(&home(), &manifest.id).await?;
-
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "action": "link",
-                        "id": manifest.id,
-                        "version": manifest.version,
-                        "activation": if activation.is_some() { "active" } else { "deferred" }
-                    }))?
-                );
+                if failed > 0 {
+                    return Err(
+                        format!("{failed} of {total} plugin installation(s) failed.").into()
+                    );
+                }
             } else {
-                println!("Linked {} {}.", manifest.id, manifest.version);
-                print_activation(&manifest.id, activation);
+                let total = installed.len() + errors.len();
+
+                if let Some(summary) = plugin_install_summary(&installed, total) {
+                    println!("{summary}");
+                }
+
+                let needs_daemon = activations.iter().any(|(_, activation)| activation.is_none());
+
+                if needs_daemon {
+                    println!();
+                    println!(
+                        "Some plugins you installed need the Crabbot daemon running to work properly."
+                    );
+                    println!("Start it with `crab service start` or run `crabbot-daemon`.");
+                }
+
+                for (id, activation) in activations {
+                    if let Some(note) = activation_note(&id, activation, needs_daemon) {
+                        println!("{note}");
+                    }
+                }
+
+                for error in &errors {
+                    eprintln!("Could not install {}: {}", error["id"], error["error"]);
+                }
+
+                if !errors.is_empty() {
+                    return Err(format!(
+                        "{} of {} plugin installation(s) failed.",
+                        errors.len(),
+                        installed.len() + errors.len()
+                    )
+                    .into());
+                }
             }
         }
 
@@ -9177,14 +9740,89 @@ async fn plugin(
     Ok(())
 }
 
-fn print_activation(id: &str, value: Option<serde_json::Value>) {
-    println!("{}", activation_text(id, value));
+fn plugin_sources(
+    install: PluginInstall,
+) -> Result<(bool, Vec<Source>), Box<dyn std::error::Error + Send + Sync>> {
+    if install.ids.is_empty() {
+        return Err("At least one plugin ID is required.".into());
+    }
+
+    if (install.source.is_some() || install.revision.is_some()) && install.ids.len() != 1 {
+        return Err("--source and --revision can be used with only one plugin ID.".into());
+    }
+
+    if install.revision.is_some() && install.source.is_none() {
+        return Err("--revision requires --source.".into());
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+
+    for id in &install.ids {
+        if !valid(id) {
+            return Err(format!("Invalid plugin ID: {id}.").into());
+        }
+
+        if !seen.insert(id) {
+            return Err(format!("Plugin ID {id} was listed more than once.").into());
+        }
+    }
+
+    let sources = install
+        .ids
+        .into_iter()
+        .map(|id| Source {
+            id,
+            source: install.source.clone(),
+            revision: install.revision.clone(),
+            yes: install.yes,
+        })
+        .collect();
+
+    Ok((install.link, sources))
+}
+
+fn activation_note(
+    id: &str,
+    value: Option<serde_json::Value>,
+    needs_daemon: bool,
+) -> Option<String> {
+    if value.is_some() || (id == "tui" && needs_daemon) {
+        return None;
+    }
+
+    Some(activation_text(id, value))
+}
+
+fn plugin_install_summary(installed: &[serde_json::Value], total: usize) -> Option<String> {
+    let count = installed.len();
+
+    if count == 0 {
+        return None;
+    }
+
+    if count == 1 && total == 1 {
+        let plugin = &installed[0];
+        return Some(format!(
+            "Installed plugin {} {} successfully!",
+            plugin["id"].as_str().unwrap_or("unknown"),
+            plugin["version"].as_str().unwrap_or("unknown")
+        ));
+    }
+
+    Some(format!("Installed {count} of {total} plugins successfully."))
 }
 
 fn activation_text(id: &str, value: Option<serde_json::Value>) -> String {
-    if id == "tui" {
-        return "Plugin tui is ready. Run `crab tui`; local sessions work without the background runtime."
-            .into();
+    if id == "tui" && value.is_none() {
+        return "The TUI will be ready when the Crabbot daemon is running.".into();
+    }
+
+    if id == "codex" && value.is_none() {
+        return concat!(
+            "Codex is available through `crab codex` now.\n",
+            "Daemon-hosted turns require the background runtime."
+        )
+        .into();
     }
 
     match value {
@@ -9195,7 +9833,7 @@ fn activation_text(id: &str, value: Option<serde_json::Value>) -> String {
         ),
 
         None => {
-            format!("Plugin {id} is installed and will load when the background runtime starts.")
+            format!("Plugin {id} will be ready when the background runtime starts.")
         }
     }
 }
@@ -9810,7 +10448,7 @@ fn inspect_update(
         || manifest.commands != entry.commands
     {
         return Err(format!(
-            "Plugin {id} changes declared capabilities, permissions, secrets, or commands; review it with plugin link --yes."
+            "Plugin {id} changes declared capabilities, permissions, secrets, or commands; review it with plugin install --link --yes."
         )
         .into());
     }
@@ -10006,7 +10644,7 @@ fn update_one(
         || manifest.commands != entry.commands
     {
         return Err(format!(
-            "Plugin {id} changes declared capabilities, permissions, secrets, or commands; review it with plugin link --yes."
+            "Plugin {id} changes declared capabilities, permissions, secrets, or commands; review it with plugin install --link --yes."
         )
         .into());
     }
@@ -10215,6 +10853,14 @@ fn link_at(
     };
 
     let root = resolve(&origin, source.revision.as_deref())?;
+
+    if linked && root.temp.is_some() {
+        return Err(
+            "--link requires a stable local plugin source; install remote plugins without --link."
+                .into(),
+        );
+    }
+
     let root_path = root.path.clone();
 
     let manifest = read_manifest(&root_path)
@@ -11408,7 +12054,7 @@ mod tests {
         append_memory_context, archive, archive_root, archive_url, assistant, binary_at,
         canonical_source, changed, channel_message_id, command_output_limited, commit_event,
         completion_name_from, crabfile_output_path, daemon_lock, default_crabfile_path,
-        delivery_at, delivery_request, download, embedded, ensure_home, env_for,
+        delivery_at, delivery_request, download, embedded, ensure_home, ensure_root, env_for,
         export_crabfile_at, generate_completion, import_crabfile_at, init_at, installed_at,
         isolate_at, local_session, memory_scope, memory_tools, model_content, plugin_binary,
         read_manifest, reclaim_worktrees, recover, recover_plugins, redact, resolve, restart_tool,
@@ -11581,15 +12227,92 @@ mod tests {
     }
 
     #[test]
-    fn tui_activation_does_not_require_the_background_runtime() {
+    fn tui_activation_explains_the_background_runtime_requirement() {
         assert_eq!(
             super::activation_text("tui", None),
-            "Plugin tui is ready. Run `crab tui`; local sessions work without the background runtime."
+            "The TUI will be ready when the Crabbot daemon is running."
         );
 
         assert_eq!(
             super::activation_text("memory", None),
-            "Plugin memory is installed and will load when the background runtime starts."
+            "Plugin memory will be ready when the background runtime starts."
+        );
+
+        assert_eq!(
+            super::activation_text("codex", None),
+            concat!(
+                "Codex is available through `crab codex` now.\n",
+                "Daemon-hosted turns require the background runtime."
+            )
+        );
+    }
+
+    #[test]
+    fn install_output_omits_plugins_already_active_in_the_runtime() {
+        assert_eq!(
+            super::activation_note(
+                "tools",
+                Some(serde_json::json!({"id": "tools", "version": "0.1.0"})),
+                false
+            ),
+            None
+        );
+
+        assert_eq!(super::activation_note("tui", None, true), None);
+        assert_eq!(
+            super::activation_note("tools", None, true).as_deref(),
+            Some("Plugin tools will be ready when the background runtime starts.")
+        );
+    }
+
+    #[tokio::test]
+    async fn tui_reports_a_human_readable_daemon_requirement() {
+        let root = test_root("tui-daemon-required");
+        let error = super::require_tui_daemon(&root).await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            concat!(
+                "The Crabbot daemon is not running.\n",
+                "Start it with `crab service start` or run `crabbot-daemon`."
+            )
+        );
+    }
+
+    #[test]
+    fn formats_plugin_install_summaries() {
+        assert_eq!(
+            super::plugin_install_summary(
+                &[serde_json::json!({"id": "tui", "version": "0.1.0"})],
+                1
+            )
+            .as_deref(),
+            Some("Installed plugin tui 0.1.0 successfully!")
+        );
+
+        assert_eq!(
+            super::plugin_install_summary(
+                &[
+                    serde_json::json!({"id": "codex", "version": "0.1.0"}),
+                    serde_json::json!({"id": "tools", "version": "0.1.0"}),
+                    serde_json::json!({"id": "tui", "version": "0.1.0"}),
+                ],
+                3
+            )
+            .as_deref(),
+            Some("Installed 3 of 3 plugins successfully.")
+        );
+
+        assert_eq!(
+            super::plugin_install_summary(
+                &[
+                    serde_json::json!({"id": "codex", "version": "0.1.0"}),
+                    serde_json::json!({"id": "tools", "version": "0.1.0"}),
+                ],
+                3
+            )
+            .as_deref(),
+            Some("Installed 2 of 3 plugins successfully.")
         );
     }
 
@@ -11838,13 +12561,72 @@ mod tests {
 
     #[test]
     fn config_deserializes_with_defaults() {
-        let config: Config = toml::from_str("[channels.telegram]\nallow = [\"123\"]\n").unwrap();
+        let config: Config =
+            toml::from_str("[channels.telegram]\nallow = [\"123\"]\n[clients.tui]\ntools = true\n")
+                .unwrap();
 
         assert_eq!(config.update, "prompt");
         assert!(!config.shell);
         assert_eq!(config.approval, "off");
         assert_eq!(config.channels["telegram"].allow, vec!["123"]);
+        assert!(config.clients["tui"].tools);
+        assert!(config.clients["tui"].theme);
+        assert!(super::ClientConfig::default().theme);
+        let monochrome: Config = toml::from_str("[clients.tui]\ntheme = false\n").unwrap();
+
+        assert!(!monochrome.clients["tui"].theme);
+        assert!(!Config::default().clients.get("tui").is_some_and(|client| client.tools));
         assert!(toml::from_str::<Config>("unknown = true\n").is_err());
+    }
+
+    #[tokio::test]
+    async fn config_set_preserves_comments_validates_and_saves_the_tui_alias() {
+        let root = test_root("config-set");
+        std::fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "# keep this note\nshell = false\n").unwrap();
+
+        super::config_command(
+            super::ConfigCommand::Set(super::ConfigSet {
+                assignment: "clients.tui=true".into(),
+                force: false,
+            }),
+            &root,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        let config: super::Config = toml::from_str(&saved).unwrap();
+
+        assert!(saved.contains("# keep this note"));
+        assert!(config.clients["tui"].tools);
+
+        assert!(
+            super::config_command(
+                super::ConfigCommand::Set(super::ConfigSet {
+                    assignment: "shell=\"not a boolean\"".into(),
+                    force: false,
+                }),
+                &root,
+                true,
+            )
+            .await
+            .is_err()
+        );
+
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), saved);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parses_native_config_get_and_set_commands() {
+        assert!(Cli::try_parse_from(["crab", "config", "get", "clients.tui.tools"]).is_ok());
+        assert!(Cli::try_parse_from(["crab", "config", "set", "clients.tui=true"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["crab", "config", "set", "approval=prompt", "--force"]).is_ok()
+        );
     }
 
     #[test]
@@ -11909,6 +12691,10 @@ mod tests {
         );
 
         assert!(values.iter().any(|(key, value)| key == "CRABBOT_SHELL" && value == "off"));
+        let expected_root =
+            std::env::var("CRABBOT_ROOT").unwrap_or_else(|_| "/tmp/crabbot-home/workspace".into());
+
+        assert!(values.iter().any(|(key, value)| key == "CRABBOT_ROOT" && value == &expected_root));
 
         let values = env_for(
             &Manifest {
@@ -11936,13 +12722,23 @@ mod tests {
     }
 
     #[test]
-    fn propagates_default_home_with_database_override() {
+    fn propagates_default_home_and_tools_root_with_database_override() {
         let mut values = vec![("CRABBOT_DB".into(), "/tmp/crabbot.db".into())];
         ensure_home(&mut values, Path::new("/tmp/crabbot-home"));
+        ensure_root(&mut values, Path::new("/tmp/crabbot-home"));
 
         assert!(
             values.iter().any(|(key, value)| key == "CRABBOT_HOME" && value == "/tmp/crabbot-home")
         );
+
+        assert!(values.iter().any(|(key, value)| {
+            key == "CRABBOT_ROOT" && value == "/tmp/crabbot-home/workspace"
+        }));
+
+        let mut configured = vec![("CRABBOT_ROOT".into(), "/work/project".into())];
+        ensure_root(&mut configured, Path::new("/tmp/crabbot-home"));
+
+        assert_eq!(configured, [("CRABBOT_ROOT".into(), "/work/project".into())]);
     }
 
     #[test]
@@ -12169,6 +12965,17 @@ mod tests {
         )
         .unwrap();
 
+        assert!(
+            super::service_at_with_status(
+                &path,
+                ServiceCommand::Restart,
+                |_, _| panic!("restart must not run without an installed definition"),
+                || panic!("restart must not query the manager without an installed definition"),
+                true,
+            )
+            .is_err()
+        );
+
         service_at(&path, ServiceCommand::Install(super::ServiceInstall { force: false })).unwrap();
 
         assert!(path.is_file());
@@ -12195,12 +13002,28 @@ mod tests {
         )
         .unwrap();
 
+        let mut restarted = false;
+        super::service_at_with_status(
+            &path,
+            ServiceCommand::Restart,
+            |_, action| {
+                assert_eq!(action, super::ServiceAction::Restart);
+                restarted = true;
+                Ok(())
+            },
+            || panic!("restart delegates directly to the native service manager"),
+            true,
+        )
+        .unwrap();
+
+        assert!(restarted);
+
         let mut stopped = false;
         service_at_with(
             &path,
             ServiceCommand::Remove(super::ServiceRemove { yes: true }),
-            |_, start| {
-                assert!(!start);
+            |_, action| {
+                assert_eq!(action, super::ServiceAction::Stop);
                 stopped = true;
                 Ok(())
             },
@@ -12226,17 +13049,20 @@ mod tests {
         assert!(super::service_action_is_noop(false, NotInstalled));
         assert!(!super::service_action_is_noop(false, Starting));
         assert!(!super::service_action_is_noop(false, Stopping));
+        assert_eq!(super::service_action_start(super::ServiceAction::Restart), None);
 
-        for (start, previous) in [
-            (true, Some(Active)),
-            (false, Some(Inactive)),
-            (false, Some(Failed)),
-            (false, Some(NotInstalled)),
-            (true, None),
-            (false, None),
+        for (action, previous) in [
+            (super::ServiceAction::Start, Some(Active)),
+            (super::ServiceAction::Stop, Some(Inactive)),
+            (super::ServiceAction::Stop, Some(Failed)),
+            (super::ServiceAction::Stop, Some(NotInstalled)),
+            (super::ServiceAction::Restart, Some(Active)),
+            (super::ServiceAction::Start, None),
+            (super::ServiceAction::Stop, None),
+            (super::ServiceAction::Restart, None),
         ] {
-            super::service_action_message(start, previous, false).unwrap();
-            super::service_action_message(start, previous, true).unwrap();
+            super::service_action_message(action, previous, false).unwrap();
+            super::service_action_message(action, previous, true).unwrap();
         }
     }
 
@@ -12594,24 +13420,10 @@ mod tests {
             commands: Vec::new(),
         };
 
-        fs::write(
-            root.join("sessions.json"),
-            r#"
-                {
-                    "sessions": {
-                        "kept": {
-                            "id": "kept",
-                            "model": "test",
-                            "messages": [],
-                            "status": "idle",
-                            "created": 0,
-                            "updated": 0
-                        }
-                    }
-                }
-            "#,
-        )
-        .unwrap();
+        let catalog = root.join("data/sessions/index.json");
+        let mut store = super::state::Store::load(&catalog).unwrap();
+        store.create("kept", "test").unwrap();
+        store.save().unwrap();
 
         let mut lock = super::Lock::default();
         lock.plugins.insert("model-one".into(), entry("model"));
@@ -12640,26 +13452,25 @@ mod tests {
         assert_eq!(super::last_plugin_state(&lock, "model-one", &root), (false, false));
         assert!(super::ensure_no_orphaned_plugin_state(&lock, "model-one", &root).is_ok());
 
-        fs::write(
-            root.join("sessions.json"),
-            r#"
-                {
-                    "sessions": {},
-                    "outbox": [
-                        {
-                            "id": "delivery-1",
-                            "channel": "test",
-                            "chat": "chat",
-                            "text": "pending",
-                            "attempts": 0,
-                            "created": 0,
-                            "status": "pending"
-                        }
-                    ]
-                }
-            "#,
-        )
-        .unwrap();
+        let mut store = super::state::Store::load(&catalog).unwrap();
+        store
+            .reply(
+                "kept",
+                Message {
+                    id: "delivery-user".into(),
+                    session: "kept".into(),
+                    role: Role::User,
+                    sender: None,
+                    content: vec![Content::Text { text: "pending".into() }],
+                },
+                "delivery-1",
+                "test",
+                "chat",
+                None,
+                "pending",
+            )
+            .unwrap();
+        store.save().unwrap();
 
         lock.plugins.clear();
         lock.plugins.insert("channel-one".into(), entry("channel"));
@@ -12683,7 +13494,7 @@ mod tests {
 
         let purged = super::purge_state_at(&root, true, false).await.unwrap();
 
-        assert_eq!(purged["sessions"], 0);
+        assert_eq!(purged["sessions"], 1);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -12730,6 +13541,10 @@ mod tests {
 
         assert!(cli.json);
 
+        let cli = Cli::try_parse_from(["crabbot", "service", "restart"]).unwrap();
+
+        assert!(matches!(cli.command, Command::Service { command: ServiceCommand::Restart }));
+
         let error = Cli::try_parse_from(["crabbot", "service"]).unwrap_err();
         let help = error.to_string();
 
@@ -12738,6 +13553,7 @@ mod tests {
         assert!(help.contains("status"));
         assert!(help.contains("start"));
         assert!(help.contains("stop"));
+        assert!(help.contains("restart"));
         assert!(help.contains("--json"));
         assert!(help.contains("--debug"));
         assert!(help.contains("--verbose"));
@@ -12778,6 +13594,49 @@ mod tests {
         assert!(Cli::try_parse_from(["crabbot", "plugin", "remove", "tools", "-y"]).is_err());
         assert!(Cli::try_parse_from(["crabbot", "service", "remove", "-y"]).is_err());
 
+        let cli = Cli::try_parse_from([
+            "crabbot", "plugin", "install", "tui", "codex", "tools", "--link", "-y",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Plugin {
+                command: super::PluginCommand::Install(super::PluginInstall {
+                    ids,
+                    source: None,
+                    revision: None,
+                    link: true,
+                    yes: true,
+                })
+            } if ids == ["tui", "codex", "tools"]
+        ));
+
+        let cli = Cli::try_parse_from([
+            "crabbot",
+            "plugin",
+            "install",
+            "custom",
+            "--source",
+            "./plugin",
+            "--revision",
+            "abc123",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Plugin {
+                command: super::PluginCommand::Install(super::PluginInstall {
+                    ids,
+                    source: Some(source),
+                    revision: Some(revision),
+                    link: false,
+                    yes: false,
+                })
+            } if ids == ["custom"] && source == "./plugin" && revision == "abc123"
+        ));
+
         let cli = Cli::try_parse_from(["crabbot", "plugin", "update", "-y"]).unwrap();
 
         assert!(matches!(
@@ -12792,13 +13651,33 @@ mod tests {
 
         let tui_help = super::external_command_help(
             "tui",
-            "Open the TUI; local sessions do not require the background runtime.",
+            "Open the TUI; the Crabbot daemon must be running.",
         );
 
         assert!(tui_help.contains("Usage: crab tui [OPTIONS]"));
-        assert!(tui_help.contains("do not require the background runtime"));
+        assert!(tui_help.contains("daemon must be running"));
         assert!(tui_help.contains("--once <prompt>"));
-        assert!(tui_help.contains("CRABBOT_MODEL or gpt-6-luna"));
+        assert!(tui_help.contains("CRABBOT_MODEL or unset"));
+        let codex_help = super::external_command_help(
+            "codex",
+            "Manage Codex sign-in and list available models.",
+        );
+
+        assert!(codex_help.contains("login [--device]"));
+        assert!(codex_help.contains("  models            List models"));
+        assert!(!codex_help.contains("models list"));
+        assert!(
+            super::external_command_output(&serde_json::json!({"text": "Signed in."}), false)
+                .unwrap()
+                .contains("Signed in.")
+        );
+
+        assert!(
+            super::external_command_output(&serde_json::json!({"text": "Signed in."}), true)
+                .unwrap()
+                .contains("\"text\"")
+        );
+
         assert!(
             super::external_command_help("memory", "Manage memory.")
                 .contains("Usage: crabbot memory [arguments...]")
@@ -12874,6 +13753,48 @@ mod tests {
 
             assert_eq!(error.kind(), ErrorKind::DisplayVersion);
         }
+    }
+
+    #[test]
+    fn plugin_install_accepts_multiple_ids_and_limits_explicit_sources() {
+        let (linked, sources) = super::plugin_sources(super::PluginInstall {
+            ids: vec!["tui".into(), "codex".into()],
+            source: None,
+            revision: None,
+            link: true,
+            yes: true,
+        })
+        .unwrap();
+
+        assert!(linked);
+        assert_eq!(
+            sources.iter().map(|source| source.id.as_str()).collect::<Vec<_>>(),
+            ["tui", "codex"]
+        );
+
+        assert!(sources.iter().all(|source| source.yes));
+
+        assert!(
+            super::plugin_sources(super::PluginInstall {
+                ids: vec!["tui".into(), "codex".into()],
+                source: Some("./plugin".into()),
+                revision: None,
+                link: false,
+                yes: false,
+            })
+            .is_err()
+        );
+
+        assert!(
+            super::plugin_sources(super::PluginInstall {
+                ids: vec!["tui".into(), "tui".into()],
+                source: None,
+                revision: None,
+                link: false,
+                yes: false,
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -12957,10 +13878,15 @@ mod tests {
         let behavior = fs::read_to_string(root.join("workspace/CLAW.md")).unwrap();
 
         assert!(personality.contains("Personality Instructions"));
+        assert!(personality.contains("Your name is Crabbot"));
+        assert!(personality.contains("you are a crab"));
+        assert!(personality.contains("crab joke"));
         assert!(personality.contains("## Initiative"));
         assert!(behavior.contains("Behavioral Instructions"));
+        assert!(behavior.contains("Created an empty file named"));
         assert!(behavior.contains("## Uncertainty And Mistakes"));
         assert!(behavior.contains("## Sensitive Tasks"));
+        assert!(behavior.contains("## Workflows"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -13030,7 +13956,7 @@ mod tests {
 
         let ask = super::Ask::try_parse_from(["ask", "hello"]).unwrap();
 
-        assert_eq!(ask.model, "gpt-6-luna");
+        assert_eq!(ask.model, "unset");
         let cli = Cli::try_parse_from(["crabbot", "ask", "hello"]).unwrap();
 
         assert!(matches!(cli.command, Command::External(args) if args == vec!["ask", "hello"]));
@@ -13411,6 +14337,35 @@ mod tests {
 
         assert!(!super::mutating("read", &serde_json::json!({})));
         assert!(!super::mutating("git", &serde_json::json!({"args": ["status"]})));
+    }
+
+    #[test]
+    fn runs_only_one_mutating_tool_from_each_model_response() {
+        let mut events = vec![
+            super::Event::Tool {
+                name: "read".into(),
+                args: serde_json::json!({"path": "note.txt"}),
+                id: None,
+                thought_signature: None,
+            },
+            super::Event::Tool {
+                name: "write".into(),
+                args: serde_json::json!({"path": "note.txt", "text": "updated"}),
+                id: None,
+                thought_signature: None,
+            },
+            super::Event::Tool {
+                name: "shell".into(),
+                args: serde_json::json!({"command": "touch note.txt"}),
+                id: None,
+                thought_signature: None,
+            },
+        ];
+
+        super::keep_one_mutation(&mut events);
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events.last(), Some(super::Event::Tool { name, .. }) if name == "write"));
     }
 
     #[test]
@@ -14214,10 +15169,11 @@ mod tests {
 
         assert!(
             super::plugin(
-                super::PluginCommand::Install(Source {
-                    id: "bad_id".into(),
+                super::PluginCommand::Install(super::PluginInstall {
+                    ids: vec!["bad_id".into()],
                     source: None,
                     revision: None,
+                    link: false,
                     yes: true,
                 }),
                 false,
@@ -14235,13 +15191,60 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn linked_plugin_binary_rebuilds_keep_passing_integrity_checks() {
+        let root = test_root("linked-plugin-rebuild");
+        let source = root.join("source");
+        let binary = source.join("bin/crabbot-plugin-memory");
+        let manifest = source.join("crabbot-plugin.toml");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(
+            &manifest,
+            "id = 'memory'\nversion = '0.1.0'\ncapabilities = ['memory']\n\n[protocol]\nmajor = 0\nminor = 1\n",
+        )
+        .unwrap();
+
+        write_test_plugin(&binary, "memory", "memory", "0.1.0");
+
+        super::init_at(&root).unwrap();
+        super::link_at(
+            Source {
+                id: "memory".into(),
+                source: Some(source.display().to_string()),
+                revision: None,
+                yes: true,
+            },
+            true,
+            &root,
+        )
+        .unwrap();
+
+        let installed = super::binary_at("memory", &root).unwrap();
+
+        assert!(super::verify_plugin_integrity(&root, "memory", &installed).is_ok());
+
+        use std::io::Write;
+
+        let mut rebuilt = fs::OpenOptions::new().append(true).open(&binary).unwrap();
+        rebuilt.write_all(b"# rebuilt\n").unwrap();
+        rebuilt.flush().unwrap();
+
+        assert!(super::verify_plugin_integrity(&root, "memory", &installed).is_ok());
+
+        fs::write(&manifest, "id = 'memory'\nversion = '0.2.0'\n").unwrap();
+
+        assert!(super::verify_plugin_integrity(&root, "memory", &installed).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn covers_offline_delivery_and_crabfile_commands() {
         let root = test_root("offline-delivery");
         let _ = fs::remove_dir_all(&root);
         super::init_at(&root).unwrap();
 
-        let mut store = super::state::Store::load(root.join("sessions.json")).unwrap();
+        let mut store = super::state::Store::load(root.join("data/sessions/index.json")).unwrap();
         store.create("main", "test").unwrap();
 
         store
@@ -16506,7 +17509,7 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn routes_plugin_tool_requests_through_host_policy() {
-        let script = r#"while IFS= read -r line; do case "$line" in *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"tools","version":"0.1.0","capabilities":["tool"]}}' ;; *read*) printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"text":"workspace content"}}' ;; *write*) case "$line" in *'"approve":false'*) printf '%s\n' '{"jsonrpc":"2.0","id":9,"error":{"code":-32000,"message":"Approval required."}}' ;; *) printf '%s\n' '{"jsonrpc":"2.0","id":10,"result":{"text":"Write executed."}}' ;; esac ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;; esac; done"#;
+        let script = r#"while IFS= read -r line; do case "$line" in *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"tools","version":"0.1.0","capabilities":["tool"]}}' ;; *read*) printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"text":"workspace content"}}' ;; *list*) printf '%s\n' '{"jsonrpc":"2.0","id":8,"result":{"items":["Cargo.toml","src"]}}' ;; *write*) case "$line" in *'"approve":false'*) printf '%s\n' '{"jsonrpc":"2.0","id":9,"error":{"code":-32000,"message":"Approval required."}}' ;; *) printf '%s\n' '{"jsonrpc":"2.0","id":10,"result":{"text":"Write executed."}}' ;; esac ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;; esac; done"#;
         let process = Process::start_with("sh", ["-c", script]).await.unwrap();
         let plugins = registry([process]).await;
         let sessions = Arc::new(Mutex::new(super::state::Store::default()));
@@ -16553,8 +17556,33 @@ done
         .await
         .unwrap();
 
-        assert_eq!(response.result.unwrap()["output"], "workspace content");
+        assert_eq!(response.result.unwrap()["text"], "workspace content");
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let listing = super::host_tool(
+            Request::call(
+                8,
+                "host/tool",
+                serde_json::json!({"name": "list", "args": {"path": "."}}),
+            ),
+            &plugins,
+            &sessions,
+            "room",
+            None,
+            true,
+            super::ApprovalMode::Off,
+            Arc::clone(&approvals),
+            "telegram",
+            "8",
+            None,
+            notices.clone(),
+            Arc::clone(&calls),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(listing.result.unwrap()["text"], r#"{"items":["Cargo.toml","src"]}"#);
 
         let mutation = super::host_tool(
             Request::call(
@@ -16636,7 +17664,7 @@ done
         .await
         .unwrap();
 
-        assert_eq!(approved.result.unwrap()["output"], "Write executed.");
+        assert_eq!(approved.result.unwrap()["text"], "Write executed.");
         assert_eq!(sessions.lock().unwrap().sessions["room"].phase, "unsafe");
         stop_registry(&plugins).await;
     }
@@ -16721,6 +17749,7 @@ done
                 None,
                 &root,
                 true,
+                false,
                 super::ApprovalMode::Off,
                 Arc::new(super::AsyncMutex::new(super::approval::Gate::new().unwrap())),
                 &Cancellation::new(),

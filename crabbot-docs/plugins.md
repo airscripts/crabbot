@@ -124,10 +124,11 @@ The executable must complete the `hello` handshake and implement `ping`,
 stderr, and use bounded JSON-RPC 2.0 lines. Add capability-specific handlers
 only for the capabilities declared in the manifest.
 
-Build the executable, then link it into a local Crabbot installation:
+Build the executable, then link it into a local Crabbot installation for
+development, or install a copy for regular use:
 
 ```sh
-crabbot plugin link hello ./hello --yes
+crabbot plugin install hello --source ./hello --link --yes
 crabbot plugin list
 crabbot doctor
 crabbot hello
@@ -152,23 +153,23 @@ the existing plugins as protocol references.
 
 ## Install And Update Lifecycle
 
-When `plugin install` or `plugin link` is given an ID without a source, Crabbot
-looks for that plugin in the local `crabbot-plugins/<id>` directory or in a
-category directory such as `crabbot-plugins/intelligence/<id>`. Run the command
-from the repository root; the plugin must already be built in the workspace's
-`target/debug` directory. Otherwise, pass an explicit local path or Git URL.
+When `plugin install` is given one or more IDs without `--source`, Crabbot looks
+for each plugin in the local `crabbot-plugins/<id>` directory or in a category
+directory such as `crabbot-plugins/intelligence/<id>`. Run the command from the
+repository root; each plugin must already be built in the workspace's
+`target/debug` directory. Otherwise, pass an explicit local path or Git URL with
+`--source` (explicit sources apply to one plugin ID per command).
 
-`crabbot plugin link` is the local development workflow: it canonicalizes the
-source, validates the manifest, stages the executable, runs a health check, and
-links the built executable into the Crabbot home (copying it if symlinks are not
-available). Rebuilding and linking again picks up local changes.
-`crabbot plugin install` accepts a Git URL, verified archive, or local source
-path, then copies the verified executable into the Crabbot home so it is
-independent of that source. `crabbot plugin update`
+By default, `crabbot plugin install` copies the verified executable into the
+Crabbot home so it is independent of its source. Add `--link` to use the local
+development workflow instead: Crabbot canonicalizes the source, validates the
+manifest, stages the executable, runs a health check, and links the built
+executable into the Crabbot home (copying it if symlinks are unavailable).
+Rebuilding and running the command again picks up local changes. `crabbot plugin update`
 repeats the process for locked entries and keeps installed files in place until
 each staged replacement passes validation.
 
-After `install` or `link` commits the plugin and lock entry, the CLI asks a
+After `install` commits the plugin and lock entry, the CLI asks a
 running daemon to start it through authenticated local IPC. The plugin becomes
 available without restarting the daemon or reinstalling the core. When no
 daemon is running, it is discovered at the next daemon start. A selected model

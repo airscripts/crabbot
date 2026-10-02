@@ -97,7 +97,7 @@ async fn call_with_sandbox(
 
     let result = match method.as_str() {
         "read" => {
-            let workspace = workspace(policy, params["workspace"].as_str())?;
+            let workspace = workspace(params["workspace"].as_str())?;
             let path = confined(
                 policy,
                 params["path"].as_str().ok_or_else(|| denied("read.path is required"))?,
@@ -110,7 +110,7 @@ async fn call_with_sandbox(
         }
 
         "write" => {
-            let workspace = workspace(policy, params["workspace"].as_str())?;
+            let workspace = workspace(params["workspace"].as_str())?;
             let path = params["path"].as_str().ok_or_else(|| denied("write.path is required"))?;
             let text = params["text"].as_str().ok_or_else(|| denied("write.text is required"))?;
 
@@ -125,7 +125,7 @@ async fn call_with_sandbox(
         }
 
         "list" => {
-            let workspace = workspace(policy, params["workspace"].as_str())?;
+            let workspace = workspace(params["workspace"].as_str())?;
             let path = confined(
                 policy,
                 params["path"].as_str().unwrap_or("."),
@@ -176,7 +176,7 @@ async fn call_with_sandbox(
             }
 
             let text = params["text"].as_str().ok_or_else(|| denied("patch.text is required"))?;
-            let workspace = workspace(policy, params["workspace"].as_str())?;
+            let workspace = workspace(params["workspace"].as_str())?;
             let root = file_at(policy, ".", workspace.as_deref())?;
             patch_paths_at(policy, text, workspace.as_deref())?;
             let checked = apply(&root, text, true)
@@ -212,7 +212,7 @@ async fn call_with_sandbox(
                 .map(|value| value.as_str().map(str::to_owned))
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| denied("git.args must contain strings"))?;
-            let workspace = workspace(policy, params["workspace"].as_str())?;
+            let workspace = workspace(params["workspace"].as_str())?;
             let changes = matches!(args.as_slice(), [command, action, _] if command == "worktree" && action == "add")
                 || matches!(args.as_slice(), [command, action, _] if command == "worktree" && action == "remove");
 
@@ -244,7 +244,7 @@ async fn call_with_sandbox(
             policy.shell(params["approve"].as_bool() == Some(true))?;
             let command =
                 params["command"].as_str().ok_or_else(|| denied("shell.command is required"))?;
-            let workspace = workspace(policy, params["workspace"].as_str())?;
+            let workspace = workspace(params["workspace"].as_str())?;
             let root = file_at(policy, ".", workspace.as_deref())?;
             let output = shell_with(command, &root, sandbox)
                 .await
@@ -760,11 +760,7 @@ fn file(policy: &Policy, path: &str) -> crabbot_core::Result<PathBuf> {
     file_at(policy, path, None)
 }
 
-fn workspace(policy: &Policy, path: Option<&str>) -> crabbot_core::Result<Option<PathBuf>> {
-    let root = policy.root.as_ref().ok_or_else(|| denied("Workspace root is unset"))?;
-    let root = std::fs::canonicalize(root)
-        .map_err(|error| denied(format!("Workspace is unavailable: {error}")))?;
-
+fn workspace(path: Option<&str>) -> crabbot_core::Result<Option<PathBuf>> {
     let Some(path) = path.filter(|path| !path.trim().is_empty()) else {
         return Ok(None);
     };
@@ -772,30 +768,23 @@ fn workspace(policy: &Policy, path: Option<&str>) -> crabbot_core::Result<Option
     let workspace = std::fs::canonicalize(path)
         .map_err(|error| denied(format!("Workspace is unavailable: {error}")))?;
 
-    if workspace.starts_with(&root) {
-        Ok(Some(workspace))
-    } else {
-        Err(denied("Workspace leaves the configured root"))
+    if !workspace.is_dir() {
+        return Err(denied("Workspace is not a directory"));
     }
+
+    Ok(Some(workspace))
 }
 
 fn file_at(policy: &Policy, path: &str, workspace: Option<&Path>) -> crabbot_core::Result<PathBuf> {
-    let root = policy.root.as_ref().ok_or_else(|| denied("Workspace root is unset"))?;
+    let root =
+        workspace.or(policy.root.as_deref()).ok_or_else(|| denied("Workspace root is unset"))?;
+
     let root = std::fs::canonicalize(root)
         .map_err(|error| denied(format!("Workspace is unavailable: {error}")))?;
 
-    let root = if let Some(workspace) = workspace {
-        let workspace = std::fs::canonicalize(workspace)
-            .map_err(|error| denied(format!("Workspace is unavailable: {error}")))?;
-
-        if !workspace.starts_with(&root) {
-            return Err(denied("Workspace leaves the configured root"));
-        }
-
-        workspace
-    } else {
-        root
-    };
+    if !root.is_dir() {
+        return Err(denied("Workspace is not a directory"));
+    }
 
     let candidate =
         if Path::new(path).is_absolute() { PathBuf::from(path) } else { root.join(path) };
@@ -913,34 +902,20 @@ fn confined(
 
     #[cfg(unix)]
     {
-        let configured = policy.root.as_ref().ok_or_else(|| denied("Workspace root is unset"))?;
+        let configured = workspace
+            .or(policy.root.as_deref())
+            .ok_or_else(|| denied("Workspace root is unset"))?;
+
         let root = std::fs::canonicalize(configured)
             .map_err(|error| denied(format!("Workspace is unavailable: {error}")))?;
-
-        let base = workspace.map_or_else(
-            || Ok(root.clone()),
-            |path| {
-                std::fs::canonicalize(path)
-                    .map_err(|error| denied(format!("Workspace is unavailable: {error}")))
-            },
-        )?;
-
-        let base_parts = components(
-            base.strip_prefix(&root).map_err(|_| denied("Workspace leaves the configured root"))?,
-        )?;
-
         let target =
-            display.strip_prefix(&base).map_err(|_| denied("Path leaves the workspace"))?;
+            display.strip_prefix(&root).map_err(|_| denied("Path leaves the workspace"))?;
 
         let mut target_parts = components(target)?;
         let name = target_parts.pop();
         let root_fd = open_directory(&root)
             .map_err(|error| denied(format!("Workspace is unavailable: {error}")))?;
-
-        let base_fd = descend(root_fd, &base_parts, false)
-            .map_err(|error| denied(format!("Workspace is unavailable: {error}")))?;
-
-        let directory = descend(base_fd, &target_parts, create)
+        let directory = descend(root_fd, &target_parts, create)
             .map_err(|error| denied(format!("Path is unavailable: {error}")))?;
 
         Ok(Confined { display, directory, name })
@@ -1403,7 +1378,7 @@ fn search_request(
     workspace_path: Option<&str>,
     cancel: Arc<AtomicBool>,
 ) -> crabbot_core::Result<Vec<String>> {
-    let workspace = workspace(policy, workspace_path)?;
+    let workspace = workspace(workspace_path)?;
 
     let path = file_at(policy, path, workspace.as_deref())?;
     let mut hits = Vec::new();
@@ -1968,6 +1943,52 @@ mod tests {
 
         assert!(search(&root.join("missing"), &policy(&root), "x", &mut Vec::new()).is_ok());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn selected_workspace_replaces_the_default_root_without_escaping_it() {
+        let default_root = test_root("crabbot-tools-default-root");
+        let selected_root = test_root("crabbot-tools-selected-root");
+        let outside_file = test_root("crabbot-tools-outside-file");
+        let _ = fs::remove_dir_all(&default_root);
+        let _ = fs::remove_dir_all(&selected_root);
+        let _ = fs::remove_file(&outside_file);
+        fs::create_dir_all(&default_root).unwrap();
+        fs::create_dir_all(&selected_root).unwrap();
+        fs::write(selected_root.join("README.md"), "session workspace").unwrap();
+        fs::write(&outside_file, "outside session workspace").unwrap();
+
+        let selected = call(
+            &policy(&default_root),
+            Request::call(
+                1,
+                "list",
+                json!({"path": ".", "workspace": selected_root.display().to_string()}),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(selected.result.unwrap()["items"], json!(["README.md"]));
+
+        let outside = call(
+            &policy(&default_root),
+            Request::call(
+                2,
+                "read",
+                json!({
+                    "path": outside_file.display().to_string(),
+                    "workspace": selected_root.display().to_string(),
+                }),
+            ),
+        )
+        .await;
+
+        assert!(outside.is_err());
+        let _ = fs::remove_dir_all(default_root);
+        let _ = fs::remove_dir_all(selected_root);
+        let _ = fs::remove_file(outside_file);
     }
 
     #[cfg(unix)]

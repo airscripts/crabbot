@@ -169,9 +169,34 @@ pub struct Store {
     path: Option<PathBuf>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct SessionIndex {
+    version: u8,
+    sessions: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct ClientState {
+    deferred: BTreeMap<String, Vec<serde_json::Value>>,
+    deferred_acknowledged: BTreeSet<String>,
+    offsets: BTreeMap<String, i64>,
+    seen: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct DeliveryIndex {
+    outbox: Vec<String>,
+    dead: Vec<String>,
+}
+
 impl Store {
     pub fn load(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
+
+        if session_catalog(&path) {
+            return load_catalog(&path);
+        }
+
         let bytes = match load_file(&path, BYTE_LIMIT) {
             Ok(bytes) => bytes,
 
@@ -322,6 +347,10 @@ impl Store {
         let Some(path) = &self.path else {
             return Ok(());
         };
+
+        if session_catalog(path) {
+            return save_catalog(path, self);
+        }
 
         let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
 
@@ -1280,10 +1309,10 @@ impl Store {
             ));
         };
 
-        if session.inflight.is_none() {
+        if session.inflight.is_none() && !session.has_live_tui_reservation() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "Session has no active lease.",
+                "Session has no active turn lease.",
             ));
         }
 
@@ -1907,6 +1936,226 @@ fn unsafe_phase() -> String {
     "unsafe".into()
 }
 
+fn session_catalog(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "index.json")
+        && path.parent().and_then(Path::file_name).is_some_and(|name| name == "sessions")
+}
+
+fn load_catalog(path: &Path) -> std::io::Result<Store> {
+    let Some(bytes) = load_file(path, BYTE_LIMIT)? else {
+        let home =
+            path.parent().and_then(Path::parent).and_then(Path::parent).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Invalid session catalog path.",
+                )
+            })?;
+
+        let legacy = home.join("sessions.json");
+        let mut store = if legacy.exists() { Store::load(legacy)? } else { Store::default() };
+
+        store.path = Some(path.to_path_buf());
+
+        let offline = home.join("data/plugins/tui/sessions.json");
+
+        if offline.exists() {
+            let bytes = load_file(&offline, 8 * 1024 * 1024)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "TUI session source disappeared.",
+                )
+            })?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+
+            if let Some(sessions) = value.get("sessions").and_then(serde_json::Value::as_object) {
+                for (id, value) in sessions {
+                    let imported_id = format!("tui-{id}");
+
+                    if store.sessions.contains_key(&imported_id) {
+                        continue;
+                    }
+
+                    if let Ok(mut session) = serde_json::from_value::<Session>(value.clone())
+                        && session.id == *id
+                        && valid(id)
+                    {
+                        session.id = imported_id.clone();
+
+                        for message in &mut session.messages {
+                            message.session = imported_id.clone();
+                        }
+
+                        for message in &mut session.queued {
+                            message.session = imported_id.clone();
+                        }
+
+                        if let Some(message) = &mut session.inflight {
+                            message.session = imported_id.clone();
+                        }
+
+                        store.sessions.insert(imported_id, session);
+                    }
+                }
+            }
+        }
+
+        store.save()?;
+        return Ok(store);
+    };
+
+    let index: SessionIndex = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+
+    if index.version != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Unsupported session catalog version.",
+        ));
+    }
+
+    let root = path.parent().expect("catalog has parent");
+    let mut store = Store { path: Some(path.to_path_buf()), ..Store::default() };
+
+    for (id, key) in index.sessions {
+        if !valid(&id) || key.len() != 64 || key.bytes().any(|byte| !byte.is_ascii_hexdigit()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Session catalog contains an invalid record key.",
+            ));
+        }
+
+        let record_path = root.join("records").join(format!("{key}.json"));
+        let record = load_file(&record_path, BYTE_LIMIT)?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "Session record is missing.")
+        })?;
+
+        let session: Session = serde_json::from_slice(&record).map_err(std::io::Error::other)?;
+
+        if session.id != id || session_record_key(&record) != key {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Session record ID does not match its catalog entry.",
+            ));
+        }
+
+        store.sessions.insert(id, session);
+    }
+
+    if let Some(bytes) = load_file(root.join("state/clients/runtime.json"), BYTE_LIMIT)? {
+        let client: ClientState = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        store.deferred = client.deferred;
+        store.deferred_acknowledged = client.deferred_acknowledged;
+        store.offsets = client.offsets;
+        store.seen = client.seen;
+    }
+
+    if let Some(bytes) = load_file(root.join("state/deliveries/index.json"), BYTE_LIMIT)? {
+        let index: DeliveryIndex = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+
+        for (key, dead) in index
+            .outbox
+            .into_iter()
+            .map(|key| (key, false))
+            .chain(index.dead.into_iter().map(|key| (key, true)))
+        {
+            let record = load_file(
+                root.join("state/deliveries/records").join(format!("{key}.json")),
+                BYTE_LIMIT,
+            )?
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Delivery record is missing.")
+            })?;
+
+            let delivery: Delivery =
+                serde_json::from_slice(&record).map_err(std::io::Error::other)?;
+
+            if session_record_key(&record) != key {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Delivery record key is invalid.",
+                ));
+            }
+
+            if dead {
+                store.dead.push(delivery);
+            } else {
+                store.outbox.push(delivery);
+            }
+        }
+    }
+
+    Ok(store)
+}
+
+fn save_catalog(path: &Path, store: &Store) -> std::io::Result<()> {
+    let root = path.parent().expect("catalog has parent");
+    let mut sessions = BTreeMap::new();
+
+    for (id, session) in &store.sessions {
+        if !valid(id) || session.id != *id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Session ID is invalid.",
+            ));
+        }
+
+        let bytes = serde_json::to_vec(session).map_err(std::io::Error::other)?;
+        let key = session_record_key(&bytes);
+        save_file(root.join("records").join(format!("{key}.json")), bytes)?;
+        sessions.insert(id.clone(), key);
+    }
+
+    let state = ClientState {
+        deferred: store.deferred.clone(),
+        deferred_acknowledged: store.deferred_acknowledged.clone(),
+        offsets: store.offsets.clone(),
+        seen: store.seen.clone(),
+    };
+
+    save_json(&root.join("state/clients/runtime.json"), &state)?;
+
+    let mut delivery_index = DeliveryIndex::default();
+
+    for (delivery, dead) in store
+        .outbox
+        .iter()
+        .map(|item| (item, false))
+        .chain(store.dead.iter().map(|item| (item, true)))
+    {
+        let bytes = serde_json::to_vec(delivery).map_err(std::io::Error::other)?;
+
+        let key = session_record_key(&bytes);
+        save_file(root.join("state/deliveries/records").join(format!("{key}.json")), bytes)?;
+
+        if dead {
+            delivery_index.dead.push(key);
+        } else {
+            delivery_index.outbox.push(key);
+        }
+    }
+
+    save_json(&root.join("state/deliveries/index.json"), &delivery_index)?;
+
+    save_json(path, &SessionIndex { version: 1, sessions })
+}
+
+fn save_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+
+    if bytes.len() as u64 > BYTE_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "State record exceeds the size limit.",
+        ));
+    }
+
+    save_file(path, bytes)
+}
+
+fn session_record_key(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |value| value.as_secs())
 }
@@ -1926,7 +2175,7 @@ fn seen_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeliveryStatus, LIMIT, Session, Store, compact_messages, valid};
+    use super::{DeliveryStatus, LIMIT, Session, Store, compact_messages, save_file, valid};
 
     use crabbot_core::types::{Content, Message, Role};
     use std::collections::BTreeMap;
@@ -2601,6 +2850,18 @@ mod tests {
     }
 
     #[test]
+    fn marks_mutating_tui_turns_unsafe_under_the_reservation_lease() {
+        let mut store = Store::default();
+        store.create("main", "model").unwrap();
+        store.reserve("main", "owner-token".into()).unwrap();
+
+        store.phase("main", "unsafe").unwrap();
+
+        assert_eq!(store.sessions["main"].phase, "unsafe");
+        assert!(store.sessions["main"].has_live_tui_reservation());
+    }
+
+    #[test]
     fn does_not_replay_unsafe_inflight_work() {
         let root =
             std::env::temp_dir().join(format!("crabbot-state-unsafe-{}", std::process::id()));
@@ -2867,6 +3128,84 @@ mod tests {
         }
 
         assert!(store.queue("main", message(10_001, "main")).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stores_sessions_in_opaque_records_and_round_trips_catalog_state() {
+        let root = std::env::temp_dir().join(format!("crabbot-catalog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("data/sessions/index.json");
+        let mut store = Store::load(&path).unwrap();
+        store.create("private-session-name", "model").unwrap();
+        store.append("private-session-name", message(1, "private-session-name")).unwrap();
+        store.commit("telegram", "event", Some(9)).unwrap();
+        store
+            .reply(
+                "private-session-name",
+                message(2, "private-session-name"),
+                "telegram-event",
+                "telegram",
+                "chat",
+                None,
+                "reply",
+            )
+            .unwrap();
+
+        let index = std::fs::read_to_string(&path).unwrap();
+        let catalog: serde_json::Value = serde_json::from_str(&index).unwrap();
+        let digest = catalog["sessions"]["private-session-name"].as_str().unwrap();
+
+        assert_eq!(digest.len(), 64);
+        assert!(root.join(format!("data/sessions/records/{digest}.json")).is_file());
+
+        let loaded = Store::load(&path).unwrap();
+
+        assert_eq!(loaded.sessions["private-session-name"].messages.len(), 2);
+        assert_eq!(loaded.offset("telegram"), 9);
+        assert_eq!(loaded.outbox.len(), 1);
+        assert!(root.join("data/sessions/state/deliveries/records").is_dir());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imports_legacy_and_offline_sessions_once_without_overwriting_collisions() {
+        let root = std::env::temp_dir().join(format!("crabbot-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let legacy_path = root.join("sessions.json");
+        let mut legacy = Store::load(&legacy_path).unwrap();
+        legacy.create("shared", "daemon-model").unwrap();
+        legacy.save().unwrap();
+
+        let offline = root.join("data/plugins/tui/sessions.json");
+        save_file(
+            &offline,
+            serde_json::to_vec(&serde_json::json!({
+                "sessions": {
+                    "shared": {
+                        "id": "shared", "model": "offline-model", "status": "idle",
+                        "messages": [], "created": 1, "updated": 1
+                    },
+                    "local-only": {
+                        "id": "local-only", "model": "offline-model", "status": "idle",
+                        "messages": [], "created": 1, "updated": 1
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let catalog = root.join("data/sessions/index.json");
+        let imported = Store::load(&catalog).unwrap();
+
+        assert_eq!(imported.sessions["shared"].model, "daemon-model");
+        assert_eq!(imported.sessions["tui-shared"].model, "offline-model");
+        assert_eq!(imported.sessions["tui-local-only"].model, "offline-model");
+        assert!(legacy_path.is_file());
+        assert!(offline.is_file());
+
         let _ = std::fs::remove_dir_all(root);
     }
 

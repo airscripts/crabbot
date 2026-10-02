@@ -2,7 +2,10 @@ use std::{
     collections::BTreeMap,
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crabbot_core::{
@@ -12,7 +15,7 @@ use crabbot_core::{
 
 use serde_json::{Value, json};
 use tokio::{
-    io::BufReader,
+    io::{AsyncRead, AsyncReadExt, BufReader},
     net::{TcpListener, TcpStream},
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{Duration, timeout},
@@ -25,6 +28,7 @@ use super::{Cancellation, Stop, state::Store};
 const FRAME: usize = jsonl::MAX;
 const SUMMARY_LIMIT: usize = 1024;
 const DETAIL_LIMIT: usize = 16 * 1024;
+const SHELL_OUTPUT_LIMIT: usize = 16 * 1024;
 const CANCEL_WAIT: Duration = Duration::from_secs(310);
 #[cfg(test)]
 const CLIENTS: usize = 64;
@@ -47,6 +51,7 @@ pub struct State {
     pub pending: Arc<tokio::sync::Mutex<super::approval::Gate>>,
     pub plugins: super::Plugins,
     pub config: super::Config,
+    pub tui_tools: Arc<AtomicBool>,
     pub channel: String,
     pub model: String,
 }
@@ -102,19 +107,522 @@ async fn handle(
         return Ok(());
     }
 
+    if request.method == "session.answer" {
+        return session_answer(&request, &state, &mut output).await;
+    }
+
+    if request.method == "session.command" {
+        return session_command(&request, &state, &mut output).await;
+    }
+
     let response = match request.method.as_str() {
         "plugin.load" => load(&request, &state).await,
         "plugin.unload" => unload(&request, &state).await,
         "plugin.active" => active(&request, &state).await,
         "capability.call" => capability_call(&request, &state).await,
+        "model.list" => model_list(&request, &state).await,
         "approval.list" => approval_list(&request, &state).await,
         "approval.resolve" => approval_resolve(&request, &state).await,
+
         "session.cancel" => cancel(&request, &state).await,
         _ => dispatch(&request, &state)
             .unwrap_or_else(|error| IpcResponse::fail(request.id, -32000, error.to_string())),
     };
 
     jsonl::write(&mut output, &response).await.map_err(to_io)
+}
+
+async fn model_list(request: &IpcRequest, state: &State) -> IpcResponse {
+    let Some(plugin_id) = request.params["plugin"].as_str() else {
+        return IpcResponse::fail(request.id, -32602, "model.list.plugin is required.");
+    };
+
+    let Some(plugin) = state.plugins.get(plugin_id).await else {
+        return IpcResponse::fail(request.id, -32004, "The selected model plugin is not running.");
+    };
+
+    if !plugin.supports(Capability::Model) {
+        return IpcResponse::fail(
+            request.id,
+            -32602,
+            "The selected plugin is not an intelligence provider.",
+        );
+    }
+
+    let Some(command) = plugin.hello.commands.iter().find(|command| command.name == plugin_id)
+    else {
+        return IpcResponse::fail(
+            request.id,
+            -32601,
+            "The selected model plugin has no model-list command.",
+        );
+    };
+
+    match plugin
+        .call(Request::call(
+            request.id,
+            "command",
+            json!({"name": command.name, "args": ["models"]}),
+        ))
+        .await
+    {
+        Ok(response) => match (response.error, response.result) {
+            (Some(error), _) => IpcResponse::fail(request.id, error.code, error.message),
+            (None, Some(value)) => IpcResponse::ok(request.id, value),
+
+            (None, None) => {
+                IpcResponse::fail(request.id, -32000, "The model plugin returned no model list.")
+            }
+        },
+        Err(error) => IpcResponse::fail(request.id, -32000, error.to_string()),
+    }
+}
+
+async fn session_answer(
+    request: &IpcRequest,
+    state: &State,
+    output: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> io::Result<()> {
+    let Some(id) = request.params["id"].as_str() else {
+        return write_frame(
+            output,
+            IpcResponse::fail(request.id, -32602, "session.answer.id is required."),
+        )
+        .await;
+    };
+
+    let Some(plugin_id) = request.params["plugin"].as_str() else {
+        return write_frame(
+            output,
+            IpcResponse::fail(request.id, -32602, "session.answer.plugin is required."),
+        )
+        .await;
+    };
+
+    let Some(provider) = state.plugins.get(plugin_id).await else {
+        return write_frame(
+            output,
+            IpcResponse::fail(request.id, -32004, "The selected model plugin is not running."),
+        )
+        .await;
+    };
+
+    if !provider.supports(Capability::Model) {
+        return write_frame(
+            output,
+            IpcResponse::fail(
+                request.id,
+                -32602,
+                "The selected plugin is not an intelligence provider.",
+            ),
+        )
+        .await;
+    }
+
+    let snapshot = (|| {
+        let sessions = state.sessions.lock().map_err(|error| (-32000, lock(error).to_string()))?;
+
+        let session =
+            sessions.sessions.get(id).ok_or((-32004, "Session was not found.".to_owned()))?;
+
+        if session.status != "working" || session.inflight.is_some() {
+            return Err((-32000, "Session is not reserved for a turn.".to_owned()));
+        }
+
+        if !session.messages.last().is_some_and(|message| {
+            message.role == Role::User && message.sender.as_deref() == Some("tui")
+        }) {
+            return Err((-32602, "The TUI turn has no saved user message.".to_owned()));
+        }
+
+        Ok((session.model.clone(), session.messages.clone(), session.workspace.clone()))
+    })();
+
+    let (model, messages, workspace) = match snapshot {
+        Ok(snapshot) => snapshot,
+
+        Err((code, message)) => {
+            return write_frame(output, IpcResponse::fail(request.id, code, message)).await;
+        }
+    };
+
+    let messages = super::turn_messages(id, &state.home, messages);
+    let cancel = super::cancellation(&state.cancels, id);
+    let media_root = super::media_root_at(&state.home);
+    let (notices, mut receiver) = tokio::sync::mpsc::channel(32);
+    let mut call_id = request.id;
+    let mut failed_tool = None;
+
+    let answer = super::answer(
+        &provider,
+        &state.plugins,
+        &model,
+        messages,
+        id,
+        "tui",
+        id,
+        None,
+        &state.sessions,
+        workspace.as_deref().map(std::path::Path::new).or(Some(state.root.as_path())),
+        &media_root,
+        state.tui_tools.load(Ordering::Acquire),
+        state.config.shell,
+        state.config.approval_mode(),
+        Arc::clone(&state.pending),
+        &cancel,
+        &state.stop,
+        tokio::time::Instant::now() + super::TURN_LIMIT,
+        &mut call_id,
+        &mut failed_tool,
+        notices,
+    );
+
+    tokio::pin!(answer);
+    let result = loop {
+        tokio::select! {
+            result = &mut answer => break result,
+
+            notice = receiver.recv() => {
+                let Some(notice) = notice else { continue };
+
+                write_stream_notice(output, request.id, notice).await?;
+            }
+        }
+    };
+
+    while let Some(notice) = receiver.recv().await {
+        write_stream_notice(output, request.id, notice).await?;
+    }
+
+    let _ = super::acknowledge(&state.cancels, id);
+
+    if let Ok(reply) = &result
+        && let Err(error) = persist_tui_answer(state, id, request.id, &reply.text)
+    {
+        return write_frame(output, IpcResponse::fail(request.id, -32000, error.to_string())).await;
+    }
+
+    let status_result = match state.sessions.lock() {
+        Ok(mut sessions) => {
+            let _ = sessions.set_status(id, "idle");
+            Ok(())
+        }
+
+        Err(error) => Err(lock(error).to_string()),
+    };
+
+    if let Err(message) = status_result {
+        return write_frame(output, IpcResponse::fail(request.id, -32000, message)).await;
+    }
+
+    let response = match result {
+        Ok(reply) => IpcResponse::ok(request.id, json!({"done": true, "text": reply.text})),
+        Err(error) => IpcResponse::fail(request.id, -32000, error.to_string()),
+    };
+
+    write_frame(output, response).await
+}
+
+async fn session_command(
+    request: &IpcRequest,
+    state: &State,
+    output: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> io::Result<()> {
+    let Some(id) = request.params["id"].as_str() else {
+        return write_frame(
+            output,
+            IpcResponse::fail(request.id, -32602, "session.command.id is required."),
+        )
+        .await;
+    };
+
+    let Some(owner) = request.params["owner"].as_str() else {
+        return write_frame(
+            output,
+            IpcResponse::fail(request.id, -32602, "session.command.owner is required."),
+        )
+        .await;
+    };
+
+    let (command, workspace) = {
+        let snapshot = (|| {
+            let sessions =
+                state.sessions.lock().map_err(|error| (-32000, lock(error).to_string()))?;
+
+            let session =
+                sessions.sessions.get(id).ok_or((-32004, "Session was not found.".to_owned()))?;
+
+            if session.status != "working"
+                || session.inflight.is_some()
+                || session.reservation_owner.as_deref() != Some(owner)
+            {
+                return Err((-32000, "Session is not reserved for this command.".to_owned()));
+            }
+
+            let Some(message) = session.messages.last().filter(|message| {
+                message.role == Role::User && message.sender.as_deref() == Some("tui")
+            }) else {
+                return Err((-32602, "The terminal command was not saved.".to_owned()));
+            };
+
+            let command = message
+                .content
+                .iter()
+                .find_map(|content| match content {
+                    Content::Text { text } => text.strip_prefix('!').map(str::to_owned),
+                    _ => None,
+                })
+                .ok_or((
+                    -32602,
+                    "session.command requires a message beginning with !.".to_owned(),
+                ))?;
+
+            Ok((command, session.workspace.clone()))
+        })();
+
+        match snapshot {
+            Ok(snapshot) => snapshot,
+
+            Err((code, message)) => {
+                return write_frame(output, IpcResponse::fail(request.id, code, message)).await;
+            }
+        }
+    };
+
+    let workspace = workspace.as_deref().map(Path::new).unwrap_or(state.root.as_path());
+    let cancel = super::cancellation(&state.cancels, id);
+
+    let text = if state.config.shell {
+        let (notices, mut receiver) = tokio::sync::mpsc::channel(8);
+        let command_task = run_terminal_command(
+            &command,
+            workspace,
+            notices,
+            cancel,
+            tokio::time::Instant::now() + super::TURN_LIMIT,
+        );
+
+        tokio::pin!(command_task);
+        let text = loop {
+            tokio::select! {
+                result = &mut command_task => {
+                    break result.unwrap_or_else(|error| {
+                        format!("Command failed: {}", super::sentence(error.to_string()))
+                    });
+                }
+
+                notice = receiver.recv() => {
+                    let Some(notice) = notice else { continue };
+
+                    write_stream_notice(output, request.id, notice).await?;
+                }
+            }
+        };
+
+        while let Some(notice) = receiver.recv().await {
+            write_stream_notice(output, request.id, notice).await?;
+        }
+
+        text
+    } else {
+        format!(
+            "Shell access is disabled in the running daemon. Check `shell = true` in {} and restart the daemon.",
+            state.home.join("config.toml").display()
+        )
+    };
+
+    let assistant = Message {
+        id: format!("tui-system-command-{}-{}", super::now(), request.id),
+        session: id.into(),
+        role: Role::Assistant,
+        sender: None,
+        content: vec![Content::Text { text: super::clip(text.clone(), DETAIL_LIMIT) }],
+    };
+
+    if let Err(error) =
+        state.sessions.lock().map_err(lock).and_then(|mut sessions| sessions.append(id, assistant))
+    {
+        return write_frame(output, IpcResponse::fail(request.id, -32000, error.to_string())).await;
+    }
+
+    write_frame(output, IpcResponse::ok(request.id, json!({"done": true, "text": text}))).await
+}
+
+async fn run_terminal_command(
+    command: &str,
+    workspace: &Path,
+    notices: tokio::sync::mpsc::Sender<super::StreamNotice>,
+    cancel: Arc<super::Cancellation>,
+    deadline: tokio::time::Instant,
+) -> io::Result<String> {
+    let mut process = terminal_shell(command);
+
+    process
+        .current_dir(workspace)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = process.spawn()?;
+    let stdout =
+        child.stdout.take().ok_or_else(|| io::Error::other("Shell stdout was not captured."))?;
+
+    let stderr =
+        child.stderr.take().ok_or_else(|| io::Error::other("Shell stderr was not captured."))?;
+
+    let text = Arc::new(Mutex::new(String::new()));
+    let stdout_task =
+        tokio::spawn(stream_terminal_output(stdout, notices.clone(), Arc::clone(&text)));
+
+    let stderr_task = tokio::spawn(stream_terminal_output(stderr, notices, Arc::clone(&text)));
+
+    let status = tokio::select! {
+        result = tokio::time::timeout_at(deadline, child.wait()) => {
+            match result {
+                Ok(status) => status?,
+
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    let _ = stdout_task.await;
+                    let _ = stderr_task.await;
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "Shell command timed out."));
+                }
+            }
+        }
+
+        _ = cancel.cancelled() => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "Shell command was interrupted."));
+        }
+    };
+
+    stdout_task.await.map_err(|error| io::Error::other(error.to_string()))??;
+    stderr_task.await.map_err(|error| io::Error::other(error.to_string()))??;
+
+    let mut text = text.lock().map_err(lock)?.clone();
+
+    if !status.success() {
+        let status = status.code().map_or_else(|| "terminated".to_owned(), |code| code.to_string());
+
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+
+        text.push_str(&format!("Process exited with status {status}."));
+    }
+
+    if text.len() >= SHELL_OUTPUT_LIMIT {
+        text.push_str("\n[output truncated at 16 KiB]");
+    }
+
+    Ok(text)
+}
+
+#[cfg(windows)]
+fn terminal_shell(command: &str) -> tokio::process::Command {
+    let mut process = tokio::process::Command::new("cmd.exe");
+    process.args(["/C", command]);
+    process
+}
+
+#[cfg(not(windows))]
+fn terminal_shell(command: &str) -> tokio::process::Command {
+    let mut process = tokio::process::Command::new("sh");
+    process.args(["-c", command]);
+
+    #[cfg(unix)]
+    process.process_group(0);
+
+    process
+}
+
+async fn stream_terminal_output<R>(
+    mut stream: R,
+    notices: tokio::sync::mpsc::Sender<super::StreamNotice>,
+    output: Arc<Mutex<String>>,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = [0_u8; 4096];
+
+    loop {
+        let count = stream.read(&mut buffer).await?;
+
+        if count == 0 {
+            return Ok(());
+        }
+
+        let chunk = String::from_utf8_lossy(&buffer[..count]);
+        let text = {
+            let mut output = output.lock().map_err(lock)?;
+            let remaining = SHELL_OUTPUT_LIMIT.saturating_sub(output.len());
+            let mut end = chunk.len().min(remaining);
+
+            while !chunk.is_char_boundary(end) {
+                end -= 1;
+            }
+
+            let text = chunk[..end].to_owned();
+            output.push_str(&text);
+            text
+        };
+
+        if !text.is_empty() {
+            let _ = notices.send(super::StreamNotice::Text(text)).await;
+        }
+    }
+}
+
+fn persist_tui_answer(state: &State, session: &str, request_id: u64, text: &str) -> io::Result<()> {
+    let assistant = Message {
+        id: format!("tui-assistant-{}-{request_id}", super::now()),
+        session: session.into(),
+        role: Role::Assistant,
+        sender: None,
+        content: vec![Content::Text { text: super::clip(text.to_owned(), DETAIL_LIMIT) }],
+    };
+
+    state.sessions.lock().map_err(lock)?.append(session, assistant)
+}
+
+async fn write_stream_notice<W>(
+    output: &mut W,
+    id: u64,
+    notice: super::StreamNotice,
+) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let event = match notice {
+        super::StreamNotice::Text(text) => json!({"event": "text", "text": text}),
+        super::StreamNotice::Tool(name) => json!({"event": "tool", "name": name}),
+
+        super::StreamNotice::Approval { tool, arguments, command, text, approve, .. } => {
+            let id = approve.split('.').next().unwrap_or_default();
+            json!({
+                "event": "approval",
+                "id": id,
+                "text": text,
+                "tool": tool,
+                "arguments": arguments,
+                "command": command
+            })
+        }
+    };
+
+    jsonl::write(output, &IpcResponse::ok(id, event)).await.map_err(to_io)
+}
+
+async fn write_frame(
+    output: &mut tokio::net::tcp::OwnedWriteHalf,
+    response: IpcResponse,
+) -> io::Result<()> {
+    jsonl::write(output, &response).await.map_err(to_io)
 }
 
 async fn approval_list(request: &IpcRequest, state: &State) -> IpcResponse {
@@ -242,7 +750,10 @@ async fn cancel(request: &IpcRequest, state: &State) -> IpcResponse {
             Err(error) => return IpcResponse::fail(request.id, -32000, lock(error).to_string()),
         };
 
-        let active = sessions.sessions.get(id).is_some_and(|session| session.inflight.is_some());
+        let active = sessions
+            .sessions
+            .get(id)
+            .is_some_and(|session| session.inflight.is_some() || session.status == "working");
 
         if let Err(error) = sessions.cancel(id) {
             return IpcResponse::fail(request.id, -32000, error.to_string());
@@ -355,6 +866,27 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
 
         "plugin.list" => json!({"items": plugin_inventory(&state.home)}),
 
+        "config.client.set" => {
+            if request.params["client"] != "tui" {
+                return Ok(IpcResponse::fail(
+                    request.id,
+                    -32602,
+                    "Only the TUI client setting is reloadable.",
+                ));
+            }
+
+            let Some(tools) = request.params["tools"].as_bool() else {
+                return Ok(IpcResponse::fail(
+                    request.id,
+                    -32602,
+                    "config.client.set.tools must be a boolean.",
+                ));
+            };
+
+            state.tui_tools.store(tools, Ordering::Release);
+            json!({"client": "tui", "tools": tools})
+        }
+
         "session.list" => {
             let sessions = state.sessions.lock().map_err(lock)?;
             json!({"items": sessions.sessions.values().map(summary).collect::<Vec<_>>()})
@@ -453,7 +985,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             let id = request.params["id"]
                 .as_str()
                 .ok_or_else(|| invalid("session.ensure.id is required."))?;
-            let model = request.params["model"].as_str().unwrap_or("gpt-6-luna");
+            let model = request.params["model"].as_str().unwrap_or("unset");
             let mut sessions = state.sessions.lock().map_err(lock)?;
             sessions.ensure(id, model)?;
             json!({"id": id})
@@ -511,7 +1043,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             let id = request.params["id"]
                 .as_str()
                 .ok_or_else(|| invalid("session.new.id is required."))?;
-            let model = request.params["model"].as_str().unwrap_or("gpt-6-luna");
+            let model = request.params["model"].as_str().unwrap_or("unset");
             let mut sessions = state.sessions.lock().map_err(lock)?;
             sessions.create(id, model)?;
             json!({"id": id})
@@ -949,7 +1481,8 @@ mod tests {
     use super::super::{Stop, state::Store};
     use super::{
         FRAME, State, active, approval_list, approval_resolve, cancel as cancel_request,
-        capability_call, dispatch, load, plugins, unload,
+        capability_call, dispatch, load, plugins, run_terminal_command, unload,
+        write_stream_notice,
     };
 
     use crabbot_core::{
@@ -965,7 +1498,7 @@ mod tests {
     };
 
     use tokio::{
-        io::BufReader,
+        io::{BufReader, duplex},
         net::{TcpListener, TcpStream},
         sync::Semaphore,
         time::Duration,
@@ -975,16 +1508,149 @@ mod tests {
         state_at("")
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_terminal_command_streams_output_without_the_tools_plugin() {
+        let (notices, mut receiver) = tokio::sync::mpsc::channel(8);
+        let workspace = std::env::temp_dir();
+        let command = run_terminal_command(
+            "printf first; sleep 0.05; printf second",
+            &workspace,
+            notices,
+            Arc::new(crate::Cancellation::new()),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        );
+
+        tokio::pin!(command);
+        let mut streamed = String::new();
+
+        let output = loop {
+            tokio::select! {
+                result = &mut command => break result.unwrap(),
+
+                notice = receiver.recv() => {
+                    if let Some(crate::StreamNotice::Text(text)) = notice {
+                        streamed.push_str(&text);
+                    }
+                }
+            }
+        };
+
+        while let Some(crate::StreamNotice::Text(text)) = receiver.recv().await {
+            streamed.push_str(&text);
+        }
+
+        assert_eq!(output, "firstsecond");
+        assert_eq!(streamed, "firstsecond");
+    }
+
+    #[tokio::test]
+    async fn disabled_terminal_command_is_saved_as_a_system_reply() {
+        let mut state = state_at("disabled-terminal-command");
+        state.home = std::env::temp_dir()
+            .join(format!("crabbot-ipc-disabled-command-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&state.home);
+        std::fs::create_dir_all(&state.home).unwrap();
+        state.config.shell = false;
+
+        dispatch(
+            &IpcRequest::call(
+                1,
+                "secret",
+                "session.ensure",
+                json!({"id": "terminal", "model": "test-model"}),
+            ),
+            &state,
+        )
+        .unwrap();
+
+        let owner = dispatch(
+            &IpcRequest::call(2, "secret", "session.reserve", json!({"id": "terminal"})),
+            &state,
+        )
+        .unwrap()
+        .result
+        .unwrap()["owner"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let user = Message {
+            id: "tui-user-1".into(),
+            session: "terminal".into(),
+            role: Role::User,
+            sender: Some("tui".into()),
+            content: vec![Content::Text { text: "!pwd".into() }],
+        };
+
+        dispatch(
+            &IpcRequest::call(
+                3,
+                "secret",
+                "session.append_reserved",
+                json!({"id": "terminal", "owner": owner.clone(), "message": user}),
+            ),
+            &state,
+        )
+        .unwrap();
+
+        let listener = match TcpListener::bind(("127.0.0.1", 0)).await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("listener failed: {error}"),
+        };
+
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(state.home.join("ipc.token"), "secret").unwrap();
+        std::fs::write(state.home.join("ipc.port"), port.to_string()).unwrap();
+        let state = Arc::new(state);
+        let task_state = Arc::clone(&state);
+        let task = tokio::spawn(async move { super::serve(listener, task_state).await });
+
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (input, mut output) = stream.into_split();
+
+        jsonl::write(
+            &mut output,
+            &IpcRequest::call(
+                4,
+                "secret",
+                "session.command",
+                json!({"id": "terminal", "owner": owner}),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let response: IpcResponse =
+            jsonl::read(&mut BufReader::new(input), FRAME).await.unwrap().unwrap();
+
+        let text = response.result.unwrap()["text"].as_str().unwrap().to_owned();
+
+        assert!(text.contains("Shell access is disabled in the running daemon."));
+        assert!(text.contains("config.toml"));
+
+        let messages = state.sessions.lock().unwrap().sessions["terminal"].messages.clone();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content[0].render(), "!pwd");
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert!(messages[1].id.starts_with("tui-system-command-"));
+        assert_eq!(messages[1].content[0].render(), text);
+
+        state.stop.signal();
+        task.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&state.home);
+    }
+
     fn state_at(label: &str) -> State {
+        let path = test_store_path(label);
         let thread = std::thread::current()
             .name()
             .unwrap_or("test")
             .chars()
             .map(|value| if value.is_ascii_alphanumeric() { value } else { '_' })
             .collect::<String>();
-
-        let path = std::env::temp_dir()
-            .join(format!("crabbot-ipc-test-{}-{thread}-{label}.json", std::process::id()));
 
         let _ = std::fs::remove_file(&path);
         let temp = std::env::temp_dir();
@@ -1001,9 +1667,121 @@ mod tests {
             pending: Arc::new(tokio::sync::Mutex::new(crate::approval::Gate::new().unwrap())),
             plugins: crate::Plugins::default(),
             config: crate::Config::default(),
+            tui_tools: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             channel: "telegram".into(),
             model: "codex".into(),
         }
+    }
+
+    fn test_store_path(label: &str) -> PathBuf {
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .chars()
+            .map(|value| if value.is_ascii_alphanumeric() { value } else { '_' })
+            .collect::<String>();
+
+        std::env::temp_dir()
+            .join(format!("crabbot-ipc-test-{}-{thread}-{label}.json", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn writes_streamed_text_as_an_ipc_event() {
+        let (client_input, mut server_output) = duplex(1024);
+
+        write_stream_notice(
+            &mut server_output,
+            7,
+            super::super::StreamNotice::Text("A streamed reply".into()),
+        )
+        .await
+        .unwrap();
+
+        let response: IpcResponse =
+            jsonl::read(&mut BufReader::new(client_input), FRAME).await.unwrap().unwrap();
+
+        assert_eq!(response.id, 7);
+        assert_eq!(
+            response.result.unwrap(),
+            json!({
+                "event": "text",
+                "text": "A streamed reply"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn includes_tool_arguments_in_streamed_approval_events() {
+        let (client_input, mut server_output) = duplex(1024);
+
+        write_stream_notice(
+            &mut server_output,
+            8,
+            super::super::StreamNotice::Approval {
+                chat: "chat".into(),
+                thread: None,
+                tool: "shell".into(),
+                arguments: "{\"command\":\"rm foo\"}".into(),
+                command: Some("rm foo".into()),
+                text: "Crabbot requests approval to run this shell command: rm foo.".into(),
+                approve: "approval-id.signature".into(),
+                deny: "deny-id.signature".into(),
+                deadline: tokio::time::Instant::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let response: IpcResponse =
+            jsonl::read(&mut BufReader::new(client_input), FRAME).await.unwrap().unwrap();
+
+        assert_eq!(
+            response.result.unwrap(),
+            json!({
+                "event": "approval",
+                "id": "approval-id",
+                "text": "Crabbot requests approval to run this shell command: rm foo.",
+                "tool": "shell",
+                "arguments": "{\"command\":\"rm foo\"}",
+                "command": "rm foo"
+            })
+        );
+    }
+
+    #[test]
+    fn persists_tui_answers_in_the_session_store_before_returning() {
+        let state = state_at("tui-answer");
+        let path = test_store_path("tui-answer");
+
+        {
+            let mut sessions = state.sessions.lock().unwrap();
+            sessions.create("tui-work", "model").unwrap();
+            sessions
+                .append(
+                    "tui-work",
+                    Message {
+                        id: "user-1".into(),
+                        session: "tui-work".into(),
+                        role: Role::User,
+                        sender: Some("tui".into()),
+                        content: vec![Content::Text { text: "What is here?".into() }],
+                    },
+                )
+                .unwrap();
+        }
+
+        super::persist_tui_answer(&state, "tui-work", 7, "The project files are here.").unwrap();
+
+        let sessions = crate::state::Store::load(path).unwrap();
+        let messages = &sessions.sessions["tui-work"].messages;
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(
+            messages[1].content,
+            vec![Content::Text { text: "The project files are here.".into() }]
+        );
     }
 
     #[cfg(unix)]
@@ -1321,7 +2099,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
             dispatch(&IpcRequest::call(3, "secret", "session.get", json!({"id": "one"})), &state)
                 .unwrap();
 
-        assert_eq!(get.result.unwrap()["model"], "gpt-6-luna");
+        assert_eq!(get.result.unwrap()["model"], "unset");
         let model = dispatch(
             &IpcRequest::call(
                 4,
@@ -1584,6 +2362,27 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         assert!(response.result.unwrap()["owner"].as_str().is_some());
+    }
+
+    #[test]
+    fn applies_tui_tools_configuration_live() {
+        let state = state_at("config-client-set");
+
+        assert!(!state.tui_tools.load(std::sync::atomic::Ordering::Acquire));
+
+        let response = dispatch(
+            &IpcRequest::call(
+                1,
+                "secret",
+                "config.client.set",
+                json!({"client": "tui", "tools": true}),
+            ),
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(response.result.unwrap()["tools"], true);
+        assert!(state.tui_tools.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]
@@ -1987,6 +2786,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
             pending: Arc::new(tokio::sync::Mutex::new(crate::approval::Gate::new().unwrap())),
             plugins: crate::Plugins::default(),
             config: crate::Config::default(),
+            tui_tools: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             channel: "telegram".into(),
             model: "codex".into(),
         };
@@ -2135,6 +2935,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
             pending: Arc::new(tokio::sync::Mutex::new(crate::approval::Gate::new().unwrap())),
             plugins: crate::Plugins::default(),
             config: crate::Config::default(),
+            tui_tools: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             channel: "telegram".into(),
             model: "codex".into(),
         });

@@ -5,7 +5,7 @@ permissions = ["terminal"]
 
 [[commands]]
 name = "tui"
-description = "Open the TUI; local sessions do not require the background runtime."
+description = "Open the TUI; the Crabbot daemon must be running."
 interactive = true
 
 [protocol]

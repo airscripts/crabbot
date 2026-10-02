@@ -14,7 +14,7 @@ tracked separately so one is not mistaken for the other.
 | `crabbot` | [ ] | [x] | [x] |
 | `crabbot-daemon` | [ ] | [x] | [x] |
 | `crabbot-plugin-claude` | [ ] | [x] | [ ] |
-| `crabbot-plugin-codex` | [ ] | [x] | [ ] |
+| `crabbot-plugin-codex` | [ ] | [x] | [x] |
 | `crabbot-plugin-gemini` | [ ] | [x] | [ ] |
 | `crabbot-plugin-ollama` | [ ] | [x] | [ ] |
 | `crabbot-plugin-openrouter` | [ ] | [x] | [ ] |
@@ -28,7 +28,7 @@ tracked separately so one is not mistaken for the other.
 | `crabbot-plugin-whatsapp` | [ ] | [x] | [ ] |
 | `crabbot-plugin-sqlite` | [ ] | [x] | [ ] |
 | `crabbot-plugin-timer` | [ ] | [x] | [ ] |
-| `crabbot-plugin-tools` | [ ] | [x] | [ ] |
+| `crabbot-plugin-tools` | [ ] | [x] | [x] |
 | `crabbot-plugin-tui` | [x] | [x] | [x] |
 | `crabbot-plugin-whisper` | [ ] | [x] | [ ] |
 
