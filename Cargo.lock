@@ -799,6 +799,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabbot-process"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "crabbot-runtime"
 version = "0.1.0"
 dependencies = [
@@ -807,9 +815,11 @@ dependencies = [
  "clap_complete",
  "crabbot-core",
  "crabbot-file",
+ "crabbot-process",
  "getrandom 0.4.3",
  "keyring",
  "ring",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",

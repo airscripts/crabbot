@@ -7,6 +7,8 @@ Semantic Versioning.
 
 ### Added
 
+- Keep Linux shell commands and their descendants in the command process group
+  so timeout, cancellation, and task cleanup terminate them together.
 - Refresh shared TUI session transcripts and working status across multiple
   windows; prevent conflicting turns and report a busy session as System.
 - Let explicitly linked plugins pass integrity checks after their local binary

@@ -5,6 +5,7 @@ packages=(
     crabbot
     crabbot-core
     crabbot-file
+    crabbot-process
     crabbot-runtime
     crabbot-daemon
     crabbot-plugin-claude

@@ -21,6 +21,9 @@ use tokio::{
     time::{Duration, timeout},
 };
 
+#[cfg(target_os = "linux")]
+use tokio::io::AsyncWriteExt;
+
 use tracing::warn;
 
 use super::{Cancellation, Stop, state::Store};
@@ -457,13 +460,53 @@ async fn run_terminal_command(
 ) -> io::Result<String> {
     let mut process = terminal_shell(command);
 
+    #[cfg(windows)]
+    let process_job = crabbot_process::TerminalJob::new()?;
+
+    #[cfg(windows)]
+    process.creation_flags(crabbot_process::CREATE_SUSPENDED);
+
     process
         .current_dir(workspace)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
 
+    #[cfg(target_os = "linux")]
+    process.stdin(std::process::Stdio::piped());
+
+    #[cfg(target_os = "linux")]
+    let _ = crabbot_process::restrict_process_group(process.as_std_mut());
+
     let mut child = process.spawn()?;
+    let process_id = child.id();
+
+    #[cfg(unix)]
+    let _containment = process_id.map(TerminalContainment::new);
+
+    #[cfg(target_os = "linux")]
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(b"\n").await?;
+    }
+
+    #[cfg(windows)]
+    {
+        let Some(process_id) = process_id else {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+
+            return Err(io::Error::other("The shell process ID is unavailable."));
+        };
+
+        if let Err(error) = process_job.assign_and_resume(process_id) {
+            process_job.terminate();
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+
+            return Err(error);
+        }
+    }
+
     let stdout =
         child.stdout.take().ok_or_else(|| io::Error::other("Shell stdout was not captured."))?;
 
@@ -471,37 +514,61 @@ async fn run_terminal_command(
         child.stderr.take().ok_or_else(|| io::Error::other("Shell stderr was not captured."))?;
 
     let text = Arc::new(Mutex::new(String::new()));
-    let stdout_task =
+    let mut stdout_task =
         tokio::spawn(stream_terminal_output(stdout, notices.clone(), Arc::clone(&text)));
 
-    let stderr_task = tokio::spawn(stream_terminal_output(stderr, notices, Arc::clone(&text)));
+    let mut stderr_task = tokio::spawn(stream_terminal_output(stderr, notices, Arc::clone(&text)));
 
-    let status = tokio::select! {
-        result = tokio::time::timeout_at(deadline, child.wait()) => {
-            match result {
-                Ok(status) => status?,
+    let completion = {
+        let completion = async {
+            let status = child.wait().await?;
 
-                Err(_) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    let _ = stdout_task.await;
-                    let _ = stderr_task.await;
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "Shell command timed out."));
-                }
-            }
-        }
+            (&mut stdout_task).await.map_err(|error| io::Error::other(error.to_string()))??;
+            (&mut stderr_task).await.map_err(|error| io::Error::other(error.to_string()))??;
 
-        _ = cancel.cancelled() => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "Shell command was interrupted."));
+            Ok::<_, io::Error>(status)
+        };
+
+        tokio::pin!(completion);
+
+        tokio::select! {
+            result = tokio::time::timeout_at(deadline, &mut completion) => Some(result),
+            _ = cancel.cancelled() => None,
         }
     };
 
-    stdout_task.await.map_err(|error| io::Error::other(error.to_string()))??;
-    stderr_task.await.map_err(|error| io::Error::other(error.to_string()))??;
+    let status = match completion {
+        Some(Ok(status)) => status?,
+
+        Some(Err(_)) => {
+            terminate_terminal_process(
+                process_id,
+                &mut child,
+                #[cfg(windows)]
+                &process_job,
+            )
+            .await;
+            stop_terminal_readers(&mut stdout_task, &mut stderr_task).await;
+
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "Shell command timed out."));
+        }
+
+        None => {
+            terminate_terminal_process(
+                process_id,
+                &mut child,
+                #[cfg(windows)]
+                &process_job,
+            )
+            .await;
+            stop_terminal_readers(&mut stdout_task, &mut stderr_task).await;
+
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Shell command was interrupted.",
+            ));
+        }
+    };
 
     let mut text = text.lock().map_err(lock)?.clone();
 
@@ -522,6 +589,62 @@ async fn run_terminal_command(
     Ok(text)
 }
 
+#[cfg(unix)]
+struct TerminalContainment {
+    process_id: u32,
+}
+
+#[cfg(unix)]
+impl TerminalContainment {
+    fn new(process_id: u32) -> Self {
+        Self { process_id }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalContainment {
+    fn drop(&mut self) {
+        if let Some(process_id) = rustix::process::Pid::from_raw(self.process_id as i32) {
+            let _ = rustix::process::kill_process_group(process_id, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+async fn terminate_terminal_process(
+    process_id: Option<u32>,
+    child: &mut tokio::process::Child,
+    #[cfg(windows)] process_job: &crabbot_process::TerminalJob,
+) {
+    #[cfg(unix)]
+    if let Some(process_id) = process_id {
+        let process_id = rustix::process::Pid::from_raw(process_id as i32);
+
+        if let Some(process_id) = process_id {
+            let _ = rustix::process::kill_process_group(process_id, rustix::process::Signal::KILL);
+        }
+    }
+
+    #[cfg(windows)]
+    process_job.terminate();
+
+    #[cfg(not(unix))]
+    let _ = process_id;
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+async fn stop_terminal_readers(
+    stdout_task: &mut tokio::task::JoinHandle<io::Result<()>>,
+    stderr_task: &mut tokio::task::JoinHandle<io::Result<()>>,
+) {
+    stdout_task.abort();
+    stderr_task.abort();
+
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+}
+
 #[cfg(windows)]
 fn terminal_shell(command: &str) -> tokio::process::Command {
     let mut process = tokio::process::Command::new("cmd.exe");
@@ -529,7 +652,15 @@ fn terminal_shell(command: &str) -> tokio::process::Command {
     process
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn terminal_shell(command: &str) -> tokio::process::Command {
+    let mut process = tokio::process::Command::new("sh");
+    process.args(["-c", "IFS= read -r _; eval \"$1\"", "crabbot-terminal", command]);
+    process.process_group(0);
+    process
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn terminal_shell(command: &str) -> tokio::process::Command {
     let mut process = tokio::process::Command::new("sh");
     process.args(["-c", command]);
@@ -919,6 +1050,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
 
             let (session_ids, deliveries) =
                 state.sessions.lock().map_err(lock)?.purge(purge_sessions, purge_deliveries)?;
+
             let mut pending_worktrees = Vec::new();
 
             for id in &session_ids {
@@ -950,6 +1082,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
                 .as_str()
                 .ok_or_else(|| invalid("delivery.retry.id is required."))?;
             let mut sessions = state.sessions.lock().map_err(lock)?;
+
             sessions.retry_delivery(id)?;
             json!({"id": id, "status": "pending"})
         }
@@ -967,6 +1100,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
                 .as_str()
                 .ok_or_else(|| invalid("delivery.drop.id is required."))?;
             let mut sessions = state.sessions.lock().map_err(lock)?;
+
             sessions.drop_delivery(id)?;
             json!({"id": id, "status": "dropped"})
         }
@@ -976,8 +1110,10 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
                 .as_str()
                 .ok_or_else(|| invalid("session.get.id is required."))?;
             let sessions = state.sessions.lock().map_err(lock)?;
+
             let session =
                 sessions.sessions.get(id).ok_or_else(|| not_found("Session was not found."))?;
+
             detail(session)
         }
 
@@ -986,6 +1122,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
                 .as_str()
                 .ok_or_else(|| invalid("session.ensure.id is required."))?;
             let model = request.params["model"].as_str().unwrap_or("unset");
+
             let mut sessions = state.sessions.lock().map_err(lock)?;
             sessions.ensure(id, model)?;
             json!({"id": id})
@@ -997,6 +1134,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
                 .ok_or_else(|| invalid("session.reserve.id is required."))?;
 
             let mut sessions = state.sessions.lock().map_err(lock)?;
+
             let owner = token()?;
             sessions.reserve(id, owner.clone())?;
             json!({"id": id, "reserved": true, "owner": owner})
@@ -1044,6 +1182,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
                 .as_str()
                 .ok_or_else(|| invalid("session.new.id is required."))?;
             let model = request.params["model"].as_str().unwrap_or("unset");
+
             let mut sessions = state.sessions.lock().map_err(lock)?;
             sessions.create(id, model)?;
             json!({"id": id})
@@ -1093,6 +1232,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
                 .as_str()
                 .ok_or_else(|| invalid("session.clear.id is required."))?;
             let mut sessions = state.sessions.lock().map_err(lock)?;
+
             let session =
                 sessions.sessions.get(id).ok_or_else(|| not_found("Session was not found."))?;
 
@@ -1111,6 +1251,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             let target = request.params["target"]
                 .as_str()
                 .ok_or_else(|| invalid("session.fork.target is required."))?;
+
             let mut sessions = state.sessions.lock().map_err(lock)?;
             sessions.fork(source, target)?;
             json!({"id": target})
@@ -1152,6 +1293,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
                 .as_str()
                 .ok_or_else(|| invalid("session.delete.id is required."))?;
             let mut sessions = state.sessions.lock().map_err(lock)?;
+
             sessions.remove(id)?;
             let worktree = match super::state::remove_worktree(&state.root, id) {
                 Ok(()) => json!({"status": "removed"}),
@@ -1171,6 +1313,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
                 .ok_or_else(|| invalid("session archive id is required."))?;
 
             let archived = request.method == "session.archive";
+
             let mut sessions = state.sessions.lock().map_err(lock)?;
             let current = sessions
                 .sessions
@@ -1193,6 +1336,7 @@ fn dispatch(request: &IpcRequest, state: &State) -> io::Result<IpcResponse> {
             let model = request.params["model"]
                 .as_str()
                 .ok_or_else(|| invalid("session.model.model is required."))?;
+
             let mut sessions = state.sessions.lock().map_err(lock)?;
             sessions.set_model(id, model)?;
             json!({"id": id, "model": model})
@@ -1284,6 +1428,7 @@ pub(crate) fn detail(session: &super::state::Session) -> Value {
             .map_or(true, |bytes| bytes.len().saturating_add(DETAIL_LIMIT) > FRAME)
         {
             messages.pop();
+
             truncated = true;
             break;
         }
@@ -1294,6 +1439,7 @@ pub(crate) fn detail(session: &super::state::Session) -> Value {
     value["messages"] = Value::Array(messages);
     value["workspace"] =
         session.workspace.as_ref().map_or(Value::Null, |path| Value::String(path.clone()));
+
     value["truncated"] = Value::Bool(truncated);
     value
 }
@@ -1407,6 +1553,7 @@ fn plugin_items(home: &std::path::Path, include_manifest: bool) -> Vec<Value> {
         .flatten()
         .filter_map(|entry| {
             let entry = entry.ok()?;
+
             let file_type = entry.file_type().ok()?;
 
             if !file_type.is_dir() {
@@ -1544,6 +1691,178 @@ mod tests {
         assert_eq!(streamed, "firstsecond");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_command_deadline_covers_output_drain_and_kills_background_child() {
+        let (notices, _receiver) = tokio::sync::mpsc::channel(8);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_terminal_command(
+                "sleep 30 &",
+                &std::env::temp_dir(),
+                notices,
+                Arc::new(crate::Cancellation::new()),
+                tokio::time::Instant::now() + Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("terminal command should be bounded by its deadline");
+
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_command_cancellation_kills_background_child() {
+        let (notices, _receiver) = tokio::sync::mpsc::channel(8);
+        let cancel = Arc::new(crate::Cancellation::new());
+        let workspace = std::env::temp_dir();
+        let command = run_terminal_command(
+            "sleep 30 &",
+            &workspace,
+            notices,
+            Arc::clone(&cancel),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        );
+
+        tokio::pin!(command);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.request();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), command)
+            .await
+            .expect("cancelled terminal command should finish promptly");
+
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminal_command_cannot_leave_its_process_group() {
+        let (notices, _receiver) = tokio::sync::mpsc::channel(8);
+        let marker = std::env::temp_dir().join(format!(
+            "crabbot-ipc-blocked-setsid-{}-{}",
+            std::process::id(),
+            super::super::now()
+        ));
+
+        let _ = std::fs::remove_file(&marker);
+        let command = format!("setsid sh -c 'touch {}'", marker.display());
+        let output = run_terminal_command(
+            &command,
+            &std::env::temp_dir(),
+            notices,
+            Arc::new(crate::Cancellation::new()),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("Operation not permitted"));
+        assert!(!marker.exists(), "setsid command escaped its process group");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminal_command_deadline_kills_detached_pipe_holders() {
+        let (notices, _receiver) = tokio::sync::mpsc::channel(8);
+        let marker = std::env::temp_dir().join(format!(
+            "crabbot-ipc-detached-{}-{}",
+            std::process::id(),
+            super::super::now()
+        ));
+
+        let command = format!("setsid sh -c 'sleep 0.5; touch {}' & sleep 30", marker.display());
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_terminal_command(
+                &command,
+                &std::env::temp_dir(),
+                notices,
+                Arc::new(crate::Cancellation::new()),
+                tokio::time::Instant::now() + Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("terminal command should not wait for a detached pipe holder");
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        let continued = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+
+        assert!(!continued, "detached command continued after the deadline");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_terminal_command_kills_descendants() {
+        let (notices, _receiver) = tokio::sync::mpsc::channel(8);
+        let marker = std::env::temp_dir().join(format!(
+            "crabbot-ipc-dropped-{}-{}",
+            std::process::id(),
+            super::super::now()
+        ));
+
+        let _ = std::fs::remove_file(&marker);
+        let command = format!("sh -c 'sleep 0.5; touch {}' & sleep 0.05; exit 0", marker.display());
+        let workspace = std::env::temp_dir();
+        let task = tokio::spawn(async move {
+            run_terminal_command(
+                &command,
+                &workspace,
+                notices,
+                Arc::new(crate::Cancellation::new()),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let continued = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+
+        assert!(!continued, "detached command continued after its task was dropped");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn successful_terminal_command_kills_background_descendants() {
+        let (notices, _receiver) = tokio::sync::mpsc::channel(8);
+        let marker = std::env::temp_dir().join(format!(
+            "crabbot-ipc-success-descendant-{}-{}",
+            std::process::id(),
+            super::super::now()
+        ));
+
+        let _ = std::fs::remove_file(&marker);
+        let command =
+            format!("sh -c 'sleep 0.5; touch {}' >/dev/null 2>&1 </dev/null &", marker.display());
+
+        run_terminal_command(
+            &command,
+            &std::env::temp_dir(),
+            notices,
+            Arc::new(crate::Cancellation::new()),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let continued = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+
+        assert!(!continued, "background descendant continued after successful command");
+    }
+
     #[tokio::test]
     async fn disabled_terminal_command_is_saved_as_a_system_reply() {
         let mut state = state_at("disabled-terminal-command");
@@ -1551,6 +1870,7 @@ mod tests {
             .join(format!("crabbot-ipc-disabled-command-{}", std::process::id()));
 
         let _ = std::fs::remove_dir_all(&state.home);
+
         std::fs::create_dir_all(&state.home).unwrap();
         state.config.shell = false;
 
@@ -1575,6 +1895,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
+
         let user = Message {
             id: "tui-user-1".into(),
             session: "terminal".into(),
@@ -1891,6 +2212,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         let request = IpcRequest::call(1, "secret", "plugin.load", json!({"id": "tools"}));
+
         let response = load(&request, &state).await;
 
         assert!(response.error.is_none(), "{:?}", response.error);
@@ -1928,6 +2250,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
                 .unwrap();
 
         assert_eq!(new.result.unwrap()["id"], "one");
+
         let ensured = dispatch(
             &IpcRequest::call(
                 21,
@@ -1940,6 +2263,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         assert_eq!(ensured.result.unwrap()["id"], "terminal");
+
         let ensured = dispatch(
             &IpcRequest::call(
                 22,
@@ -1952,6 +2276,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         assert_eq!(ensured.result.unwrap()["id"], "terminal");
+
         let reserved = dispatch(
             &IpcRequest::call(25, "secret", "session.reserve", json!({"id": "terminal"})),
             &state,
@@ -1959,6 +2284,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         let owner = reserved.result.unwrap()["owner"].as_str().unwrap().to_owned();
+
         let renewed = dispatch(
             &IpcRequest::call(
                 29,
@@ -1971,6 +2297,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         assert_eq!(renewed.result.unwrap()["renewed"], true);
+
         assert!(
             dispatch(
                 &IpcRequest::call(26, "secret", "session.reserve", json!({"id": "terminal"})),
@@ -1999,6 +2326,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         assert_eq!(appended.result.unwrap()["saved"], true);
+
         let terminal = dispatch(
             &IpcRequest::call(24, "secret", "session.get", json!({"id": "terminal"})),
             &state,
@@ -2043,6 +2371,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         assert_eq!(released.result.unwrap()["released"], true);
+
         let invalid_message = Message {
             id: "terminal-tool-1".into(),
             session: "terminal".into(),
@@ -2082,6 +2411,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         assert_eq!(cleared.result.unwrap()["cleared"], true);
+
         let terminal = dispatch(
             &IpcRequest::call(28, "secret", "session.get", json!({"id": "terminal"})),
             &state,
@@ -2100,6 +2430,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
                 .unwrap();
 
         assert_eq!(get.result.unwrap()["model"], "unset");
+
         let model = dispatch(
             &IpcRequest::call(
                 4,
@@ -2112,6 +2443,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         assert_eq!(model.result.unwrap()["model"], "test-model");
+
         let fork = dispatch(
             &IpcRequest::call(
                 5,
@@ -2124,6 +2456,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         assert_eq!(fork.result.unwrap()["id"], "copy");
+
         state.sessions.lock().unwrap().set_status("one", "working").unwrap();
 
         assert!(
@@ -2142,6 +2475,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .await;
 
         assert_eq!(cancelled.result.unwrap()["status"], "cancelled");
+
         let deleted = dispatch(
             &IpcRequest::call(6, "secret", "session.delete", json!({"id": "copy"})),
             &state,
@@ -2149,6 +2483,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         assert_eq!(deleted.result.unwrap()["id"], "copy");
+
         assert_eq!(
             dispatch(&IpcRequest::call(7, "secret", "unknown", json!({})), &state)
                 .unwrap()
@@ -2382,6 +2717,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         assert_eq!(response.result.unwrap()["tools"], true);
+
         assert!(state.tui_tools.load(std::sync::atomic::Ordering::Acquire));
     }
 
@@ -2474,6 +2810,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .unwrap();
 
         std::fs::write(plugin_root.join("file"), "not a plugin").unwrap();
+
         std::fs::create_dir(plugin_root.join("Bad")).unwrap();
 
         assert_eq!(
@@ -2716,6 +3053,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .await;
 
         assert!(missing_id.error.unwrap().message.contains(".id is required"));
+
         let missing_action = approval_resolve(
             &IpcRequest::call(1, "secret", "approval.resolve", json!({"id": "bad"})),
             &state,
@@ -2723,6 +3061,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
         .await;
 
         assert!(missing_action.error.unwrap().message.contains(".approved is required"));
+
         let expired = approval_resolve(
             &IpcRequest::call(
                 1,

@@ -16892,9 +16892,30 @@ fn main() {
             Arc::new(Mutex::new(super::state::Store::load(root.join("sessions.json")).unwrap()));
         let stop = Arc::new(Stop::new());
         let signal = Arc::clone(&stop);
+        let completed_sessions = Arc::clone(&sessions);
         let notifier = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let completed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    let completed = completed_sessions
+                        .lock()
+                        .unwrap()
+                        .sessions
+                        .get("telegram-7")
+                        .is_some_and(|session| session.messages.len() >= 4);
+
+                    if completed {
+                        break;
+                    }
+
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+
             signal.signal();
+
+            assert!(completed, "tool turn should finish before timeout");
         });
 
         super::bridge(

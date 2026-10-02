@@ -1047,11 +1047,14 @@ where
 
                     KeyCode::Up | KeyCode::Down => return Ok(false),
 
-                    KeyCode::Enter if let Some(id) = approvals.first() => {
-                        let command = if app.approval_selection == 0 { "approve" } else { "deny" };
+                    KeyCode::Enter => {
+                        if let Some(id) = approvals.first() {
+                            let command =
+                                if app.approval_selection == 0 { "approve" } else { "deny" };
 
-                        app.input = format!("/{command} {id}").chars().collect();
-                        app.cursor = app.input.len();
+                            app.input = format!("/{command} {id}").chars().collect();
+                            app.cursor = app.input.len();
+                        }
                     }
 
                     KeyCode::Esc => return Ok(false),
@@ -1074,6 +1077,7 @@ where
                             .command_selection
                             .saturating_add(1)
                             .min(suggestions.len().saturating_sub(1));
+
                         return Ok(false);
                     }
 
@@ -1267,6 +1271,7 @@ where
                         "Statusline: {}\nSet it with /statusline <format>. Placeholders: {{name}}, {{model}}, {{session}}, {{workspace}}, {{status}}.\n",
                         app.statusline
                     ));
+
                         app.complete_local_interaction(response);
                         return Ok(false);
                     }
@@ -1283,6 +1288,7 @@ where
                             app.complete_local_interaction(
                                 "Statusline restored to its default.".into(),
                             );
+
                             return Ok(false);
                         }
 
@@ -1566,6 +1572,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             },
             |started| started.elapsed(),
         );
+
         let line = generation_status_line(&text, elapsed);
 
         let indicator_area = Rect::new(
@@ -1574,6 +1581,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             areas[0].width,
             1,
         );
+
         frame.render_widget(Paragraph::new(line), indicator_area);
     }
 
@@ -1595,11 +1603,13 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
                 .into_iter()
                 .map(|mut row| {
                     row.spans.insert(0, Span::styled("▌ ", rail_style));
+
                     row
                 })
                 .collect::<Vec<_>>();
 
             let popup = Paragraph::new(rows);
+
             frame.render_widget(popup, popup_area);
         } else if let Some(suggestions) = suggestions {
             let selected = app.command_selection.min(suggestions.len().saturating_sub(1));
@@ -1650,6 +1660,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
                 .collect::<Vec<_>>();
 
             let popup = List::new(items);
+
             frame.render_widget(popup, popup_area);
         }
     }
@@ -1685,6 +1696,7 @@ fn generation_status_line(text: &str, elapsed: Duration) -> Line<'static> {
         .enumerate()
         .map(|(index, character)| {
             let distance = (index as isize - glow_center).unsigned_abs();
+
             let green = if distance <= 16 { 140 + (45 * (16 - distance) / 16) as u8 } else { 140 };
 
             let color = Color::Rgb(255, green, 0);
@@ -1709,6 +1721,7 @@ fn wrapped_rows(text: &str, width: u16) -> usize {
     text.split('\n')
         .map(|line| {
             let mut rows = 1_usize;
+
             let mut columns = 0_usize;
             let mut last_width = 0_usize;
 
@@ -1736,6 +1749,7 @@ fn wrapped_rows(text: &str, width: u16) -> usize {
 
 fn input_cursor_position(input: &[char], cursor: usize, width: u16) -> (u16, u16) {
     let width = width.saturating_sub(3).max(1) as usize;
+
     let mut row = 0_usize;
     let mut column = 0_usize;
 
@@ -1826,6 +1840,7 @@ fn save_preferences(
     let preferences = TuiPreferences { statusline: statusline.to_owned(), typewriter };
     let content = toml::to_string(&preferences)
         .map_err(|error| crabbot_core::Error::Denied(error.to_string()))?;
+
     crabbot_file::save(path, content).map_err(crabbot_core::Error::from)
 }
 
@@ -1888,6 +1903,7 @@ fn wrap_transcript_layout(
                 is_system,
                 hovered_message == Some(message_index),
             ));
+
             message_rows.push(start..rows.len());
 
             if index < lines.len() {
@@ -2023,6 +2039,7 @@ fn wrap_rail_message(
 
     for line in message_rows {
         let mut spans = vec![Span::styled("▌ ", rail_style)];
+
         spans.extend(line.spans);
         rows.push(Line::from(spans));
     }
@@ -2114,6 +2131,7 @@ fn wrap_styled_segments(segments: &[(String, Style)], width: usize) -> Vec<Line<
 
     let flush_word = |builder: &mut TranscriptLineBuilder,
                       spaces: &mut Vec<(String, Style)>,
+
                       word: &mut Vec<(String, Style)>| {
         if word.is_empty() {
             return;
@@ -2121,6 +2139,7 @@ fn wrap_styled_segments(segments: &[(String, Style)], width: usize) -> Vec<Line<
 
         let spaces_width =
             spaces.iter().map(|(text, _)| UnicodeWidthStr::width(text.as_str())).sum::<usize>();
+
         let word_width =
             word.iter().map(|(text, _)| UnicodeWidthStr::width(text.as_str())).sum::<usize>();
 
@@ -3011,6 +3030,7 @@ mod tests {
             .chunks(100)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>();
+
         let input_row = rows.iter().position(|row| row.contains("Message")).unwrap();
 
         assert!(input_row > 0);
@@ -3021,6 +3041,7 @@ mod tests {
             Approve: /approve approval-1\nDeny: /deny approval-1\n"
             .into();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
         let approval = terminal
             .backend()
             .buffer()
@@ -3392,8 +3413,10 @@ mod tests {
     fn transcript_uses_role_colored_rails_on_the_left() {
         let rows =
             super::wrap_transcript("You | now\nHello\n\nCrabbot | now\nHi there.", "Crabbot", 50);
+
         let row_text =
             |row: &Line<'_>| row.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+
         let user_top = row_text(&rows[0]);
         let assistant_header = rows.iter().find(|row| row_text(row).contains("Crabbot")).unwrap();
 
@@ -3406,6 +3429,7 @@ mod tests {
             .flat_map(|row| row.spans.iter())
             .find(|span| span.content == "Crabbot")
             .unwrap();
+
         assert_eq!(user_title.style.fg, None);
         assert_eq!(assistant_title.style.fg, Some(super::ACCENT_COLOR));
         assert!(user_title.style.add_modifier.contains(super::Modifier::ITALIC));
@@ -3430,6 +3454,7 @@ mod tests {
         let transcript = "You | 2026-10-01 at 12:26\nping\n\nCrabbot | 2026-10-01 at 12:27\npong";
         let row_text =
             |row: &Line<'_>| row.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+
         let rows = super::wrap_transcript_layout(transcript, "Crabbot", 80, None).0;
         let visible = rows.iter().map(row_text).collect::<String>();
 
@@ -3496,6 +3521,7 @@ mod tests {
         )
         .await
         .unwrap();
+
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let rendered = terminal
@@ -3523,6 +3549,7 @@ mod tests {
         )
         .await
         .unwrap();
+
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let rendered = terminal
@@ -3573,6 +3600,7 @@ mod tests {
         let rows = super::wrap_transcript_line("alpha workspace beta", "Crabbot", 9);
         let row_text =
             |row: &Line<'_>| row.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+
         let rendered = rows.iter().map(row_text).collect::<Vec<_>>();
 
         assert_eq!(rendered, ["alpha", "workspace", "beta"]);
@@ -3604,6 +3632,7 @@ mod tests {
             "Crabbot",
             60,
         );
+
         let second_paragraph = rows
             .iter()
             .position(|row| row.spans.iter().any(|span| span.content == "Second paragraph."));
