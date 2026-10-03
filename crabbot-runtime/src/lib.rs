@@ -11472,7 +11472,17 @@ fn unpack(
     validate_archive(archive_path)?;
     archive_bounds(archive_path)?;
     let name = archive_path.to_string_lossy().to_ascii_lowercase();
-    let (program, args): (&str, Vec<String>) = if name.ends_with(".zip") {
+    let (program, args): (&str, Vec<String>) = if name.ends_with(".zip") && cfg!(windows) {
+        (
+            "tar",
+            vec![
+                "-xf".into(),
+                archive_path.display().to_string(),
+                "-C".into(),
+                destination.display().to_string(),
+            ],
+        )
+    } else if name.ends_with(".zip") {
         (
             "unzip",
             vec![
@@ -11518,7 +11528,9 @@ fn unpack(
 
 fn archive_bounds(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let name = path.to_string_lossy().to_ascii_lowercase();
-    let (program, args): (&str, Vec<String>) = if name.ends_with(".zip") {
+    let (program, args): (&str, Vec<String>) = if name.ends_with(".zip") && cfg!(windows) {
+        ("tar", vec!["-tvf".into(), path.display().to_string()])
+    } else if name.ends_with(".zip") {
         ("unzip", vec!["-l".into(), path.display().to_string()])
     } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         ("tar", vec!["-tvzf".into(), path.display().to_string()])
@@ -11537,14 +11549,14 @@ fn archive_bounds(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + 
             continue;
         }
 
-        let size = if name.ends_with(".zip") {
+        let size = if name.ends_with(".zip") && !cfg!(windows) {
             fields.first().and_then(|value| value.parse::<u64>().ok()).filter(|_| fields.len() >= 4)
         } else {
             tar_size(&fields)
         };
 
         let Some(size) = size else {
-            if !name.ends_with(".zip") {
+            if !name.ends_with(".zip") || cfg!(windows) {
                 return Err("Archive size listing could not be parsed.".into());
             }
 
@@ -11590,7 +11602,9 @@ fn tar_date(value: &str) -> bool {
 
 fn validate_archive(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let name = path.to_string_lossy().to_ascii_lowercase();
-    let (program, args): (&str, Vec<String>) = if name.ends_with(".zip") {
+    let (program, args): (&str, Vec<String>) = if name.ends_with(".zip") && cfg!(windows) {
+        ("tar", vec!["-tf".into(), path.display().to_string()])
+    } else if name.ends_with(".zip") {
         ("unzip", vec!["-Z1".into(), path.display().to_string()])
     } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         ("tar", vec!["-tzf".into(), path.display().to_string()])
@@ -11617,7 +11631,9 @@ fn validate_archive_types(
     path: &Path,
     zip: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (program, args): (&str, Vec<String>) = if zip {
+    let (program, args): (&str, Vec<String>) = if zip && cfg!(windows) {
+        ("tar", vec!["-tvf".into(), path.display().to_string()])
+    } else if zip {
         ("unzip", vec!["-Z".into(), "-v".into(), path.display().to_string()])
     } else {
         ("tar", vec!["-tvf".into(), path.display().to_string()])
@@ -11626,7 +11642,7 @@ fn validate_archive_types(
     let output = archive_listing(program, &args)?;
 
     for line in String::from_utf8_lossy(&output).lines() {
-        let kind = if zip {
+        let kind = if zip && !cfg!(windows) {
             line.strip_prefix("  Unix file attributes (")
                 .and_then(|value| value.split_once("): "))
                 .and_then(|(_, value)| value.trim_start().as_bytes().first().copied())

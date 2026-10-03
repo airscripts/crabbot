@@ -406,8 +406,9 @@ atomically replacing an existing plugin. Sources may be local directories,
 Git URLs with an optional `--revision`, or verified `.tar`, `.tar.gz`, `.tgz`,
 and `.zip` archives. Archive sources must include a `#sha256=<64-hex-digits>`
 fragment. Remote archives require HTTPS; extraction rejects unsafe paths and
-symbolic links and hard links. Remote archive downloads use the system `curl`,
-`tar`, or `unzip` commands and are capped at 64 MiB. The update command
+symbolic links and hard links. Remote downloads use the system `curl`, and
+archive handling uses `tar` or `unzip` on Unix and Windows' built-in `tar`
+command. Archives are capped at 64 MiB. The update command
 refreshes every locked source through the same staged path, validates its
 manifest and protocol, then activates it atomically. A failed source leaves
 the previous plugin active.

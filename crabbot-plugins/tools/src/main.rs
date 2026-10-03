@@ -869,6 +869,7 @@ async fn fetch_url_bounded(value: &str) -> crabbot_core::Result<serde_json::Valu
         }
 
         let mut text = String::from_utf8_lossy(&body).into_owned();
+
         let truncated = text.len() > FETCH_TEXT_LIMIT;
 
         if truncated {

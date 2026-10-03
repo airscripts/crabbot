@@ -5,6 +5,12 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Use Windows' built-in `tar` command to validate and extract ZIP plugin
+  archives, and reclaim superseded live session snapshots and delivery records
+  after catalog updates.
+
 ### Added
 
 - Report `crab status` as healthy or unhealthy with concrete reasons, and allow

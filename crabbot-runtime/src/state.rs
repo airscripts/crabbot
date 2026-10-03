@@ -1430,38 +1430,14 @@ impl Store {
     }
 
     pub fn remove_deep(&mut self, id: &str) -> std::io::Result<()> {
-        let session = self.sessions.get(id).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "Session was not found.")
-        })?;
-
-        let bytes = serde_json::to_vec(session).map_err(std::io::Error::other)?;
-        let record_key = session_record_key(&bytes);
-
         self.remove(id)?;
 
         let Some(path) = self.path.as_deref().filter(|path| session_catalog(path)) else {
             return Ok(());
         };
 
-        if self.sessions.values().any(|session| {
-            serde_json::to_vec(session)
-                .ok()
-                .is_some_and(|bytes| session_record_key(&bytes) == record_key)
-        }) {
-            return Ok(());
-        }
-
-        let record = path
-            .parent()
-            .expect("catalog has parent")
-            .join("records")
-            .join(format!("{record_key}.json"));
-
-        match std::fs::remove_file(record) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        let records = path.parent().expect("catalog has parent").join("records");
+        remove_session_records(&records, id)
     }
 
     pub fn purge(
@@ -2216,6 +2192,14 @@ fn save_catalog(path: &Path, store: &Store) -> std::io::Result<()> {
         }
 
         let bytes = serde_json::to_vec(session).map_err(std::io::Error::other)?;
+
+        if bytes.len() as u64 > BYTE_LIMIT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "Session record exceeds the size limit.",
+            ));
+        }
+
         let key = session_record_key(&bytes);
         save_file(root.join("records").join(format!("{key}.json")), bytes)?;
         sessions.insert(id.clone(), key);
@@ -2231,6 +2215,7 @@ fn save_catalog(path: &Path, store: &Store) -> std::io::Result<()> {
     save_json(&root.join("state/clients/runtime.json"), &state)?;
 
     let mut delivery_index = DeliveryIndex::default();
+    let mut delivery_records = BTreeSet::new();
 
     for (delivery, dead) in store
         .outbox
@@ -2242,6 +2227,7 @@ fn save_catalog(path: &Path, store: &Store) -> std::io::Result<()> {
 
         let key = session_record_key(&bytes);
         save_file(root.join("state/deliveries/records").join(format!("{key}.json")), bytes)?;
+        delivery_records.insert(key.clone());
 
         if dead {
             delivery_index.dead.push(key);
@@ -2251,8 +2237,141 @@ fn save_catalog(path: &Path, store: &Store) -> std::io::Result<()> {
     }
 
     save_json(&root.join("state/deliveries/index.json"), &delivery_index)?;
+    save_json(path, &SessionIndex { version: 1, sessions: sessions.clone() })?;
 
-    save_json(path, &SessionIndex { version: 1, sessions })
+    let _ = cleanup_session_records(&root.join("records"), &sessions);
+    let _ = cleanup_records(&root.join("state/deliveries/records"), delivery_records);
+
+    Ok(())
+}
+
+fn cleanup_session_records(
+    directory: &Path,
+    sessions: &BTreeMap<String, String>,
+) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(key) = name.strip_suffix(".json") else {
+            continue;
+        };
+
+        if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+
+        if sessions.values().any(|referenced| referenced == key) {
+            continue;
+        }
+
+        if entry.metadata()?.len() > BYTE_LIMIT {
+            continue;
+        }
+
+        let bytes = std::fs::read(entry.path())?;
+        let session = serde_json::from_slice::<Session>(&bytes).ok();
+
+        if session.is_some_and(|session| !sessions.contains_key(&session.id)) {
+            continue;
+        }
+
+        remove_record(entry.path())?;
+    }
+
+    Ok(())
+}
+
+fn remove_session_records(directory: &Path, id: &str) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(key) = name.strip_suffix(".json") else {
+            continue;
+        };
+
+        if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+
+        if entry.metadata()?.len() > BYTE_LIMIT {
+            continue;
+        }
+
+        let bytes = std::fs::read(entry.path())?;
+        let Ok(session) = serde_json::from_slice::<Session>(&bytes) else {
+            continue;
+        };
+
+        if session.id == id {
+            remove_record(entry.path())?;
+        }
+    }
+
+    Ok(())
+}
+
+fn cleanup_records(directory: &Path, referenced: BTreeSet<String>) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+
+        let Some(key) = name.strip_suffix(".json") else {
+            continue;
+        };
+
+        if key.len() == 64
+            && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && !referenced.contains(key)
+        {
+            remove_record(path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_record(path: PathBuf) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn save_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
@@ -3346,7 +3465,63 @@ mod tests {
     }
 
     #[test]
-    fn deep_remove_deletes_the_shared_record_but_regular_remove_keeps_it() {
+    fn catalog_rejects_oversized_session_records_without_replacing_saved_catalog() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-catalog-size-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        let path = root.join("data/sessions/index.json");
+        let mut store = Store::load(&path).unwrap();
+        store.create("main", "model").unwrap();
+        store.sessions.get_mut("main").unwrap().messages.push(Message {
+            id: "oversized".into(),
+            session: "main".into(),
+            role: Role::User,
+            sender: None,
+            content: vec![Content::Text { text: "x".repeat(super::BYTE_LIMIT as usize) }],
+        });
+
+        let error = store.save().unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+
+        let loaded = Store::load(&path).unwrap();
+
+        assert!(loaded.sessions["main"].messages.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn catalog_save_succeeds_when_post_commit_record_cleanup_fails() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-catalog-cleanup-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("data/sessions/index.json");
+        let mut store = Store::load(&path).unwrap();
+        let records = path.parent().unwrap().join("records");
+
+        std::fs::create_dir_all(records.parent().unwrap()).unwrap();
+        std::fs::write(&records, b"not a directory").unwrap();
+
+        store.commit("telegram", "event", Some(9)).unwrap();
+
+        let index = std::fs::read_to_string(&path).unwrap();
+        let catalog: serde_json::Value = serde_json::from_str(&index).unwrap();
+        let loaded = Store::load(&path).unwrap();
+
+        assert_eq!(catalog["version"], 1);
+        assert_eq!(catalog["sessions"], serde_json::json!({}));
+        assert_eq!(store.offset("telegram"), 9);
+        assert_eq!(loaded.offset("telegram"), 9);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn catalog_saves_reclaim_superseded_and_unreferenced_records() {
         let root = std::env::temp_dir().join(format!("crabbot-deep-remove-{}", std::process::id()));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -3359,20 +3534,64 @@ mod tests {
         let regular_record = root.join(format!("data/sessions/records/{regular_key}.json"));
 
         assert!(regular_record.is_file());
+        store.append("regular", message(1, "regular")).unwrap();
+
+        assert!(!regular_record.exists());
+
+        let current_bytes = serde_json::to_vec(&store.sessions["regular"]).unwrap();
+        let current_key = super::session_record_key(&current_bytes);
+        let current_record = root.join(format!("data/sessions/records/{current_key}.json"));
+
+        assert!(current_record.is_file());
+
         store.remove("regular").unwrap();
 
-        assert!(regular_record.is_file());
+        assert!(current_record.is_file());
 
         store.create("deep", "model").unwrap();
+
+        assert!(current_record.is_file());
+
         let deep_bytes = serde_json::to_vec(&store.sessions["deep"]).unwrap();
         let deep_key = super::session_record_key(&deep_bytes);
         let deep_record = root.join(format!("data/sessions/records/{deep_key}.json"));
 
-        assert!(deep_record.is_file());
+        store.append("deep", message(2, "deep")).unwrap();
+
+        assert!(!deep_record.exists());
+        std::fs::write(&deep_record, deep_bytes).unwrap();
+
+        let current_bytes = serde_json::to_vec(&store.sessions["deep"]).unwrap();
+        let current_key = super::session_record_key(&current_bytes);
+        let current_record = root.join(format!("data/sessions/records/{current_key}.json"));
+
+        assert!(current_record.is_file());
         store.remove_deep("deep").unwrap();
 
         assert!(!deep_record.exists());
+        assert!(!current_record.exists());
         assert!(!store.sessions.contains_key("deep"));
+
+        store.create("delivery", "model").unwrap();
+        store
+            .reply("delivery", message(3, "delivery"), "delivery", "telegram", "chat", None, "text")
+            .unwrap();
+
+        let delivery_bytes = serde_json::to_vec(&store.outbox[0]).unwrap();
+        let delivery_key = super::session_record_key(&delivery_bytes);
+        let delivery_record =
+            root.join(format!("data/sessions/state/deliveries/records/{delivery_key}.json"));
+
+        assert!(delivery_record.is_file());
+
+        store.set_status("delivery", "idle").unwrap();
+
+        assert!(delivery_record.is_file());
+
+        store.outbox.clear();
+        store.save().unwrap();
+
+        assert!(!delivery_record.exists());
 
         let _ = std::fs::remove_dir_all(root);
     }
