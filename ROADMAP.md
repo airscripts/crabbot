@@ -7,9 +7,13 @@ the public behavior stable.
 
 - Resolve all known high and medium reliability findings.
 - Improve recovery, cancellation, queue handling, persistence, and plugin updates.
+- Reconcile TUI session changes saved to the local fallback during daemon outages
+  with the daemon's session catalog on reconnect; make replay safe and preserve
+  history when both stores have changed.
 - Design and implement native Atomic Updates: validate a staged release before
   promotion, preserve the previous version, and recover or roll back safely
   across interruption and failed health checks.
+- Add bounded web search through an explicit, permissioned search provider.
 - Preserve stable JSON-RPC 0.x compatibility.
 - Keep core coverage above 80% and runtime host coverage above 50%.
 - Require clean dependency vulnerability audits.

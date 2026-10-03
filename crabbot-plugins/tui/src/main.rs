@@ -40,6 +40,7 @@ const SESSION_LIST_PAGE_SIZE: usize = 5;
 const PLUGIN_LIST_PAGE_SIZE: usize = 5;
 const STREAMING_TURN_TIMEOUT: Duration = Duration::from_secs(310);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+const COMPACTION_TIMEOUT: Duration = Duration::from_secs(305);
 #[cfg(test)]
 const SAVED_REPLY_LIMIT: usize = 16 * 1024;
 // 365 days (one year), expressed in seconds.
@@ -144,6 +145,8 @@ struct ToolsProcess {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum EngineEvent {
     GenerationStarted,
+    CompactionStarted,
+    CompactionFinished,
     AssistantText(String),
     SystemText(String),
     SystemNotice(String),
@@ -635,7 +638,7 @@ where
                 let usage = match action {
                     "archive" => "Usage: /session archive <id>...|--all.\n> ",
                     "unarchive" => "Usage: /session unarchive <id>...|--all.\n> ",
-                    _ => "Usage: /session delete <id>...|--all [-y|--yes].\n> ",
+                    _ => "Usage: /session delete <id>...|--all [-y|--yes] [--deep].\n> ",
                 };
 
                 match parse_session_targets(value, allow_confirmation) {
@@ -761,6 +764,57 @@ where
                 messages.clear();
                 output.write_all(b"Conversation cleared.\n> ").await?;
                 output.flush().await?;
+                continue;
+            }
+
+            if line == "/compact" {
+                if let Some(events) = &engine_events {
+                    let _ = events.send(EngineEvent::CompactionStarted);
+                }
+
+                let result = if !model_plugin_available {
+                    Err(crabbot_core::Error::Denied(
+                        "The selected model plugin is unavailable.".into(),
+                    ))
+                } else {
+                    compact_command(&home, &session, &plugin, host).await
+                };
+
+                match result {
+                    Ok((Some((removed, retained)), _, view)) => {
+                        messages = view.messages.clone();
+                        send_session_view(&session_events, view);
+                        output
+                            .write_all(
+                                format!(
+                                    "Compacted {removed} older messages into a summary; kept {retained} recent messages.\n> "
+                                )
+                                .as_bytes(),
+                            )
+                            .await?;
+                    }
+
+                    Ok((None, Some(reason), _)) if reason == "already_compacted" => {
+                        output.write_all(b"This conversation was just compacted; skipping another compaction.\n> ").await?;
+                    }
+
+                    Ok((None, _, _)) => {
+                        output.write_all(b"There are not enough earlier turns to compact.\n> ").await?;
+                    }
+
+                    Err(error) => {
+                        output
+                            .write_all(format!("Compaction failed: {}.\n> ", sentence(error.to_string())).as_bytes())
+                            .await?;
+                    }
+                }
+
+                output.flush().await?;
+
+                if let Some(events) = &engine_events {
+                    let _ = events.send(EngineEvent::CompactionFinished);
+                }
+
                 continue;
             }
 
@@ -1278,8 +1332,9 @@ where
 
     let messages = serde_json::from_value(value["messages"].clone())?;
     let workspace = value["workspace"].as_str().map(str::to_owned);
+    let context_usage = serde_json::from_value(value["context_usage"].clone()).ok().flatten();
     let working = value["status"] == "working" || value["inflight"] == true;
-    Ok(ui::SessionView { id: id.to_owned(), model, workspace, messages, working })
+    Ok(ui::SessionView { id: id.to_owned(), model, workspace, context_usage, messages, working })
 }
 
 fn send_session_view(
@@ -1303,6 +1358,7 @@ struct SessionTargets {
     ids: Vec<String>,
     all: bool,
     confirmed: bool,
+    deep: bool,
 }
 
 fn parse_session_targets(value: &str, allow_confirmation: bool) -> Result<SessionTargets, ()> {
@@ -1317,6 +1373,10 @@ fn parse_session_targets(value: &str, allow_confirmation: bool) -> Result<Sessio
             }
 
             "-y" | "--yes" => return Err(()),
+
+            "--deep" if allow_confirmation && !targets.deep => targets.deep = true,
+
+            "--deep" => return Err(()),
 
             _ if valid_session(part) && !targets.ids.iter().any(|id| id == part) => {
                 targets.ids.push(part.to_owned());
@@ -1389,9 +1449,26 @@ where
             _ => "session.delete",
         };
 
-        match host(home.to_owned(), method.into(), serde_json::json!({"id": id})).await {
+        let params = serde_json::json!({
+            "id": id,
+            "deep": action == "delete" && targets.deep,
+        });
+
+        match host(home.to_owned(), method.into(), params).await {
             Ok(result) if action == "delete" || result["changed"] != false => {
-                completed.push(tui_session_name(&id).unwrap_or(&id).to_owned());
+                let name = tui_session_name(&id).unwrap_or(&id).to_owned();
+
+                if action == "delete"
+                    && targets.deep
+                    && let Err(error) = data::delete_fallback_session(home, &id)
+                {
+                    failures.push(format!(
+                        "Could not remove local fallback for {name}: {}",
+                        sentence(error.to_string())
+                    ));
+                }
+
+                completed.push(name);
             }
 
             Ok(_) => already.push(tui_session_name(&id).unwrap_or(&id).to_owned()),
@@ -1501,6 +1578,12 @@ fn read_only_tools() -> Vec<ToolSpec> {
             }),
             vec!["text"],
         ),
+        (
+            "fetch",
+            "Fetch bounded text from a public HTTPS URL.",
+            serde_json::json!({"url": {"type": "string"}}),
+            vec!["url"],
+        ),
     ]
     .into_iter()
     .map(|(name, description, properties, required)| ToolSpec {
@@ -1530,8 +1613,9 @@ async fn serve_read_only_tool(
         return Ok(Response::fail(id, -32601, "Method not found."));
     }
 
-    let Some(name) =
-        params["name"].as_str().filter(|name| matches!(*name, "read" | "list" | "search"))
+    let Some(name) = params["name"]
+        .as_str()
+        .filter(|name| matches!(*name, "read" | "list" | "search" | "fetch"))
     else {
         return Ok(Response::fail(id, -32000, "Only read-only tools are available in the TUI."));
     };
@@ -1565,6 +1649,17 @@ async fn serve_read_only_tool(
             .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"))
             .unwrap_or_default(),
         "search" => serde_json::to_string_pretty(&result["hits"]).unwrap_or_else(|_| "[]".into()),
+
+        "fetch" => {
+            let status = result["status"].as_u64().unwrap_or_default();
+            let content_type = result["content_type"].as_str().unwrap_or("unknown");
+            let text = result["text"].as_str().unwrap_or_default();
+            let truncated = result["truncated"].as_bool().unwrap_or(false);
+            let suffix = if truncated { "\n[response truncated at the text limit]" } else { "" };
+
+            format!("HTTP {status} ({content_type})\n{text}{suffix}")
+        }
+
         _ => unreachable!(),
     };
 
@@ -1609,7 +1704,7 @@ fn command_help(home: &str, has_model: bool, daemon: bool) -> String {
         ("/new <id>", "Create and switch to a session."),
         ("/workspace [path|reset]", "Show or change this session's filesystem root."),
         ("/clear", "Clear this session's conversation."),
-        ("/statusline [format|reset]", "Show, configure, or reset the bottom statusline."),
+        ("/statusline [reset]", "Choose which details appear in the bottom statusline."),
         ("/animation [on|off]", "Show or configure typewriter animation."),
         ("/quit, /exit", "Leave the TUI."),
     ];
@@ -1625,6 +1720,7 @@ fn command_help(home: &str, has_model: bool, daemon: bool) -> String {
 
     if has_model {
         conditional.push(("/model <help|list|show|set>", "Manage the selected model."));
+        conditional.push(("/compact", "Summarize older turns and keep recent conversation."));
     }
 
     if daemon && has_capability(home, "tool") {
@@ -1675,18 +1771,93 @@ fn format_help_rows(rows: &[(&str, &str)]) -> String {
         .join("\n")
 }
 
-fn session_help() -> &'static str {
-    "Session commands:\n  /session help                       Show these commands.\n  /session list [page]                List sessions, 10 per page; active first, then recent.\n  /session create <id>                Create and switch to a session.\n  /session switch <id>                Switch to a saved session.\n  /session rename <new-id>            Rename the active session.\n  /session archive <id>...|--all      Archive saved sessions.\n  /session unarchive <id>...|--all    Restore archived sessions.\n  /session delete <id>...|--all [-y]  Permanently delete sessions.\n  /new <id>                           Create and switch to a session (shortcut).\n> "
+fn session_help() -> String {
+    let commands = [
+        ("/session help", "Show these commands."),
+        ("/session list [page]", "List sessions, 10 per page; active first, then recent."),
+        ("/session create <id>", "Create and switch to a session."),
+        ("/session switch <id>", "Switch to a saved session."),
+        ("/session rename <new-id>", "Rename the active session."),
+        ("/session archive <id>...|--all", "Archive saved sessions."),
+        ("/session unarchive <id>...|--all", "Restore archived sessions."),
+        (
+            "/session delete <id>...|--all [-y] [--deep]",
+            "Permanently delete sessions; --deep also removes local and shared session data.",
+        ),
+        ("/new <id>", "Create and switch to a session (shortcut)."),
+    ];
+
+    format!("Session commands:\n{}\n> ", format_help_rows(&commands))
 }
 
 fn model_help() -> &'static str {
     "Model commands:\n  /model help          Show these commands.\n  /model list          List Codex models (when Codex is selected).\n  /model show          Show the selected model.\n  /model set <id>      Select a model.\n  /model <id>          Select a model (shortcut).\n> "
 }
 
+async fn compact_command<C, F>(
+    home: &str,
+    session: &str,
+    plugin: &str,
+    host: C,
+) -> crabbot_core::Result<(Option<(usize, usize)>, Option<String>, ui::SessionView)>
+where
+    C: Fn(String, String, Value) -> F + Copy + Send + Sync + 'static,
+    F: Future<Output = crabbot_core::Result<Value>> + Send + 'static,
+{
+    let reservation =
+        host(home.to_owned(), "session.reserve".into(), serde_json::json!({"id": session})).await?;
+
+    let owner = reservation["owner"].as_str().map(str::to_owned).ok_or_else(|| {
+        crabbot_core::Error::Denied("Session reservation returned no owner token.".into())
+    })?;
+
+    let mut reservation =
+        SessionReservation::new(home.to_owned(), session.to_owned(), owner.clone(), host);
+
+    let response = host(
+        home.to_owned(),
+        "session.compact".into(),
+        serde_json::json!({"id": session, "plugin": plugin, "owner": owner}),
+    )
+    .await;
+
+    let released = reservation.release().await;
+
+    let value = match response {
+        Ok(value) => {
+            released?;
+
+            value
+        }
+
+        Err(error) => {
+            let _ = released;
+
+            return Err(error);
+        }
+    };
+
+    let view = read_session(home, session, host).await?;
+    let compacted = value["compacted"].as_bool().unwrap_or(false).then(|| {
+        (
+            value["removed"].as_u64().unwrap_or_default() as usize,
+            value["retained"].as_u64().unwrap_or_default() as usize,
+        )
+    });
+
+    let reason = value["reason"].as_str().map(str::to_owned);
+
+    Ok((compacted, reason, view))
+}
+
 #[cfg(test)]
 async fn local_aware(home: String, method: String, params: Value) -> crabbot_core::Result<Value> {
     if method == "session.answer" {
         return Ok(serde_json::json!({"text": "Reply"}));
+    }
+
+    if method == "session.compact" {
+        return Ok(serde_json::json!({"compacted": false}));
     }
 
     if method == "model.list" {
@@ -2237,6 +2408,14 @@ async fn control_with_stream(
                     continue;
                 }
 
+                if value["event"] == "system" {
+                    if let (Some(events), Some(text)) = (&events, value["text"].as_str()) {
+                        let _ = events.send(EngineEvent::SystemText(text.to_owned()));
+                    }
+
+                    continue;
+                }
+
                 if value["event"] == "text" {
                     if let Some(text) = value["text"].as_str() {
                         streamed.push_str(text);
@@ -2286,7 +2465,13 @@ async fn control_with_stream(
         }
     };
 
-    let wait = if streaming_turn { STREAMING_TURN_TIMEOUT } else { CONTROL_TIMEOUT };
+    let wait = if streaming_turn {
+        STREAMING_TURN_TIMEOUT
+    } else if method == "session.compact" {
+        COMPACTION_TIMEOUT
+    } else {
+        CONTROL_TIMEOUT
+    };
 
     timeout(wait, exchange).await.map_err(|_| {
         ControlError::Failed(crabbot_core::Error::Denied(
@@ -2887,10 +3072,15 @@ mod tests {
 
         assert!(targets.all);
         assert!(targets.confirmed);
+        let targets = super::parse_session_targets("one --deep --yes", true).unwrap();
+
+        assert!(targets.deep);
+        assert!(targets.confirmed);
         assert!(super::parse_session_targets("--all one", true).is_err());
         assert!(super::parse_session_targets("one one", true).is_err());
         assert!(super::parse_session_targets("-y", true).is_err());
         assert!(super::parse_session_targets("-y", false).is_err());
+        assert!(super::parse_session_targets("one --deep", false).is_err());
     }
 
     #[tokio::test]
@@ -2907,6 +3097,54 @@ mod tests {
             super::apply_session_action("/tmp", "delete", targets, "tui-saved", mock_control).await;
 
         assert_eq!(result, "No sessions were deleted. Kept active session saved.");
+    }
+
+    #[tokio::test]
+    async fn deep_session_delete_removes_matching_local_fallback() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-tui-deep-delete-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.to_string_lossy().into_owned();
+
+        super::offline::control(&home, "session.new", json!({"id": "tui-first", "model": "test"}))
+            .await
+            .unwrap();
+
+        super::offline::control(&home, "session.new", json!({"id": "tui-second", "model": "test"}))
+            .await
+            .unwrap();
+
+        let targets = super::parse_session_targets("first --deep -y", true).unwrap();
+        let result =
+            super::apply_session_action(&home, "delete", targets, "tui-active", mock_deep_delete)
+                .await;
+
+        assert_eq!(result, "Deleted session first.");
+        assert!(
+            super::offline::control(&home, "session.get", json!({"id": "tui-first"}))
+                .await
+                .is_err()
+        );
+
+        assert!(
+            super::offline::control(&home, "session.get", json!({"id": "tui-second"}))
+                .await
+                .is_ok()
+        );
+
+        let targets = super::parse_session_targets("second -y", true).unwrap();
+        let result =
+            super::apply_session_action(&home, "delete", targets, "tui-active", mock_control).await;
+
+        assert_eq!(result, "Deleted session second.");
+        assert!(
+            super::offline::control(&home, "session.get", json!({"id": "tui-second"}))
+                .await
+                .is_ok()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2927,6 +3165,7 @@ mod tests {
 
         assert!(basic.contains("/statusline"));
         assert!(basic.contains("/session help"));
+        assert!(!basic.contains("/compact"));
         assert!(!basic.contains("/model [id]"));
         assert!(!basic.contains("/deliveries"));
         assert!(basic.contains("Plugin commands run in the CLI: crab <command>."));
@@ -2938,9 +3177,9 @@ mod tests {
             .lines()
             .filter_map(|line| {
                 if line.contains("Show or change this session's filesystem root.")
-                    || line.contains("Show, configure, or reset the bottom statusline.")
+                    || line.contains("Choose which details appear in the bottom statusline.")
                 {
-                    line.find("Show")
+                    line.find("Show").or_else(|| line.find("Choose"))
                 } else {
                     None
                 }
@@ -2953,6 +3192,7 @@ mod tests {
         let model_commands = super::command_help("missing-home", true, false);
 
         assert!(model_commands.contains("/model <help|list|show|set>"));
+        assert!(model_commands.contains("/compact"));
         assert!(model_commands.contains("/plugins [page]"));
         assert!(model_commands.contains("Conditional commands (shown only when usable):"));
         assert!(model_commands.contains("\n\nPlugin commands run in the CLI:"));
@@ -2964,9 +3204,18 @@ mod tests {
         assert!(sessions.contains("/session archive <id>...|--all"));
         assert!(sessions.contains("/session unarchive <id>...|--all"));
         assert!(sessions.contains("/session rename <new-id>"));
-        assert!(sessions.contains("/session delete <id>...|--all [-y]"));
+        assert!(sessions.contains("/session delete <id>...|--all [-y] [--deep]"));
+        assert!(sessions.contains("--deep also removes local and shared session data."));
         assert!(sessions.contains("/new <id>"));
         assert!(!sessions.contains("/sessions"));
+
+        let aligned_columns = [
+            "List sessions, 10 per page; active first, then recent.",
+            "Permanently delete sessions; --deep also removes local and shared session data.",
+        ]
+        .map(|description| sessions.lines().find_map(|line| line.find(description)).unwrap());
+
+        assert_eq!(aligned_columns[0], aligned_columns[1]);
     }
 
     #[test]
@@ -3448,6 +3697,7 @@ mod tests {
             "session.reserve",
             "session.renew",
             "session.release",
+            "session.compact",
             "session.clear",
             "session.model",
             "session.rename",
@@ -3461,6 +3711,10 @@ mod tests {
 
             if method == "session.reserve" {
                 return Ok(json!({"id": params["id"], "owner": "mock-reservation-owner"}));
+            }
+
+            if method == "session.compact" {
+                return Ok(json!({"compacted": false}));
             }
 
             return Ok(json!({"id": params["id"]}));
@@ -3540,6 +3794,17 @@ mod tests {
         }
     }
 
+    async fn mock_deep_delete(
+        _home: String,
+        method: String,
+        params: serde_json::Value,
+    ) -> crabbot_core::Result<serde_json::Value> {
+        assert_eq!(method, "session.delete");
+        assert_eq!(params["deep"], true);
+
+        Ok(json!({"id": params["id"], "worktree": {"status": "removed"}}))
+    }
+
     async fn delayed_answer_control(
         home: String,
         method: String,
@@ -3584,7 +3849,7 @@ mod tests {
     fn tui_advertises_only_read_only_workspace_tools() {
         let names = super::read_only_tools().into_iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(names, ["read", "list", "search"]);
+        assert_eq!(names, ["read", "list", "search", "fetch"]);
     }
 
     #[test]
@@ -3642,6 +3907,7 @@ mod tests {
             "*'\"method\":\"hello\"'*) printf '%s\\n' ",
             "'{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol\":{\"major\":0,\"minor\":1},\"id\":\"tools\",\"version\":\"0.1.0\",\"capabilities\":[\"tool\"]}}' ;;\n",
             "*'\"method\":\"list\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"items\":[\"Cargo.toml\",\"src\"]}}\\n' \"$id\" ;;\n",
+            "*'\"method\":\"fetch\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"status\":200,\"content_type\":\"text/plain\",\"text\":\"Fetched text\",\"truncated\":true}}\\n' \"$id\" ;;\n",
             "*'\"method\":\"shutdown\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"ok\":true}}\\n' \"$id\"; exit 0 ;;\n",
             "esac\n",
             "done\n",
@@ -3666,6 +3932,23 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.result.unwrap()["text"], "Cargo.toml\nsrc");
+
+        let response = super::serve_read_only_tool(
+            std::sync::Arc::clone(&tools),
+            crabbot_core::types::Request::call(
+                8,
+                "host/tool",
+                json!({"name": "fetch", "args": {"url": "https://example.com"}}),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response.result.unwrap()["text"],
+            "HTTP 200 (text/plain)\nFetched text\n[response truncated at the text limit]"
+        );
 
         if let Some(tools) = tools.lock().await.take() {
             tools.process.stop().await.unwrap();
@@ -3784,7 +4067,7 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
         fs::write(
             &input_path,
             format!(
-                "/help\n/status\n/approval\n/approvals\n/approve 0123456789abcdef01234567\n/deny 0123456789abcdef01234567\n/session list\n/session help\n/deliveries\n/retry bad id\n/drop bad id\n/plugins\n/workspace\n/workspace {}\n/workspace reset\n/timer list\n/timer add 30 break\n/timer remove 7\n/memory list\n/memory remember drink=tea\n/memory forget drink\n/model \n/model test\n/session bad!\n/new two\n/session create test-one\n/session one\n/session rename renamed\n/session archive two\n/session unarchive two\n/session unarchive missing\n/session delete two -y\n/session delete renamed -y\n/session archive renamed\n/clear\n\nhello\n/quit\n",
+                "/help\n/status\n/approval\n/approvals\n/approve 0123456789abcdef01234567\n/deny 0123456789abcdef01234567\n/session list\n/session help\n/deliveries\n/retry bad id\n/drop bad id\n/plugins\n/workspace\n/workspace {}\n/workspace reset\n/timer list\n/timer add 30 break\n/timer remove 7\n/memory list\n/memory remember drink=tea\n/memory forget drink\n/model \n/model test\n/session bad!\n/new two\n/session create test-one\n/session one\n/session rename renamed\n/session archive two\n/session unarchive two\n/session unarchive missing\n/session delete two -y\n/session delete renamed -y\n/session archive renamed\n/compact\n/clear\n\nhello\n/quit\n",
                 root.display()
             ),
         )
@@ -3818,6 +4101,7 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
         assert!(text.contains("Pending approvals:"));
         assert!(text.contains("Approval accepted."));
         assert!(text.contains("Approval denied."));
+        assert!(text.contains("There are not enough earlier turns to compact."));
         assert!(text.contains(
             "Plugins | 1–1 of 1 | page 1/1:\n└─ codex | vunknown\n   ├─ health: ready\n   ├─ capabilities: model\n   ├─ protocol: 0.0\n   ├─ commands: none\n   └─ permissions: none"
         ));

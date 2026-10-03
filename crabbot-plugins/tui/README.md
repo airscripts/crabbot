@@ -12,6 +12,8 @@ requires it for both interactive and `--once` use. Prompts, session history,
 tools, and approvals go through the shared daemon runtime. TUI tools are
 disabled by default; enable them with `[clients.tui] tools = true` in the home
 `config.toml` to opt in under the global approval policy.
+Markdown fenced code blocks appear in a labeled panel in the transcript; the
+fence's language tag is shown above the code.
 Prefix a line with `!` to run it directly through the daemon's shell. This
 requires `shell = true`, but not the Tools plugin or a separate approval; the
 command is already an explicit user action and runs in the selected workspace.
@@ -23,7 +25,7 @@ In an interactive terminal, use `/help`, `/status`, `/approval`, `/approvals`, `
 `/deny <id>`, `/session help`, `/session list`, `/deliveries`, `/retry <id>`,
 `/drop <id>`, `/model <name>`, `/new <id>`,
 `/plugins [page]`, `/workspace [path|reset]`, `/timer <list|add|remove>`, `/memory
-<list|remember|forget>`, `/clear`, and `/quit`. Plain lines are sent through
+<list|remember|forget>`, `/compact`, `/clear`, and `/quit`. Plain lines are sent through
 the configured model plugin. Sessions, selected models, and completed turns
 are persisted through authenticated daemon IPC. `/session switch <id>` resumes
 an existing session; `/new <id>` creates and selects one. `/session rename`
@@ -39,6 +41,9 @@ locks chat input until that turn finishes. The waiting state is shown as a
 System notice; approval commands remain available.
 `/workspace reset` uses `CRABBOT_ROOT` again. `/clear` removes the selected
 session's transcript and refuses to clear an active session.
+`/compact` asks the selected model to summarize older turns and keeps the two
+most recent user turns. The TUI also compacts automatically before a turn when
+the saved conversation exceeds its history threshold.
 While generation waits for an approval, start typing `/` from an empty input to
 enter `/approvals`, `/approve <id>`, or `/deny <id>` to resolve the current
 approval; ordinary chat stays locked. Hold Shift while dragging to select and

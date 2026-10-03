@@ -54,7 +54,7 @@ Brand positioning:
   protocol-only and stderr is for redacted logs. Require handshake, protocol
   range negotiation, capability advertisement, health, shutdown, correlated
   requests, streams, cancellation, deadlines, bounded frames and queues,
-  restart backoff, and circuit breaking.
+  restart backoff with capped delays and retries until shutdown or recovery.
 - Plugins may call host services but never call one another directly.
 - Normalize content, model streams, channel events, tool schemas, approvals,
   results, and artifacts before crossing a plugin boundary.

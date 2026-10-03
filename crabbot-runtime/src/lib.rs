@@ -4955,24 +4955,46 @@ async fn recover(
     name: &str,
     stop: &Stop,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    *failures = failures.saturating_add(1);
+    loop {
+        *failures = failures.saturating_add(1);
+        let delay = retry_delay(*failures);
 
-    if *failures >= 3 {
-        warn!(plugin = name, "Plugin restart circuit is open; stopping retries.");
-        return Ok(false);
+        warn!(
+            plugin = name,
+            attempt = *failures,
+            delay_seconds = delay.as_secs(),
+            "Plugin transport failed; retrying after backoff."
+        );
+
+        tokio::select! {
+            biased;
+            _ = stop.notified() => return Ok(false),
+
+            _ = tokio::time::sleep(delay) => {}
+        }
+
+        let result = tokio::select! {
+            biased;
+            _ = stop.notified() => return Ok(false),
+
+            result = process.restart() => result,
+        };
+
+        match result {
+            Ok(()) => {
+                info!(plugin = name, "Plugin restarted after a transport failure.");
+                return Ok(true);
+            }
+
+            Err(error) => {
+                warn!(
+                    plugin = name,
+                    error = %diagnostic(error.to_string()),
+                    "Plugin restart failed; retrying."
+                );
+            }
+        }
     }
-
-    let delay = retry_delay(*failures);
-    tokio::select! {
-        biased;
-        _ = stop.notified() => return Ok(false),
-
-        _ = tokio::time::sleep(delay) => {}
-    }
-
-    process.restart().await?;
-    info!(plugin = name, "Plugin restarted after a transport failure.");
-    Ok(true)
 }
 
 fn content(event: &serde_json::Value) -> Vec<Content> {
@@ -6509,6 +6531,7 @@ fn tools(shell_enabled: bool) -> Vec<ToolSpec> {
         ),
         ("list", "List workspace entries.", &["path"]),
         ("search", "Search workspace text.", &["path", "text"]),
+        ("fetch", "Fetch bounded text from a public HTTPS URL.", &["url"]),
         ("patch", "Apply an approved Git patch.", &["text"]),
         ("git", "Inspect or manage approved Git worktrees.", &["args"]),
     ];
@@ -6524,7 +6547,10 @@ fn tools(shell_enabled: bool) -> Vec<ToolSpec> {
                 .iter()
                 .map(|key| {
                     let value = match *key {
-                        "path" | "text" | "command" => serde_json::json!({"type": "string"}),
+                        "path" | "text" | "command" | "url" => {
+                            serde_json::json!({"type": "string"})
+                        }
+
                         "args" => serde_json::json!({"type": "array", "items": {"type": "string"}}),
                         _ => serde_json::json!({}),
                     };
@@ -6555,6 +6581,14 @@ mod tool_availability_tests {
     fn shell_is_only_declared_when_enabled() {
         assert!(!tools(false).iter().any(|tool| tool.name == "shell"));
         assert!(tools(true).iter().any(|tool| tool.name == "shell"));
+    }
+
+    #[test]
+    fn fetch_tool_requires_a_url() {
+        let fetch = tools(false).into_iter().find(|tool| tool.name == "fetch").unwrap();
+
+        assert_eq!(fetch.schema["required"], serde_json::json!(["url"]));
+        assert_eq!(fetch.schema["properties"]["url"]["type"], "string");
     }
 }
 
@@ -6653,6 +6687,7 @@ async fn append_memory_context(
 enum StreamNotice {
     Text(String),
     Tool(String),
+    System(String),
     Approval {
         chat: String,
         thread: Option<String>,
@@ -6698,6 +6733,8 @@ impl StreamOutput {
                 self.text.clear();
                 self.display = format!("Working with {}…", clip(name, META_LIMIT));
             }
+
+            StreamNotice::System(_) => {}
 
             StreamNotice::Approval { .. } => {}
         }
@@ -7004,6 +7041,14 @@ async fn answer(
         merge_stream(&mut parsed, notes);
         keep_one_mutation(&mut parsed.events);
         parsed.text = clip(parsed.text, TEXT_LIMIT);
+
+        if let Some(usage) = parsed.context_usage {
+            sessions
+                .lock()
+                .map_err(|_| "Session lock is poisoned.")?
+                .set_context_usage(session, usage)?;
+        }
+
         tokens = tokens.saturating_add(parsed.input.unwrap_or_default());
         tokens = tokens.saturating_add(parsed.output.unwrap_or_default());
 
@@ -8291,6 +8336,8 @@ fn windows_service_install(
             created = true;
         }
 
+        windows_service_recovery()?;
+
         let data = environment
             .iter()
             .map(|(name, value)| format!("{name}={value}"))
@@ -8374,6 +8421,28 @@ fn windows_service_configure(
         return Err(
             format!("Service configuration failed: {}", windows_command_detail(&output)).into()
         );
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_service_recovery() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let output = command_output(std::process::Command::new("sc.exe").args([
+        "failure",
+        "Crabbot",
+        "reset=",
+        "0",
+        "actions=",
+        "restart/5000/restart/5000/restart/5000",
+    ]))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "Service recovery configuration failed: {}",
+            windows_command_detail(&output)
+        )
+        .into());
     }
 
     Ok(())
@@ -8910,7 +8979,7 @@ fn service_text(executable: &Path, environment: &[(String, String)]) -> String {
             .collect::<String>();
 
         format!(
-            "[Unit]\nDescription=Crabbot agent\nAfter=network-online.target\n\n[Service]\nExecStart=\"{}\"\n{}Restart=on-failure\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=Crabbot agent\nAfter=network-online.target\nStartLimitIntervalSec=0\n\n[Service]\nExecStart=\"{}\"\n{}Restart=always\nRestartSec=5s\n\n[Install]\nWantedBy=default.target\n",
             executable.replace('\\', "\\\\").replace('"', "\\\""),
             environment
         )
@@ -9000,21 +9069,29 @@ async fn status_command(json: bool) -> Result<(), Box<dyn std::error::Error + Se
         entry.capabilities.iter().any(|capability| capability == "model") && ready(&model)
     });
 
-    let channel_ready = lock.plugins.get(&channel).is_some_and(|entry| {
+    let messaging_installed = lock
+        .plugins
+        .values()
+        .any(|entry| entry.capabilities.iter().any(|capability| capability == "channel"));
+    let messaging_selected = std::env::var_os("CRABBOT_CHANNEL").is_some();
+    let messaging_ready = lock.plugins.get(&channel).is_some_and(|entry| {
         entry.capabilities.iter().any(|capability| capability == "channel") && ready(&channel)
     });
 
     let conflicts = available_commands(&root).values().any(|owners| owners.len() > 1);
     let daemon = ipc::call(&root, "status", serde_json::json!({})).await.is_ok();
-    let health = if config_ok && model_ready && channel_ready && !conflicts {
-        "healthy"
-    } else {
-        "attention"
-    };
+    let (health, health_details) = status_health(
+        config_ok,
+        model_ready,
+        messaging_installed || messaging_selected,
+        messaging_ready,
+        conflicts,
+    );
 
     let value = serde_json::json!({
         "version": VERSION,
         "health": health,
+        "health_details": health_details,
         "daemon": if daemon { "running" } else { "stopped" },
         "intelligence": capability_status(&lock, "model"),
         "messaging": capability_status(&lock, "channel"),
@@ -9028,6 +9105,36 @@ async fn status_command(json: bool) -> Result<(), Box<dyn std::error::Error + Se
     }
 
     Ok(())
+}
+
+fn status_health(
+    config_ok: bool,
+    model_ready: bool,
+    messaging_expected: bool,
+    messaging_ready: bool,
+    conflicts: bool,
+) -> (&'static str, Vec<&'static str>) {
+    let mut details = Vec::new();
+
+    if !config_ok {
+        details.push("configuration is invalid");
+    }
+
+    if !model_ready {
+        details.push("selected intelligence plugin is not ready");
+    }
+
+    if messaging_expected && !messaging_ready {
+        details.push("selected messaging plugin is not ready");
+    }
+
+    if conflicts {
+        details.push("plugin commands have name conflicts");
+    }
+
+    let health = if details.is_empty() { "healthy" } else { "unhealthy" };
+
+    (health, details)
 }
 
 fn capability_status(lock: &Lock, capability: &str) -> serde_json::Value {
@@ -9061,12 +9168,12 @@ fn capability_text(value: &serde_json::Value) -> String {
 }
 
 fn status_text(value: &serde_json::Value, installed: usize) -> String {
-    format!(
+    let mut output = format!(
         "{:<20}{}\n{:<20}{}\n{:<20}{}\n{:<20}{}\n{:<20}{}\n{:<20}{} installed",
         "Version:",
         value["version"].as_str().unwrap_or(VERSION),
         "Health:",
-        value["health"].as_str().unwrap_or("attention"),
+        value["health"].as_str().unwrap_or("unhealthy"),
         "Background runtime:",
         value["daemon"].as_str().unwrap_or("stopped"),
         "Intelligence:",
@@ -9075,7 +9182,18 @@ fn status_text(value: &serde_json::Value, installed: usize) -> String {
         capability_text(&value["messaging"]),
         "Plugins:",
         installed
-    )
+    );
+
+    if let Some(details) = value["health_details"].as_array() {
+        let details = details.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>();
+
+        if !details.is_empty() {
+            output.push_str("\nHealth details:     ");
+            output.push_str(&details.join("; "));
+        }
+    }
+
+    output
 }
 
 async fn external_command(
@@ -12197,7 +12315,7 @@ mod tests {
     fn formats_status_as_aligned_lines() {
         let value = serde_json::json!({
             "version": super::VERSION,
-            "health": "attention",
+            "health": "unhealthy",
             "daemon": "stopped",
             "intelligence": {
                 "status": "configured",
@@ -12212,7 +12330,7 @@ mod tests {
         assert_eq!(
             super::status_text(&value, 0),
             format!(
-                "Version:            {}\nHealth:             attention\nBackground runtime: stopped\nIntelligence:       configured (codex, gemini)\nMessaging:          configured (telegram, discord)\nPlugins:            0 installed",
+                "Version:            {}\nHealth:             unhealthy\nBackground runtime: stopped\nIntelligence:       configured (codex, gemini)\nMessaging:          configured (telegram, discord)\nPlugins:            0 installed",
                 super::VERSION
             )
         );
@@ -12224,6 +12342,51 @@ mod tests {
             })),
             "not configured"
         );
+    }
+
+    #[test]
+    fn status_health_treats_messaging_as_optional_and_explains_unhealthy_state() {
+        assert_eq!(super::status_health(true, true, false, false, false), ("healthy", vec![]));
+        assert_eq!(
+            super::status_health(true, true, true, false, true),
+            (
+                "unhealthy",
+                vec![
+                    "selected messaging plugin is not ready",
+                    "plugin commands have name conflicts",
+                ],
+            )
+        );
+
+        assert_eq!(
+            super::status_health(false, false, false, false, false),
+            (
+                "unhealthy",
+                vec!["configuration is invalid", "selected intelligence plugin is not ready"],
+            )
+        );
+    }
+
+    #[test]
+    fn formats_status_health_details_only_when_present() {
+        let mut value = serde_json::json!({
+            "version": super::VERSION,
+            "health": "unhealthy",
+            "health_details": ["configuration is invalid", "plugin commands have name conflicts"],
+            "daemon": "running",
+            "intelligence": {"status": "configured", "plugins": ["codex"]},
+            "messaging": {"status": "not configured", "plugins": []},
+        });
+
+        let text = super::status_text(&value, 3);
+
+        assert!(text.ends_with(
+            "Plugins:            3 installed\nHealth details:     configuration is invalid; plugin commands have name conflicts"
+        ));
+
+        value["health_details"] = serde_json::json!([]);
+
+        assert!(!super::status_text(&value, 3).contains("Health details:"));
     }
 
     #[test]
@@ -12676,6 +12839,7 @@ mod tests {
 
         assert!(invalid.validate().is_err());
 
+        let test_home = Path::new("/tmp/crabbot-home");
         let values = env_for(
             &Manifest {
                 id: "tools".into(),
@@ -12687,14 +12851,19 @@ mod tests {
                 commands: Vec::new(),
             },
             &Config::default(),
-            Path::new("/tmp/crabbot-home"),
+            test_home,
         );
 
         assert!(values.iter().any(|(key, value)| key == "CRABBOT_SHELL" && value == "off"));
-        let expected_root =
-            std::env::var("CRABBOT_ROOT").unwrap_or_else(|_| "/tmp/crabbot-home/workspace".into());
+        let expected_root = std::env::var_os("CRABBOT_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| test_home.join("workspace"));
 
-        assert!(values.iter().any(|(key, value)| key == "CRABBOT_ROOT" && value == &expected_root));
+        assert!(
+            values
+                .iter()
+                .any(|(key, value)| { key == "CRABBOT_ROOT" && Path::new(value) == expected_root })
+        );
 
         let values = env_for(
             &Manifest {
@@ -12707,15 +12876,13 @@ mod tests {
                 commands: Vec::new(),
             },
             &Config::default(),
-            Path::new("/tmp/crabbot-home"),
+            test_home,
         );
 
         if std::env::var_os("CRABBOT_HOME").is_none() {
-            assert!(
-                values
-                    .iter()
-                    .any(|(key, value)| key == "CRABBOT_HOME" && value == "/tmp/crabbot-home")
-            );
+            assert!(values.iter().any(|(key, value)| {
+                key == "CRABBOT_HOME" && value == &test_home.display().to_string()
+            }));
         }
 
         assert!(!values.iter().any(|(key, _)| { matches!(key.as_str(), "HOME" | "USERPROFILE") }));
@@ -12724,19 +12891,22 @@ mod tests {
     #[test]
     fn propagates_default_home_and_tools_root_with_database_override() {
         let mut values = vec![("CRABBOT_DB".into(), "/tmp/crabbot.db".into())];
-        ensure_home(&mut values, Path::new("/tmp/crabbot-home"));
-        ensure_root(&mut values, Path::new("/tmp/crabbot-home"));
+        let test_home = Path::new("/tmp/crabbot-home");
+        ensure_home(&mut values, test_home);
+        ensure_root(&mut values, test_home);
+        let home_text = test_home.display().to_string();
+        let expected_root = test_home.join("workspace");
+
+        assert!(values.iter().any(|(key, value)| key == "CRABBOT_HOME" && value == &home_text));
 
         assert!(
-            values.iter().any(|(key, value)| key == "CRABBOT_HOME" && value == "/tmp/crabbot-home")
+            values
+                .iter()
+                .any(|(key, value)| { key == "CRABBOT_ROOT" && Path::new(value) == expected_root })
         );
 
-        assert!(values.iter().any(|(key, value)| {
-            key == "CRABBOT_ROOT" && value == "/tmp/crabbot-home/workspace"
-        }));
-
         let mut configured = vec![("CRABBOT_ROOT".into(), "/work/project".into())];
-        ensure_root(&mut configured, Path::new("/tmp/crabbot-home"));
+        ensure_root(&mut configured, test_home);
 
         assert_eq!(configured, [("CRABBOT_ROOT".into(), "/work/project".into())]);
     }
@@ -12860,7 +13030,9 @@ mod tests {
         assert!(!text.contains("serve"));
         #[cfg(target_os = "linux")]
         {
-            assert!(text.contains("Restart=on-failure"));
+            assert!(text.contains("Restart=always"));
+            assert!(text.contains("RestartSec=5s"));
+            assert!(text.contains("StartLimitIntervalSec=0"));
             assert!(!text.contains("ExecStart=\\\""));
         }
 
@@ -14037,6 +14209,7 @@ mod tests {
             stop: "tool".into(),
             input: None,
             output: None,
+            context_usage: None,
             events: vec![
                 Event::Tool {
                     name: "read".into(),
@@ -14080,6 +14253,7 @@ mod tests {
             stop: "tool".into(),
             input: None,
             output: None,
+            context_usage: None,
             events: vec![Event::Tool {
                 name: "patch".into(),
                 args: args.clone(),
@@ -14103,6 +14277,7 @@ mod tests {
                 stop: "tool".into(),
                 input: None,
                 output: None,
+                context_usage: None,
                 events: vec![Event::Tool {
                     name,
                     args: serde_json::json!({}),
@@ -14126,6 +14301,7 @@ mod tests {
             stop: "tool".into(),
             input: None,
             output: None,
+            context_usage: None,
             events: (0..super::CONTENT_LIMIT)
                 .map(|index| Event::Tool {
                     name: "patch".into(),
@@ -14161,6 +14337,7 @@ mod tests {
             stop: "stop".into(),
             input: None,
             output: None,
+            context_usage: None,
             events: vec![
                 Event::Text { text: "Hello ".into() },
                 Event::Text { text: "world".into() },
@@ -14203,6 +14380,7 @@ mod tests {
             stop: "stop".into(),
             input: None,
             output: None,
+            context_usage: None,
             events: Vec::new(),
         };
 
@@ -14420,15 +14598,33 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn opens_the_plugin_restart_circuit() {
-        let script = "while IFS= read -r line; do case \"$line\" in *hello*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol\":{\"major\":0,\"minor\":1},\"id\":\"test\",\"version\":\"0.1.0\",\"capabilities\":[]}}' ;; *shutdown*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":9999,\"result\":{\"ok\":true}}'; exit 0 ;; esac; done";
-        let process = Process::start_with("sh", ["-c", script]).await.unwrap();
-        let process = Live::new(process);
-        let mut failures = 3;
+    async fn plugin_restart_backoff_keeps_retrying_with_a_cap() {
+        assert_eq!(super::retry_delay(1), std::time::Duration::from_secs(2));
+        assert_eq!(super::retry_delay(4), std::time::Duration::from_secs(16));
+        assert_eq!(super::retry_delay(100), std::time::Duration::from_secs(30));
+    }
 
-        assert!(!recover(&process, &mut failures, "test", &Stop::new()).await.unwrap());
-        assert_eq!(failures, 4);
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn keeps_retrying_after_a_plugin_restart_fails() {
+        let root = test_root("restart-retry");
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join("fail-once");
+        let script = format!(
+            "if [ -e '{}' ]; then rm -f '{}'; exit 1; fi\nwhile IFS= read -r line; do case \"$line\" in *hello*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocol\":{{\"major\":0,\"minor\":1}},\"id\":\"test\",\"version\":\"0.1.0\",\"capabilities\":[]}}}}' ;; *shutdown*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":9999,\"result\":{{\"ok\":true}}}}'; exit 0 ;; esac; done",
+            marker.display(),
+            marker.display()
+        );
+
+        let process = Process::start_with("sh", ["-c", &script]).await.unwrap();
+        let process = Live::new(process);
+        fs::write(&marker, "fail next startup").unwrap();
+        let mut failures = 0;
+
+        assert!(recover(&process, &mut failures, "test", &Stop::new()).await.unwrap());
+        assert_eq!(failures, 2);
         process.stop().await.unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

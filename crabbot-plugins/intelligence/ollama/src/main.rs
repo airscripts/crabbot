@@ -270,6 +270,7 @@ where
             stop,
             input: input_tokens,
             output: output_tokens,
+            context_usage: None,
             events,
         })?,
     )
@@ -533,6 +534,7 @@ fn stream_body(
             stop,
             input: None,
             output: None,
+            context_usage: None,
             events: Vec::new(),
         })?,
     )
@@ -582,6 +584,7 @@ fn response_body(
             stop: body["done_reason"].as_str().unwrap_or("stop").into(),
             input: body["prompt_eval_count"].as_u64(),
             output: body["eval_count"].as_u64(),
+            context_usage: None,
             events,
         })?,
     )

@@ -111,10 +111,14 @@ uses the default config and an empty plugin list. If the output Crabfile is
 already present, export stops without changing it; pass `--force` to overwrite
 that file.
 
-`crabbot status` prints aligned installation health, background runtime state, intelligence
-setup, messaging setup, version, and the installed plugin count. Use `--json`
-for automation; capability fields are objects with a `status` and `plugins`
-array.
+`crabbot status` prints aligned installation health, background runtime state,
+intelligence setup, messaging setup, version, and the installed plugin count.
+Messaging is optional for local CLI and TUI use; health only requires a ready
+messaging plugin when one is installed or explicitly selected. Health is
+`unhealthy` when a required setup check fails, and the output lists the reasons.
+Use `--json` for automation; the
+health details are in `health_details`, and capability fields are objects with
+a `status` and `plugins` array.
 
 `crabbot tui` opens a full-screen terminal chat with a scrollable conversation
 and an editable message box. Press Enter to send, Ctrl+O to add a line,
@@ -128,15 +132,17 @@ the Crabbot version and `/help` hint. `/help` lists commands available in this s
 conditional commands appear only when their plugin capability and required
 background runtime are available. Plugin-contributed commands remain CLI
 commands and are run as `crab <command>`. `/model` shows the current model;
-`/model <id>` changes it when an intelligence plugin is installed. Configure
-the bottom line with `/statusline`, for example
-`/statusline {name} · model: {model} · session: {session}`. The built-in
-statusline labels model and session values explicitly. Supported placeholders are
-`{name}`, `{model}`, `{session}`, `{workspace}`, and `{status}`. Use
-`/statusline reset` to restore the built-in default. Custom formats are saved
-to `<CRABBOT_HOME>/data/plugins/tui/preferences.toml`. The displayed Crabbot
-name defaults to `Crabbot` and can be changed globally with `name` in
-`config.toml`.
+`/model <id>` changes it when an intelligence plugin is installed. Use
+`/statusline` to open a checkbox menu for the title, model, context fill,
+session, workspace, and status. Move with Up/Down, toggle with Space, save with
+Enter, or cancel with Escape. At least one detail stays enabled. Long lines
+scroll across the footer so each enabled detail remains available. Context fill
+shows the latest provider-reported token count and model limit, for example
+`12,345/128,000 (9.6%)`; it shows `context: unavailable` when the provider does
+not report both values. Use `/statusline reset` to restore the default choices.
+Choices are saved to `<CRABBOT_HOME>/data/plugins/tui/preferences.toml`. The
+displayed Crabbot name defaults to `Crabbot` and can be changed globally with
+`name` in `config.toml`.
 When no intelligence plugin is installed, the statusline shows the model as
 `unset`, regardless of the model value saved in the session.
 
@@ -279,7 +285,11 @@ deleting it; repeating either action reports that the session is already in
 that state. Add `--all` to archive, unarchive, or delete every matching session;
 the active session is always kept for archive/delete. `/session delete <id>...`
 permanently deletes sessions and requires `-y` or `--yes`; `--all` also requires
-confirmation. Command action
+confirmation. Add `--deep` to also remove the matching shared session record
+and the TUI's local fallback entry; when that removes the final local entry, the
+fallback JSON file is deleted. Without `--deep`, deletion keeps the current
+behavior.
+Command action
 errors show the specific actionable error directly, without a redundant
 operation-failed prefix; add operation context only when the underlying error
 does not explain the failure. `/new <id>` is a shortcut for session creation.

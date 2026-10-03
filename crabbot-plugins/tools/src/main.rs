@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicU64;
 use std::{
     ffi::OsString,
     io::{ErrorKind, Read, Write},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Component, Path, PathBuf},
     sync::{
         Arc, OnceLock,
@@ -25,9 +26,11 @@ use rustix::{
     process::{Pid, Signal, getpgid, getpgrp, kill_process, kill_process_group},
 };
 
+use reqwest::{Url, header::ACCEPT};
 use serde_json::json;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    net::lookup_host,
     process::{Child, Command},
     sync::Semaphore,
     time::timeout,
@@ -44,8 +47,14 @@ const SEARCH_FILES: usize = 10_000;
 const SEARCH_BYTES: u64 = 256 * 1024 * 1024;
 const SEARCH_DEPTH: usize = 64;
 const SEARCH_TIME: Duration = Duration::from_secs(10);
+const FETCH_TIME: Duration = Duration::from_secs(15);
+const FETCH_CONNECT_TIME: Duration = Duration::from_secs(3);
+const FETCH_BODY_LIMIT: usize = 2 * 1024 * 1024;
+const FETCH_TEXT_LIMIT: usize = 48 * 1024;
+const FETCH_REDIRECT_LIMIT: usize = 3;
 const COMMAND_LIMIT: Duration = Duration::from_secs(120);
 static SEARCHES: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static FETCHES: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static TEMP_FILES: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::main]
@@ -168,6 +177,11 @@ async fn call_with_sandbox(
 
             let hits = result?;
             json!({"hits": hits})
+        }
+
+        "fetch" => {
+            let url = params["url"].as_str().ok_or_else(|| denied("fetch.url is required"))?;
+            fetch_url(url).await?
         }
 
         "patch" => {
@@ -746,6 +760,212 @@ fn kill_group(group: Pid, signal: Signal) {
             let _ = kill_process(pid, signal);
         }
     }
+}
+
+async fn fetch_url(value: &str) -> crabbot_core::Result<serde_json::Value> {
+    let permit = timeout(FETCH_TIME, fetches().acquire_owned())
+        .await
+        .map_err(|_| denied("Web fetch exceeded the hard time limit"))?
+        .map_err(|_| denied("Web fetch is unavailable"))?;
+
+    timeout(FETCH_TIME, async move {
+        let _permit = permit;
+        fetch_url_bounded(value).await
+    })
+    .await
+    .map_err(|_| denied("Web fetch exceeded the hard time limit"))?
+}
+
+fn fetches() -> Arc<Semaphore> {
+    Arc::clone(FETCHES.get_or_init(|| Arc::new(Semaphore::new(4))))
+}
+
+async fn fetch_url_bounded(value: &str) -> crabbot_core::Result<serde_json::Value> {
+    let mut url = fetch_url_parse(value)?;
+
+    for redirect in 0..=FETCH_REDIRECT_LIMIT {
+        let host =
+            url.host_str().ok_or_else(|| denied("Web fetch URL must include a public host"))?;
+
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| denied("Web fetch URL has no supported port"))?;
+
+        if port != 443 {
+            return Err(denied("Web fetch only supports HTTPS on port 443"));
+        }
+
+        let lookup = timeout(FETCH_CONNECT_TIME, lookup_host((host, port)))
+            .await
+            .map_err(|_| denied("Web fetch host lookup timed out"))?
+            .map_err(|_| denied("Web fetch host lookup failed"))?;
+
+        let addresses = lookup.collect::<Vec<_>>();
+
+        if addresses.is_empty() || addresses.iter().any(|address| !public_ip(address.ip())) {
+            return Err(denied("Web fetch may only connect to public IP addresses"));
+        }
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(FETCH_CONNECT_TIME)
+            .timeout(FETCH_TIME)
+            .resolve_to_addrs(host, &addresses)
+            .build()
+            .map_err(|_| denied("Web fetch client could not be configured"))?;
+
+        let mut response = client
+            .get(url.clone())
+            .header(ACCEPT, "text/html, text/plain, application/json, */*;q=0.5")
+            .send()
+            .await
+            .map_err(|_| denied("Web fetch request failed"))?;
+
+        let status = response.status();
+
+        if status.is_redirection() {
+            if redirect == FETCH_REDIRECT_LIMIT {
+                return Err(denied("Web fetch exceeded the redirect limit"));
+            }
+
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| denied("Web fetch redirect did not include a valid location"))?;
+
+            let next =
+                url.join(location).map_err(|_| denied("Web fetch redirect URL is invalid"))?;
+
+            url = fetch_url_parse(next.as_str())?;
+
+            continue;
+        }
+
+        if response.content_length().is_some_and(|length| length > FETCH_BODY_LIMIT as u64) {
+            return Err(denied("Web fetch response exceeded the body limit"));
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("unknown")
+            .chars()
+            .take(256)
+            .collect::<String>();
+
+        let mut body = Vec::new();
+
+        while let Some(chunk) =
+            response.chunk().await.map_err(|_| denied("Web fetch response could not be read"))?
+        {
+            if body.len().saturating_add(chunk.len()) > FETCH_BODY_LIMIT {
+                return Err(denied("Web fetch response exceeded the body limit"));
+            }
+
+            body.extend_from_slice(&chunk);
+        }
+
+        let mut text = String::from_utf8_lossy(&body).into_owned();
+        let truncated = text.len() > FETCH_TEXT_LIMIT;
+
+        if truncated {
+            let mut end = FETCH_TEXT_LIMIT;
+
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+
+            text.truncate(end);
+        }
+
+        return Ok(json!({
+            "status": status.as_u16(),
+            "content_type": content_type,
+            "text": text,
+            "truncated": truncated,
+        }));
+    }
+
+    Err(denied("Web fetch exceeded the redirect limit"))
+}
+
+fn fetch_url_parse(value: &str) -> crabbot_core::Result<Url> {
+    if value.len() > 8 * 1024 {
+        return Err(denied("Web fetch URL exceeded the length limit"));
+    }
+
+    let url = Url::parse(value).map_err(|_| denied("Web fetch URL is invalid"))?;
+
+    if url.scheme() != "https" || url.username() != "" || url.password().is_some() {
+        return Err(denied("Web fetch requires an HTTPS URL without credentials"));
+    }
+
+    if url.port().is_some_and(|port| port != 443) {
+        return Err(denied("Web fetch only supports HTTPS on port 443"));
+    }
+
+    let host = url.host_str().ok_or_else(|| denied("Web fetch URL must include a public host"))?;
+    let host = host.to_ascii_lowercase();
+
+    if host == "localhost"
+        || [".localhost", ".local", ".internal", ".test", ".invalid", ".example"]
+            .iter()
+            .any(|suffix| host.ends_with(suffix))
+    {
+        return Err(denied("Web fetch may not access local hostnames"));
+    }
+
+    Ok(url)
+}
+
+fn public_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => public_ipv4(address),
+        IpAddr::V6(address) => public_ipv6(address),
+    }
+}
+
+fn public_ipv4(address: Ipv4Addr) -> bool {
+    let value = u32::from(address);
+    let in_range = |network: Ipv4Addr, prefix: u32| {
+        let mask = u32::MAX << (32 - prefix);
+        value & mask == u32::from(network) & mask
+    };
+
+    !(address.is_unspecified()
+        || address.is_private()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.is_multicast()
+        || address.is_broadcast()
+        || in_range(Ipv4Addr::new(0, 0, 0, 0), 8)
+        || in_range(Ipv4Addr::new(100, 64, 0, 0), 10)
+        || in_range(Ipv4Addr::new(192, 0, 0, 0), 24)
+        || in_range(Ipv4Addr::new(192, 0, 2, 0), 24)
+        || in_range(Ipv4Addr::new(192, 88, 99, 0), 24)
+        || in_range(Ipv4Addr::new(198, 18, 0, 0), 15)
+        || in_range(Ipv4Addr::new(198, 51, 100, 0), 24)
+        || in_range(Ipv4Addr::new(203, 0, 113, 0), 24)
+        || in_range(Ipv4Addr::new(240, 0, 0, 0), 4))
+}
+
+fn public_ipv6(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    let global_unicast = segments[0] & 0xe000 == 0x2000;
+    let documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+    let teredo = segments[0] == 0x2001 && segments[1] == 0;
+    let orchid = segments[0] == 0x2001 && segments[1] & 0xfff0 == 0x0010;
+    let six_to_four = segments[0] == 0x2002;
+
+    global_unicast
+        && !documentation
+        && !teredo
+        && !orchid
+        && !six_to_four
+        && address.to_ipv4_mapped().is_none()
 }
 
 fn denied(error: impl Into<String>) -> crabbot_core::Error {
@@ -1401,8 +1621,8 @@ fn read_text(file: std::fs::File) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ENTRY_LIMIT, Policy, Sandbox, Shell, apply, call, confined, denied, file, git,
-        list_confined, patch_paths, search, shell, shell_with,
+        ENTRY_LIMIT, Policy, Sandbox, Shell, apply, call, confined, denied, fetch_url_parse, file,
+        git, list_confined, patch_paths, public_ip, search, shell, shell_with,
     };
 
     use crabbot_core::types::{Request, Response};
@@ -1440,6 +1660,46 @@ mod tests {
             Sandbox::parse(Some("docker"), Some("local/tool:latest")).unwrap(),
             Some(Sandbox { runtime: "docker".into(), image: "local/tool:latest".into() })
         );
+    }
+
+    #[test]
+    fn web_fetch_requires_safe_https_urls_and_public_addresses() {
+        assert!(fetch_url_parse("https://example.com/article").is_ok());
+        assert!(fetch_url_parse("https://example.com:444/article").is_err());
+        assert!(fetch_url_parse("http://example.com/article").is_err());
+        assert!(fetch_url_parse("https://user@example.com/").is_err());
+        assert!(fetch_url_parse("https://localhost/").is_err());
+        assert!(fetch_url_parse("https://service.internal/").is_err());
+
+        assert!(public_ip("8.8.8.8".parse().unwrap()));
+        assert!(public_ip("2606:4700:4700::1111".parse().unwrap()));
+        assert!(!public_ip("127.0.0.1".parse().unwrap()));
+        assert!(!public_ip("10.0.0.4".parse().unwrap()));
+        assert!(!public_ip("169.254.169.254".parse().unwrap()));
+        assert!(!public_ip("100.100.100.200".parse().unwrap()));
+        assert!(!public_ip("::1".parse().unwrap()));
+        assert!(!public_ip("fd00::1".parse().unwrap()));
+        assert!(!public_ip("2001:db8::1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn web_fetch_rejects_non_https_requests_without_network_access() {
+        let root = test_root("crabbot-tools-fetch");
+        fs::create_dir_all(&root).unwrap();
+
+        assert!(
+            call(&policy(&root), Request::call(9, "fetch", json!({"url": "http://example.com/"})))
+                .await
+                .is_err()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn web_fetch_denies_private_ip_literals_before_connecting() {
+        assert!(super::fetch_url("https://127.0.0.1/").await.is_err());
+        assert!(super::fetch_url("https://[::1]/").await.is_err());
     }
 
     #[test]

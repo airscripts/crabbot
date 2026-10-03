@@ -17,7 +17,17 @@ make verify
 
 Lefthook runs fast checks before commits. `make verify` runs formatting,
 Clippy, locked compilation, all tests, coverage, builds, and metrics. Provider
-tests use local fixtures and never call paid APIs.
+tests use local fixtures and never call paid APIs. Every implementation
+handoff must finish with the configured coverage gates passing; run `make verify`
+at the end of each work turn and resolve coverage failures without lowering
+thresholds.
+
+Coverage verification requires localhost loopback access. Some provider and
+channel integration tests return early when binding `127.0.0.1` fails with
+`PermissionDenied`; the test process can still exit successfully while coverage
+is understated. If coverage falls below a package threshold in a restricted
+sandbox, rerun `make verify` with loopback access before calling the gate failed.
+Do not lower thresholds to work around skipped integration tests.
 
 ## Formatting
 

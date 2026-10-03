@@ -130,8 +130,16 @@ pub struct ModelReply {
     pub stop: String,
     pub input: Option<u64>,
     pub output: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<ContextUsage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<Event>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextUsage {
+    pub used: u64,
+    pub limit: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -341,6 +349,21 @@ mod tests {
 
         assert_eq!(request.workspace, None);
         assert!(serde_json::to_value(request).unwrap().get("workspace").is_none());
+    }
+
+    #[test]
+    fn model_replies_accept_legacy_payloads_without_context_usage() {
+        let value = serde_json::json!({
+            "text": "hello",
+            "stop": "stop",
+            "input": null,
+            "output": null
+        });
+
+        let reply: ModelReply = serde_json::from_value(value).unwrap();
+
+        assert_eq!(reply.context_usage, None);
+        assert!(serde_json::to_value(reply).unwrap().get("context_usage").is_none());
     }
 
     #[test]

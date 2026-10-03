@@ -333,6 +333,7 @@ where
             stop: "stream".into(),
             input: None,
             output: None,
+            context_usage: None,
             events,
         })?,
     )
@@ -445,6 +446,7 @@ fn response_body(
             stop: choice["finish_reason"].as_str().unwrap_or("stop").into(),
             input: body["usage"]["prompt_tokens"].as_u64(),
             output: body["usage"]["completion_tokens"].as_u64(),
+            context_usage: None,
             events,
         })?,
     )
@@ -482,7 +484,7 @@ mod tests {
 
     use crabbot_core::types::{Content, Message, ModelRequest, Request, Role, ToolSpec};
     use futures_util::stream;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn loopback_listener() -> Option<tokio::net::TcpListener> {
@@ -557,6 +559,86 @@ mod tests {
             .collect();
 
         assert_eq!(tools(&too_many).len(), TOOL_LIMIT);
+    }
+
+    #[test]
+    fn maps_assistant_and_mixed_content_for_the_provider() {
+        let mut input = model();
+
+        input.messages = vec![
+            Message {
+                id: "assistant".into(),
+                session: "session".into(),
+                role: Role::Assistant,
+                sender: None,
+                content: vec![Content::Text { text: "answer".into() }],
+            },
+            Message {
+                id: "system-image".into(),
+                session: "session".into(),
+                role: Role::System,
+                sender: None,
+                content: vec![Content::Image {
+                    uri: "file:///not-forwarded".into(),
+                    alt: Some("diagram".into()),
+                }],
+            },
+            Message {
+                id: "attachments".into(),
+                session: "session".into(),
+                role: Role::User,
+                sender: None,
+                content: vec![
+                    Content::File {
+                        uri: "file:///notes.txt".into(),
+                        name: "notes.txt".into(),
+                        mime: Some("text/plain".into()),
+                    },
+                    Content::Audio { uri: "file:///voice.ogg".into(), mime: None },
+                    Content::Image { uri: "https://cdn.example/attachment.png".into(), alt: None },
+                ],
+            },
+        ];
+
+        let values = messages(&input).unwrap();
+
+        assert_eq!(values[0], json!({"role":"assistant","content":"answer"}));
+        assert_eq!(values[1]["content"], "diagram");
+
+        assert_eq!(
+            values[2]["content"],
+            json!([
+                {"type":"text","text":"[File: notes.txt]"},
+                {"type":"text","text":"[Audio attachment.]"},
+                {"type":"image_url","image_url":{"url":"https://cdn.example/attachment.png"}}
+            ])
+        );
+
+        input.messages[2].content[2] = Content::Image { uri: "file:///bad.png".into(), alt: None };
+
+        assert!(messages(&input).is_err());
+
+        input.messages[2].content[0] = Content::ToolCall {
+            name: "read".into(),
+            args: json!({"path":"README.md"}),
+            id: None,
+            thought_signature: None,
+        };
+
+        input.messages[2].content[2] =
+            Content::Image { uri: "https://cdn.example/attachment.png".into(), alt: None };
+
+        assert!(messages(&input).unwrap()[2]["content"].to_string().contains("[Tool call read]"));
+    }
+
+    #[test]
+    fn bounds_and_validates_tool_definitions_and_image_references() {
+        let mut input = model();
+        input.tools[0].description = None;
+
+        assert_eq!(tools(&input)[0]["function"]["description"], Value::Null);
+        assert!(image("data:text/plain;base64,abc").is_err());
+        assert!(image("https://cdn.example/image.png").is_ok());
     }
 
     #[tokio::test]
@@ -643,6 +725,41 @@ mod tests {
         assert!(
             response_body(1, reqwest::StatusCode::OK, json!({"choices":[{"message":{}}]})).is_err()
         );
+
+        let default_stop = response_body(
+            2,
+            reqwest::StatusCode::OK,
+            json!({"choices":[{"message":{"content":"ok"}}]}),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(default_stop.result.unwrap()["stop"], "stop");
+    }
+
+    #[tokio::test]
+    async fn handles_sparse_and_malformed_stream_deltas() {
+        let mut text = String::new();
+        let mut pending = String::new();
+        let mut calls = std::collections::BTreeMap::new();
+
+        assert!(!stream_line(b"event: ping\n", &mut text, &mut pending, &mut calls).unwrap());
+        assert!(!stream_line(b"data: {}\n", &mut text, &mut pending, &mut calls).unwrap());
+        assert!(stream_line(
+            br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]}}]}"#,
+            &mut text,
+            &mut pending,
+            &mut calls,
+        )
+        .is_ok());
+
+        let (output, _) = tokio::sync::mpsc::channel(1);
+        let mut emitter = crabbot_core::plugin::Emitter::new(output);
+        let incomplete = stream::iter(vec![Ok::<_, std::io::Error>(
+            br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]}}]}"#.to_vec(),
+        )]);
+
+        assert!(stream_body(3, incomplete, &mut emitter).await.is_err());
     }
 
     #[tokio::test]

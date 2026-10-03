@@ -404,6 +404,7 @@ where
             stop: "stream".into(),
             input: None,
             output: None,
+            context_usage: None,
             events,
         })?,
     )
@@ -526,6 +527,7 @@ fn response_body(
             stop: choice["finish_reason"].as_str().unwrap_or("stop").into(),
             input: usage["prompt_tokens"].as_u64(),
             output: usage["completion_tokens"].as_u64(),
+            context_usage: None,
             events,
         })?,
     )

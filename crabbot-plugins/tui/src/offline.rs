@@ -531,6 +531,27 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn deep_delete_removes_only_the_selected_fallback_session() {
+        let root = home();
+        let home = root.to_string_lossy().into_owned();
+        let path = super::super::data::plugin_file(&root, "tui", "sessions.json");
+
+        control(&home, "session.new", json!({"id": "first", "model": "test"})).await.unwrap();
+        control(&home, "session.new", json!({"id": "second", "model": "test"})).await.unwrap();
+
+        assert!(super::super::data::delete_fallback_session(&home, "first").unwrap());
+        assert!(path.is_file());
+        assert!(control(&home, "session.get", json!({"id": "second"})).await.is_ok());
+        assert!(control(&home, "session.get", json!({"id": "first"})).await.is_err());
+
+        assert!(super::super::data::delete_fallback_session(&home, "second").unwrap());
+        assert!(!path.exists());
+        assert!(!super::super::data::delete_fallback_session(&home, "second").unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn serializes_concurrent_local_session_updates() {
         let root = home();

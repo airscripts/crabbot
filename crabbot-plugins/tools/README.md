@@ -15,6 +15,13 @@ worktree mutations need explicit approval.
 Git inspection allows status, diff, worktree listing, and approved worktree
 add/remove operations within that active workspace.
 
+The read-only `fetch` tool retrieves bounded text from public HTTPS URLs. It
+blocks local and private network addresses, pins requests to validated DNS
+addresses, rechecks redirects, caps redirects at three and response bodies at
+2 MiB, and returns at most 48 KiB of text. Fetch requests have a 15-second
+deadline and a four-request concurrency limit. The plugin declares its network
+permission in the manifest.
+
 Approved shell commands run on the host only when no container sandbox is
 configured. To isolate them, set `CRABBOT_SANDBOX_RUNTIME` to `docker` or
 `podman` and `CRABBOT_SANDBOX_IMAGE` to an image already available locally.

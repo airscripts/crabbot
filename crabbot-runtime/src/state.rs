@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crabbot_core::types::{Message, Role};
+use crabbot_core::types::{ContextUsage, Message, Role};
 use crabbot_file::{load as load_file, private as private_file, save as save_file};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -89,6 +89,12 @@ pub struct Session {
     #[serde(default = "direct")]
     pub private: bool,
     pub messages: Vec<Message>,
+    #[serde(default)]
+    pub compacted_through: Option<String>,
+    #[serde(default)]
+    pub compacted_context: Option<Vec<Message>>,
+    #[serde(default)]
+    pub context_usage: Option<ContextUsage>,
     #[serde(default)]
     pub queued: Vec<Message>,
     #[serde(default)]
@@ -414,6 +420,9 @@ impl Store {
                     thread: None,
                     private: true,
                     messages: Vec::new(),
+                    compacted_through: None,
+                    compacted_context: None,
+                    context_usage: None,
                     queued: Vec::new(),
                     queue_roles: BTreeMap::new(),
                     inflight: None,
@@ -569,6 +578,38 @@ impl Store {
         self.push_with_status(id, message, true, true)
     }
 
+    pub fn set_compacted_context_reserved(
+        &mut self,
+        id: &str,
+        owner: &str,
+        context: Vec<Message>,
+    ) -> std::io::Result<()> {
+        let session = self.sessions.get(id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "Session was not found.")
+        })?;
+
+        if session.inflight.is_some()
+            || session.status != "working"
+            || session.reservation_owner.as_deref() != Some(owner)
+            || context.iter().any(|message| message.session != id)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Session reservation is unavailable.",
+            ));
+        }
+
+        self.change(|store| {
+            if let Some(session) = store.sessions.get_mut(id) {
+                session.compacted_through =
+                    session.messages.last().map(|message| message.id.clone());
+                session.compacted_context = Some(context);
+                session.context_usage = None;
+                session.updated = now();
+            }
+        })
+    }
+
     fn push_with_status(
         &mut self,
         id: &str,
@@ -619,6 +660,9 @@ impl Store {
         self.change(|store| {
             if let Some(session) = store.sessions.get_mut(id) {
                 session.messages.clear();
+                session.compacted_through = None;
+                session.compacted_context = None;
+                session.context_usage = None;
                 session.updated = now();
             }
         })
@@ -1183,7 +1227,31 @@ impl Store {
             };
 
             session.model = model.into();
+            session.context_usage = None;
             session.updated = now();
+        })
+    }
+
+    pub fn set_context_usage(&mut self, id: &str, usage: ContextUsage) -> std::io::Result<()> {
+        if usage.limit == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Context usage is invalid.",
+            ));
+        }
+
+        if !self.sessions.contains_key(id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Session was not found.",
+            ));
+        }
+
+        self.change(|store| {
+            if let Some(session) = store.sessions.get_mut(id) {
+                session.context_usage = Some(usage);
+                session.updated = now();
+            }
         })
     }
 
@@ -1260,6 +1328,16 @@ impl Store {
                 })
                 .collect();
 
+            let compacted_context = source.compacted_context.map(|messages| {
+                messages
+                    .into_iter()
+                    .map(|mut message| {
+                        message.session = target.clone();
+                        message
+                    })
+                    .collect()
+            });
+
             store.sessions.insert(
                 target.clone(),
                 Session {
@@ -1272,6 +1350,9 @@ impl Store {
                     thread: source.thread,
                     private: source.private,
                     messages,
+                    compacted_through: source.compacted_through,
+                    compacted_context,
+                    context_usage: source.context_usage,
                     queued: Vec::new(),
                     queue_roles: BTreeMap::new(),
                     inflight: None,
@@ -1346,6 +1427,41 @@ impl Store {
         self.change(|store| {
             store.sessions.remove(id);
         })
+    }
+
+    pub fn remove_deep(&mut self, id: &str) -> std::io::Result<()> {
+        let session = self.sessions.get(id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "Session was not found.")
+        })?;
+
+        let bytes = serde_json::to_vec(session).map_err(std::io::Error::other)?;
+        let record_key = session_record_key(&bytes);
+
+        self.remove(id)?;
+
+        let Some(path) = self.path.as_deref().filter(|path| session_catalog(path)) else {
+            return Ok(());
+        };
+
+        if self.sessions.values().any(|session| {
+            serde_json::to_vec(session)
+                .ok()
+                .is_some_and(|bytes| session_record_key(&bytes) == record_key)
+        }) {
+            return Ok(());
+        }
+
+        let record = path
+            .parent()
+            .expect("catalog has parent")
+            .join("records")
+            .join(format!("{record_key}.json"));
+
+        match std::fs::remove_file(record) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn purge(
@@ -2177,7 +2293,7 @@ fn seen_now() -> u64 {
 mod tests {
     use super::{DeliveryStatus, LIMIT, Session, Store, compact_messages, save_file, valid};
 
-    use crabbot_core::types::{Content, Message, Role};
+    use crabbot_core::types::{Content, ContextUsage, Message, Role};
     use std::collections::BTreeMap;
 
     fn message(id: usize, session: &str) -> Message {
@@ -2188,6 +2304,39 @@ mod tests {
             sender: None,
             content: vec![Content::Text { text: "hello".into() }],
         }
+    }
+
+    #[test]
+    fn stores_reserved_compacted_context_without_replacing_history() {
+        let root = std::env::temp_dir().join(format!("crabbot-replace-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let path = root.join("sessions.json");
+        let mut store = Store::load(&path).unwrap();
+        store.create("main", "local").unwrap();
+        store.append("main", message(1, "main")).unwrap();
+        store.reserve("main", "owner".into()).unwrap();
+
+        assert_eq!(
+            store.set_compacted_context_reserved("main", "other", Vec::new()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        store.set_compacted_context_reserved("main", "owner", vec![message(2, "main")]).unwrap();
+
+        assert_eq!(store.sessions["main"].messages, vec![message(1, "main")]);
+        assert_eq!(store.sessions["main"].compacted_context, Some(vec![message(2, "main")]));
+
+        drop(store);
+
+        let restored = Store::load(&path).unwrap();
+
+        assert_eq!(restored.sessions["main"].messages, vec![message(1, "main")]);
+        assert_eq!(restored.sessions["main"].compacted_context, Some(vec![message(2, "main")]));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2445,6 +2594,9 @@ mod tests {
                 thread: None,
                 private: true,
                 messages: Vec::new(),
+                compacted_through: None,
+                compacted_context: None,
+                context_usage: None,
                 queued: Vec::new(),
                 queue_roles: BTreeMap::new(),
                 inflight: None,
@@ -2485,6 +2637,30 @@ mod tests {
 
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_context_usage_and_clears_it_when_model_changes() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-context-usage-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("sessions.json");
+        let mut store = Store::load(&path).unwrap();
+        store.create("main", "codex/model").unwrap();
+        store.set_context_usage("main", ContextUsage { used: 12345, limit: 128000 }).unwrap();
+
+        let mut loaded = Store::load(&path).unwrap();
+
+        assert_eq!(
+            loaded.sessions["main"].context_usage,
+            Some(ContextUsage { used: 12345, limit: 128000 })
+        );
+
+        loaded.set_model("main", "other/model").unwrap();
+
+        assert_eq!(loaded.sessions["main"].context_usage, None);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3165,6 +3341,38 @@ mod tests {
         assert_eq!(loaded.offset("telegram"), 9);
         assert_eq!(loaded.outbox.len(), 1);
         assert!(root.join("data/sessions/state/deliveries/records").is_dir());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deep_remove_deletes_the_shared_record_but_regular_remove_keeps_it() {
+        let root = std::env::temp_dir().join(format!("crabbot-deep-remove-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("data/sessions/index.json");
+        let mut store = Store::load(&path).unwrap();
+
+        store.create("regular", "model").unwrap();
+        let regular_bytes = serde_json::to_vec(&store.sessions["regular"]).unwrap();
+        let regular_key = super::session_record_key(&regular_bytes);
+        let regular_record = root.join(format!("data/sessions/records/{regular_key}.json"));
+
+        assert!(regular_record.is_file());
+        store.remove("regular").unwrap();
+
+        assert!(regular_record.is_file());
+
+        store.create("deep", "model").unwrap();
+        let deep_bytes = serde_json::to_vec(&store.sessions["deep"]).unwrap();
+        let deep_key = super::session_record_key(&deep_bytes);
+        let deep_record = root.join(format!("data/sessions/records/{deep_key}.json"));
+
+        assert!(deep_record.is_file());
+        store.remove_deep("deep").unwrap();
+
+        assert!(!deep_record.exists());
+        assert!(!store.sessions.contains_key("deep"));
 
         let _ = std::fs::remove_dir_all(root);
     }

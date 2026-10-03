@@ -7,6 +7,15 @@ Semantic Versioning.
 
 ### Added
 
+- Report `crab status` as healthy or unhealthy with concrete reasons, and allow
+  healthy local-only setups without an installed messaging plugin.
+- Add `/session delete --deep` to remove the shared session record and matching
+  TUI local fallback data.
+- Add TUI `/compact` and automatic history summaries that preserve recent turns.
+- Add TUI context fill, a scrolling statusline, and a fixed-choice `/statusline`
+  menu.
+- Render fenced Markdown code blocks in the TUI with language labels.
+- Add a bounded HTTPS fetch tool for public web pages.
 - Keep Linux shell commands and their descendants in the command process group
   so timeout, cancellation, and task cleanup terminate them together.
 - Refresh shared TUI session transcripts and working status across multiple

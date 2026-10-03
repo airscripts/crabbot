@@ -324,7 +324,14 @@ where
 
     response(
         id,
-        serde_json::to_value(ModelReply { text, stop, input: None, output: None, events })?,
+        serde_json::to_value(ModelReply {
+            text,
+            stop,
+            input: None,
+            output: None,
+            context_usage: None,
+            events,
+        })?,
     )
 }
 
@@ -573,6 +580,7 @@ fn stream_body(
             stop,
             input: None,
             output: None,
+            context_usage: None,
             events: Vec::new(),
         })?,
     )
@@ -621,6 +629,7 @@ fn response_body(
             stop: body["stop_reason"].as_str().unwrap_or("stop").into(),
             input: body["usage"]["input_tokens"].as_u64(),
             output: body["usage"]["output_tokens"].as_u64(),
+            context_usage: None,
             events,
         })?,
     )

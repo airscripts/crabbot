@@ -58,6 +58,10 @@ deadline. Model requests and global `CRAB.md`/`CLAW.md` context are bounded by
 serialized bytes before dispatch. `init --force --yes` deletes all user state
 under `CRABBOT_HOME`; stop the daemon and verify that path before confirming
 the reset.
+The tools plugin declares network access for its read-only HTTPS fetch tool.
+Fetch validates and pins public DNS addresses, rejects local or private targets,
+rechecks redirects, limits redirects, response size, duration, and concurrency,
+and returns bounded text. It does not use ambient HTTP proxy settings.
 Plugin restarts terminate their process trees so canceled shell descendants do
 not continue after the host has stopped a turn. Provider and channel response
 bodies reserve protocol-frame headroom, plugin metadata and persisted values

@@ -751,6 +751,7 @@ name = "crabbot-plugin-tools"
 version = "0.1.0"
 dependencies = [
  "crabbot-core",
+ "reqwest",
  "rustix",
  "serde_json",
  "tokio",

@@ -130,6 +130,7 @@ async fn generate_at(
             stop: stop.into(),
             input: None,
             output: None,
+            context_usage: None,
             events,
         })?,
     )))

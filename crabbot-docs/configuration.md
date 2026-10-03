@@ -91,6 +91,15 @@ without a person confirming each request.
 
 ## Paths
 
+Crabbot keeps operational state, working files, and installed plugin files in
+separate locations under `CRABBOT_HOME`:
+
+| Location | Purpose |
+| --- | --- |
+| `data/` | Durable runtime state, including session records, client and delivery state, and plugin-owned data or settings. This is storage, not telemetry collection. |
+| `workspace/` | The default agent working area for project files and context instructions. `CRAB.md` and `CLAW.md` are loaded into turns; file tools are confined to the active workspace. |
+| `plugins/<plugin-id>/` | Installed plugin files and their `crabbot-plugin.toml` manifests. A manifest declares capabilities; plugin code supplies them through the plugin protocol. |
+
 `CRABBOT_HOME` contains configuration, the plugin registry, credential
 references, durable session state, IPC markers, and a `workspace/` directory
 for your Crabbot's global personal data and instructions. When the optional

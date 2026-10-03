@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, ffi::OsString, path::PathBuf, process::Stdio, t
 use crabbot_core::{
     jsonl,
     plugin::Emitter,
-    types::{Content, Message, ModelReply, ModelRequest, Response, Role, ToolSpec},
+    types::{Content, ContextUsage, Message, ModelReply, ModelRequest, Response, Role, ToolSpec},
 };
 
 use serde_json::{Value, json};
@@ -227,6 +227,14 @@ pub struct Session {
     server: Option<Server>,
 }
 
+fn context_usage(params: &Value) -> Option<ContextUsage> {
+    let usage = &params["tokenUsage"];
+    let used = usage["last"]["totalTokens"].as_u64()?;
+    let limit = usage["modelContextWindow"].as_u64()?;
+
+    (limit > 0).then_some(ContextUsage { used, limit })
+}
+
 impl Session {
     pub fn new(binary: OsString, home: Option<PathBuf>) -> Self {
         Self { binary, home, server: None }
@@ -330,6 +338,8 @@ async fn generate_on(
         .await
         .map_err(|_| denied("Codex exceeded the turn time limit."))??;
 
+    let context_usage = server.context_usage;
+
     let response = Response::ok(
         id,
         serde_json::to_value(ModelReply {
@@ -337,6 +347,7 @@ async fn generate_on(
             stop: "stop".into(),
             input: None,
             output: None,
+            context_usage,
             events: Vec::new(),
         })?,
     );
@@ -493,6 +504,7 @@ struct Server {
     output: ChildStdin,
     next: u64,
     failed_tool_calls: BTreeSet<String>,
+    context_usage: Option<ContextUsage>,
 }
 
 fn tool_call_key(name: &str, args: &Value) -> crabbot_core::Result<String> {
@@ -553,6 +565,7 @@ impl Server {
             output,
             next: 1,
             failed_tool_calls: BTreeSet::new(),
+            context_usage: None,
         })
     }
 
@@ -659,6 +672,8 @@ impl Server {
     ) -> crabbot_core::Result<String> {
         self.failed_tool_calls.clear();
 
+        self.context_usage = None;
+
         let deadline = Instant::now() + TURN_TIMEOUT;
 
         let mut text = String::new();
@@ -696,6 +711,16 @@ impl Server {
             }
 
             if value.get("method").is_none() {
+                continue;
+            }
+
+            if value["method"] == "thread/tokenUsage/updated" {
+                let params = &value["params"];
+
+                if params["threadId"] == thread && params["turnId"] == turn {
+                    self.context_usage = context_usage(params);
+                }
+
                 continue;
             }
 
@@ -741,7 +766,7 @@ impl Server {
 
                 self.tool(&value, thread, turn, allowed, emitter).await?;
             } else if value["method"] == "error" {
-                return Err(denied("Codex app-server reported an error."));
+                return Err(denied(&app_server_error(&value)));
             }
         }
     }
@@ -973,6 +998,32 @@ fn denied(message: &str) -> crabbot_core::Error {
     crabbot_core::Error::Denied(message.into())
 }
 
+fn app_server_error(value: &Value) -> String {
+    let message = value
+        .pointer("/params/error/message")
+        .or_else(|| value.pointer("/params/message"))
+        .or_else(|| value.pointer("/message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty());
+
+    let Some(message) = message else {
+        return "Codex app-server reported an error.".into();
+    };
+
+    let message = message
+        .chars()
+        .map(|character| if character.is_control() { ' ' } else { character })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let message = message.chars().take(300).collect::<String>();
+
+    format!("Codex app-server error: {message}")
+}
+
 fn version_reported(success: bool, value: &str) -> bool {
     success && !value.trim().is_empty()
 }
@@ -1002,9 +1053,9 @@ fn workspace(value: Option<&str>) -> crabbot_core::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Server, check_version, command_with, dynamic_tools, final_text, instructions, prompt,
-        tool_call_failed, tool_call_key, tool_denial, tool_guidance, valid_rpc, version_reported,
-        workspace,
+        Server, check_version, command_with, context_usage, dynamic_tools, final_text,
+        instructions, prompt, tool_call_failed, tool_call_key, tool_denial, tool_guidance,
+        valid_rpc, version_reported, workspace,
     };
 
     use std::time::Duration;
@@ -1012,6 +1063,47 @@ mod tests {
     use crabbot_core::types::{Content, Message, ModelRequest, Role, ToolSpec};
     use serde_json::json;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn reads_context_window_and_latest_token_usage() {
+        let usage = context_usage(&json!({
+            "tokenUsage": {
+                "modelContextWindow": 128000,
+                "last": {"totalTokens": 12345}
+            }
+        }));
+
+        assert_eq!(usage, Some(crabbot_core::types::ContextUsage { used: 12345, limit: 128000 }));
+
+        assert_eq!(context_usage(&json!({"tokenUsage": {"last": {"totalTokens": 3}}})), None);
+        assert_eq!(
+            context_usage(&json!({
+                "tokenUsage": {
+                    "modelContextWindow": 0,
+                    "last": {"totalTokens": 3}
+                }
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn reports_bounded_app_server_error_details() {
+        let message = super::app_server_error(&json!({
+            "method": "error",
+            "params": {"error": {"message": "  session expired\nplease retry  "}}
+        }));
+
+        assert_eq!(message, "Codex app-server error: session expired please retry");
+        assert_eq!(
+            super::app_server_error(&json!({"method": "error"})),
+            "Codex app-server reported an error."
+        );
+
+        assert!(
+            super::app_server_error(&json!({"params": {"message": "x".repeat(400)}})).len() < 340
+        );
+    }
 
     #[cfg(unix)]
     fn write_binary(path: &std::path::Path, script: &str) -> std::io::Result<()> {

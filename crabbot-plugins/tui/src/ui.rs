@@ -59,15 +59,118 @@ const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const TYPEWRITER_BACKLOG: usize = 96;
 const TYPEWRITER_BURST: usize = 2;
 const TYPEWRITER_CATCHUP_BURST: usize = 12;
-const DEFAULT_STATUSLINE: &str = "{name} | model: {model} | session: {session} | {workspace}";
-const LEGACY_DEFAULT_STATUSLINE: &str = "{name} | {model} | {session} | {workspace}";
+const STATUSLINE_ITEMS: [(&str, &str); 6] = [
+    ("Title", "title"),
+    ("Model", "model"),
+    ("Context", "context"),
+    ("Session", "session"),
+    ("Workspace", "workspace"),
+    ("Status", "status"),
+];
+
+const STATUSLINE_SCROLL_INTERVAL: Duration = Duration::from_millis(300);
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct TuiPreferences {
-    statusline: String,
+    #[serde(deserialize_with = "deserialize_statusline")]
+    statusline: StatuslineOptions,
     #[serde(default = "default_typewriter")]
     typewriter: bool,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+struct StatuslineOptions {
+    title: bool,
+    model: bool,
+    context: bool,
+    session: bool,
+    workspace: bool,
+    status: bool,
+}
+
+impl Default for StatuslineOptions {
+    fn default() -> Self {
+        Self {
+            title: true,
+            model: true,
+            context: true,
+            session: true,
+            workspace: true,
+            status: false,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum SavedStatusline {
+    Legacy(String),
+    Options(StatuslineOptions),
+}
+
+fn deserialize_statusline<'de, D>(
+    deserializer: D,
+) -> std::result::Result<StatuslineOptions, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let statusline = <SavedStatusline as serde::Deserialize>::deserialize(deserializer)?;
+
+    match statusline {
+        SavedStatusline::Legacy(value) => Ok(statusline_from_legacy(&value)),
+        SavedStatusline::Options(options) => Ok(options),
+    }
+}
+
+fn statusline_from_legacy(value: &str) -> StatuslineOptions {
+    let mut options = StatuslineOptions {
+        title: false,
+        model: false,
+        context: false,
+        session: false,
+        workspace: false,
+        status: false,
+    };
+
+    options.title = value.contains("{name}");
+    options.model = value.contains("{model}");
+    options.context = value.contains("{context}");
+    options.session = value.contains("{session}");
+    options.workspace = value.contains("{workspace}");
+    options.status = value.contains("{status}");
+
+    if STATUSLINE_ITEMS.iter().all(|(_, item)| !statusline_item_enabled(options, item)) {
+        StatuslineOptions::default()
+    } else {
+        options
+    }
+}
+
+fn statusline_item_enabled(options: StatuslineOptions, item: &str) -> bool {
+    match item {
+        "title" => options.title,
+        "model" => options.model,
+        "context" => options.context,
+        "session" => options.session,
+        "workspace" => options.workspace,
+        "status" => options.status,
+        _ => false,
+    }
+}
+
+fn toggle_statusline_item(options: &mut StatuslineOptions, item: &str) {
+    match item {
+        "title" => options.title = !options.title,
+        "model" => options.model = !options.model,
+        "context" => options.context = !options.context,
+        "session" => options.session = !options.session,
+        "workspace" => options.workspace = !options.workspace,
+        "status" => options.status = !options.status,
+
+        _ => {}
+    }
 }
 
 fn default_typewriter() -> bool {
@@ -76,7 +179,7 @@ fn default_typewriter() -> bool {
 
 impl Default for TuiPreferences {
     fn default() -> Self {
-        Self { statusline: String::new(), typewriter: true }
+        Self { statusline: StatuslineOptions::default(), typewriter: true }
     }
 }
 
@@ -104,19 +207,26 @@ struct App {
     session: String,
     model: String,
     model_available: bool,
+    context_usage: Option<crabbot_core::types::ContextUsage>,
     workspace: String,
     default_workspace: String,
     name: String,
-    statusline: String,
+    statusline: StatuslineOptions,
+    statusline_draft: StatuslineOptions,
+    statusline_picker: bool,
+    statusline_selection: usize,
+    statusline_started: Option<Instant>,
     statusline_changed: bool,
-    statusline_reset: bool,
     preferences_path: PathBuf,
     typewriter: bool,
     theme_enabled: bool,
     generation_active: bool,
+    compaction_active: bool,
     session_working: bool,
     generation_started: Option<Instant>,
+    compaction_started: Option<Instant>,
     generation_message: &'static str,
+    compaction_message: &'static str,
     exiting: bool,
     interrupt_requested: bool,
     reply_pending: bool,
@@ -296,7 +406,7 @@ where
         .and_then(|bytes| toml::from_str::<TuiPreferences>(&String::from_utf8_lossy(&bytes)).ok())
         .unwrap_or_default();
 
-    let statusline = upgraded_statusline(&preferences.statusline);
+    let statusline = preferences.statusline;
     let typewriter = preferences.typewriter;
     let theme_enabled = std::env::var("CRABBOT_TUI_THEME").as_deref() != Ok("off");
 
@@ -353,6 +463,8 @@ where
         session: initial_session.id,
         model: display_model(&initial_session.model, model_available),
         model_available,
+        context_usage: initial_session.context_usage,
+        statusline_started: Some(Instant::now()),
         command_options,
         workspace,
         session_working: initial_session.working,
@@ -373,9 +485,12 @@ where
     let mut quit = false;
     let mut session_refresh = tokio::time::interval(SESSION_REFRESH_INTERVAL);
     let mut generation_refresh = tokio::time::interval(GENERATION_FRAME_INTERVAL);
+    let mut statusline_refresh = tokio::time::interval(GENERATION_FRAME_INTERVAL);
     generation_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    statusline_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     session_refresh.tick().await;
     generation_refresh.tick().await;
+    statusline_refresh.tick().await;
 
     while !quit {
         terminal.draw(|frame| draw(frame, &mut app))?;
@@ -392,12 +507,11 @@ where
                     }
 
                     if app.statusline_changed {
-                        if app.statusline_reset {
-                            save_preferences(&app.preferences_path, "", app.typewriter)?;
-                            app.statusline_reset = false;
-                        } else {
-                            save_preferences(&app.preferences_path, &app.statusline, app.typewriter)?;
-                        }
+                        save_preferences(
+                            &app.preferences_path,
+                            app.statusline,
+                            app.typewriter,
+                        )?;
 
                         app.statusline_changed = false;
                     }
@@ -437,12 +551,14 @@ where
                             app.workspace = session
                                 .workspace
                                 .unwrap_or_else(|| app.default_workspace.clone());
-                        } else {
+                        } else if created_input.is_some() || app.session != session.id {
                             app.restore_session(session);
 
                             if let Some(input) = created_input {
                                 app.push_user(&input);
                             }
+                        } else {
+                            app.refresh_session(session);
                         }
                     }
 
@@ -450,7 +566,7 @@ where
                 }
             }
 
-            _ = session_refresh.tick(), if !app.generation_active => {
+            _ = session_refresh.tick(), if !app.generation_active && !app.compaction_active => {
                 let session_id = app.session.clone();
 
                 if let Ok(session) = load_session_snapshot(&home, &session_id, host).await {
@@ -465,6 +581,14 @@ where
                         app.generation_started = Some(Instant::now());
                         app.interrupt_requested = false;
                         app.generation_message = random_generation_message();
+                    }
+
+                    Some(crate::EngineEvent::CompactionStarted) => {
+                        app.begin_compaction();
+                    }
+
+                    Some(crate::EngineEvent::CompactionFinished) => {
+                        app.finish_compaction();
                     }
 
                     Some(crate::EngineEvent::GenerationFinished { interrupted }) => {
@@ -503,15 +627,18 @@ where
                 app.reveal_next();
             }
 
-            _ = generation_refresh.tick(), if app.generation_active => {
+            _ = generation_refresh.tick(), if app.generation_active || app.compaction_active => {
                 // Keep the waiting-message glow moving smoothly.
             }
+
+            _ = statusline_refresh.tick() => {}
 
             result = output_rx.read(&mut buffer), if !engine_finished => {
                 match result {
                     Ok(0) => {
                         engine_finished = true;
                         app.generation_active = false;
+                        app.compaction_active = false;
                         app.reply_pending = false;
                         app.reply_system = false;
                         app.pending_model = None;
@@ -562,6 +689,7 @@ where
                         engine.abort();
                         engine_finished = true;
                         app.generation_active = false;
+                        app.compaction_active = false;
                         app.reply_pending = false;
 
                         for interaction in app.take_persistable_interactions() {
@@ -607,6 +735,8 @@ where
                 crate::EngineEvent::SystemNotice(text) => app.push_system(&text),
 
                 crate::EngineEvent::GenerationStarted => {}
+
+                crate::EngineEvent::CompactionStarted | crate::EngineEvent::CompactionFinished => {}
 
                 crate::EngineEvent::GenerationFinished { .. } => {}
             }
@@ -659,9 +789,10 @@ where
 
     let messages = serde_json::from_value(value["messages"].clone())?;
     let workspace = value["workspace"].as_str().map(str::to_owned);
+    let context_usage = serde_json::from_value(value["context_usage"].clone()).ok().flatten();
     let working = value["status"] == "working" || value["inflight"] == true;
 
-    Ok(SessionView { id: id.to_owned(), model, workspace, messages, working })
+    Ok(SessionView { id: id.to_owned(), model, workspace, context_usage, messages, working })
 }
 
 async fn persist_interaction<C, F>(home: &str, interaction: SavedInteraction, host: C) -> Result<()>
@@ -726,20 +857,13 @@ pub(super) struct SessionView {
     pub(super) id: String,
     pub(super) model: String,
     pub(super) workspace: Option<String>,
+    pub(super) context_usage: Option<crabbot_core::types::ContextUsage>,
     pub(super) messages: Vec<Message>,
     pub(super) working: bool,
 }
 
 fn display_model(model: &str, model_available: bool) -> String {
     if model_available { model.into() } else { "unset".into() }
-}
-
-fn upgraded_statusline(statusline: &str) -> String {
-    if statusline.is_empty() || statusline == LEGACY_DEFAULT_STATUSLINE {
-        DEFAULT_STATUSLINE.to_owned()
-    } else {
-        statusline.to_owned()
-    }
 }
 
 fn render_messages(messages: &[Message], name: &str) -> String {
@@ -838,12 +962,34 @@ const GENERATION_MESSAGES: &[&str] = &[
     "The Crabbot is preparing a thoughtful reply...",
 ];
 
+const COMPACTION_MESSAGES: &[&str] = &[
+    "The Crabbot is tidying up the conversation...",
+    "The Crabbot is folding the earlier turns into a summary...",
+    "The Crabbot is packing away the older messages...",
+    "The Crabbot is keeping the useful bits close...",
+    "The Crabbot is making room for what comes next...",
+];
+
 fn random_generation_message() -> &'static str {
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.subsec_nanos() as usize);
 
     GENERATION_MESSAGES[seed % GENERATION_MESSAGES.len()]
+}
+
+fn random_compaction_message(previous: &str) -> &'static str {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.subsec_nanos() as usize);
+
+    let mut index = seed % COMPACTION_MESSAGES.len();
+
+    if COMPACTION_MESSAGES[index] == previous {
+        index = (index + 1) % COMPACTION_MESSAGES.len();
+    }
+
+    COMPACTION_MESSAGES[index]
 }
 
 fn format_elapsed(elapsed: Duration) -> String {
@@ -881,18 +1027,25 @@ fn interrupt_generation(
 const TUI_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show commands available in this session."),
     ("/status", "Show whether the background runtime is running."),
-    ("/plugins", "Browse installed plugins."),
+    ("/plugins [page]", "Browse installed plugins."),
     ("/session help", "Show session commands."),
-    ("/session list", "List saved sessions."),
+    ("/session list [page]", "List saved sessions."),
     ("/session create <id>", "Create and switch to a session."),
     ("/session switch <id>", "Switch to a saved session."),
-    ("/session rename <id>", "Rename the active session."),
+    ("/session rename <new-id>", "Rename the active session."),
+    ("/session archive <id>...|--all", "Archive saved sessions."),
+    ("/session unarchive <id>...|--all", "Restore archived sessions."),
+    (
+        "/session delete <id>...|--all [-y] [--deep]",
+        "Permanently delete sessions; --deep also removes local and shared session data.",
+    ),
     ("/new <id>", "Create and switch to a session."),
-    ("/workspace", "Show or change this session's filesystem root."),
+    ("/workspace [path|reset]", "Show or change this session's filesystem root."),
     ("/clear", "Clear this session's conversation."),
-    ("/statusline", "Show, configure, or reset the statusline."),
-    ("/animation", "Show or configure typewriter animation."),
+    ("/statusline [reset]", "Choose which details appear in the statusline."),
+    ("/animation [on|off]", "Show or configure typewriter animation."),
     ("/quit", "Leave the TUI."),
+    ("/exit", "Leave the TUI."),
 ];
 
 fn command_options(home: &str, has_model: bool) -> Vec<(&'static str, &'static str)> {
@@ -900,10 +1053,12 @@ fn command_options(home: &str, has_model: bool) -> Vec<(&'static str, &'static s
 
     if has_model {
         commands.push(("/model <help|list|show|set>", "Manage the selected model."));
+        commands.push(("/compact", "Summarize older turns and keep recent conversation."));
     }
 
     if crate::has_capability(home, "tool") {
         commands.extend([
+            ("/approval", "Show approval policy."),
             ("/approvals", "List pending tool approvals."),
             ("/approve <id>", "Approve a pending tool action."),
             ("/deny <id>", "Deny a pending tool action."),
@@ -1033,6 +1188,56 @@ where
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             app.input_cursor_needs_visibility = true;
 
+            if app.statusline_picker {
+                match key.code {
+                    KeyCode::Up => {
+                        app.statusline_selection = app.statusline_selection.saturating_sub(1);
+                    }
+
+                    KeyCode::Down => {
+                        app.statusline_selection = app
+                            .statusline_selection
+                            .saturating_add(1)
+                            .min(STATUSLINE_ITEMS.len().saturating_sub(1));
+                    }
+
+                    KeyCode::Char(' ') => {
+                        let item = STATUSLINE_ITEMS[app.statusline_selection].1;
+
+                        if !statusline_item_enabled(app.statusline_draft, item)
+                            || STATUSLINE_ITEMS
+                                .iter()
+                                .filter(|(_, name)| {
+                                    statusline_item_enabled(app.statusline_draft, name)
+                                })
+                                .count()
+                                > 1
+                        {
+                            toggle_statusline_item(&mut app.statusline_draft, item);
+                        }
+                    }
+
+                    KeyCode::Enter => {
+                        app.statusline = app.statusline_draft;
+                        app.statusline_changed = true;
+                        app.statusline_picker = false;
+                        app.push_bot("Statusline updated.\n".into());
+                        app.complete_local_interaction("Statusline updated.".into());
+                    }
+
+                    KeyCode::Esc => {
+                        app.statusline_picker = false;
+                        app.statusline_draft = app.statusline;
+                        app.push_bot("Statusline unchanged.\n".into());
+                        app.complete_local_interaction("Statusline unchanged.".into());
+                    }
+
+                    _ => {}
+                }
+
+                return Ok(false);
+            }
+
             if let Some(approvals) = approval_prompts(&app.transcript) {
                 match key.code {
                     KeyCode::Left => {
@@ -1109,12 +1314,14 @@ where
                 }
 
                 KeyCode::Char(character)
-                    if (app.generation_active || app.session_working)
+                    if (app.generation_active || app.compaction_active || app.session_working)
                         && app.input.first() != Some(&'/')
                         && character != '/' =>
                 {
                     app.status = if app.generation_active {
                         "A response is running; use approval commands or Esc to interrupt.".into()
+                    } else if app.compaction_active {
+                        "Crabbot is compacting this conversation. Wait for it to finish.".into()
                     } else {
                         "This session is busy; wait for Crabbot's turn to finish.".into()
                     };
@@ -1192,6 +1399,7 @@ where
                             || command.starts_with("/statusline ");
 
                     if (app.generation_active
+                        || app.compaction_active
                         || app.session_working
                         || !app.pending_interactions.is_empty())
                         && !is_live_control
@@ -1199,12 +1407,14 @@ where
                         app.status = if app.generation_active {
                             "A response is still running. Use /approvals, /approve, /deny, or Esc."
                                 .into()
+                        } else if app.compaction_active {
+                            "Crabbot is compacting this conversation. Wait for it to finish.".into()
                         } else {
                             "Crabbot is working in this session. Wait for the turn to finish."
                                 .into()
                         };
 
-                        if !app.generation_active {
+                        if !app.generation_active && !app.compaction_active {
                             app.push_system(&app.status.clone());
                         }
 
@@ -1262,17 +1472,10 @@ where
                     }
 
                     if line == "/statusline" {
-                        let response = format!(
-                            "Statusline: {}\nSet it with /statusline <format>. Placeholders: {{name}}, {{model}}, {{session}}, {{workspace}}, {{status}}.",
-                            app.statusline
-                        );
-
-                        app.push_bot(format!(
-                        "Statusline: {}\nSet it with /statusline <format>. Placeholders: {{name}}, {{model}}, {{session}}, {{workspace}}, {{status}}.\n",
-                        app.statusline
-                    ));
-
-                        app.complete_local_interaction(response);
+                        app.statusline_draft = app.statusline;
+                        app.statusline_selection = 0;
+                        app.statusline_picker = true;
+                        app.push_bot("Choose which details appear in the statusline.\n".into());
                         return Ok(false);
                     }
 
@@ -1280,30 +1483,18 @@ where
                         let value = value.trim();
 
                         if value == "reset" {
-                            app.statusline = DEFAULT_STATUSLINE.to_owned();
+                            app.statusline = StatuslineOptions::default();
                             app.statusline_changed = true;
-                            app.statusline_reset = true;
                             app.push_bot("Statusline restored to its default.\n".into());
 
                             app.complete_local_interaction(
                                 "Statusline restored to its default.".into(),
                             );
-
-                            return Ok(false);
-                        }
-
-                        match validate_statusline(value) {
-                            Ok(value) => {
-                                app.statusline = value;
-                                app.statusline_changed = true;
-                                app.push_bot("Statusline updated.\n".into());
-                                app.complete_local_interaction("Statusline updated.".into());
-                            }
-
-                            Err(error) => {
-                                app.push_bot(format!("{error}\n"));
-                                app.complete_local_interaction(error.to_owned());
-                            }
+                        } else {
+                            let error =
+                                "Use /statusline to choose visible details, or /statusline reset.";
+                            app.push_bot(format!("{error}\n"));
+                            app.complete_local_interaction(error.into());
                         }
 
                         return Ok(false);
@@ -1349,6 +1540,10 @@ where
                     }
 
                     if !engine_finished {
+                        if command == "/compact" {
+                            app.begin_compaction();
+                        }
+
                         command_tx.write_all(serde_json::to_string(&line)?.as_bytes()).await?;
                         command_tx.write_all(b"\n").await?;
 
@@ -1423,13 +1618,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 
     let approvals = approval_prompts(&app.transcript).unwrap_or_default();
     let suggestions = command_suggestions(&input_text, &app.command_options);
-    let popup_rows = if !approvals.is_empty() {
+    let popup_rows = if app.statusline_picker {
+        STATUSLINE_ITEMS.len().min(u16::MAX as usize) as u16
+    } else if !approvals.is_empty() {
         3
     } else {
         suggestions.as_ref().map_or(0, |items| items.len().min(7) as u16)
     };
 
-    let is_working = app.generation_active || app.session_working;
+    let is_working = app.generation_active || app.compaction_active || app.session_working;
     let composer_gap = if is_working { 0 } else { COMPOSER_GAP_ROWS };
 
     let picker_gap = if popup_rows > 0 { COMPOSER_GAP_ROWS } else { 0 };
@@ -1515,23 +1712,30 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let visible_rows = &rows[start..end];
     let transcript = TranscriptViewport { rows: visible_rows };
 
-    let input =
-        Paragraph::new(padded_input).scroll((input_scroll, 0)).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .border_type(BorderType::Plain)
-                .borders(Borders::TOP | Borders::BOTTOM)
-                .title(if app.exiting {
-                    "Exiting Crabbot… | Please wait "
-                } else if app.generation_active {
-                    "Approval commands only  |  /approvals  |  /approve <id>  |  Esc interrupt "
-                } else if app.session_working {
-                    "Session busy  |  /approvals  |  /approve <id>  |  /deny <id> "
-                } else {
-                    "Message  |  Enter send  |  Esc quit "
-                }),
-        );
+    let input = Paragraph::new(padded_input)
+        .scroll((input_scroll, 0))
+        .wrap(Wrap { trim: false })
+        .block(
+        Block::default()
+            .border_type(BorderType::Plain)
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .title(if app.exiting {
+                "Exiting Crabbot… | Please wait "
+            } else if app.statusline_picker {
+                "Statusline elements  |  ↑/↓ move  |  Space toggle  |  Enter save  |  Esc cancel "
+            } else if app.compaction_active {
+                "Compacting conversation  |  Please wait "
+            } else if app.generation_active {
+                "Approval commands only  |  /approvals  |  /approve <id>  |  Esc interrupt "
+            } else if app.session_working {
+                "Session busy  |  /approvals  |  /approve <id>  |  /deny <id> "
+            } else {
+                "Message  |  Enter send  |  Esc quit "
+            }),
+    );
 
-    let footer_text = format!("{} v{} | /help for commands", app.name, env!("CARGO_PKG_VERSION"));
+    let footer_text =
+        format!(" | {} v{} | /help for commands", app.name, env!("CARGO_PKG_VERSION"));
 
     let footer_width = UnicodeWidthStr::width(footer_text.as_str()).min(u16::MAX as usize) as u16;
 
@@ -1540,7 +1744,18 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .constraints([Constraint::Min(0), Constraint::Length(footer_width)])
         .split(areas[5]);
 
-    let statusline = Paragraph::new(statusline_text).style(footer_style);
+    let statusline_elapsed =
+        app.statusline_started.map_or(Duration::ZERO, |started| started.elapsed());
+
+    let statusline_offset =
+        (statusline_elapsed.as_millis() / STATUSLINE_SCROLL_INTERVAL.as_millis()) as usize;
+
+    let statusline = Paragraph::new(marquee_statusline(
+        &statusline_text,
+        footer_areas[0].width as usize,
+        statusline_offset,
+    ))
+    .style(footer_style);
 
     let footer = Paragraph::new(footer_text).alignment(Alignment::Right).style(footer_style);
 
@@ -1550,7 +1765,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     );
 
     if is_working && content_height > 0 {
-        let text = if app.generation_active {
+        let text = if app.compaction_active {
+            let elapsed = app
+                .compaction_started
+                .map(|started| format_elapsed(started.elapsed()))
+                .unwrap_or_else(|| "0s".into());
+
+            format!("{}  |  {elapsed}", app.compaction_message)
+        } else if app.generation_active {
             let indicator =
                 if app.interrupt_requested { "Stopping…" } else { "Esc to interrupt" };
 
@@ -1564,7 +1786,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             "Crabbot is working in this session  |  waiting for the turn to finish".into()
         };
 
-        let elapsed = app.generation_started.map_or_else(
+        let started =
+            if app.compaction_active { app.compaction_started } else { app.generation_started };
+
+        let elapsed = started.map_or_else(
             || {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1588,7 +1813,43 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     if popup_rows > 0 {
         let popup_area = areas[2];
 
-        if !approvals.is_empty() {
+        if app.statusline_picker {
+            let selected = app.statusline_selection.min(STATUSLINE_ITEMS.len().saturating_sub(1));
+            app.statusline_selection = selected;
+
+            let items = STATUSLINE_ITEMS
+                .iter()
+                .enumerate()
+                .map(|(index, (label, item))| {
+                    let style = if index == selected && app.theme_enabled {
+                        Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD)
+                    } else if index == selected {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+
+                    let rail_style = if app.theme_enabled {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default()
+                    };
+
+                    let checked = if statusline_item_enabled(app.statusline_draft, item) {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        Span::styled("▌ ", rail_style),
+                        Span::styled(format!("{checked} {label}"), style),
+                    ]))
+                })
+                .collect::<Vec<_>>();
+
+            frame.render_widget(List::new(items), popup_area);
+        } else if !approvals.is_empty() {
             let summary = approval_summary(&app.transcript, &approvals[0]);
             let rows =
                 approval_picker(&approvals[0], summary, app.approval_selection, app.theme_enabled);
@@ -1674,13 +1935,16 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 
     if !is_working {
         let (cursor_x, cursor_y) = input_cursor_position(&app.input, app.cursor, input_area.width);
-
-        frame.set_cursor_position((
+        let cursor_position = (
             input_area.x.saturating_add(3).saturating_add(cursor_x),
             input_area.y.saturating_add(1).saturating_add(
                 cursor_y.saturating_sub(input_scroll).min(input_rows.saturating_sub(1) as u16),
             ),
-        ));
+        );
+
+        if input_area.contains(cursor_position.into()) {
+            frame.set_cursor_position(cursor_position);
+        }
     }
 }
 
@@ -1778,43 +2042,92 @@ fn input_cursor_position(input: &[char], cursor: usize, width: u16) -> (u16, u16
     (column.min(u16::MAX as usize) as u16, row.min(u16::MAX as usize) as u16)
 }
 
-fn validate_statusline(value: &str) -> std::result::Result<String, &'static str> {
-    const TOKENS: &[&str] = &["{name}", "{model}", "{session}", "{workspace}", "{status}"];
+fn render_statusline(app: &App) -> String {
+    let options = app.statusline;
+    let mut values = Vec::new();
 
-    if value.is_empty() || value.len() > 120 || value.chars().any(char::is_control) {
-        return Err("Statusline must be 1–120 visible characters.");
+    if options.title {
+        values.push(app.name.clone());
     }
 
-    let mut remainder = value;
-
-    while let Some(start) = remainder.find('{') {
-        let Some(end) = remainder[start..].find('}') else {
-            return Err("Statusline has an unclosed placeholder.");
-        };
-
-        let token = &remainder[start..=start + end];
-
-        if !TOKENS.contains(&token) {
-            return Err(
-                "Supported placeholders: {name}, {model}, {session}, {workspace}, {status}.",
-            );
-        }
-
-        remainder = &remainder[start + end + 1..];
+    if options.model {
+        values.push(format!("model: {}", app.model));
     }
 
-    Ok(value.to_owned())
+    if options.context {
+        values.push(format_context_usage(app.context_usage));
+    }
+
+    if options.session {
+        values.push(format!("session: {}", session_display_name(&app.session)));
+    }
+
+    if options.workspace {
+        values.push(workspace_label(&app.workspace));
+    }
+
+    if options.status {
+        values.push(format!("status: {}", app.status));
+    }
+
+    values.join(" | ")
 }
 
-fn render_statusline(app: &App) -> String {
-    let workspace = workspace_label(&app.workspace);
+fn marquee_statusline(text: &str, width: usize, offset: usize) -> String {
+    if width == 0 || text.is_empty() {
+        return String::new();
+    }
 
-    app.statusline
-        .replace("{name}", &app.name)
-        .replace("{model}", &app.model)
-        .replace("{session}", session_display_name(&app.session))
-        .replace("{workspace}", &workspace)
-        .replace("{status}", &app.status)
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+
+    let mut cycle = text.to_owned();
+    cycle.push_str("   ");
+    let graphemes = cycle.graphemes(true).collect::<Vec<_>>();
+    let mut result = String::new();
+    let mut columns = 0;
+
+    for index in 0..graphemes.len() {
+        let grapheme = graphemes[(offset + index) % graphemes.len()];
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+
+        if columns + grapheme_width > width {
+            break;
+        }
+
+        result.push_str(grapheme);
+        columns += grapheme_width;
+    }
+
+    result
+}
+
+fn format_context_usage(usage: Option<crabbot_core::types::ContextUsage>) -> String {
+    let Some(usage) = usage.filter(|usage| usage.limit > 0) else {
+        return "context: unavailable".into();
+    };
+
+    let tenths_percent = (u128::from(usage.used) * 1000 / u128::from(usage.limit)) as u64;
+    let used = grouped_count(usage.used);
+    let limit = grouped_count(usage.limit);
+
+    format!("context: {used}/{limit} ({}.{:01}%)", tenths_percent / 10, tenths_percent % 10)
+}
+
+fn grouped_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+
+    for (index, digit) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            grouped.push(',');
+        }
+
+        grouped.push(digit);
+    }
+
+    grouped.chars().rev().collect()
 }
 
 fn workspace_label(path: &str) -> String {
@@ -1834,10 +2147,10 @@ fn workspace_label(path: &str) -> String {
 
 fn save_preferences(
     path: &std::path::Path,
-    statusline: &str,
+    statusline: StatuslineOptions,
     typewriter: bool,
 ) -> crabbot_core::Result<()> {
-    let preferences = TuiPreferences { statusline: statusline.to_owned(), typewriter };
+    let preferences = TuiPreferences { statusline, typewriter };
     let content = toml::to_string(&preferences)
         .map_err(|error| crabbot_core::Error::Denied(error.to_string()))?;
 
@@ -1881,8 +2194,30 @@ fn wrap_transcript_layout(
         if let Some((title, is_user, is_system)) = message_title(line, name) {
             index += 1;
             let body_start = index;
+            let mut open_fence = None;
 
-            while index < lines.len() && message_title(lines[index], name).is_none() {
+            while index < lines.len() {
+                if let Some((character, length)) = open_fence {
+                    if is_closing_code_fence(lines[index], character, length) {
+                        open_fence = None;
+                    } else if is_timestamped_message_title(lines[index], name) {
+                        break;
+                    }
+
+                    index += 1;
+                    continue;
+                }
+
+                if let Some((character, length, _)) = opening_code_fence(lines[index]) {
+                    open_fence = Some((character, length));
+                    index += 1;
+                    continue;
+                }
+
+                if message_title(lines[index], name).is_some() {
+                    break;
+                }
+
                 index += 1;
             }
 
@@ -1961,6 +2296,30 @@ fn message_title<'a>(line: &'a str, name: &str) -> Option<(&'a str, bool, bool)>
     }
 }
 
+fn is_timestamped_message_title(line: &str, name: &str) -> bool {
+    let Some((title, _, _)) = message_title(line, name) else {
+        return false;
+    };
+
+    let Some((_, timestamp)) = title.split_once(" | ") else {
+        return false;
+    };
+
+    let Some((date, time)) = timestamp.split_once(" at ") else {
+        return false;
+    };
+
+    date.len() == 10
+        && date.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 4 | 7) { byte == b'-' } else { byte.is_ascii_digit() }
+        })
+        && time.len() == 5
+        && time
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| if index == 2 { byte == b':' } else { byte.is_ascii_digit() })
+}
+
 fn actor_heading(
     title: &str,
     is_user: bool,
@@ -2034,14 +2393,183 @@ fn wrap_rail_message(
     let mut rows = Vec::new();
 
     let mut message_rows = wrap_styled_segments(&heading, content_width);
-    message_rows
-        .extend(body.iter().flat_map(|line| wrap_transcript_line(line, name, content_width)));
+    message_rows.extend(wrap_message_body(body, name, content_width));
 
     for line in message_rows {
         let mut spans = vec![Span::styled("▌ ", rail_style)];
 
         spans.extend(line.spans);
         rows.push(Line::from(spans));
+    }
+
+    rows
+}
+
+fn wrap_message_body(body: &[&str], name: &str, width: usize) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    let mut index = 0;
+
+    while index < body.len() {
+        if let Some((character, length, info)) = opening_code_fence(body[index]) {
+            index += 1;
+            let code_start = index;
+
+            while index < body.len() && !is_closing_code_fence(body[index], character, length) {
+                index += 1;
+            }
+
+            rows.extend(wrap_code_block(&body[code_start..index], &info, width));
+
+            if index < body.len() {
+                index += 1;
+            }
+
+            continue;
+        }
+
+        rows.extend(wrap_transcript_line(body[index], name, width));
+        index += 1;
+    }
+
+    rows
+}
+
+fn opening_code_fence(line: &str) -> Option<(char, usize, String)> {
+    let leading_spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+
+    if leading_spaces > 3 {
+        return None;
+    }
+
+    let fence = &line[leading_spaces..];
+    let character = fence.chars().next()?;
+
+    if character != '`' && character != '~' {
+        return None;
+    }
+
+    let length = fence.chars().take_while(|candidate| *candidate == character).count();
+
+    if length < 3 {
+        return None;
+    }
+
+    let info = fence[length..].trim();
+
+    if character == '`' && info.contains('`') {
+        return None;
+    }
+
+    Some((character, length, code_language(info)))
+}
+
+fn code_language(info: &str) -> String {
+    let language = info.split_whitespace().next().unwrap_or_default();
+    let language = language
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '+' | '.' | '#' | '-')
+        })
+        .take(24)
+        .collect::<String>();
+
+    if language.is_empty() { "code".into() } else { language }
+}
+
+fn is_closing_code_fence(line: &str, character: char, minimum_length: usize) -> bool {
+    let leading_spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+
+    if leading_spaces > 3 {
+        return false;
+    }
+
+    let fence = &line[leading_spaces..];
+    let length = fence.chars().take_while(|candidate| *candidate == character).count();
+
+    length >= minimum_length && fence[length..].trim().is_empty()
+}
+
+fn wrap_code_block(lines: &[&str], language: &str, width: usize) -> Vec<Line<'static>> {
+    if width < 8 {
+        let mut rows = wrap_transcript_line(&format!("[{language}]"), "", width);
+        rows.extend(lines.iter().flat_map(|line| wrap_transcript_line(line, "", width)));
+
+        return rows;
+    }
+
+    let border_style = Style::default().fg(ACCENT_COLOR);
+    let header_style = Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD);
+    let code_style = Style::default().fg(Color::Gray);
+    let inner_width = width.saturating_sub(4);
+    let language = truncate_display_width(language, width.saturating_sub(5));
+    let header = format!("┌─ {language} ");
+    let header_width = UnicodeWidthStr::width(header.as_str());
+
+    let mut rows = vec![Line::from(vec![
+        Span::styled(header, header_style),
+        Span::styled("─".repeat(width.saturating_sub(header_width + 1)), border_style),
+        Span::styled("┐", border_style),
+    ])];
+
+    for line in lines {
+        for fragment in wrap_code_line(line, inner_width) {
+            let fragment_width = UnicodeWidthStr::width(fragment.as_str());
+            let padding = " ".repeat(inner_width.saturating_sub(fragment_width));
+
+            rows.push(Line::from(vec![
+                Span::styled("│ ", border_style),
+                Span::styled(fragment, code_style),
+                Span::styled(padding, code_style),
+                Span::styled(" │", border_style),
+            ]));
+        }
+    }
+
+    rows.push(Line::from(vec![Span::styled(format!("└{}┘", "─".repeat(width - 2)), border_style)]));
+    rows
+}
+
+fn truncate_display_width(text: &str, width: usize) -> String {
+    let mut result = String::new();
+    let mut columns = 0;
+
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+
+        if columns + grapheme_width > width {
+            break;
+        }
+
+        result.push_str(grapheme);
+        columns += grapheme_width;
+    }
+
+    result
+}
+
+fn wrap_code_line(line: &str, width: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut rows = Vec::new();
+    let mut fragment = String::new();
+    let mut columns = 0;
+
+    for grapheme in line.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+
+        if columns > 0 && columns + grapheme_width > width {
+            rows.push(std::mem::take(&mut fragment));
+            columns = 0;
+        }
+
+        fragment.push_str(grapheme);
+        columns += grapheme_width;
+    }
+
+    if !fragment.is_empty() {
+        rows.push(fragment);
     }
 
     rows
@@ -2202,12 +2730,6 @@ fn wrap_transcript_line(line: &str, name: &str, width: usize) -> Vec<Line<'stati
         || line.starts_with("Plugins | ")
     {
         vec![(line.to_owned(), Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD))]
-    } else if line.starts_with("* ") {
-        vec![(line.to_owned(), Style::default().add_modifier(Modifier::BOLD))]
-    } else if line.starts_with("o ") {
-        vec![(line.to_owned(), Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD))]
-    } else if line.starts_with("- ") || line.starts_with("– ") {
-        vec![(line.to_owned(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))]
     } else if line.starts_with("Error:") || line.starts_with("Session not found") {
         vec![(line.to_owned(), Style::default().fg(ACCENT_COLOR))]
     } else if let Some((label, value)) = line.split_once(": ")
@@ -2347,6 +2869,17 @@ impl Drop for TerminalGuard {
 }
 
 impl App {
+    fn begin_compaction(&mut self) {
+        self.compaction_active = true;
+        self.compaction_started = Some(Instant::now());
+        self.compaction_message = random_compaction_message(self.compaction_message);
+    }
+
+    fn finish_compaction(&mut self) {
+        self.compaction_active = false;
+        self.compaction_started = None;
+    }
+
     fn finish_generation(&mut self, interrupted: bool) {
         self.generation_active = false;
         self.generation_started = None;
@@ -2362,7 +2895,7 @@ impl App {
     }
 
     fn take_persistable_interactions(&mut self) -> Vec<SavedInteraction> {
-        if self.generation_active || self.reply_pending {
+        if self.generation_active || self.compaction_active || self.reply_pending {
             return Vec::new();
         }
 
@@ -2468,6 +3001,7 @@ impl App {
         self.session = session.id;
         self.model = display_model(&session.model, self.model_available);
         self.workspace = session.workspace.unwrap_or_else(|| self.default_workspace.clone());
+        self.context_usage = session.context_usage;
         self.session_working = session.working;
         self.transcript = render_messages(&session.messages, &self.name);
         self.invalidate_transcript_layout();
@@ -2488,6 +3022,7 @@ impl App {
         let transcript = render_messages(&session.messages, &self.name);
         let model = display_model(&session.model, self.model_available);
         let workspace = session.workspace.unwrap_or_else(|| self.default_workspace.clone());
+        self.context_usage = session.context_usage;
         self.session_working = session.working;
 
         if self.session != session.id
@@ -2499,6 +3034,7 @@ impl App {
                 id: session.id,
                 model: session.model,
                 workspace: Some(workspace),
+                context_usage: session.context_usage,
                 messages: session.messages,
                 working: session.working,
             });
@@ -2782,10 +3318,10 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     use super::{
-        App, DEFAULT_STATUSLINE, GENERATION_MESSAGES, INPUT_HISTORY_LIMIT, ScrollState,
-        TuiPreferences, draw, generation_status_line, handle_event, input_cursor_position,
-        interrupt_generation, render_statusline, save_preferences, validate_statusline,
-        wrapped_rows,
+        App, GENERATION_MESSAGES, INPUT_HISTORY_LIMIT, STATUSLINE_SCROLL_INTERVAL, ScrollState,
+        StatuslineOptions, TuiPreferences, draw, generation_status_line, handle_event,
+        input_cursor_position, interrupt_generation, marquee_statusline, render_statusline,
+        save_preferences, wrapped_rows,
     };
 
     #[test]
@@ -2935,6 +3471,121 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn compact_submission_shows_the_wait_state_before_engine_response() {
+        let (mut command_tx, mut command_rx) = duplex(1024);
+        let mut app = App {
+            input: "/compact".chars().collect(),
+            cursor: "/compact".len(),
+            command_options: vec![(
+                "/compact",
+                "Summarize older turns and keep recent conversation.",
+            )],
+            ..App::default()
+        };
+
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(app.compaction_active);
+        assert!(app.compaction_started.is_some());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("The Crabbot is"));
+
+        let mut submitted = [0; 32];
+        let count = command_rx.read(&mut submitted).await.unwrap();
+
+        assert_eq!(&submitted[..count], b"\"/compact\"\n");
+
+        app.finish_compaction();
+
+        assert!(!app.compaction_active);
+        assert!(app.compaction_started.is_none());
+    }
+
+    #[test]
+    fn compact_appears_in_command_picker_when_a_model_is_available() {
+        let commands = super::command_options("missing-home", true);
+
+        assert!(commands.iter().any(|(command, _)| *command == "/compact"));
+
+        let commands = super::command_options("missing-home", false);
+
+        assert!(!commands.iter().any(|(command, _)| *command == "/compact"));
+    }
+
+    #[test]
+    fn command_picker_includes_every_session_action_and_alias() {
+        let commands = super::command_options("missing-home", false);
+        let names = commands.iter().map(|(command, _)| *command).collect::<Vec<_>>();
+
+        for command in [
+            "/session archive <id>...|--all",
+            "/session unarchive <id>...|--all",
+            "/session delete <id>...|--all [-y] [--deep]",
+            "/exit",
+        ] {
+            assert!(names.contains(&command), "missing command: {command}");
+        }
+    }
+
+    #[test]
+    fn command_picker_includes_installed_capability_commands() {
+        let home =
+            std::env::temp_dir().join(format!("crabbot-tui-commands-{}", std::process::id()));
+
+        for (id, capability) in
+            [("tools", "tool"), ("channel", "channel"), ("timer", "timer"), ("memory", "memory")]
+        {
+            let plugin = home.join("plugins").join(id);
+            let binary = crabbot_core::plugin::binary_name(id);
+
+            std::fs::create_dir_all(plugin.join("bin")).unwrap();
+            std::fs::write(
+                plugin.join("crabbot-plugin.toml"),
+                format!("capabilities = ['{capability}']\n"),
+            )
+            .unwrap();
+            std::fs::write(plugin.join("bin").join(binary), "test").unwrap();
+        }
+
+        let commands = super::command_options(home.to_str().unwrap(), false);
+        let names = commands.iter().map(|(command, _)| *command).collect::<Vec<_>>();
+
+        for command in [
+            "/approval",
+            "/approvals",
+            "/approve <id>",
+            "/deny <id>",
+            "/deliveries",
+            "/retry <id>",
+            "/drop <id>",
+            "/timer <list|add|remove>",
+            "/memory <list|remember|forget>",
+        ] {
+            assert!(names.contains(&command), "missing command: {command}");
+        }
+
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[tokio::test]
@@ -3140,13 +3791,13 @@ mod tests {
             model: super::display_model("foo", false),
             session: "default".into(),
             workspace: String::new(),
-            statusline: DEFAULT_STATUSLINE.into(),
+            statusline: StatuslineOptions::default(),
             ..App::default()
         };
 
         assert_eq!(
             render_statusline(&app),
-            "Crabbot | model: unset | session: default | workspace: unset"
+            "Crabbot | model: unset | context: unavailable | session: default | workspace: unset"
         );
     }
 
@@ -3174,6 +3825,20 @@ mod tests {
             &mut app,
             &interrupt_tx
         ));
+    }
+
+    #[test]
+    fn compaction_status_uses_crabbot_phrases_without_consecutive_repeats() {
+        assert_eq!(super::COMPACTION_MESSAGES.len(), 5);
+        assert!(
+            super::COMPACTION_MESSAGES.iter().all(|message| {
+                message.starts_with("The Crabbot is ") && message.ends_with("...")
+            })
+        );
+
+        for previous in super::COMPACTION_MESSAGES {
+            assert_ne!(super::random_compaction_message(previous), *previous);
+        }
     }
 
     #[test]
@@ -3287,6 +3952,38 @@ mod tests {
     }
 
     #[test]
+    fn drawing_compaction_status_shows_a_dedicated_glowing_message() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let mut app = App {
+            compaction_active: true,
+            compaction_started: Some(std::time::Instant::now()),
+            transcript: "You | now\n/compact".into(),
+            theme_enabled: true,
+            ..App::default()
+        };
+
+        app.begin_compaction();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains(app.compaction_message));
+        assert!(rendered.contains("Compacting conversation  |  Please wait"));
+
+        let indicator =
+            terminal.backend().buffer().content().iter().find(|cell| cell.symbol() == "C").unwrap();
+
+        assert_eq!(indicator.fg, Color::Rgb(255, 140, 0));
+    }
+
+    #[test]
     fn generation_status_glow_moves_across_the_message_only() {
         let text = "The Crabbot is thinking...  |  Esc to interrupt  |  2s";
         let first = generation_status_line(text, Duration::from_secs(1));
@@ -3335,6 +4032,20 @@ mod tests {
         assert!(app.completed_interactions.is_empty());
     }
 
+    #[test]
+    fn completed_local_interactions_wait_for_compaction_to_finish() {
+        let mut app = App { compaction_active: true, ..App::default() };
+        app.begin_interaction("/compact");
+        app.complete_local_interaction("Compacted the conversation.".into());
+
+        assert!(app.take_persistable_interactions().is_empty());
+        assert_eq!(app.completed_interactions.len(), 1);
+
+        app.compaction_active = false;
+
+        assert_eq!(app.take_persistable_interactions().len(), 1);
+    }
+
     #[tokio::test]
     async fn typewriter_reveals_whole_graphemes_and_can_be_disabled_mid_reply() {
         let (mut command_tx, _) = duplex(1024);
@@ -3375,7 +4086,7 @@ mod tests {
         let mut app = App { typewriter: true, ..App::default() };
 
         app.push_user("/help");
-        app.push_bot("Commands:\n  /statusline [format|reset]   Show or reset it.\n".into());
+        app.push_bot("Commands:\n  /statusline [reset]   Choose statusline details.\n".into());
 
         assert!(!app.generation_active);
         assert!(!app.transcript.contains("Show or reset it."));
@@ -3383,7 +4094,7 @@ mod tests {
 
         app.reveal_all();
 
-        assert!(app.transcript.contains("Show or reset it."));
+        assert!(app.transcript.contains("Choose statusline details."));
     }
 
     #[test]
@@ -3447,6 +4158,95 @@ mod tests {
         assert!(!system_text.contains("NOTICE"));
         assert_eq!(rows[0].spans[0].style.fg, Some(Color::Reset));
         assert_eq!(assistant_header.spans[0].style.fg, Some(super::ACCENT_COLOR));
+    }
+
+    #[test]
+    fn fenced_code_blocks_show_a_language_panel_and_preserve_code_lines() {
+        let transcript = concat!(
+            "Crabbot\nBefore the example.\n```js\n",
+            "const speaker = \"System\";\nSystem\n",
+            "const answer = 42;\n```\nAfter the example."
+        );
+        let (rows, message_ranges) = super::wrap_transcript_layout(transcript, "Crabbot", 60, None);
+        let row_text =
+            |row: &Line<'_>| row.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        let rendered = rows.iter().map(row_text).collect::<Vec<_>>();
+
+        assert_eq!(message_ranges.len(), 1);
+        assert!(rendered.iter().any(|row| row.starts_with("▌ ┌─ js ─")));
+        assert!(rendered.iter().any(|row| row.contains("const speaker = \"System\";")));
+        assert!(rendered.iter().any(|row| row.contains("▌ │ System")));
+        assert!(rendered.iter().any(|row| row.contains("const answer = 42;")));
+        assert!(rendered.iter().any(|row| row.contains("After the example.")));
+        assert!(!rendered.iter().any(|row| row.contains("```")));
+
+        let code_row = rows
+            .iter()
+            .find(|row| row.spans.iter().any(|span| span.content.contains("const answer")))
+            .unwrap();
+
+        let code =
+            code_row.spans.iter().find(|span| span.content.contains("const answer")).unwrap();
+
+        assert_eq!(code.style.bg, None);
+
+        let header_row = rows.iter().find(|row| row_text(row).contains("┌─ js ")).unwrap();
+
+        assert!(header_row.spans.iter().all(|span| span.style.bg.is_none()));
+        assert!(header_row.spans.iter().all(|span| span.style.fg == Some(super::ACCENT_COLOR)));
+    }
+
+    #[test]
+    fn code_panels_render_open_streams_and_wrap_long_unicode_lines() {
+        let transcript = "Crabbot\n```rust\nlet greeting = \"こんにちは世界\";";
+        let rows = super::wrap_transcript(transcript, "Crabbot", 28);
+
+        let row_text =
+            |row: &Line<'_>| row.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+
+        let rendered = rows.iter().map(row_text).collect::<Vec<_>>();
+        let code = rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .filter(|span| {
+                span.style.fg == Some(Color::Gray)
+                    && !span.content.trim().is_empty()
+                    && !span.content.contains('│')
+            })
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.iter().any(|row| row.starts_with("▌ ┌─ rust")));
+        assert!(code.contains("こんにちは世界"));
+        assert!(rendered.iter().any(|row| row.starts_with("▌ └")));
+        assert!(rendered.iter().all(|row| UnicodeWidthStr::width(row.as_str()) <= 28));
+    }
+
+    #[test]
+    fn code_fence_parser_supports_tildes_and_sanitizes_the_language_label() {
+        assert_eq!(
+            super::opening_code_fence("  ~~~~ c++ title=sample"),
+            Some(('~', 4, "c++".into()))
+        );
+
+        assert_eq!(super::opening_code_fence("```"), Some(('`', 3, "code".into())));
+        assert!(super::opening_code_fence("    ```js").is_none());
+        assert!(!super::is_closing_code_fence("  ```", '~', 3));
+        assert!(super::is_closing_code_fence("  ~~~~  ", '~', 3));
+        assert!(!super::is_closing_code_fence("~~~ trailing", '~', 3));
+    }
+
+    #[test]
+    fn timestamped_message_boundaries_recover_after_an_unclosed_code_fence() {
+        let transcript = concat!(
+            "Crabbot | 2026-10-03 at 12:00\n```js\n",
+            "const title = \"System\";\n",
+            "You | 2026-10-03 at 12:01\nNext turn."
+        );
+
+        let (_, message_ranges) = super::wrap_transcript_layout(transcript, "Crabbot", 60, None);
+
+        assert_eq!(message_ranges.len(), 2);
     }
 
     #[test]
@@ -3694,9 +4494,26 @@ mod tests {
     }
 
     #[test]
+    fn list_items_keep_regular_transcript_styling() {
+        for line in [
+            "- Enter `q` to quit.",
+            "– Other input is ignored.",
+            "* A regular list item.",
+            "o Another regular list item.",
+        ] {
+            let row = super::wrap_transcript_line(line, "Crabbot", 100);
+
+            assert_eq!(row.len(), 1);
+            assert_eq!(row[0].spans.len(), 1);
+            assert_eq!(row[0].spans[0].content, line);
+            assert_eq!(row[0].spans[0].style, super::Style::default());
+        }
+    }
+
+    #[test]
     fn help_commands_and_descriptions_use_distinct_colors() {
         let row = super::wrap_transcript_line(
-            "  /statusline [format|reset]   Show, configure, or reset the bottom statusline.",
+            "  /statusline [reset]   Choose which details appear in the bottom statusline.",
             "Crabbot",
             100,
         );
@@ -3710,7 +4527,7 @@ mod tests {
 
         let rendered = row[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
 
-        assert!(rendered.contains("Show, configure"));
+        assert!(rendered.contains("Choose which details"));
         assert!(row[0].spans.iter().skip(1).all(|span| span.style.fg == Some(Color::DarkGray)));
 
         let row = super::wrap_transcript_line(
@@ -3745,14 +4562,17 @@ mod tests {
     }
 
     #[test]
-    fn upgrades_the_saved_builtin_statusline_but_preserves_custom_formats() {
-        assert_eq!(super::upgraded_statusline(""), DEFAULT_STATUSLINE);
-        assert_eq!(
-            super::upgraded_statusline(super::LEGACY_DEFAULT_STATUSLINE),
-            DEFAULT_STATUSLINE
-        );
+    fn migrates_legacy_statusline_placeholders_to_fixed_options() {
+        let options = super::statusline_from_legacy("{name} / {session}");
 
-        assert_eq!(super::upgraded_statusline("{name} / {session}"), "{name} / {session}");
+        assert!(options.title);
+        assert!(options.session);
+        assert!(!options.model);
+        assert!(!options.context);
+        assert!(!options.workspace);
+        assert!(!options.status);
+
+        assert_eq!(super::statusline_from_legacy("old custom text"), StatuslineOptions::default());
     }
 
     #[test]
@@ -3762,14 +4582,32 @@ mod tests {
             model: "unset".into(),
             session: "default".into(),
             workspace: "/home/airscript/repos/personal/crabbot".into(),
-            statusline: DEFAULT_STATUSLINE.into(),
+            context_usage: Some(crabbot_core::types::ContextUsage { used: 12345, limit: 128000 }),
+            statusline: StatuslineOptions::default(),
             ..App::default()
         };
 
         assert_eq!(
             render_statusline(&app),
-            "Crabbot | model: unset | session: default | workspace: crabbot"
+            "Crabbot | model: unset | context: 12,345/128,000 (9.6%) | session: default | workspace: crabbot"
         );
+    }
+
+    #[test]
+    fn statusline_reports_unavailable_context_for_providers_without_usage() {
+        let app = App {
+            statusline: StatuslineOptions {
+                title: false,
+                model: false,
+                context: true,
+                session: false,
+                workspace: false,
+                status: false,
+            },
+            ..App::default()
+        };
+
+        assert_eq!(render_statusline(&app), "context: unavailable");
     }
 
     #[test]
@@ -3778,7 +4616,14 @@ mod tests {
             name: "Ada".into(),
             session: "old".into(),
             model: "old-model".into(),
-            statusline: "{name} | {model} | {session}".into(),
+            statusline: StatuslineOptions {
+                title: true,
+                model: true,
+                context: false,
+                session: true,
+                workspace: false,
+                status: false,
+            },
             model_available: false,
             ..App::default()
         };
@@ -3790,6 +4635,7 @@ mod tests {
             id: "fresh".into(),
             model: crate::DEFAULT_MODEL.into(),
             workspace: Some("/work".into()),
+            context_usage: None,
             messages: Vec::new(),
             working: false,
         });
@@ -3798,20 +4644,21 @@ mod tests {
         assert_eq!(app.model, "unset");
         assert_eq!(app.workspace, "/work");
         assert!(app.transcript_scroll.follow_end);
-        assert_eq!(render_statusline(&app), "Ada | unset | fresh");
+        assert_eq!(render_statusline(&app), "Ada | model: unset | session: fresh");
 
         app.model_available = true;
         app.restore_session(super::SessionView {
             id: "configured".into(),
             model: "provider/model".into(),
             workspace: None,
+            context_usage: None,
             messages: Vec::new(),
             working: false,
         });
 
         assert_eq!(app.model, "provider/model");
         assert!(app.workspace.is_empty());
-        assert_eq!(render_statusline(&app), "Ada | provider/model | configured");
+        assert_eq!(render_statusline(&app), "Ada | model: provider/model | session: configured");
     }
 
     #[test]
@@ -3828,6 +4675,7 @@ mod tests {
             id: "shared".into(),
             model: "model".into(),
             workspace: Some("/work".into()),
+            context_usage: None,
             messages: vec![crabbot_core::types::Message {
                 id: "new-user-message".into(),
                 session: "shared".into(),
@@ -3842,6 +4690,73 @@ mod tests {
 
         assert!(app.transcript.contains("message from the other TUI"));
         assert!(app.session_working);
+    }
+
+    #[test]
+    fn compaction_snapshot_waits_for_the_local_system_reply_to_be_saved() {
+        let mut app = App {
+            name: "Crabbot".into(),
+            session: "work".into(),
+            model: "model".into(),
+            ..App::default()
+        };
+
+        app.begin_interaction("/compact");
+        app.push_user("/compact");
+        app.reply_pending = true;
+        app.reply_system = true;
+
+        app.refresh_session(super::SessionView {
+            id: "work".into(),
+            model: "model".into(),
+            workspace: None,
+            context_usage: None,
+            messages: vec![crabbot_core::types::Message {
+                id: "compact-summary".into(),
+                session: "work".into(),
+                role: crabbot_core::types::Role::Assistant,
+                sender: Some("compaction".into()),
+                content: vec![crabbot_core::types::Content::Text {
+                    text: "Earlier conversation summary: Keep the project goals.".into(),
+                }],
+            }],
+            working: false,
+        });
+
+        assert!(app.transcript.contains("/compact"));
+        assert!(!app.transcript.contains("Earlier conversation summary"));
+
+        let reply = "Compacted 11 older messages into a summary; kept 5 recent messages.";
+        let completed = app.push_assistant_output(format!("{reply}\n> "));
+
+        assert_eq!(completed.len(), 1);
+
+        app.refresh_session(super::SessionView {
+            id: "work".into(),
+            model: "model".into(),
+            workspace: None,
+            context_usage: None,
+            messages: vec![
+                crabbot_core::types::Message {
+                    id: "tui-interaction-user-1709164800000-1".into(),
+                    session: "work".into(),
+                    role: crabbot_core::types::Role::User,
+                    sender: Some("tui".into()),
+                    content: vec![crabbot_core::types::Content::Text { text: "/compact".into() }],
+                },
+                crabbot_core::types::Message {
+                    id: "tui-system-interaction-assistant-1709164860000-1".into(),
+                    session: "work".into(),
+                    role: crabbot_core::types::Role::Assistant,
+                    sender: None,
+                    content: vec![crabbot_core::types::Content::Text { text: reply.into() }],
+                },
+            ],
+            working: false,
+        });
+
+        assert_eq!(app.transcript.matches(reply).count(), 1);
+        assert!(app.transcript.contains("System | "));
     }
 
     #[test]
@@ -3874,6 +4789,7 @@ mod tests {
                 id: "shared".into(),
                 model: "model".into(),
                 workspace: None,
+                context_usage: None,
                 messages: Vec::new(),
                 working: false,
             });
@@ -3901,6 +4817,7 @@ mod tests {
             id: "work".into(),
             model: "model".into(),
             workspace: None,
+            context_usage: None,
             messages: vec![crabbot_core::types::Message {
                 id: "old-reply".into(),
                 session: "work".into(),
@@ -4572,7 +5489,7 @@ mod tests {
             model_available: true,
             session: "work".into(),
             typewriter: true,
-            statusline: DEFAULT_STATUSLINE.into(),
+            statusline: StatuslineOptions::default(),
             preferences_path: root
                 .join("data")
                 .join("plugins")
@@ -4620,16 +5537,59 @@ mod tests {
             "first\nsecond\nthird"
         );
 
-        app.statusline = validate_statusline("{name} / {session}").unwrap();
-        save_preferences(&app.preferences_path, &app.statusline, app.typewriter).unwrap();
+        app.input = "/statusline".chars().collect();
+        app.cursor = app.input.len();
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(app.statusline_picker);
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &mut command_tx,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(!app.statusline_picker);
+        assert!(!app.statusline.model);
+        save_preferences(&app.preferences_path, app.statusline, app.typewriter).unwrap();
         let saved = crabbot_file::load(&app.preferences_path, 16 * 1024).unwrap().unwrap();
         let preferences: TuiPreferences =
             toml::from_str(&String::from_utf8(saved).unwrap()).unwrap();
 
-        assert_eq!(preferences.statusline, "{name} / {session}");
-        assert_eq!(render_statusline(&app), "Ada / work");
+        assert_eq!(preferences.statusline, app.statusline);
+        assert_eq!(
+            render_statusline(&app),
+            "Ada | context: unavailable | session: work | workspace: unset"
+        );
+
         assert_eq!(wrapped_rows("one\ntwo", 80), 2);
-        assert!(validate_statusline("{unknown}").is_err());
 
         app.input = "/statusline reset".chars().collect();
         app.cursor = app.input.len();
@@ -4642,15 +5602,14 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(app.statusline, DEFAULT_STATUSLINE);
-        assert!(app.statusline_reset);
-        save_preferences(&app.preferences_path, "", app.typewriter).unwrap();
+        assert_eq!(app.statusline, StatuslineOptions::default());
+        save_preferences(&app.preferences_path, app.statusline, app.typewriter).unwrap();
         let saved = crabbot_file::load(&app.preferences_path, 16 * 1024).unwrap().unwrap();
 
         let preferences: TuiPreferences =
             toml::from_str(&String::from_utf8(saved).unwrap()).unwrap();
 
-        assert!(preferences.statusline.is_empty());
+        assert_eq!(preferences.statusline, StatuslineOptions::default());
         assert!(preferences.typewriter);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4735,7 +5694,14 @@ mod tests {
             session: "tui-main".into(),
             model: "model-main".into(),
             model_available: true,
-            statusline: "{session}".into(),
+            statusline: StatuslineOptions {
+                title: false,
+                model: false,
+                context: false,
+                session: true,
+                workspace: false,
+                status: false,
+            },
             ..App::default()
         };
 
@@ -4754,7 +5720,7 @@ mod tests {
         assert!(output.contains("Using session work."));
         assert!(output.contains("Session not found"));
         assert!(!app.transcript.contains("main"));
-        assert_eq!(render_statusline(&app), "work");
+        assert_eq!(render_statusline(&app), "session: work");
 
         app.pending_model = Some("model-next".into());
         app.observe_context_output("Using mod");
@@ -4778,6 +5744,7 @@ mod tests {
             id: "plain".into(),
             model: crate::DEFAULT_MODEL.into(),
             workspace: None,
+            context_usage: None,
             messages: Vec::new(),
             working: false,
         });
@@ -4789,13 +5756,71 @@ mod tests {
     }
 
     #[test]
-    fn validates_statusline_bounds_and_input_cursor_wrapping() {
-        assert!(validate_statusline("").is_err());
-        assert!(validate_statusline("line\nnext").is_err());
-        assert!(validate_statusline("{name").is_err());
-        assert!(validate_statusline(&"x".repeat(121)).is_err());
+    fn marquee_scrolls_long_statusline_and_keeps_short_statusline_still() {
+        assert_eq!(marquee_statusline("short", 10, 0), "short");
+        assert_eq!(marquee_statusline("abcdefghij", 4, 0), "abcd");
+        assert_eq!(marquee_statusline("abcdefghij", 4, 1), "bcde");
+        assert_eq!(marquee_statusline("a界bc", 4, 0), "a界b");
         assert_eq!(input_cursor_position(&['a', 'b', 'c', 'd'], 4, 6), (1, 1));
         assert_eq!(input_cursor_position(&['界'], 1, 8), (2, 0));
+    }
+
+    #[test]
+    fn marquee_moves_slowly_without_glow_or_cursor_on_its_row() {
+        assert_eq!(STATUSLINE_SCROLL_INTERVAL, Duration::from_millis(300));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let mut app = App {
+            name: "Crabbot".into(),
+            model: "provider/model-with-a-long-name".into(),
+            session: "session-with-a-long-name".into(),
+            workspace: "workspace-with-a-long-name".into(),
+            statusline_started: Some(std::time::Instant::now()),
+            ..App::default()
+        };
+
+        for offset in [0, 1, 2] {
+            app.statusline_started =
+                Some(std::time::Instant::now() - STATUSLINE_SCROLL_INTERVAL * offset);
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+            let statusline_area = app.input_area.unwrap();
+            let statusline_y = terminal.backend().buffer().area().bottom() - 1;
+            let statusline = (0..terminal.backend().buffer().area().width)
+                .map(|x| terminal.backend().buffer()[(x, statusline_y)].symbol())
+                .collect::<String>();
+
+            let cursor = terminal.backend().cursor_position();
+
+            assert!(terminal.backend().cursor_visible());
+            assert_ne!(cursor.y, statusline_y);
+            assert!(statusline_area.contains(cursor));
+            assert!(!statusline.contains('█'));
+        }
+
+        assert_ne!(marquee_statusline("abcdefghij", 4, 0), marquee_statusline("abcdefghij", 4, 1));
+    }
+
+    #[test]
+    fn marquee_cursor_stays_inside_the_composer() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let mut app = App {
+            name: "Crabbot".into(),
+            model: "provider/model-with-a-long-name".into(),
+            session: "session-with-a-long-name".into(),
+            workspace: "workspace-with-a-long-name".into(),
+            statusline_started: Some(std::time::Instant::now()),
+            ..App::default()
+        };
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let position = terminal.backend().cursor_position();
+        let input_area = app.input_area.unwrap();
+
+        assert!(terminal.backend().cursor_visible());
+        assert!(input_area.contains(position));
+        assert!(position.y < 11);
     }
 
     #[test]
