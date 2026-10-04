@@ -72,7 +72,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@1.89
+        uses: dtolnay/rust-toolchain@1.120
 
         with:
           targets: ${{ matrix.target }}
