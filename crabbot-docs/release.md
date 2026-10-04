@@ -13,6 +13,10 @@ x86_64 and ARM64, emits `SHA256SUMS` for all release archives, and publishes
 the artifacts. Installers verify checksums before activation. Crabbot does not
 publish crates or containers.
 
+To dispatch release automation manually, target the release tag itself (for
+example, `gh workflow run release.yml --ref vX.Y.Z`). The workflow builds the
+ref it runs on and does not accept a separate source ref.
+
 ## Release Checklist
 
 1. Update `VERSION`, the workspace manifests, `CITATION.cff`, and the matching

@@ -2,11 +2,6 @@ name: Prepare
 
 on:
   workflow_call:
-    inputs:
-      tag:
-        required: true
-        type: string
-
     outputs:
       tag:
         value: ${{ jobs.prepare.outputs.tag }}
@@ -39,14 +34,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-        with:
-          ref: ${{ inputs.tag }}
-
       - id: release
         name: Validate Release Metadata
 
         env:
-          CRABBOT_RELEASE_TAG: ${{ inputs.tag }}
+          CRABBOT_RELEASE_TAG: ${{ github.ref_name }}
 
         run: |
           set -euo pipefail

@@ -5,11 +5,7 @@ on:
     tags: ["v*"]
 
   workflow_dispatch:
-    inputs:
-      tag:
-        description: Release tag, for example v0.1.0
-        required: true
-        type: string
+    # Dispatch from the release tag selected in GitHub Actions.
 
 permissions:
   contents: read
@@ -20,16 +16,10 @@ jobs:
     name: Prepare
     uses: ./.github/workflows/prepare.yml
 
-    with:
-      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-
   verify:
     name: Verify
     needs: prepare
     uses: ./.github/workflows/verify.yml
-
-    with:
-      ref: ${{ needs.prepare.outputs.tag }}
 
   package:
     name: Package
@@ -37,7 +27,6 @@ jobs:
     uses: ./.github/workflows/package.yml
 
     with:
-      ref: ${{ needs.prepare.outputs.tag }}
       version: ${{ needs.prepare.outputs.version }}
 
   checksum:

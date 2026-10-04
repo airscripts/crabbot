@@ -17,11 +17,6 @@ on:
 
   workflow_call:
     inputs:
-      ref:
-        required: false
-        type: string
-        default: ""
-
       container_image:
         required: false
         type: string
@@ -49,9 +44,6 @@ jobs:
       - name: Checkout
         if: inputs.local != 'true'
         uses: actions/checkout@v7
-
-        with:
-          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install Metrics Tools
         if: inputs.local != 'true'
@@ -168,9 +160,6 @@ jobs:
         if: inputs.local != 'true'
         uses: actions/checkout@v7
 
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-
       - name: Install Archive Tools
         if: inputs.local != 'true'
         run: |
@@ -197,9 +186,6 @@ jobs:
         if: inputs.local != 'true'
         uses: actions/checkout@v7
 
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-
       - name: Check Workspace
         run: CARGO_BUILD_JOBS=4 cargo check --workspace --all-targets --locked
 
@@ -216,9 +202,6 @@ jobs:
       - name: Checkout
         if: inputs.local != 'true'
         uses: actions/checkout@v7
-
-        with:
-          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install MinGW
         if: inputs.local != 'true'
