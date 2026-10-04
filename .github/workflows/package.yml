@@ -79,9 +79,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-
       - if: matrix.archive == 'tar.gz'
         name: Build Unix Archives
         run: bash crabbot-scripts/package.sh "${{ inputs.version }}" "${{ matrix.target }}"

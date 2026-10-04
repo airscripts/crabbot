@@ -1792,7 +1792,7 @@ fn seen_key(channel: &str, id: &str) -> String {
 
     let mut hash = Sha256::new();
     hash.update(key.as_bytes());
-    format!("#oversized:{:x}", hash.finalize())
+    format!("#oversized:{}", super::hex_digest(hash.finalize()))
 }
 
 pub fn remove_worktree(root: &Path, id: &str) -> std::io::Result<()> {
@@ -2388,7 +2388,7 @@ fn save_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
 }
 
 fn session_record_key(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    super::hex_digest(Sha256::digest(bytes))
 }
 
 fn now() -> u64 {

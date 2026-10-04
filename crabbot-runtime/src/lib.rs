@@ -58,7 +58,22 @@ const BANNER: &str = concat!(
     " ╚═════╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝   ╚═════╝     ╚═╝   ",
 );
 
+pub(crate) fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let bytes = bytes.as_ref();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+
+    encoded
+}
+
 const TOOL_STEPS: usize = 8;
+
 const TOOL_CALLS: usize = 16;
 const TURN_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 const TOKEN_LIMIT: u64 = 128_000;
@@ -5219,7 +5234,7 @@ fn pin_media(content: Vec<Content>, media_root: &Path) -> Vec<Content> {
         let mut digest = Sha256::new();
         digest.update(uri.as_bytes());
         digest.update(&bytes);
-        let destination = pinned.join(format!("{:x}.bin", digest.finalize()));
+        let destination = pinned.join(format!("{}.bin", hex_digest(digest.finalize())));
 
         if std::fs::create_dir_all(&pinned).is_ok()
             && crabbot_file::save(&destination, &bytes).is_ok()
@@ -5511,7 +5526,7 @@ fn session_id(channel: &str, chat: &str, thread: Option<&str>) -> String {
     key.update(chat.as_bytes());
     key.update([0]);
     key.update(thread.unwrap_or_default().as_bytes());
-    format!("{channel}-x{:x}", key.finalize())
+    format!("{channel}-x{}", hex_digest(key.finalize()))
 }
 
 fn turn_messages(session: &str, home_root: &Path, history: Vec<Message>) -> Vec<Message> {
@@ -11158,7 +11173,7 @@ fn digest(
         hash.update(&buffer[..count]);
     }
 
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(hex_digest(hash.finalize()))
 }
 
 fn revision(path: impl AsRef<Path>) -> String {
@@ -11456,7 +11471,7 @@ fn verify_archive(
 
     let mut hash = Sha256::new();
     hash.update(std::fs::read(path)?);
-    let actual = format!("{:x}", hash.finalize());
+    let actual = hex_digest(hash.finalize());
 
     if actual != expected.to_ascii_lowercase() {
         return Err("Archive checksum did not match the requested SHA-256.".into());
@@ -12214,6 +12229,11 @@ mod tests {
         sync::{Arc, Mutex},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn hex_digest_preserves_lowercase_byte_encoding() {
+        assert_eq!(super::hex_digest([0x00, 0x0a, 0xab, 0xff]), "000aabff");
+    }
 
     fn test_root(label: &str) -> PathBuf {
         let nonce =
@@ -16249,7 +16269,7 @@ fn main() {
         );
         let mut hash = Sha256::new();
         hash.update(fs::read(&archive).unwrap());
-        let checksum = format!("{:x}", hash.finalize());
+        let checksum = super::hex_digest(hash.finalize());
         let extracted =
             resolve(&format!("file://{}#sha256={checksum}", archive.display()), None).unwrap();
         assert!(extracted.path.join("crabbot-plugin.toml").is_file());

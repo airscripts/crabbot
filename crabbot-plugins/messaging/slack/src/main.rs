@@ -552,13 +552,29 @@ async fn api_at(
     body: Value,
     base: &str,
 ) -> crabbot_core::Result<Value> {
-    let response = client
-        .post(format!("{base}/{method}"))
-        .bearer_auth(token)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| crabbot_core::Error::Denied(format!("Slack request failed: {error}.")))?;
+    let base = reqwest::Url::parse(base).map_err(|error| {
+        crabbot_core::Error::Denied(format!("Slack API URL was invalid: {error}."))
+    })?;
+
+    let url = base.join(method).map_err(|error| {
+        crabbot_core::Error::Denied(format!("Slack API URL was invalid: {error}."))
+    })?;
+
+    let loopback_http = cfg!(test)
+        && url.scheme() == "http"
+        && url
+            .host_str()
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
+
+    if url.scheme() != "https" && !loopback_http {
+        return Err(crabbot_core::Error::Denied("Slack API requests require HTTPS.".into()));
+    }
+
+    let response =
+        client.post(url).bearer_auth(token).json(&body).send().await.map_err(|error| {
+            crabbot_core::Error::Denied(format!("Slack request failed: {error}."))
+        })?;
 
     let status = response.status();
     let retry_after = response
@@ -1378,6 +1394,16 @@ mod tests {
 
     fn test_client() -> reqwest::Client {
         reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejects_non_loopback_http_api_urls() {
+        let error =
+            api_at(&test_client(), "token", "auth.test", json!({}), "http://example.com/api")
+                .await
+                .unwrap_err();
+
+        assert!(error.to_string().contains("require HTTPS"));
     }
 
     fn set_modified(path: &Path, modified: SystemTime) {

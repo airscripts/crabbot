@@ -22,12 +22,17 @@ handoff must finish with the configured coverage gates passing; run `make verify
 at the end of each work turn and resolve coverage failures without lowering
 thresholds.
 
+### Interpreting Coverage Results
+
 Coverage verification requires localhost loopback access. Some provider and
 channel integration tests return early when binding `127.0.0.1` fails with
 `PermissionDenied`; the test process can still exit successfully while coverage
-is understated. If coverage falls below a package threshold in a restricted
-sandbox, rerun `make verify` with loopback access before calling the gate failed.
-Do not lower thresholds to work around skipped integration tests.
+is understated. Treat an under-threshold report from a run with loopback binding
+failures as inconclusive, not as a failed coverage gate. Rerun the full
+configured profile with loopback available, and report a gate failure only if
+that complete run still misses a threshold. Do not infer a gate failure from an
+isolated package rerun or a restricted run, and do not lower thresholds to work
+around skipped integration tests.
 
 ## Formatting
 
@@ -91,6 +96,9 @@ supports Bash, Fish, PowerShell, and Zsh through `clap_complete`.
 
 ## Change Rules
 
+- Keep changelog bullets to one concise line of professional, user-facing English.
+  Describe features, not implementation details, tests, or CI work. Before the
+  first release, keep the unreleased section to `Added` entries only.
 - Keep the core capability-free and provider-neutral.
 - Add provider or channel behavior only in its plugin.
 - Keep plugin stdout as protocol-only JSONL and logs on stderr.

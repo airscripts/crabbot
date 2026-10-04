@@ -20,6 +20,20 @@ const VALUE_LIMIT: usize = 256 * 1024;
 const BYTE_LIMIT: usize = 32 * 1024 * 1024;
 const FRAME_HEADROOM: usize = 64 * 1024;
 
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let bytes = bytes.as_ref();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+
+    encoded
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 struct Entry {
     #[serde(default)]
@@ -474,7 +488,11 @@ fn record_ref(scope: &str, key: &str) -> String {
     let mut key_hash = Sha256::new();
     key_hash.update(key.as_bytes());
 
-    format!("memory-records/{:x}/{:x}.md", scope_hash.finalize(), key_hash.finalize())
+    format!(
+        "memory-records/{}/{}.md",
+        hex_digest(scope_hash.finalize()),
+        hex_digest(key_hash.finalize())
+    )
 }
 
 fn summary(value: &str) -> String {
@@ -779,6 +797,11 @@ mod tests {
     use crabbot_core::types::Request;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn hex_digest_preserves_lowercase_byte_encoding() {
+        assert_eq!(super::hex_digest([0x00, 0x0a, 0xab, 0xff]), "000aabff");
+    }
 
     fn items() -> Arc<Mutex<State>> {
         Arc::new(Mutex::new(State::default()))
