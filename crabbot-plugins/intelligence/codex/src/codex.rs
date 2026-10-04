@@ -294,7 +294,7 @@ async fn generate_on(
                 "sandbox": "read-only",
                 "dynamicTools": tools,
                 "developerInstructions": format!(
-                    "{tool_guidance}\nNever claim an operation succeeded until a Crabbot tool confirms it. Do not suggest shell commands such as `cat` or `grep` as a substitute for declared tools.\n\n{instructions}"
+                    "{tool_guidance}\n\n{instructions}"
                 ),
                 "config": {
                     "features": {
@@ -361,13 +361,13 @@ async fn generate_on(
 
 fn tool_guidance(tools: &[ToolSpec]) -> String {
     if tools.is_empty() {
-        return "No Crabbot workspace tools are declared for this turn. Do not claim to have inspected workspace files or claim a tool call failed; explain that workspace tools were not provided.".into();
+        return "Workspace tools are unavailable. Say so for workspace tasks; don't claim access or tool failures, and don't suggest shell instead.".into();
     }
 
     let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join(", ");
 
     format!(
-        "These Crabbot tools are declared and available for this turn: {names}. File paths must remain inside the active workspace; prefer workspace-relative paths. For workspace questions, call the relevant declared tool; do not claim tools are unavailable unless an actual tool call returns an error. Issue at most one mutating tool call in a response, then wait for its result before deciding whether another change is needed. If a tool call fails, explain its error and do not repeat the same call unchanged. After a tool confirms success, do not repeat that operation through another tool, such as using shell to redo a successful file write."
+        "Available Crabbot tools: {names}. Use workspace-relative paths inside the active workspace. Use relevant tools for workspace tasks; say a tool is unavailable only after an error. Make one mutating call at a time and wait for its result. Report failures; don't retry unchanged. Never claim success without confirmation or repeat confirmed work through another tool. Don't suggest shell as a substitute."
     )
 }
 
@@ -1088,6 +1088,27 @@ mod tests {
     }
 
     #[test]
+    fn keeps_tool_guidance_compact_and_preserves_safety_rules() {
+        let tools = vec![ToolSpec { name: "read".into(), description: None, schema: json!({}) }];
+        let guidance = tool_guidance(&tools);
+
+        assert!(guidance.len() < 500);
+        assert!(guidance.contains("read"));
+        assert!(guidance.contains("workspace-relative paths"));
+        assert!(guidance.contains("only after an error"));
+        assert!(guidance.contains("wait for its result"));
+        assert!(guidance.contains("don't retry unchanged"));
+        assert!(guidance.contains("repeat confirmed work through another tool"));
+        assert!(guidance.contains("shell as a substitute"));
+
+        let no_tools = tool_guidance(&[]);
+
+        assert!(no_tools.len() < 150);
+        assert!(no_tools.contains("Workspace tools are unavailable"));
+        assert!(no_tools.contains("don't claim access or tool failures"));
+    }
+
+    #[test]
     fn reports_bounded_app_server_error_details() {
         let message = super::app_server_error(&json!({
             "method": "error",
@@ -1154,15 +1175,15 @@ mod tests {
         let guidance = tool_guidance(&[tool]);
 
         assert!(guidance.contains("read"));
-        assert!(guidance.contains("declared and available"));
-        assert!(guidance.contains("unless an actual tool call returns an error"));
-        assert!(guidance.contains("After a tool confirms success"));
-        assert!(guidance.contains("at most one mutating tool call in a response"));
+        assert!(guidance.contains("workspace-relative paths"));
+        assert!(guidance.contains("only after an error"));
+        assert!(guidance.contains("Make one mutating call at a time"));
+        assert!(guidance.contains("repeat confirmed work through another tool"));
 
         let guidance = tool_guidance(&[]);
 
-        assert!(guidance.contains("No Crabbot workspace tools are declared"));
-        assert!(!guidance.contains("declared and available"));
+        assert!(guidance.contains("Workspace tools are unavailable"));
+        assert!(guidance.contains("don't claim access or tool failures"));
     }
 
     #[test]
@@ -1601,9 +1622,11 @@ done
         );
 
         assert!(
-            std::fs::read_to_string(format!("{}.requests", binary.display())).unwrap().contains(
-                "do not claim tools are unavailable unless an actual tool call returns an error"
-            )
+            std::fs::read_to_string(format!("{}.requests", binary.display()))
+                .unwrap()
+                .contains(
+                    "Never claim success without confirmation or repeat confirmed work through another tool"
+                )
         );
 
         assert_eq!(events.try_recv().unwrap()["params"]["event"]["text"], "Hello");

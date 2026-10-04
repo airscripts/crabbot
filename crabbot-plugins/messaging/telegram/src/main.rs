@@ -17,7 +17,11 @@ const ID_LIMIT: usize = 256;
 const TEXT_LIMIT: usize = 256 * 1024;
 
 #[tokio::main]
-async fn main() -> crabbot_core::Result<()> {
+async fn main() -> std::process::ExitCode {
+    crabbot_log::run_plugin("telegram", plugin_main()).await
+}
+
+async fn plugin_main() -> crabbot_core::Result<()> {
     let client = client()?;
 
     serve_with(

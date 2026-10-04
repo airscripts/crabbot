@@ -7,6 +7,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+crabbot-date.workspace = true
+crabbot-log.workspace = true
 crossterm.workspace = true
 crabbot-core = { path = "../../crabbot-core" }
 crabbot-file = { path = "../../crabbot-libs/file" }

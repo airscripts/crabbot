@@ -7,6 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+crabbot-log.workspace = true
 crabbot-core = { path = "../../../crabbot-core" }
 reqwest.workspace = true
 serde_json.workspace = true

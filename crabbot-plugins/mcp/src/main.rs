@@ -22,7 +22,11 @@ const BODY_LIMIT: usize = crabbot_core::jsonl::MAX / 2;
 const DEADLINE: Duration = Duration::from_secs(30);
 
 #[tokio::main]
-async fn main() -> crabbot_core::Result<()> {
+async fn main() -> std::process::ExitCode {
+    crabbot_log::run_plugin("mcp", plugin_main()).await
+}
+
+async fn plugin_main() -> crabbot_core::Result<()> {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))

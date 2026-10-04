@@ -35,7 +35,7 @@ File operations are confined to that selected directory. Confirm that the
 TUI has `[clients.tui] tools = true`, or that the messaging channel has
 `tools = true`. Mutating tools also require `approval = "prompt"` for inline
 confirmation or `approval = "auto"` for unattended approval. Shell execution
-requires the separate `shell = true` setting and the configured approval mode.
+requires `clients.tui.shell = true` and the configured approval mode.
 
 ## Provider Errors
 

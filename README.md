@@ -11,6 +11,9 @@ and extendable through isolated plugins while keeping the host small. You can
 shape it around the way you work instead of adopting a fixed workflow or
 locking your data into a hosted service.
 
+> Crabbot is pre-release software. Commands and configuration may change
+> incompatibly before version 1.0.
+
 ## Table Of Contents
 
 - [For Agents](#for-agents)
@@ -27,7 +30,9 @@ locking your data into a hosted service.
 
 ## For Agents
 
-> Install Crabbot from https://github.com/airscripts/crabbot with the official installer for your operating system, then run `crabbot init` and `crabbot doctor`.
+```text
+Install Crabbot from https://github.com/airscripts/crabbot with the official installer for your operating system, then run crabbot init and crabbot doctor.
+```
 
 When working on the repository, read `AGENTS.md`, the nearest scoped guidance,
 and the relevant local documentation before making changes. Treat the
@@ -114,7 +119,7 @@ the repository root or pass an absolute source path:
 ```sh
 cargo build -p crabbot-plugin-PLUGIN_ID --locked
 crabbot init
-crabbot plugin install PLUGIN_ID --link --yes
+crabbot plugin install PLUGIN_ID --link
 crabbot doctor
 ```
 
@@ -123,12 +128,12 @@ does not require a particular intelligence or messaging plugin.
 
 Use `crabbot plugin list` to inspect installed capabilities. A local link
 records the canonical source and executable in `plugins.lock`; rebuild and run
-`crabbot plugin install PLUGIN_ID --link --yes` again to validate and hot-load
+`crabbot plugin install PLUGIN_ID --link` again to validate and hot-load
 your changes. Install several bundled plugins with one command, for example
 `crabbot plugin install codex tui tools`. `crabbot plugin update` previews
 available updates. Run
-`crabbot plugin update --yes` to apply the preview; it unloads and reloads only
-plugins that were active, without restarting the daemon. Review every
+`crabbot plugin update` to review changes and confirm in the terminal; it
+unloads and reloads active plugins without restarting the daemon. Review every
 manifest's permissions and declared secrets before linking community plugins.
 
 ## Usage
@@ -198,7 +203,8 @@ Use `crabbot service install` followed by `crabbot service start` to activate
 the native service. Use `crabbot service restart` after changing a plugin or
 daemon configuration. Existing definitions require
 `crabbot service install --force` to replace them. `crabbot service stop`
-deactivates the service, and `crabbot service uninstall -y` removes it. See the
+deactivates the service, and `crabbot service uninstall` removes it after
+confirmation. See the
 [configuration guide](crabbot-docs/configuration.md)
 for the full `config.toml` reference and recovery behavior. `crabbot service
 status` reports whether the service is active. On Linux it uses the user-level

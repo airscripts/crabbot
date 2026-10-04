@@ -7,15 +7,12 @@ Use Keep a Changelog headings and a semantic version tag such as `vX.Y.Z`.
 crabbot-scripts/release.sh vX.Y.Z
 ```
 
-Release automation validates `VERSION` and the matching changelog section,
-builds separate core and plugin archives for Linux, macOS, and Windows on
+Pushing a version tag starts release automation. It validates `VERSION` and
+the matching changelog section, then builds separate core and plugin archives
+for Linux, macOS, and Windows on
 x86_64 and ARM64, emits `SHA256SUMS` for all release archives, and publishes
 the artifacts. Installers verify checksums before activation. Crabbot does not
 publish crates or containers.
-
-To dispatch release automation manually, target the release tag itself (for
-example, `gh workflow run release.yml --ref vX.Y.Z`). The workflow builds the
-ref it runs on and does not accept a separate source ref.
 
 ## Release Checklist
 

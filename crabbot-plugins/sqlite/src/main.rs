@@ -22,9 +22,14 @@ const VALUE_LIMIT: usize = 256 * 1024;
 const FRAME_HEADROOM: usize = 64 * 1024;
 const DB_LIMIT: i64 = 32 * 1024 * 1024;
 
-#[tokio::main]
 #[cfg(not(test))]
-async fn main() -> crabbot_core::Result<()> {
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    crabbot_log::run_plugin("sqlite", plugin_main()).await
+}
+
+#[cfg(not(test))]
+async fn plugin_main() -> crabbot_core::Result<()> {
     let path = std::env::var_os("CRABBOT_DB")
         .map(PathBuf::from)
         .or_else(|| {

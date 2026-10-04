@@ -30,18 +30,28 @@ clearer for adopters and contributors.
 - Add deterministic onboarding and command-output tests.
 - Preserve protocol and plugin compatibility.
 
-## v0.4 | Ecosystem
+## v0.4 | Plugin Ecosystem
 
-Make it easy to create, review, discover, and securely install community
-plugins without adding a hosted runtime to Crabbot.
+Standardize how official and community plugins are published, discovered, and
+installed, with plugin releases independent from Crabbot kernel releases.
 
 - Add the `crabbot-plugins/template` Hello Crabworld Rust starter.
-- Document the plugin authoring and catalog submission workflow.
-- Create a separate Astro site deployed on Vercel.
-- Add a curated public plugin catalog with reviewed pull requests.
-- Include pinned sources, project details, capabilities, permissions, secrets, targets, maintainers, and security status.
-- Generate copyable install commands for immutable GitHub revisions.
-- Keep private plugins directly installable but outside the public catalog.
+- Use one plugin manifest and release format for official and community plugins.
+- Keep the official catalog metadata in this monorepo and review community
+  submissions through pull requests.
+- Give each plugin its own version and release trigger; plugin releases must not
+  publish a Crabbot kernel release or appear as kernel GitHub Releases.
+- Publish platform artifacts with immutable versions and verifiable digests.
+- Declare supported Crabbot versions in each plugin manifest and reject
+  incompatible installs or updates.
+- Resolve catalog IDs to pinned sources and artifacts; record the selected
+  plugin version and digest in `plugins.lock` for reproducible installs.
+- Include project details, capabilities, permissions, secrets, targets,
+  maintainers, and security status in catalog entries.
+- Generate copyable install commands and a public catalog view from the same
+  metadata.
+- Document plugin authoring, independent releases, catalog submission, and
+  private direct installs outside the public catalog.
 
 ## v0.5 | Deployments
 

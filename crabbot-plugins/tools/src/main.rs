@@ -58,7 +58,11 @@ static FETCHES: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static TEMP_FILES: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::main]
-async fn main() -> crabbot_core::Result<()> {
+async fn main() -> std::process::ExitCode {
+    crabbot_log::run_plugin("tools", plugin_main()).await
+}
+
+async fn plugin_main() -> crabbot_core::Result<()> {
     let root = std::env::var_os("CRABBOT_ROOT")
         .map(PathBuf::from)
         .ok_or_else(|| crabbot_core::Error::Denied("CRABBOT_ROOT is not configured.".into()))?;

@@ -15,8 +15,9 @@ such as `crab config set 'approval="prompt"'` or
 `crab config set 'channels.telegram.allow=["123"]'`. The command
 validates the complete config before saving and preserves existing comments.
 The TUI tools switch is applied immediately to a running daemon for new turns;
-the TUI theme setting takes effect the next time `crab tui` starts. Other
-settings are saved and take effect the next time the daemon starts. Add
+the TUI theme setting takes effect the next time `crab tui` starts. TUI shell
+access takes effect after the daemon restarts. Other settings are saved and
+take effect the next time the daemon starts. Add
 `--force` to restart a running daemon and apply restart-required settings.
 
 Media-capable channels use `CRABBOT_MEDIA` for temporary downloaded content;
@@ -30,7 +31,6 @@ session are copied under `media/pinned` and are not removed by cache cleanup.
 name = "Crabbot"
 update = "prompt"
 approval = "off"
-shell = false
 
 [channels.telegram]
 allow = ["-1001234567890"]
@@ -51,6 +51,7 @@ worktree = true
 
 [clients.tui]
 tools = true
+shell = false
 theme = true
 ```
 
@@ -97,6 +98,7 @@ separate locations under `CRABBOT_HOME`:
 | Location | Purpose |
 | --- | --- |
 | `data/` | Durable runtime state, including session records, client and delivery state, and plugin-owned data or settings. This is storage, not telemetry collection. |
+| `logs/` | Daily application diagnostics, including plugin stderr, in sortable UTC-dated `YYYY-MM-DD.log` or `.jsonl` files. |
 | `workspace/` | The default agent working area for project files and context instructions. `CRAB.md` and `CLAW.md` are loaded into turns; file tools are confined to the active workspace. |
 | `plugins/<plugin-id>/` | Installed plugin files and their `crabbot-plugin.toml` manifests. A manifest declares capabilities; plugin code supplies them through the plugin protocol. |
 
@@ -112,7 +114,7 @@ contents into each model turn alongside the persisted, bounded conversation.
 Changes to either file apply on the next turn. These files guide model behavior
 but cannot grant capabilities or override host policy.
 
-Together, they share a 32 KiB context budget; excess content is truncated, so
+Together, they share an 8 KiB context budget; excess content is truncated, so
 put the most important guidance first and keep both files concise.
 
 TUI-created session IDs use an internal `tui-` namespace. Names shown in the
@@ -127,10 +129,9 @@ to `CRABBOT_ROOT` when no session workspace is selected. A root by itself does
 not enable tools: channel `tools = true` and daemon approvals are still
 required, and shell remains separately disabled by default.
 
-The TUI is a local client of the daemon. Its `tools` setting defaults to
-`false`; set `[clients.tui] tools = true` to expose workspace tools to TUI
-turns. The global approval mode continues to govern mutating tool calls. TUI
-is the only client with a supported client-specific setting at present.
+The TUI is a local daemon client. Its `tools` and `shell` settings default to
+`false`; enable them under `[clients.tui]` for TUI turns. Global approval still
+controls mutating tools. Move legacy top-level `shell` settings here.
 
 Provider and channel plugins read declared secrets from their own environment
 variables or from the JSON file named by `CRABBOT_CREDENTIALS`. The file must

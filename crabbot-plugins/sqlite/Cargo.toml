@@ -7,6 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+crabbot-log.workspace = true
 crabbot-core = { path = "../../crabbot-core" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde_json.workspace = true

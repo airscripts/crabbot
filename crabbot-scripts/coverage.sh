@@ -4,6 +4,7 @@ set -euo pipefail
 packages=(
     crabbot
     crabbot-core
+    crabbot-date
     crabbot-file
     crabbot-process
     crabbot-runtime

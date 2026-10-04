@@ -95,9 +95,14 @@ impl Default for GatewayState {
     }
 }
 
-#[tokio::main]
 #[cfg(not(test))]
-async fn main() -> crabbot_core::Result<()> {
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    crabbot_log::run_plugin("discord", plugin_main()).await
+}
+
+#[cfg(not(test))]
+async fn plugin_main() -> crabbot_core::Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(60))

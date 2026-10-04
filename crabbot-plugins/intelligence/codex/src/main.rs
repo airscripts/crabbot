@@ -18,7 +18,11 @@ mod codex;
 const BODY_LIMIT: usize = crabbot_core::jsonl::MAX / 2;
 
 #[tokio::main]
-async fn main() -> crabbot_core::Result<()> {
+async fn main() -> std::process::ExitCode {
+    crabbot_log::run_plugin("codex", plugin_main()).await
+}
+
+async fn plugin_main() -> crabbot_core::Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(120))

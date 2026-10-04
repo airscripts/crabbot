@@ -67,6 +67,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@1.89
 
@@ -75,17 +79,26 @@ jobs:
 
       - if: matrix.archive == 'tar.gz'
         name: Build Unix Archives
-        run: bash crabbot-scripts/package.sh "${{ inputs.version }}" "${{ matrix.target }}"
+
+        env:
+          CRABBOT_VERSION: ${{ inputs.version }}
+          CRABBOT_TARGET: ${{ matrix.target }}
+
+        run: bash crabbot-scripts/package.sh "$CRABBOT_VERSION" "$CRABBOT_TARGET"
 
       - if: matrix.archive == 'zip'
         name: Build Windows Archives
         shell: pwsh
 
+        env:
+          CRABBOT_VERSION: ${{ inputs.version }}
+          CRABBOT_TARGET: ${{ matrix.target }}
+
         run: |
           $ErrorActionPreference = "Stop"
-          cargo build --workspace --release --locked --target "${{ matrix.target }}"
-          $version = "${{ inputs.version }}"
-          $target = "${{ matrix.target }}"
+          cargo build --workspace --release --locked --target "$env:CRABBOT_TARGET"
+          $version = $env:CRABBOT_VERSION
+          $target = $env:CRABBOT_TARGET
           $plugins = @("core", "codex", "claude", "gemini", "ollama", "openrouter", "telegram", "discord", "whatsapp", "signal", "slack", "sqlite", "memory", "timer", "tools", "mcp", "whisper", "tui", "pi")
 
           foreach ($plugin in $plugins) {

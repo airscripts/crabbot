@@ -27,7 +27,7 @@ use tokio::{
 #[cfg(target_os = "linux")]
 use tokio::io::AsyncWriteExt;
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::{Cancellation, Stop, state::Store};
 
@@ -62,6 +62,7 @@ pub struct State {
     pub plugins: super::Plugins,
     pub config: super::Config,
     pub tui_tools: Arc<AtomicBool>,
+    pub tui_shell: Arc<AtomicBool>,
     pub channel: String,
     pub model: String,
 }
@@ -81,12 +82,29 @@ pub async fn serve(listener: TcpListener, state: Arc<State>) -> io::Result<()> {
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     if let Err(error) = handle(stream, state, slot).await {
-                        warn!(error = %super::diagnostic(super::sentence(error.to_string())), "IPC client closed.");
+                        let kind = error.kind();
+                        let message = super::diagnostic(super::sentence(error.to_string()));
+
+                        if is_client_disconnect(kind) {
+                            debug!(error = %message, "IPC client disconnected.");
+                        } else {
+                            warn!(error = %message, "IPC client request failed.");
+                        }
                     }
                 });
             }
         }
     }
+}
+
+fn is_client_disconnect(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 async fn handle(
@@ -304,7 +322,7 @@ async fn session_answer(
         workspace.as_deref().map(std::path::Path::new).or(Some(state.root.as_path())),
         &media_root,
         state.tui_tools.load(Ordering::Acquire),
-        state.config.shell,
+        state.tui_shell.load(Ordering::Acquire),
         state.config.approval_mode(),
         Arc::clone(&state.pending),
         &cancel,
@@ -767,7 +785,7 @@ async fn session_command(
     let workspace = workspace.as_deref().map(Path::new).unwrap_or(state.root.as_path());
     let cancel = super::cancellation(&state.cancels, id);
 
-    let text = if state.config.shell {
+    let text = if state.tui_shell.load(Ordering::Acquire) {
         let (notices, mut receiver) = tokio::sync::mpsc::channel(8);
         let command_task = run_terminal_command(
             &command,
@@ -801,7 +819,7 @@ async fn session_command(
         text
     } else {
         format!(
-            "Shell access is disabled in the running daemon. Check `shell = true` in {} and restart the daemon.",
+            "Shell access is disabled in the running daemon. Enable `clients.tui.shell` in {}.",
             state.home.join("config.toml").display()
         )
     };
@@ -2007,8 +2025,9 @@ mod tests {
     use super::super::{Stop, state::Store};
     use super::{
         FRAME, State, active, approval_list, approval_resolve, cancel as cancel_request,
-        capability_call, compaction_boundary, dispatch, last_interaction_was_compaction, load,
-        plugins, run_terminal_command, transcript_batches, unload, write_stream_notice,
+        capability_call, compaction_boundary, dispatch, is_client_disconnect,
+        last_interaction_was_compaction, load, plugins, run_terminal_command, transcript_batches,
+        unload, write_stream_notice,
     };
 
     use crabbot_core::{
@@ -2019,9 +2038,25 @@ mod tests {
     use serde_json::json;
     use std::{
         collections::BTreeMap,
+        io,
         path::PathBuf,
         sync::{Arc, Mutex},
     };
+
+    #[test]
+    fn treats_transport_disconnects_as_debug_events() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(is_client_disconnect(kind));
+        }
+
+        assert!(!is_client_disconnect(io::ErrorKind::TimedOut));
+        assert!(!is_client_disconnect(io::ErrorKind::PermissionDenied));
+    }
 
     use tokio::{
         io::{BufReader, duplex},
@@ -2251,7 +2286,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state.home);
 
         std::fs::create_dir_all(&state.home).unwrap();
-        state.config.shell = false;
+        state.config.clients.entry("tui".into()).or_default().shell = Some(false);
 
         dispatch(
             &IpcRequest::call(
@@ -2368,6 +2403,7 @@ mod tests {
             plugins: crate::Plugins::default(),
             config: crate::Config::default(),
             tui_tools: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_shell: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             channel: "telegram".into(),
             model: "codex".into(),
         }
@@ -3684,6 +3720,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
             plugins: crate::Plugins::default(),
             config: crate::Config::default(),
             tui_tools: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_shell: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             channel: "telegram".into(),
             model: "codex".into(),
         };
@@ -3727,6 +3764,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
             plugins: crate::Plugins::default(),
             config: crate::Config::default(),
             tui_tools: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_shell: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             channel: "telegram".into(),
             model: "codex".into(),
         };
@@ -3874,6 +3912,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
             plugins: crate::Plugins::default(),
             config: crate::Config::default(),
             tui_tools: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_shell: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             channel: "telegram".into(),
             model: "codex".into(),
         });

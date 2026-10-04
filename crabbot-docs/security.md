@@ -82,7 +82,7 @@ lock-file contents are diagnostic only and never determine ownership.
   before installation.
 - Keep `CRABBOT_HOME`, `CRABBOT_CREDENTIALS`, and workspace directories owned by
   the daemon user with restrictive permissions.
-- Keep `approval = "off"` and `shell = false` until a channel policy is tested.
+- Keep `approval = "off"` and TUI shell access disabled until its policy is tested.
 - Use explicit group `allow` entries and enable `tools` only for trusted rooms.
 - Prefer isolated worktrees for group sessions and inspect changes before
   merging them.
@@ -90,7 +90,7 @@ lock-file contents are diagnostic only and never determine ownership.
 - Treat interrupted turns and pending worktree cleanup as items for review,
   not as successful completion.
 - Review uncertain channel deliveries with `crabbot delivery list`; retry only
-  when a duplicate is acceptable, using `crabbot delivery retry <id> --yes`.
+  when a duplicate is acceptable, then confirm `crabbot delivery retry <id>`.
 
 Report vulnerabilities privately to
 [francesco@airscript.it](mailto:francesco@airscript.it), including the affected

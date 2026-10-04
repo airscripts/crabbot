@@ -428,6 +428,7 @@ pub struct Process {
     group: Option<u32>,
     input: BufReader<tokio::process::ChildStdout>,
     output: tokio::process::ChildStdin,
+    stderr: Option<mpsc::Receiver<Vec<u8>>>,
     path: PathBuf,
     args: Vec<OsString>,
     env: Option<Vec<(OsString, OsString)>>,
@@ -512,11 +513,28 @@ impl Process {
                 .env("CRABBOT_PLUGIN_GROUP", "1");
         }
 
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+        let mut child =
+            command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+
+        let stderr = child.stderr.take().map(|mut stream| {
+            let (sender, receiver) = mpsc::channel(64);
+
+            tokio::spawn(async move {
+                let mut buffer = [0; 1024];
+
+                loop {
+                    match tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await {
+                        Ok(0) | Err(_) => break,
+
+                        Ok(count) => {
+                            let _ = sender.try_send(buffer[..count].to_vec());
+                        }
+                    }
+                }
+            });
+
+            receiver
+        });
 
         #[cfg(unix)]
         let group = child.id().and_then(child_group);
@@ -567,7 +585,7 @@ impl Process {
 
         match result {
             Ok((hello, input, output)) => {
-                Ok(Self { hello, child, group, input, output, path, args, env })
+                Ok(Self { hello, child, group, input, output, stderr, path, args, env })
             }
 
             Err(error) => {
@@ -575,6 +593,10 @@ impl Process {
                 Err(error)
             }
         }
+    }
+
+    pub fn take_stderr(&mut self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        self.stderr.take()
     }
 
     pub async fn call(&mut self, request: Request) -> Result<Response> {
@@ -853,6 +875,28 @@ mod tests {
     #[cfg(unix)]
     async fn start_test_plugin(_mode: &str, script: &str) -> crate::Result<Process> {
         Process::start_with("sh", ["-c", script]).await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn captures_plugin_stderr_without_blocking_the_protocol() {
+        let script = r#"printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"test","version":"0.1.0","capabilities":[]}}'; printf 'plugin diagnostic\n' >&2; cat >/dev/null"#;
+        let mut process = Process::start_with("sh", ["-c", script]).await.unwrap();
+        let mut stderr = process.take_stderr().unwrap();
+        let diagnostic = timeout(Duration::from_secs(1), async {
+            let mut diagnostic = Vec::new();
+
+            while !diagnostic.ends_with(b"\n") {
+                diagnostic.extend(stderr.recv().await.unwrap());
+            }
+
+            diagnostic
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(diagnostic, b"plugin diagnostic\n");
+        process.stop().await.unwrap();
     }
 
     #[cfg(windows)]

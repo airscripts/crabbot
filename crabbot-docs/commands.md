@@ -10,19 +10,19 @@ crabbot config set <key=value> [--force] [--json]
 crabbot status [--json]
 crabbot version [--json]
 crabbot completion <bash|fish|powershell|zsh>
-crabbot plugin list [--json]
+crabbot plugin list [<page>] [--json]
 crabbot plugin install <id>... [--source <path-or-url>] [--revision <rev>] [--link] [-y|--yes] [--json]
 crabbot plugin update [-y|--yes] [--json]
 crabbot plugin uninstall <id> [-y|--yes] [--force] [--json]
 crabbot memory <status|search|list|show|remember|edit|forget|audit|learning> [arguments...]
 crabbot session new <id> [--model <name>] [--json]
-crabbot session list [--json]
+crabbot session list [<page>] [--json]
 crabbot session show <id> [--json]
 crabbot session fork <source> <target> [--json]
 crabbot session model <id> <model> [--json]
 crabbot session cancel <id> [--json]
 crabbot session delete <id> [-y|--yes] [--json]
-crabbot delivery list [--json]
+crabbot delivery list [<page>] [--json]
 crabbot delivery retry <id> [-y|--yes] [--json]
 crabbot delivery drop <id> [-y|--yes] [--json]
 crabbot export [PATH] [--path <PATH>] [--force] [--json]
@@ -79,25 +79,37 @@ creation, forking, model changes, cancellation, and deletion; and delivery
 retry and drop operations. The command-level form remains available where the
 subcommand declares it. Completion intentionally writes its shell script
 directly to standard output instead of wrapping it in JSON. Arbitrary external
-plugin commands own their own output schema. `--debug` prints detailed error
-diagnostics. `--verbose` prints diagnostic progress, elapsed time, and nested
-error causes for every command.
+plugin commands own their own output schema. `--verbose` prints readable
+progress, elapsed time, and nested error causes. `--debug` also prints internal
+diagnostic logs and detailed error information.
 Help is available as `-h`, `-H`, or `--help`; version is available as `-v`,
 `-V`, or `--version`. Global flags may appear before or after the subcommand.
-Command failures are printed as concise `Error: ...` messages on stderr.
-`--verbose` enables informational timing and cause events, and `--debug` also
-enables debug representations and a redacted private report. JSON mode emits
-the error as a pretty-printed `{"error":"..."}` object.
+Command failures appear directly on stderr, with continuation lines indented
+and separate error groups divided by a blank line. `--verbose` and `--debug`
+also log failures at `ERROR`.
+Application logs are written to daily files in `CRABBOT_HOME/logs/`, named by
+UTC date as `YYYY-MM-DD.log` or `YYYY-MM-DD.jsonl`; they include all tracing levels by
+default. Command failures are recorded there even when diagnostics are hidden.
+Commands show only their human-readable output unless `--verbose` is set;
+verbose progress and error details are human-readable. `--debug` also prints
+internal logs (`DEBUG` and higher) to standard error. `--json` keeps diagnostics
+off standard output and standard error so structured command output stays clean.
+Unrecoverable failures use `ERROR`, recoverable problems use
+`WARN`, normal progress uses `INFO`, and `DEBUG` adds diagnostic details.
+Successful operations do not use a separate `OK` level.
+Set `CRABBOT_LOG` to filter application logs, or use `RUST_LOG` as its fallback.
+Set `CRABBOT_LOG_FORMAT=json` for structured JSON file logs; the default is
+text. These settings apply to the daemon and plugin processes as well as the
+CLI.
 When `--debug` handles a failure, Crabbot also makes a redacted, private report
-under `<CRABBOT_HOME>/debug/` when the filesystem permits it. The report path is
+under `CRABBOT_HOME/logs/` when the filesystem permits it. The report path is
 logged at info level; report creation is best effort and never replaces the
 original command error.
 
-Confirmation is explicit for unattended destructive or duplicate-prone work:
-use `--yes` or `-y` for plugin replacement or uninstall, session deletion,
-service uninstall, delivery retry or drop, and Crabfile import. `--force` separately
-permits replacing an existing imported configuration, exported Crabfile, or
-service definition. Native commands do not read stdin for these confirmations.
+Destructive or duplicate-prone commands prompt in an interactive terminal.
+Use `--yes` or `-y` to skip the prompt. With `--json` or non-terminal input,
+pass `--yes` for operations that need confirmation. `--force` allows replacement
+of existing configuration, Crabfiles, or service definitions.
 Import reports a missing Crabfile with its expected path and
 validates TOML before changing local state; malformed Crabfiles include the
 line and column of the parse error. Use `--path <PATH>` to import a different
@@ -143,6 +155,8 @@ not report both values. Use `/statusline reset` to restore the default choices.
 Choices are saved to `<CRABBOT_HOME>/data/plugins/tui/preferences.toml`. The
 displayed Crabbot name defaults to `Crabbot` and can be changed globally with
 `name` in `config.toml`.
+Input history is saved in `<CRABBOT_HOME>/data/plugins/tui/history.json`; use
+`/history list`, `/history clear`, and `/history help` inside the TUI to manage it.
 When no intelligence plugin is installed, the statusline shows the model as
 `unset`, regardless of the model value saved in the session.
 
@@ -153,7 +167,8 @@ The TUI refuses to start when the daemon is unavailable. `--once <prompt>` sends
 one prompt and prints the response without opening the full-screen interface;
 quote prompts containing spaces.
 The default session ID is `default`; use `--session`, `--model`, and `--plugin`
-to select a different session and model configuration.
+to select a different session and model configuration. Without `--session`, the
+TUI reopens the last TUI session, or starts `default` when none exist.
 
 Local command replies and streamed model text appear with a brief typewriter
 reveal. During model generation, a rotating crab-themed status is shown. Press
@@ -177,7 +192,7 @@ input title shows that Crabbot is waiting for the daemon turn to stop.
 During generation, normal messages are disabled; you can begin typing `/` to
 enter an approval command even from an empty input, and Escape remains available.
 Prefix a line with `!` to invoke the daemon's shell directly
-in the active session workspace. This requires `shell = true`, but does not
+in the active session workspace. This requires `clients.tui.shell = true`, but does not
 require the Tools plugin or an approval prompt because the command is explicitly
 entered by you. The daemon reads this setting at startup, so restart it after
 changing the value. If shell is disabled, the TUI reports the config file used
@@ -191,11 +206,12 @@ remain attributed to Crabbot.
 first syntax or schema error. See the [Crabfile specification](crabfile.md)
 for the supported version and keys.
 
-`crabbot plugin list` shows each installed plugin as a plain-text list with its
-version, health, protocol, capabilities, commands, and permissions. The TUI's
-`/plugins [page]` command presents the same metadata in compact, paginated entries.
-`crabbot plugin list --json`
-returns the inventory in an object with an `items` array. A visible plugin
+`crabbot plugin list [page]` shows up to five installed plugins at a time in a
+tree view with version, health, protocol, capabilities, commands, and
+permissions. Omit `page` to show the first page. The TUI's `/plugin [page]`
+command presents the same metadata in compact, paginated entries.
+`crabbot plugin list --json` returns the complete inventory in an object with
+an `items` array, regardless of the selected page. A visible plugin
 directory with a missing or invalid manifest is reported as an error so the
 inventory cannot silently hide broken installation state.
 
@@ -207,15 +223,16 @@ rebuilt in place without reinstalling; restart the daemon with
 `crab service restart` to load the rebuilt executable. The linked source and
 manifest must remain at their recorded paths. When the background
 runtime is running, it starts server plugins immediately; otherwise, the next
-runtime start discovers them. Installation prints one success summary, followed
-by separate runtime guidance for plugins that need the daemon. The TUI also
+runtime start discovers them. Installation groups per-plugin progress and
+results, then prints one success summary followed by separate runtime guidance
+for plugins that need the daemon. The TUI also
 requires the daemon to be running before it can open. The core artifact contains
 the CLI and daemon executables, but no plugin binaries. Uninstalling a plugin
 unloads its active process before removing its files. `crabbot plugin update`
 previews available version, source-revision, and content changes without
-changing installed plugins. Rerun `crabbot plugin update --yes` to apply that
-preview; only changed plugins are replaced, and only active plugins are
-unloaded and reloaded. Inactive plugins stay inactive.
+changing installed plugins. Confirm in the terminal to apply the preview, or
+use `--yes` to skip the prompt. Only changed plugins are replaced, and only
+active plugins are unloaded and reloaded. Inactive plugins stay inactive.
 
 Plugin-contributed commands are registered by installed plugins. The Pi agent
 plugin registers `crabbot code`, the TUI plugin registers `crabbot tui`, the
@@ -262,7 +279,7 @@ authenticated daemon state, and `/approval` reports the daemon approval mode.
 daemon IPC and applies only to the matching pending request.
 When an approval picker is open, Left/Right selects Approve or Deny and Enter
 submits that choice.
-`/session help` lists TUI session commands; `/session list [page]` shows ten
+`/session help` lists TUI session commands; `/session list [page]` shows five
 bounded per-session rows per page with status, model, creation/update dates,
 and message count. Sessions being worked on and the selected session appear
 first; remaining sessions are ordered by most recent update, with archived
@@ -284,8 +301,8 @@ and `/session unarchive <id>...` archive or restore one or more inactive session
 deleting it; repeating either action reports that the session is already in
 that state. Add `--all` to archive, unarchive, or delete every matching session;
 the active session is always kept for archive/delete. `/session delete <id>...`
-permanently deletes sessions and requires `-y` or `--yes`; `--all` also requires
-confirmation. Add `--deep` to also remove the matching shared session record
+permanently deletes sessions after an interactive confirmation; use `-y` or
+`--yes` to skip it. Add `--deep` to also remove the matching shared session record
 and the TUI's local fallback entry; when that removes the final local entry, the
 fallback JSON file is deleted. Without `--deep`, deletion keeps the current
 behavior.
@@ -304,7 +321,7 @@ the prompt retried.
 TUI commands and their displayed replies are also stored in the active session,
 so command-only sessions and sessions used without an intelligence plugin can
 be resumed with their visible interaction history. Completed model turns and
-these command exchanges share the session's normal bounded history. `/plugins` lists
+these command exchanges share the session's normal bounded history. `/plugin` lists
 installed plugins. `/workspace` reports the selected workspace, `/workspace
 <path>` selects a canonical existing directory for that session, and
 `/workspace reset` returns to `CRABBOT_ROOT`. Workspace changes are persisted
@@ -320,14 +337,18 @@ IPC. `/memory remember <key>=<value>`, `/memory list`, and `/memory forget
 contract. Entering the `remember` command explicitly approves a guided memory
 write. `/quit` and `/exit` close the terminal client.
 
-`session list --json` returns bounded session summaries. Use `session show` for
+`session list [page]` shows up to five sessions in a tree view, with working
+sessions first and archived sessions last. `session list --json` returns the
+complete bounded session summaries, regardless of page. Use `session show` for
 the transcript of one session; it renders a readable transcript by default and
-the bounded structured record with `--json`. Session deletion requires `--yes`.
+the bounded structured record with `--json`. Session deletion prompts in an
+interactive terminal; pass `--yes` for non-interactive use.
 
-`delivery list` shows pending and uncertain outbox entries without transcript
-text. A delivery marked uncertain may already have reached the provider;
-`delivery retry` is therefore explicit and requires `--yes`. Use `delivery
-drop` to acknowledge and remove an entry without sending it again.
+`delivery list [page]` shows up to five pending and uncertain outbox entries
+in a tree view, without transcript text. `delivery list --json` returns the
+complete list regardless of page. A delivery marked uncertain may already
+have reached the provider; `delivery retry` prompts before retrying. Use
+`delivery drop` to remove an entry without sending it again.
 
 `session cancel` waits for the active turn to stop and acknowledge cancellation
 before it reports success. If the turn does not acknowledge within its bounded
@@ -365,10 +386,11 @@ turn alongside the bounded saved conversation. It does not load workspace
 `doctor` is read-only by default and validates configuration, plugin manifests,
 protocol compatibility, credentials, and local state. Pass `doctor --fix` to
 create missing safe local state; it never overwrites an existing config or
-repairs plugin binaries. Plain human output ends with a health summary;
-unhealthy output suggests `crabbot doctor --fix`. `doctor --fix` reports only
-the repairs performed in both human and JSON output; regular `doctor --json`
-includes the full structured result and `health` object. `crabbot-daemon` keeps
+repairs plugin binaries. Human output groups the health summary and setup
+checks; unhealthy output ends with a suggestion to run `crabbot doctor --fix`.
+`doctor --fix` reports only the repairs performed in human and JSON output.
+Regular `doctor --json` includes the full structured result and `health` object.
+`crabbot-daemon` keeps
 the daemon in the foreground so service managers and operators can observe its
 diagnostics. Use `crabbot service install` only after the foreground flow is
 healthy.
@@ -379,12 +401,15 @@ environment paths. If provider variables are present, their declared values
 are copied to a private service credential JSON file and the definition points
 to it; existing CRABBOT_CREDENTIALS and CRABBOT_KEYRING=1 configuration is also
 preserved. An existing definition is not replaced unless `--force` is supplied.
-`uninstall` requires `--yes` (or `-y`). `start` and `stop` activate or deactivate
+`uninstall` prompts before removal; use `--yes` (or `-y`) to skip the prompt.
+`start` and `stop` activate or deactivate
 it through systemd-user, launchd, or the Windows Service Controller. `restart`
 restarts it through the native service manager without uninstalling or disabling
 the service. Uninstall stops or unloads the service before deleting the
-definition. `status` reports both the installed definition and the
-service-manager state. On Linux this is a user service, so use
+definition. Successful lifecycle commands say when the service has been
+installed, started, stopped, restarted, or uninstalled. Installing the service
+does not start it. `status` shows its state and service-definition path. On
+Linux this is a user service, so use
 `systemctl --user status crabbot.service` for detailed systemd output; plain
 `systemctl status crabbot.service` checks the separate system-wide manager.
 Repeated `start` and `stop` commands report when the service is already in the

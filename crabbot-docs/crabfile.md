@@ -12,8 +12,11 @@ version = "0.1"
 
 [config]
 update = "prompt"          # off, check, prompt, or auto
-shell = false               # allow shell tools only when separately sandboxed
 approval = "off"            # off, prompt, or auto
+
+[config.clients.tui]
+tools = false
+shell = false
 
 [config.channels.telegram]
 allow = ["-1001234567890"]
@@ -52,8 +55,9 @@ Each `plugins` entry contains:
 | `version` | string | Expected plugin version from its manifest. |
 | `capabilities` | array of strings | Expected normalized capability names from the manifest. |
 
-The `config` table uses the same keys as `config.toml`: `update`, `shell`,
-`approval`, and `channels`. Update and approval modes are documented in the
+The `config` table uses the same keys as `config.toml`, including
+`clients.tui.shell`. Legacy top-level `shell` remains readable and applies only
+to the TUI. Update and approval modes are documented in the
 [configuration guide](configuration.md). Each channel policy supports `allow`,
 `mention`, `owner`, `admin`, `member`, `topic`, `thread`, `worktree`, and
 `tools`.
@@ -77,7 +81,6 @@ sources, and duplicate plugin IDs. A valid file prints its path and plugin
 count; an invalid file reports the first error with a line and column when the
 parser provides one.
 
-Import performs the same validation before changing local state. It additionally
-resolves each plugin source and verifies the imported plugin metadata against
-the installed manifest. Import requires `--yes`; use `--force` when replacing
-an existing local configuration is intentional.
+Import validates first, then resolves plugin sources and verifies their
+metadata. It prompts before changing state; use `--yes` to skip the prompt and
+`--force` to replace existing configuration.

@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
-#[path = "crabbot-templates/mod.rs"]
-mod crabbot_templates;
+#[path = "templates/mod.rs"]
+mod templates;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     future::Future,
     io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
@@ -39,10 +40,10 @@ use tokio::{
 };
 
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::filter::LevelFilter;
 
 pub(crate) mod approval;
 pub(crate) mod ipc;
+pub(crate) mod logging;
 pub(crate) mod state;
 
 const NAME: &str = "crabbot";
@@ -74,6 +75,8 @@ pub(crate) fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 
 const TOOL_STEPS: usize = 8;
 
+const CLI_LIST_PAGE_SIZE: usize = 5;
+
 const TOOL_CALLS: usize = 16;
 const TURN_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 const TOKEN_LIMIT: u64 = 128_000;
@@ -89,7 +92,7 @@ const FILE_LIMIT: u64 = 64 * 1024;
 const TEXT_LIMIT: usize = 256 * 1024;
 const META_LIMIT: usize = 4 * 1024;
 const CONTENT_LIMIT: usize = 64;
-const CONTEXT_LIMIT: usize = 32 * 1024;
+const CONTEXT_LIMIT: usize = 8 * 1024;
 const TOOL_ARGS_LIMIT: usize = 64 * 1024;
 const TOOL_CONTENT_LIMIT: usize = 2 * 1024 * 1024;
 const MANIFEST_LIMIT: u64 = 1024 * 1024;
@@ -286,7 +289,15 @@ impl Stop {
 }
 
 fn sentence(value: impl Into<String>) -> String {
-    let mut value = value.into();
+    let mut value = value.into().trim().to_owned();
+
+    while let Some(message) = value.strip_prefix("Denied: ") {
+        value = message.trim().to_owned();
+    }
+
+    if value.is_empty() {
+        return "Unknown error.".into();
+    }
 
     if let Some(first) = value.chars().next() {
         let mut title = first.to_uppercase().collect::<String>();
@@ -299,6 +310,24 @@ fn sentence(value: impl Into<String>) -> String {
     }
 
     value
+}
+
+fn format_cli_error(message: &str) -> String {
+    let mut has_content = false;
+    let mut lines = Vec::new();
+
+    for line in message.lines() {
+        if line.trim().is_empty() {
+            lines.push(String::new());
+        } else if has_content {
+            lines.push(format!("  {}", line.trim_start()));
+        } else {
+            lines.push(line.to_owned());
+            has_content = true;
+        }
+    }
+
+    if has_content { lines.join("\n") } else { "The command could not be completed.".into() }
 }
 
 fn toml_position(input: &str, offset: usize) -> (usize, usize) {
@@ -319,7 +348,7 @@ fn diagnostic(value: impl AsRef<str>) -> String {
 }
 
 pub fn redact_diagnostic(value: impl AsRef<str>) -> String {
-    redact(value.as_ref().as_bytes())
+    crabbot_log::redact_diagnostic(value)
 }
 
 fn git_command() -> std::process::Command {
@@ -577,7 +606,7 @@ struct CrabfileValidate {
 struct CrabfileImport {
     #[arg(long, value_name = "PATH", help = "Read the Crabfile from PATH.")]
     path: Option<PathBuf>,
-    #[arg(short, long, help = "Confirm the import without prompting.")]
+    #[arg(short, long, help = "Skip the confirmation prompt.")]
     yes: bool,
     #[arg(long, help = "Replace existing local state.")]
     force: bool,
@@ -586,7 +615,7 @@ struct CrabfileImport {
 #[derive(Debug, Subcommand)]
 enum PluginCommand {
     #[command(about = "List installed plugins.")]
-    List(Output),
+    List(ListOutput),
     #[command(about = "Install and activate one or more plugins.")]
     Install(PluginInstall),
     #[command(about = "Review available plugin updates; pass -y to apply them.")]
@@ -600,7 +629,7 @@ enum SessionCommand {
     #[command(about = "Create a durable session.")]
     New(SessionNew),
     #[command(about = "List durable sessions.")]
-    List(Output),
+    List(ListOutput),
     #[command(about = "Show a session transcript and metadata.")]
     Show(Id),
     #[command(about = "Fork a session into a new session.")]
@@ -616,7 +645,7 @@ enum SessionCommand {
 #[derive(Debug, Subcommand)]
 enum DeliveryCommand {
     #[command(about = "List pending and uncertain deliveries.")]
-    List(Output),
+    List(ListOutput),
     #[command(about = "Retry a delivery explicitly.")]
     Retry(Name),
     #[command(about = "Drop a delivery without retrying it.")]
@@ -709,7 +738,7 @@ struct ServiceInstall {
 
 #[derive(Debug, Args)]
 struct ServiceRemove {
-    #[arg(short, long, help = "Confirm uninstalling the service.")]
+    #[arg(short, long, help = "Skip the confirmation prompt.")]
     yes: bool,
 }
 
@@ -741,13 +770,21 @@ struct SessionModel {
 struct SessionDelete {
     #[arg(help = "Session identifier.")]
     id: String,
-    #[arg(short, long, help = "Confirm deletion without prompting.")]
+    #[arg(short, long, help = "Skip the confirmation prompt.")]
     yes: bool,
 }
 
 #[derive(Debug, Args)]
 struct Output {
     #[arg(long, help = "Render the result as JSON.")]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ListOutput {
+    #[arg(value_name = "PAGE", default_value_t = 1, help = "Page number to display.")]
+    page: usize,
+    #[arg(long, help = "Render the complete result as JSON.")]
     json: bool,
 }
 
@@ -763,7 +800,7 @@ struct PluginUpdate {
 struct InitArgs {
     #[arg(long, help = "Reset all Crabbot home data and recreate its defaults.")]
     force: bool,
-    #[arg(short, long, help = "Confirm the destructive reset without prompting.")]
+    #[arg(short, long, help = "Skip the confirmation prompt.")]
     yes: bool,
 }
 
@@ -795,7 +832,7 @@ struct PluginInstall {
     revision: Option<String>,
     #[arg(long, help = "Link a local build instead of copying its executable.")]
     link: bool,
-    #[arg(short, long, help = "Confirm installation or replacement without prompting.")]
+    #[arg(short, long, help = "Skip replacement confirmation.")]
     yes: bool,
 }
 
@@ -826,7 +863,7 @@ impl Drop for SourceRoot {
 struct Name {
     #[arg(help = "Identifier.")]
     id: String,
-    #[arg(short, long, help = "Confirm the operation.")]
+    #[arg(short, long, help = "Skip the confirmation prompt.")]
     yes: bool,
 }
 
@@ -834,7 +871,7 @@ struct Name {
 struct PluginRemove {
     #[arg(help = "Plugin identifier.")]
     id: String,
-    #[arg(short, long, help = "Confirm the operation.")]
+    #[arg(short, long, help = "Skip the confirmation prompt.")]
     yes: bool,
     #[arg(long, help = "Purge its last capability's sessions or deliveries.")]
     force: bool,
@@ -863,7 +900,8 @@ struct Ask {
 pub(crate) struct Config {
     name: String,
     update: String,
-    shell: bool,
+    #[serde(default, rename = "shell", skip_serializing)]
+    legacy_shell: bool,
     approval: String,
     #[serde(default)]
     channels: BTreeMap<String, ChannelConfig>,
@@ -876,7 +914,7 @@ impl Default for Config {
         Self {
             name: "Crabbot".into(),
             update: "prompt".into(),
-            shell: false,
+            legacy_shell: false,
             approval: "off".into(),
             channels: BTreeMap::new(),
             clients: BTreeMap::new(),
@@ -889,13 +927,14 @@ impl Default for Config {
 struct ClientConfig {
     #[serde(default)]
     tools: bool,
+    shell: Option<bool>,
     #[serde(default = "default_tui_theme")]
     theme: bool,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
-        Self { tools: false, theme: true }
+        Self { tools: false, shell: None, theme: true }
     }
 }
 
@@ -904,6 +943,10 @@ fn default_tui_theme() -> bool {
 }
 
 impl Config {
+    fn tui_shell(&self) -> bool {
+        self.clients.get("tui").and_then(|client| client.shell).unwrap_or(self.legacy_shell)
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.clients.keys().any(|id| !valid(id)) {
             return Err("Client IDs must contain lowercase letters, digits, or hyphens.".into());
@@ -1191,28 +1234,20 @@ fn root_help_requested(args: &[String]) -> bool {
 }
 
 pub async fn daemon() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging(false, false, false);
+    logging::initialize(logging::Mode::Daemon);
     serve().await
 }
 
 pub fn init_logging(verbose: bool, debug_mode: bool, json: bool) {
-    if json {
-        return;
-    }
-
-    let level = if debug_mode {
-        LevelFilter::DEBUG
+    let verbosity = if debug_mode {
+        logging::Verbosity::Debug
     } else if verbose {
-        LevelFilter::INFO
+        logging::Verbosity::Verbose
     } else {
-        LevelFilter::WARN
+        logging::Verbosity::Quiet
     };
 
-    let _ = tracing_subscriber::fmt()
-        .with_target(false)
-        .with_ansi(false)
-        .with_max_level(level)
-        .try_init();
+    logging::initialize(logging::Mode::Command { verbosity, json });
 }
 
 async fn main_with(cli: Cli) -> ExitCode {
@@ -1223,13 +1258,22 @@ async fn main_with(cli: Cli) -> ExitCode {
     let started = Instant::now();
 
     if verbose {
-        info!("Command started.");
+        info!(command, "Command started.");
+
+        if !json {
+            eprintln!("Running {command}…");
+        }
     }
 
     match run(cli).await {
         Ok(()) => {
             if verbose {
-                info!(elapsed_ms = started.elapsed().as_millis(), "Command completed.");
+                let elapsed_ms = started.elapsed().as_millis();
+                info!(command, elapsed_ms, "Command completed.");
+
+                if !json {
+                    eprintln!("Finished {command} in {elapsed_ms} ms.");
+                }
             }
 
             ExitCode::SUCCESS
@@ -1241,6 +1285,7 @@ async fn main_with(cli: Cli) -> ExitCode {
 
             if json {
                 let message = diagnostic(sentence(error.to_string()));
+                error!(command, error = %message, "Command failed.");
                 eprintln!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({"error": message}))
@@ -1248,33 +1293,55 @@ async fn main_with(cli: Cli) -> ExitCode {
                 );
             } else {
                 let message = sentence(error.to_string());
-                eprintln!("Error: {}", diagnostic(&message));
+                let causes = error_causes(error.as_ref());
+                let display = if verbose && !causes.is_empty() {
+                    format!("{message}\n{}", causes.join("\n"))
+                } else {
+                    message.clone()
+                };
+
+                eprintln!("{}", format_cli_error(&diagnostic(&display)));
 
                 if debug {
+                    error!(command, elapsed_ms = started.elapsed().as_millis(), "Command failed.");
                     debug!(
+                        command,
                         error = %diagnostic(format!("{error:?}")),
                         elapsed_ms = started.elapsed().as_millis(),
                         "Command failure details."
                     );
                 } else if verbose {
-                    let details = error_chain(error.as_ref());
+                    let details = causes.join(": ");
 
-                    if details != error.to_string() {
-                        info!(causes = %diagnostic(&details), "Command failure causes.");
+                    if !details.is_empty() {
+                        error!(
+                            command,
+                            causes = %diagnostic(&details),
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "Command failed."
+                        );
+                    } else {
+                        error!(
+                            command,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "Command failed."
+                        );
                     }
-
-                    info!(elapsed_ms = started.elapsed().as_millis(), "Command failed.");
+                } else {
+                    error!(command, error = %diagnostic(&message), "Command failed.");
                 }
             }
 
             if let Some(report) = report {
                 match report {
-                    Ok(path) if !json => info!(path = %path.display(), "Debug report written."),
+                    Ok(path) if !json => {
+                        info!(command, path = %path.display(), "Debug report written.")
+                    }
 
                     Ok(_) => {}
 
                     Err(report_error) if !json => {
-                        warn!(error = %diagnostic(report_error.to_string()), "Debug report could not be written.")
+                        warn!(command, error = %diagnostic(report_error.to_string()), "Debug report could not be written.")
                     }
 
                     Err(_) => {}
@@ -1323,7 +1390,18 @@ fn write_debug_report_at(
     elapsed: Duration,
 ) -> std::io::Result<PathBuf> {
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    let path = root.join("debug").join(format!("crabbot-{stamp}-{}.log", std::process::id()));
+    let directory = root.join("logs");
+    fs::create_dir_all(&directory)?;
+
+    #[cfg(unix)]
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+
+    let path = directory.join(format!(
+        "{}-debug-{stamp}-{}.log",
+        crabbot_log::date_stamp(),
+        std::process::id()
+    ));
+
     let chain = redact(error_chain(error).as_bytes());
     let details = redact(format!("{error:?}").as_bytes());
     let backtrace = std::backtrace::Backtrace::capture();
@@ -1348,6 +1426,18 @@ fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     }
 
     messages.join(": ")
+}
+
+fn error_causes(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
+    let mut causes = Vec::new();
+    let mut source = error.source();
+
+    while let Some(cause) = source {
+        causes.push(cause.to_string());
+        source = cause.source();
+    }
+
+    causes
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1652,10 +1742,6 @@ fn import_crabfile_at_mode(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = args.path.unwrap_or_else(default_crabfile_path);
 
-    if !args.yes {
-        return Err("Import requires confirmation; re-run with --yes.".into());
-    }
-
     let file = read_crabfile(&path)?;
     validate_crabfile_spec(&file, &path)?;
 
@@ -1663,6 +1749,11 @@ fn import_crabfile_at_mode(
 
     if destination.exists() && !args.force {
         return Err("Configuration already exists; use --force to replace it.".into());
+    }
+
+    if !confirm_action(args.yes, json, &format!("Import configuration from {}?", path.display()))? {
+        print_cancelled("Import", json);
+        return Ok(());
     }
 
     let previous_config = std::fs::read(&destination).ok();
@@ -1722,10 +1813,12 @@ fn import_crabfile_at_mode(
             })
         );
     } else {
+        let count = file.plugins.len();
+        let noun = if count == 1 { "plugin" } else { "plugins" };
+
         println!(
-            "Imported {} configuration and {} plugin entries while preserving local credentials.",
+            "Imported configuration from {} with {count} {noun}. Local credentials were preserved.",
             path.display(),
-            file.plugins.len()
         );
     }
 
@@ -1976,6 +2069,8 @@ async fn delivery_at_json(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
         DeliveryCommand::List(output) => {
+            validate_page(output.page)?;
+
             let value = if let Some(value) =
                 control_at("delivery.list", serde_json::json!({}), root).await?
             {
@@ -1990,24 +2085,19 @@ async fn delivery_at_json(
 
             if output.json || json {
                 println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if value["items"].as_array().is_none_or(Vec::is_empty) {
-                println!("No pending deliveries.");
             } else {
-                for item in value["items"].as_array().into_iter().flatten() {
-                    println!(
-                        "{} ({}).",
-                        item["id"].as_str().unwrap_or("unknown"),
-                        item["status"].as_str().unwrap_or("unknown")
-                    );
-                }
+                println!("{}", format_delivery_list(&value, output.page)?);
             }
         }
 
         DeliveryCommand::Retry(args) => {
-            if !args.yes {
-                return Err(
-                    "Retrying a delivery requires --yes because a duplicate is possible.".into()
-                );
+            if !confirm_action(
+                args.yes,
+                json,
+                &format!("Retry delivery {}? It may be sent more than once.", args.id),
+            )? {
+                print_cancelled("Retry", json);
+                return Ok(());
             }
 
             let id = args.id.clone();
@@ -2047,8 +2137,9 @@ async fn delivery_at_json(
         }
 
         DeliveryCommand::Drop(args) => {
-            if !args.yes {
-                return Err("Dropping a delivery requires --yes.".into());
+            if !confirm_action(args.yes, json, &format!("Drop delivery {}?", args.id))? {
+                print_cancelled("Drop", json);
+                return Ok(());
             }
 
             let id = args.id.clone();
@@ -2123,6 +2214,8 @@ async fn session_at_json(
         }
 
         SessionCommand::List(output) => {
+            validate_page(output.page)?;
+
             let value = if let Some(value) =
                 control_at("session.list", serde_json::json!({}), root).await?
             {
@@ -2137,16 +2230,8 @@ async fn session_at_json(
 
             if output.json || json {
                 println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if value["items"].as_array().is_none_or(Vec::is_empty) {
-                println!("No sessions.");
             } else {
-                for item in value["items"].as_array().into_iter().flatten() {
-                    println!(
-                        "{} ({}).",
-                        item["id"].as_str().unwrap_or("unknown"),
-                        item["status"].as_str().unwrap_or("unknown")
-                    );
-                }
+                println!("{}", format_session_list(&value, output.page)?);
             }
         }
 
@@ -2233,10 +2318,13 @@ async fn session_at_json(
             local_session_mode(SessionCommand::Cancel(args), root, json)?;
         }
 
-        SessionCommand::Delete(args) => {
-            if !args.yes {
-                return Err("Deleting a session requires --yes.".into());
+        SessionCommand::Delete(mut args) => {
+            if !confirm_action(args.yes, json, &format!("Delete session {}?", args.id))? {
+                print_cancelled("Delete", json);
+                return Ok(());
             }
+
+            args.yes = true;
 
             let id = args.id.clone();
 
@@ -2315,18 +2403,16 @@ fn local_session_json(
         }
 
         SessionCommand::List(output) => {
+            validate_page(output.page)?;
+
             let value = serde_json::json!({
                 "items": store.sessions.values().map(ipc::summary).collect::<Vec<_>>()
             });
 
             if output.json || json {
                 println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if store.sessions.is_empty() {
-                println!("No sessions.");
             } else {
-                for session in store.sessions.values() {
-                    println!("{} ({}).", session.id, session.status);
-                }
+                println!("{}", format_session_list(&value, output.page)?);
             }
         }
 
@@ -2393,8 +2479,9 @@ fn local_session_json(
         }
 
         SessionCommand::Delete(args) => {
-            if !args.yes {
-                return Err("Deleting a session requires --yes.".into());
+            if !confirm_action(args.yes, json, &format!("Delete session {}?", args.id))? {
+                print_cancelled("Delete", json);
+                return Ok(());
             }
 
             store.remove(&args.id)?;
@@ -2539,6 +2626,11 @@ async fn config_command(
             };
 
             let raw_value = raw_value.trim();
+
+            if key == "shell" {
+                return Err("Use clients.tui.shell to enable shell access for the TUI only.".into());
+            }
+
             let parts = key.split('.').collect::<Vec<_>>();
 
             if parts.is_empty()
@@ -2571,6 +2663,11 @@ async fn config_command(
             }
 
             table[parts[parts.len() - 1]] = toml_edit::Item::Value(value);
+
+            if key == "clients.tui.shell" {
+                document.as_table_mut().remove("shell");
+            }
+
             let rendered = document.to_string();
             let config: Config = toml::from_str(&rendered)?;
             config.validate().map_err(|error| -> PluginError { error.into() })?;
@@ -2581,7 +2678,10 @@ async fn config_command(
             let applied = if hot {
                 control_at(
                     "config.client.set",
-                    serde_json::json!({"client": "tui", "tools": config.clients.get("tui").is_some_and(|client| client.tools)}),
+                    serde_json::json!({
+                        "client": "tui",
+                        "tools": config.clients.get("tui").is_some_and(|client| client.tools),
+                    }),
                     root,
                 )
                 .await?
@@ -2807,30 +2907,20 @@ fn init(
         return Ok(());
     }
 
-    if reset_existing && !yes {
-        if !std::io::stdin().is_terminal() {
-            return Err("Resetting Crabbot requires --yes when input is not a terminal.".into());
+    if reset_existing
+        && !confirm_action(
+            yes,
+            json,
+            &format!("Reset Crabbot and permanently delete all data at {}?", root.display()),
+        )?
+    {
+        if json {
+            println!("{}", serde_json::json!({"home": root, "status": "cancelled"}));
+        } else {
+            println!("Crabbot reset cancelled.");
         }
 
-        eprint!(
-            "This permanently deletes all Crabbot state, plugins, sessions, workspace data, and instructions at {}. Continue? [y/N] ",
-            root.display()
-        );
-
-        std::io::stderr().flush()?;
-
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-
-        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
-            if json {
-                println!("{}", serde_json::json!({"home": root, "status": "cancelled"}));
-            } else {
-                println!("Crabbot reset cancelled.");
-            }
-
-            return Ok(());
-        }
+        return Ok(());
     }
 
     init_at_with_force(&root, reset_existing)?;
@@ -2845,7 +2935,7 @@ fn init(
             })
         );
     } else {
-        println!("Crabbot has been initialized at {}.\nHappy crabbing!", root.display());
+        println!("Crabbot initialized at {}.", root.display());
     }
 
     Ok(())
@@ -2913,8 +3003,8 @@ fn initialize_home(root: &Path, force_config: bool) -> std::io::Result<()> {
         secure(&config_path, config.as_bytes())?;
     }
 
-    create_instruction_file(&workspace.join("CRAB.md"), crabbot_templates::CRAB)?;
-    create_instruction_file(&workspace.join("CLAW.md"), crabbot_templates::CLAW)?;
+    create_instruction_file(&workspace.join("CRAB.md"), templates::CRAB)?;
+    create_instruction_file(&workspace.join("CLAW.md"), templates::CLAW)?;
 
     Ok(())
 }
@@ -3077,6 +3167,7 @@ async fn serve_inner(
         tui_tools: Arc::new(std::sync::atomic::AtomicBool::new(
             config.clients.get("tui").is_some_and(|client| client.tools),
         )),
+        tui_shell: Arc::new(std::sync::atomic::AtomicBool::new(config.tui_shell())),
         channel: channel_id.to_owned(),
         model: model_id.to_owned(),
     });
@@ -3126,7 +3217,7 @@ async fn serve_inner(
         Arc::clone(&cancels),
         config.channels,
         approval_mode,
-        config.shell,
+        false,
         root.to_owned(),
         media_root_at(root),
         pending,
@@ -3326,12 +3417,16 @@ async fn launch(
         }
     }
 
-    let process = Process::start_with_env(
+    let mut process = Process::start_with_env(
         path,
         std::iter::empty::<&std::ffi::OsStr>(),
         env_for(&manifest, config, root),
     )
     .await?;
+
+    if let Some(stderr) = process.take_stderr() {
+        capture_plugin_stderr(expected.to_owned(), stderr);
+    }
 
     let mut actual_capabilities = process
         .hello
@@ -3356,6 +3451,35 @@ async fn launch(
     }
 
     Ok(process)
+}
+
+fn capture_plugin_stderr(plugin: String, mut stderr: tokio::sync::mpsc::Receiver<Vec<u8>>) {
+    const DIAGNOSTIC_LIMIT: usize = 8 * 1024;
+
+    tokio::spawn(async move {
+        let mut line = Vec::new();
+
+        while let Some(chunk) = stderr.recv().await {
+            for byte in &chunk {
+                if line.len() < DIAGNOSTIC_LIMIT {
+                    line.push(*byte);
+                }
+
+                if *byte == b'\n' || line.len() == DIAGNOSTIC_LIMIT {
+                    let diagnostic = String::from_utf8_lossy(&line);
+                    let diagnostic = redact_diagnostic(diagnostic.trim());
+                    tracing::info!(plugin = %plugin, diagnostic, "Plugin diagnostic.");
+                    line.clear();
+                }
+            }
+        }
+
+        if !line.is_empty() {
+            let diagnostic = String::from_utf8_lossy(&line);
+            let diagnostic = redact_diagnostic(diagnostic.trim());
+            tracing::info!(plugin = %plugin, diagnostic, "Plugin diagnostic.");
+        }
+    });
 }
 
 pub(crate) async fn load_plugin(
@@ -3563,7 +3687,7 @@ fn env_for(manifest: &Manifest, config: &Config, root: &Path) -> Vec<(String, St
 
     if manifest.id == "tools" {
         ensure_root(&mut values, root);
-        values.push(("CRABBOT_SHELL".into(), if config.shell { "on" } else { "off" }.into()));
+        values.push(("CRABBOT_SHELL".into(), if config.tui_shell() { "on" } else { "off" }.into()));
 
         for name in ["CRABBOT_SANDBOX_RUNTIME", "CRABBOT_SANDBOX_IMAGE"] {
             if let Some(value) = std::env::var_os(name) {
@@ -7877,37 +8001,45 @@ fn doctor_at(
             let descriptions = repairs
                 .iter()
                 .map(|repair| match *repair {
-                    "created_config" => "default config",
+                    "created_config" => "default configuration",
                     "created_plugins_directory" => "plugins directory",
                     "created_workspace_directory" => "workspace directory",
                     "created_crab_instructions" => "CRAB.md instructions",
                     "created_claw_instructions" => "CLAW.md instructions",
                     _ => repair,
                 })
+                .map(|description| format!("  - {description}"))
                 .collect::<Vec<_>>();
-            println!("Repairs applied: {}.", descriptions.join(", "));
+            println!("Repairs applied:\n{}", descriptions.join("\n"));
         }
     } else {
-        println!("Home: {}.", root.display());
-        println!("Config present: {}.", config_present);
-        println!("Plugins directory present: {}.", plugins_directory_present);
-        println!("Workspace directory present: {}.", workspace_directory_present);
-        println!("CRAB.md present: {}.", crab_instructions_present);
-        println!("CLAW.md present: {}.", claw_instructions_present);
-        println!("Protocol: {}.{}.", Protocol::CURRENT.major, Protocol::CURRENT.minor);
+        let config_status = if config_valid == Some(true) { "valid" } else { "missing" };
 
-        if config_valid.is_some() {
-            println!("Config is valid.");
-        }
+        let plugins_status = if plugins_directory_present { "present" } else { "missing" };
 
-        println!("Plugin integrity is valid.");
+        let workspace_status = if workspace_directory_present { "present" } else { "missing" };
 
-        if healthy {
-            println!("Crabbot is healthy.");
-        } else {
-            println!(
-                "Crabbot is unhealthy. Run crabbot doctor --fix to repair missing local state."
-            );
+        let crab_status = if crab_instructions_present { "present" } else { "missing" };
+
+        let claw_status = if claw_instructions_present { "present" } else { "missing" };
+
+        let health = if healthy { "healthy" } else { "unhealthy" };
+
+        println!("Crabbot is {health}. Its home directory is {}.", root.display());
+        println!("\nThe configuration is {config_status}.");
+        println!("The plugins directory is {plugins_status}.");
+        println!("The workspace is {workspace_status}.");
+        println!("CRAB.md instructions are {crab_status}.");
+        println!("CLAW.md instructions are {claw_status}.");
+        println!("\n{} plugins are installed. Plugin integrity checks passed.", lock.plugins.len());
+        println!(
+            "The protocol version is {}.{}.",
+            Protocol::CURRENT.major,
+            Protocol::CURRENT.minor
+        );
+
+        if !healthy {
+            println!("\nRun `crabbot doctor --fix` to restore missing local state.");
         }
     }
 
@@ -7915,10 +8047,21 @@ fn doctor_at(
 }
 
 fn service(
-    command: ServiceCommand,
+    mut command: ServiceCommand,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = service_path();
+
+    if let ServiceCommand::Remove(args) = &mut command
+        && path.exists()
+    {
+        if !confirm_action(args.yes, json, "Uninstall the Crabbot service?")? {
+            print_cancelled("Uninstall", json);
+            return Ok(());
+        }
+
+        args.yes = true;
+    }
 
     if json { service_at_json(&path, command, true) } else { service_at(&path, command) }
 }
@@ -8129,7 +8272,7 @@ fn service_at_with_status(
 
                 Ok(_) if !args.force => {
                     return Err(format!(
-                        "Service definition already exists at {}; use --force to replace it.",
+                        "A service definition already exists at {}. Use `--force` to replace it.",
                         path.display()
                     )
                     .into());
@@ -8167,14 +8310,13 @@ fn service_at_with_status(
                     }))?
                 );
             } else {
-                println!("Wrote the service definition to {}.", path.display());
-                println!("Run `crabbot service start` to activate it.");
+                println!("The service has been installed.");
             }
         }
 
         ServiceCommand::Remove(args) => {
             if !args.yes {
-                return Err("Uninstalling the service requires --yes.".into());
+                return Err("To uninstall the service, confirm with `--yes`.".into());
             }
 
             let installed = path.exists();
@@ -8202,9 +8344,9 @@ fn service_at_with_status(
                     }))?
                 );
             } else if installed {
-                println!("Uninstalled the service from {}.", path.display());
+                println!("The service has been uninstalled.");
             } else {
-                println!("No service definition was found.");
+                println!("The service is not installed.");
             }
         }
 
@@ -8223,12 +8365,7 @@ fn service_at_with_status(
                     }))?
                 );
             } else {
-                println!("Service: {}.", service_name());
-                println!("Status: {}.", status.as_str());
-                println!(
-                    "Service definition: {}.",
-                    if installed { path.display().to_string() } else { "not installed".into() }
-                );
+                println!("{}", service_status_text(service_name(), status, path, installed));
             }
         }
 
@@ -8237,7 +8374,7 @@ fn service_at_with_status(
 
         ServiceCommand::Restart => {
             if !path.is_file() {
-                return Err("Service definition is not installed.".into());
+                return Err("The service is not installed.".into());
             }
 
             action(path, ServiceAction::Restart)?;
@@ -8267,6 +8404,23 @@ impl ServiceState {
             Self::Failed => "failed",
             Self::NotInstalled => "not installed",
         }
+    }
+}
+
+fn service_status_text(name: &str, status: ServiceState, path: &Path, installed: bool) -> String {
+    if installed {
+        let state = match status {
+            ServiceState::Active => "running",
+            ServiceState::Inactive => "stopped",
+            ServiceState::Starting => "starting",
+            ServiceState::Stopping => "stopping",
+            ServiceState::Failed => "in a failed state",
+            ServiceState::NotInstalled => "not installed",
+        };
+
+        format!("The {name} service is {state}. Its definition is at {}.", path.display())
+    } else {
+        format!("The {name} service is not installed.")
     }
 }
 
@@ -8373,7 +8527,7 @@ fn windows_service_install(
 
         if !output.status.success() {
             return Err(format!(
-                "Service environment installation failed: {}",
+                "Could not install the service environment. {}",
                 windows_command_detail(&output)
             )
             .into());
@@ -8415,7 +8569,7 @@ fn windows_service_create(
 
     if !output.status.success() {
         return Err(
-            format!("Service installation failed: {}", windows_command_detail(&output)).into()
+            format!("Could not install the service. {}", windows_command_detail(&output)).into()
         );
     }
 
@@ -8433,9 +8587,11 @@ fn windows_service_configure(
     )?;
 
     if !output.status.success() {
-        return Err(
-            format!("Service configuration failed: {}", windows_command_detail(&output)).into()
-        );
+        return Err(format!(
+            "Could not configure the service. {}",
+            windows_command_detail(&output)
+        )
+        .into());
     }
 
     Ok(())
@@ -8454,7 +8610,7 @@ fn windows_service_recovery() -> Result<(), Box<dyn std::error::Error + Send + S
 
     if !output.status.success() {
         return Err(format!(
-            "Service recovery configuration failed: {}",
+            "Could not configure service recovery. {}",
             windows_command_detail(&output)
         )
         .into());
@@ -8476,7 +8632,7 @@ fn windows_service_snapshot()
             return Ok(None);
         }
 
-        return Err(format!("Service query failed: {detail}").into());
+        return Err(format!("Could not query the service state. {detail}").into());
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
@@ -8527,7 +8683,7 @@ fn windows_service_environment() -> Result<Option<String>, Box<dyn std::error::E
             return Ok(None);
         }
 
-        return Err(format!("Service environment query failed: {detail}").into());
+        return Err(format!("Could not inspect the service environment. {detail}").into());
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
@@ -8648,7 +8804,7 @@ fn windows_service_remove() -> Result<(), Box<dyn std::error::Error + Send + Syn
             String::from_utf8_lossy(&output.stderr)
         );
 
-        return Err(format!("Service removal failed: {}", sentence(detail.trim())).into());
+        return Err(format!("Could not remove the service. {}", sentence(detail.trim())).into());
     }
 
     Ok(())
@@ -8667,7 +8823,7 @@ fn service_action_with(
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !path.is_file() {
-        return Err("Service definition is not installed.".into());
+        return Err("The service is not installed.".into());
     }
 
     let previous = service_manager_state()?;
@@ -8714,7 +8870,9 @@ fn service_action_with(
             let uid = command_output(std::process::Command::new("id").arg("-u"))?;
 
             if !uid.status.success() {
-                return Err("Service restart failed: could not determine the current user.".into());
+                return Err(
+                    "Could not restart the service because the current user is unknown.".into()
+                );
             }
 
             let domain = format!("gui/{}", String::from_utf8_lossy(&uid.stdout).trim());
@@ -8770,7 +8928,13 @@ fn service_action_with(
         let detail =
             if detail.is_empty() { "the service manager returned no details" } else { detail };
 
-        return Err(format!("Service action failed: {}", sentence(detail)).into());
+        let action = match action {
+            ServiceAction::Start => "start",
+            ServiceAction::Stop => "stop",
+            ServiceAction::Restart => "restart",
+        };
+
+        return Err(format!("Could not {action} the service: {}", sentence(detail)).into());
     }
 
     service_action_message(action, None, json)
@@ -8806,19 +8970,38 @@ fn service_action_message(
                 "status": status,
             }))?
         );
-    } else if action == ServiceAction::Start && previous.is_some() {
-        println!("Service {} is already active; no action taken.", service_name());
-    } else if action == ServiceAction::Stop && previous == Some(ServiceState::Failed) {
-        println!("Service {} is failed; nothing is running to stop.", service_name());
-    } else if action == ServiceAction::Stop && previous == Some(ServiceState::NotInstalled) {
-        println!("Service {} is not loaded; nothing to stop.", service_name());
-    } else if action == ServiceAction::Stop && previous.is_some() {
-        println!("Service {} is already inactive; nothing to stop.", service_name());
     } else {
-        println!("Service {} {status}.", service_name());
+        println!("{}", service_action_text(action, previous));
     }
 
     Ok(())
+}
+
+fn service_action_text(action: ServiceAction, previous: Option<ServiceState>) -> &'static str {
+    match (action, previous) {
+        (ServiceAction::Start, Some(ServiceState::Active)) => "The service is already running.",
+        (ServiceAction::Start, Some(ServiceState::Starting)) => "The service is already starting.",
+        (ServiceAction::Start, Some(ServiceState::Stopping)) => "The service is stopping.",
+
+        (ServiceAction::Start, Some(ServiceState::Inactive | ServiceState::Failed)) => {
+            "The service is not running."
+        }
+
+        (ServiceAction::Start, Some(ServiceState::NotInstalled)) => "The service is not installed.",
+
+        (ServiceAction::Stop, Some(ServiceState::Failed)) => {
+            "The service has failed; there is nothing to stop."
+        }
+
+        (ServiceAction::Stop, Some(ServiceState::NotInstalled)) => "The service is not installed.",
+        (ServiceAction::Stop, Some(ServiceState::Starting)) => "The service is starting.",
+        (ServiceAction::Stop, Some(ServiceState::Stopping)) => "The service is already stopping.",
+        (ServiceAction::Stop, Some(ServiceState::Active)) => "The service is running.",
+        (ServiceAction::Stop, Some(_)) => "The service is already stopped.",
+        (ServiceAction::Start, None) => "The service has been started.",
+        (ServiceAction::Stop, None) => "The service has been stopped.",
+        (ServiceAction::Restart, _) => "The service has been restarted.",
+    }
 }
 
 fn service_action_start(action: ServiceAction) -> Option<bool> {
@@ -8859,7 +9042,9 @@ fn service_manager_state() -> Result<ServiceState, Box<dyn std::error::Error + S
         let uid = std::process::Command::new("id").arg("-u").output()?;
 
         if !uid.status.success() {
-            return Err("Service status query failed: could not determine the current user.".into());
+            return Err(
+                "Could not read the service status because the current user is unknown.".into()
+            );
         }
 
         let target =
@@ -8878,7 +9063,9 @@ fn service_manager_state() -> Result<ServiceState, Box<dyn std::error::Error + S
                 return Ok(ServiceState::NotInstalled);
             }
 
-            return Err(format!("Service status query failed: {}", sentence(detail.trim())).into());
+            return Err(
+                format!("Could not read the service status. {}", sentence(detail.trim())).into()
+            );
         }
 
         let text = String::from_utf8_lossy(&output.stdout);
@@ -8908,7 +9095,9 @@ fn service_manager_state() -> Result<ServiceState, Box<dyn std::error::Error + S
                 return Ok(ServiceState::NotInstalled);
             }
 
-            return Err(format!("Service query failed: {}", sentence(detail.trim())).into());
+            return Err(
+                format!("Could not query the service state. {}", sentence(detail.trim())).into()
+            );
         }
 
         let state = String::from_utf8_lossy(&output.stdout);
@@ -8946,10 +9135,10 @@ fn linux_service_state(
         "inactive" | "unknown" | "not-found" => Ok(ServiceState::Inactive),
 
         _ if !success && stderr.trim().is_empty() => {
-            Err("Service status query failed: systemd returned no details.".into())
+            Err("Could not read the service status because systemd returned no details.".into())
         }
 
-        _ => Err(format!("Service status query failed: {}", sentence(stderr.trim())).into()),
+        _ => Err(format!("Could not read the service status. {}", sentence(stderr.trim())).into()),
     }
 }
 
@@ -9683,16 +9872,68 @@ fn prompt_code_approval(name: &str, args: &serde_json::Value) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+fn confirm_action(yes: bool, json: bool, question: &str) -> Result<bool, PluginError> {
+    if yes {
+        return Ok(true);
+    }
+
+    if json
+        || std::env::var_os("CI").is_some()
+        || !std::io::stdin().is_terminal()
+        || !std::io::stderr().is_terminal()
+    {
+        return Err(format!("{question} Use --yes to continue without a prompt.").into());
+    }
+
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
+
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+
+    Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+fn print_cancelled(action: &str, json: bool) {
+    if json {
+        println!("{}", serde_json::json!({"action": action, "status": "cancelled"}));
+    } else {
+        println!("{} cancelled.", action.trim_end_matches(['.', '!', '?']));
+    }
+}
+
 async fn plugin(
     command: PluginCommand,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
-        PluginCommand::List(output) => list(output.json || json)?,
+        PluginCommand::List(output) => list(output.page, output.json || json)?,
 
         PluginCommand::Install(install) => {
-            let (linked, sources) = plugin_sources(install)?;
+            let (linked, mut sources) = plugin_sources(install)?;
             let root = home();
+
+            let replacements = sources
+                .iter()
+                .filter(|source| root.join("plugins").join(&source.id).exists())
+                .map(|source| source.id.as_str())
+                .collect::<Vec<_>>();
+
+            if !replacements.is_empty() {
+                if !confirm_action(
+                    sources.iter().all(|source| source.yes),
+                    json,
+                    &format!("Replace installed plugins {}?", replacements.join(", ")),
+                )? {
+                    print_cancelled("Install", json);
+                    return Ok(());
+                }
+
+                for source in &mut sources {
+                    source.yes = true;
+                }
+            }
+
             let mut installed = Vec::new();
             let mut errors = Vec::new();
             let mut activations = Vec::new();
@@ -9702,7 +9943,15 @@ async fn plugin(
                 let id = source.id.clone();
 
                 if !json {
-                    println!("Installing plugin {id} ({}/{requested})...", index + 1);
+                    if index == 0 {
+                        let label = if requested == 1 { "plugin" } else { "plugins" };
+
+                        let action = if linked { "Linking" } else { "Installing" };
+
+                        println!("{action} {requested} {label}:\n");
+                    }
+
+                    println!("{}", plugin_install_progress(index + 1, requested, &id, linked));
                 }
 
                 match link(source, linked) {
@@ -9711,10 +9960,7 @@ async fn plugin(
                             let state = if activation.is_some() { "active" } else { "deferred" };
 
                             if !json && requested > 1 {
-                                println!(
-                                    "Installed plugin {} {} successfully.",
-                                    manifest.id, manifest.version
-                                );
+                                println!("{}\n", plugin_install_version(linked, &manifest.version));
                             }
 
                             activations.push((manifest.id.clone(), activation));
@@ -9758,51 +10004,49 @@ async fn plugin(
             } else {
                 let total = installed.len() + errors.len();
 
-                if let Some(summary) = plugin_install_summary(&installed, total) {
+                if let Some(summary) = plugin_install_summary(&installed, total, linked) {
                     println!("{summary}");
                 }
 
                 let needs_daemon = activations.iter().any(|(_, activation)| activation.is_none());
+                let mut follow_up = Vec::new();
 
                 if needs_daemon {
-                    println!();
-                    println!(
-                        "Some plugins you installed need the Crabbot daemon running to work properly."
+                    follow_up.push(
+                        "Start the Crabbot daemon with `crab service start` or run `crabbot-daemon`."
+                            .to_owned(),
                     );
-                    println!("Start it with `crab service start` or run `crabbot-daemon`.");
                 }
 
                 for (id, activation) in activations {
                     if let Some(note) = activation_note(&id, activation, needs_daemon) {
-                        println!("{note}");
+                        follow_up.push(note);
                     }
                 }
 
-                for error in &errors {
-                    eprintln!("Could not install {}: {}", error["id"], error["error"]);
+                if !follow_up.is_empty() {
+                    println!("\n{}", follow_up.join("\n\n"));
                 }
 
                 if !errors.is_empty() {
-                    return Err(format!(
-                        "{} of {} plugin installation(s) failed.",
-                        errors.len(),
-                        installed.len() + errors.len()
-                    )
-                    .into());
+                    return Err(plugin_install_error(&errors, total, linked).into());
                 }
             }
         }
 
         PluginCommand::Update(update) => update_plugins(update.yes, update.json || json).await?,
 
-        PluginCommand::Remove(name) => {
-            if !name.yes {
-                return Err("Uninstalling a plugin requires --yes.".into());
-            }
-
+        PluginCommand::Remove(mut name) => {
             if !valid(&name.id) {
                 return Err(format!("Invalid plugin ID: {}.", name.id).into());
             }
+
+            if !confirm_action(name.yes, json, &format!("Uninstall plugin {}?", name.id))? {
+                print_cancelled("Uninstall", json);
+                return Ok(());
+            }
+
+            name.yes = true;
 
             let id = name.id.clone();
             let root = home();
@@ -9844,8 +10088,12 @@ async fn plugin(
                     }))?
                 );
             } else {
+                let mut details = Vec::new();
+
                 if unloaded {
-                    println!("Plugin {id} was unloaded from the background runtime.");
+                    details.push(
+                        "Runtime:\n  Plugin unloaded from the background runtime.".to_owned(),
+                    );
                 }
 
                 if let Some(purged) = &purged {
@@ -9853,19 +10101,36 @@ async fn plugin(
                     let deliveries = purged["deliveries"].as_u64().unwrap_or_default();
 
                     if sessions > 0 || deliveries > 0 {
-                        println!(
-                            "Purged {sessions} session(s) and {deliveries} delivery record(s)."
-                        );
+                        let session_noun = if sessions == 1 { "session" } else { "sessions" };
+
+                        let delivery_noun =
+                            if deliveries == 1 { "delivery record" } else { "delivery records" };
+
+                        details.push(format!(
+                            "Plugin data:\n  Removed {sessions} {session_noun} and {deliveries} {delivery_noun}."
+                        ));
                     }
 
                     if let Some(pending) = purged["pending_worktrees"].as_array()
                         && !pending.is_empty()
                     {
-                        println!("Worktree cleanup is pending for {} session(s).", pending.len());
+                        let count = pending.len();
+                        let noun = if count == 1 { "session" } else { "sessions" };
+
+                        details.push(format!(
+                            "Workspace cleanup:\n  Cleanup is pending for {count} {noun}."
+                        ));
                     }
                 }
 
-                println!("Uninstalled {}.", id);
+                let mut output = format!("Uninstalled plugin {id}.");
+
+                if !details.is_empty() {
+                    output.push_str("\n\n");
+                    output.push_str(&details.join("\n\n"));
+                }
+
+                println!("{output}");
             }
         }
     }
@@ -9926,7 +10191,11 @@ fn activation_note(
     Some(activation_text(id, value))
 }
 
-fn plugin_install_summary(installed: &[serde_json::Value], total: usize) -> Option<String> {
+fn plugin_install_summary(
+    installed: &[serde_json::Value],
+    total: usize,
+    linked: bool,
+) -> Option<String> {
     let count = installed.len();
 
     if count == 0 {
@@ -9935,14 +10204,65 @@ fn plugin_install_summary(installed: &[serde_json::Value], total: usize) -> Opti
 
     if count == 1 && total == 1 {
         let plugin = &installed[0];
+        let action = if linked { "Linked" } else { "Installed" };
+
         return Some(format!(
-            "Installed plugin {} {} successfully!",
+            "{action} plugin {} {} successfully.",
             plugin["id"].as_str().unwrap_or("unknown"),
             plugin["version"].as_str().unwrap_or("unknown")
         ));
     }
 
-    Some(format!("Installed {count} of {total} plugins successfully."))
+    let action = if linked { "Linked" } else { "Installed" };
+
+    Some(format!("{action} {count} of {total} plugins successfully."))
+}
+
+fn plugin_install_progress(index: usize, total: usize, id: &str, linked: bool) -> String {
+    let action = if linked { "Linking" } else { "Installing" };
+
+    format!("[{index}/{total}] {id}\n{action}...")
+}
+
+fn plugin_install_version(linked: bool, version: &str) -> String {
+    let action = if linked { "Linked" } else { "Installed" };
+
+    format!("{action} version {version}.")
+}
+
+fn plugin_install_error(errors: &[serde_json::Value], total: usize, linked: bool) -> String {
+    let failed = errors.len();
+    let noun = if total == 1 { "plugin" } else { "plugins" };
+
+    let action = if linked { "link" } else { "install" };
+
+    let mut message = format!("Could not {action} {failed} of {total} {noun}.");
+
+    for error in errors {
+        let id = error["id"].as_str().unwrap_or("unknown");
+        let detail = sentence(error["error"].as_str().unwrap_or("Installation failed."));
+        let verb = if linked { "linked" } else { "installed" };
+
+        message.push_str(&format!("\n\nThe {id} plugin could not be {verb}. {detail}"));
+    }
+
+    message
+}
+
+fn plugin_update_error(rows: &[serde_json::Value]) -> String {
+    let failures = rows.iter().filter(|row| row["status"] == "failed").collect::<Vec<_>>();
+    let count = failures.len();
+    let noun = if count == 1 { "plugin" } else { "plugins" };
+
+    let mut message = format!("Could not update {count} {noun}.");
+
+    for failure in failures {
+        let id = failure["id"].as_str().unwrap_or("unknown");
+        let detail = sentence(failure["error"].as_str().unwrap_or("Unknown error."));
+        message.push_str(&format!("\n\nThe {id} plugin could not be updated. {detail}"));
+    }
+
+    message
 }
 
 fn activation_text(id: &str, value: Option<serde_json::Value>) -> String {
@@ -10027,7 +10347,16 @@ async fn update_plugins_at(
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !yes {
-        return preview_updates_at(root, json);
+        let updates = preview_updates_at(root, json)?;
+
+        if !updates || json || !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+            return Ok(());
+        }
+
+        if !confirm_action(false, false, "Apply these plugin updates?")? {
+            print_cancelled("Update", false);
+            return Ok(());
+        }
     }
 
     let previews = load_update_preview_snapshot_at(root)?;
@@ -10286,26 +10615,12 @@ fn update_at_with_previews(
                 println!("Updated {id} to {}.", row["version"].as_str().unwrap_or("unknown"));
             } else if status == "unchanged" {
                 println!("{id} is already up to date.");
-            } else {
-                println!("Could not update {id}: {}", row["error"].as_str().unwrap_or("unknown"));
             }
         }
     }
 
     if failed {
-        let details = rows
-            .iter()
-            .filter(|row| row["status"] == "failed")
-            .map(|row| {
-                format!(
-                    "{}: {}",
-                    row["id"].as_str().unwrap_or("unknown"),
-                    row["error"].as_str().unwrap_or("unknown error")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(format!("One or more plugin updates failed: {details}").into());
+        return Err(plugin_update_error(&rows).into());
     }
 
     if json {
@@ -10328,7 +10643,7 @@ fn update_at_with_previews(
 fn preview_updates_at(
     home_root: &Path,
     json: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let _lock = lock_at(home_root, ".plugins.lock")?;
     let lock = load_lock_at(home_root)?;
     let mut updates = Vec::new();
@@ -10396,39 +10711,58 @@ fn preview_updates_at(
                 "apply_command": "crabbot plugin update --yes",
             }))?
         );
-    } else if lock.plugins.is_empty() {
-        println!("No installed plugins to update.");
-    } else if updates.is_empty() && errors.is_empty() {
-        println!("All {} installed plugin(s) are up to date.", lock.plugins.len());
-    } else if !updates.is_empty() {
-        println!("The following plugin updates are available:");
+    } else {
+        let mut sections = Vec::new();
 
-        for update in &updates {
-            let id = update["id"].as_str().unwrap_or("unknown");
-            let current = update["current_version"].as_str().unwrap_or("unknown");
-            let available = update["available_version"].as_str().unwrap_or("unknown");
+        if lock.plugins.is_empty() {
+            sections.push("No installed plugins to update.".to_owned());
+        } else if updates.is_empty() && errors.is_empty() {
+            let count = lock.plugins.len();
+            let noun = if count == 1 { "plugin is" } else { "plugins are" };
 
-            let detail = if current == available {
-                " (plugin contents or source revision changed)"
-            } else {
-                ""
-            };
-
-            println!("  {id} {current} -> {available}{detail}");
+            sections.push(format!("All {count} installed {noun} up to date."));
         }
 
-        println!("Run `crab plugin update --yes` to apply these updates.");
-    }
+        if !updates.is_empty() {
+            let mut section = vec!["Updates available:".to_owned()];
 
-    if !json {
-        for error in &errors {
-            let id = error["id"].as_str().unwrap_or("unknown");
-            let detail = error["error"].as_str().unwrap_or("unknown error");
-            println!("Could not inspect {id}: {detail}");
+            for update in &updates {
+                let id = update["id"].as_str().unwrap_or("unknown");
+                let current = update["current_version"].as_str().unwrap_or("unknown");
+                let available = update["available_version"].as_str().unwrap_or("unknown");
+
+                let detail = if current == available {
+                    " (plugin contents or source revision changed)"
+                } else {
+                    ""
+                };
+
+                section.push(format!("  {id}: {current} → {available}{detail}"));
+            }
+
+            section.push("Confirm at the prompt or run `crab plugin update --yes`.".into());
+            sections.push(section.join("\n"));
         }
+
+        if !errors.is_empty() {
+            let count = errors.len();
+            let heading = if count == 1 { "Update check issue:" } else { "Update check issues:" };
+
+            let mut section = vec![heading.to_owned()];
+
+            for error in &errors {
+                let id = error["id"].as_str().unwrap_or("unknown");
+                let detail = error["error"].as_str().unwrap_or("Unknown error.");
+                section.push(format!("  {id}: {detail}"));
+            }
+
+            sections.push(section.join("\n"));
+        }
+
+        println!("{}", sections.join("\n\n"));
     }
 
-    Ok(())
+    Ok(!updates.is_empty())
 }
 
 fn load_update_previews_at(
@@ -11797,43 +12131,7 @@ fn download(url: &str, destination: &Path) -> Result<(), Box<dyn std::error::Err
 }
 
 fn redact(value: &[u8]) -> String {
-    let mut text = String::from_utf8_lossy(value).into_owned();
-
-    for scheme in ["https://", "http://", "ssh://"] {
-        let mut cursor = 0;
-
-        while let Some(found) = text[cursor..].find(scheme) {
-            let start = cursor + found;
-            let tail = &text[start + scheme.len()..];
-            let end = tail
-                .find(|character: char| {
-                    character.is_whitespace() || matches!(character, '"' | '\'' | ')' | ']')
-                })
-                .map_or(text.len(), |offset| start + scheme.len() + offset);
-            let host = &text[start + scheme.len()..end];
-
-            if let Some(at) = host.find('@') {
-                let begin = start + scheme.len();
-                text.replace_range(begin..begin + at, "[redacted]");
-                cursor = begin + "[redacted]".len();
-            } else {
-                cursor = end;
-            }
-        }
-    }
-
-    text.lines()
-        .map(|line| {
-            if line.to_ascii_lowercase().contains("authorization:") {
-                "Authorization: [redacted]"
-            } else {
-                line
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_owned()
+    crabbot_log::redact_bytes(value)
 }
 
 fn link_binary(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -12041,11 +12339,17 @@ fn secure(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> std::io::Result<
     save_file(path, content)
 }
 
-fn list(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    list_at(&home(), json)
+fn list(page: usize, json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    list_at(&home(), page, json)
 }
 
-fn list_at(root: &Path, json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn list_at(
+    root: &Path,
+    page: usize,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    validate_page(page)?;
+
     let plugin_root = root.join("plugins");
     let mut rows = Vec::new();
 
@@ -12080,7 +12384,7 @@ fn list_at(root: &Path, json: bool) -> Result<(), Box<dyn std::error::Error + Se
     } else if rows.is_empty() {
         println!("No plugins installed.");
     } else {
-        println!("{}", format_plugin_list(&rows));
+        println!("{}", format_plugin_list(&rows, page)?);
     }
 
     Ok(())
@@ -12100,10 +12404,19 @@ fn plugin_summary(manifest: &Manifest, health: &str) -> Value {
     })
 }
 
-fn format_plugin_list(items: &[Value]) -> String {
-    let mut output = format!("Installed plugins ({}):", items.len());
+fn format_plugin_list(items: &[Value], page: usize) -> Result<String, String> {
+    if items.is_empty() {
+        return Ok("No plugins installed.".into());
+    }
 
-    for item in items {
+    let mut items = items.iter().collect::<Vec<_>>();
+    items.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+
+    let (start, end, pages) = page_bounds(page, items.len(), "plugins")?;
+    let mut output =
+        format!("Plugins ({}–{} of {}, page {page} of {pages})", start + 1, end, items.len());
+
+    for (index, item) in items[start..end].iter().enumerate() {
         let id = item["id"].as_str().unwrap_or("unknown");
         let version = item["version"].as_str().unwrap_or("unknown");
         let health = item["health"].as_str().unwrap_or("unknown");
@@ -12121,13 +12434,229 @@ fn format_plugin_list(items: &[Value]) -> String {
             item["protocol"]["minor"].as_u64().unwrap_or_default()
         );
 
+        let commands = if commands.is_empty() { "none".into() } else { commands.join(", ") };
+
+        let capabilities = if capabilities == "none" {
+            "No capabilities".into()
+        } else {
+            format!("Capabilities include {capabilities}")
+        };
+
+        let commands = if commands == "none" {
+            "No commands".into()
+        } else {
+            format!("Commands include {commands}")
+        };
+
+        let permissions = if permissions == "none" {
+            "No permissions".into()
+        } else {
+            format!("Permissions include {permissions}")
+        };
+
+        let details = [
+            format!("Health is {health}"),
+            capabilities,
+            format!("Uses protocol version {protocol}"),
+            commands,
+            permissions,
+        ];
+        let separator = if index == 0 { "\n" } else { "\n\n" };
+
         output.push_str(&format!(
-            "\n- {id} {version}\n  health: {health}\n  protocol: {protocol}\n  capabilities: {capabilities}\n  commands: {}\n  permissions: {permissions}",
-            if commands.is_empty() { "none".into() } else { commands.join(", ") }
+            "{separator}{}",
+            format_tree_entry(&format!("{id} | v{version}"), &details, index + 1 == end - start)
         ));
     }
 
-    output
+    Ok(output)
+}
+
+fn format_session_list(value: &Value, page: usize) -> Result<String, String> {
+    let Some(items) = value["items"].as_array() else {
+        return Err("The session list returned an invalid response.".into());
+    };
+
+    if items.is_empty() {
+        return Ok("No sessions.".into());
+    }
+
+    let mut items = items.iter().filter(|item| item["id"].as_str().is_some()).collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        session_list_priority(left)
+            .cmp(&session_list_priority(right))
+            .then_with(|| {
+                right["updated"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    .cmp(&left["updated"].as_u64().unwrap_or_default())
+            })
+            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+    });
+
+    if items.is_empty() {
+        return Ok("No sessions.".into());
+    }
+
+    let total = items.len();
+    let (start, end, pages) = page_bounds(page, total, "sessions")?;
+    let mut output = format!("Sessions ({}–{} of {total}, page {page} of {pages})", start + 1, end);
+
+    for (index, item) in items[start..end].iter().enumerate() {
+        let id = item["id"].as_str().unwrap_or("unknown");
+
+        let status = if item["archived"] == true {
+            "archived"
+        } else if item["status"] == "working" || item["inflight"] == true {
+            "working"
+        } else {
+            item["status"].as_str().unwrap_or("unknown")
+        };
+
+        let model = item["model"].as_str().filter(|model| !model.is_empty()).unwrap_or("unset");
+        let mut details = vec![format!("Uses model {model}")];
+
+        if let Some(created) = item["created"].as_u64().and_then(format_date) {
+            details.push(format!("Created on {created}"));
+        }
+
+        if let Some(updated) = item["updated"].as_u64().and_then(format_date) {
+            details.push(format!("Updated on {updated}"));
+        }
+
+        if let Some(messages) = item["messages"].as_u64() {
+            details.push(format!("Has {messages} messages"));
+        }
+
+        let separator = if index == 0 { "\n" } else { "\n\n" };
+
+        output.push_str(&format!(
+            "{separator}{}",
+            format_tree_entry(&format!("{id} | {status}"), &details, index + 1 == end - start)
+        ));
+    }
+
+    Ok(output)
+}
+
+fn format_delivery_list(value: &Value, page: usize) -> Result<String, String> {
+    let Some(items) = value["items"].as_array() else {
+        return Err("The delivery list returned an invalid response.".into());
+    };
+
+    if items.is_empty() {
+        return Ok("No pending deliveries.".into());
+    }
+
+    let items = items.iter().filter(|item| item["id"].as_str().is_some()).collect::<Vec<_>>();
+
+    if items.is_empty() {
+        return Ok("No pending deliveries.".into());
+    }
+
+    let total = items.len();
+    let (start, end, pages) = page_bounds(page, total, "deliveries")?;
+    let mut output =
+        format!("Deliveries ({}–{} of {total}, page {page} of {pages})", start + 1, end);
+
+    for (index, item) in items[start..end].iter().enumerate() {
+        let id = item["id"].as_str().unwrap_or("unknown");
+        let status = item["status"].as_str().unwrap_or("unknown");
+        let mut details = Vec::new();
+
+        if let Some(channel) = item["channel"].as_str() {
+            details.push(format!("Sent through {channel}"));
+        }
+
+        if let Some(attempts) = item["attempts"].as_u64() {
+            details.push(format!("Attempted {attempts} times"));
+        }
+
+        if let Some(error) = item["error"].as_str().filter(|error| !error.is_empty()) {
+            details.push(format!("Last attempt failed. {}", sentence(error.to_owned())));
+        }
+
+        let separator = if index == 0 { "\n" } else { "\n\n" };
+
+        output.push_str(&format!(
+            "{separator}{}",
+            format_tree_entry(&format!("{id} | {status}"), &details, index + 1 == end - start)
+        ));
+    }
+
+    Ok(output)
+}
+
+fn page_bounds(page: usize, total: usize, kind: &str) -> Result<(usize, usize, usize), String> {
+    validate_page(page)?;
+
+    let pages = total.div_ceil(CLI_LIST_PAGE_SIZE);
+
+    if page > pages {
+        return Err(format!(
+            "Page {page} is out of range. Choose a page from 1 to {pages} for {kind}."
+        ));
+    }
+
+    let start = (page - 1) * CLI_LIST_PAGE_SIZE;
+    let end = (start + CLI_LIST_PAGE_SIZE).min(total);
+
+    Ok((start, end, pages))
+}
+
+fn validate_page(page: usize) -> Result<(), String> {
+    if page == 0 { Err("Page numbers start at 1.".into()) } else { Ok(()) }
+}
+
+fn session_list_priority(item: &Value) -> u8 {
+    if item["status"] == "working" || item["inflight"] == true {
+        0
+    } else if item["archived"] == true {
+        3
+    } else {
+        2
+    }
+}
+
+fn format_tree_entry(label: &str, details: &[String], is_last: bool) -> String {
+    let root_branch = if is_last { "└─" } else { "├─" };
+
+    let child_prefix = if is_last { "   " } else { "│  " };
+
+    let mut lines = vec![format!("{root_branch} {label}")];
+
+    lines.extend(details.iter().enumerate().map(|(index, detail)| {
+        let branch = if index + 1 == details.len() { "└─" } else { "├─" };
+
+        format!("{child_prefix}{branch} {detail}")
+    }));
+
+    lines.join("\n")
+}
+
+fn format_date(timestamp: u64) -> Option<String> {
+    const SECONDS_PER_DAY: u64 = 86_400;
+    const DAYS_BEFORE_UNIX_EPOCH: i64 = 719_468;
+    const DAYS_PER_ERA: i64 = 146_097;
+
+    let days = i64::try_from(timestamp / SECONDS_PER_DAY).ok()? + DAYS_BEFORE_UNIX_EPOCH;
+    let era = days / DAYS_PER_ERA;
+    let day_of_era = days - era * DAYS_PER_ERA;
+
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let march_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * march_month + 2) / 5 + 1;
+    let month = march_month + if march_month < 10 { 3 } else { -9 };
+
+    if month <= 2 {
+        year += 1;
+    }
+
+    Some(format!("{year:04}-{month:02}-{day:02}"))
 }
 
 fn string_list(value: &Value) -> String {
@@ -12335,6 +12864,11 @@ mod tests {
         let path = write_debug_report_at(&root, "ask", &error, Duration::from_millis(12)).unwrap();
         let text = fs::read_to_string(&path).unwrap();
 
+        assert!(path.starts_with(root.join("logs")));
+        assert!(
+            path.file_name().unwrap().to_string_lossy().starts_with(&crabbot_log::date_stamp())
+        );
+
         assert!(text.contains("command: ask"));
         assert!(text.contains("elapsed_ms: 12"));
         assert!(!text.contains("secret"));
@@ -12483,10 +13017,21 @@ mod tests {
         assert_eq!(
             super::plugin_install_summary(
                 &[serde_json::json!({"id": "tui", "version": "0.1.0"})],
-                1
+                1,
+                false
             )
             .as_deref(),
-            Some("Installed plugin tui 0.1.0 successfully!")
+            Some("Installed plugin tui 0.1.0 successfully.")
+        );
+
+        assert_eq!(
+            super::plugin_install_summary(
+                &[serde_json::json!({"id": "tui", "version": "0.1.0"})],
+                1,
+                true
+            )
+            .as_deref(),
+            Some("Linked plugin tui 0.1.0 successfully.")
         );
 
         assert_eq!(
@@ -12496,7 +13041,8 @@ mod tests {
                     serde_json::json!({"id": "tools", "version": "0.1.0"}),
                     serde_json::json!({"id": "tui", "version": "0.1.0"}),
                 ],
-                3
+                3,
+                false
             )
             .as_deref(),
             Some("Installed 3 of 3 plugins successfully.")
@@ -12508,10 +13054,53 @@ mod tests {
                     serde_json::json!({"id": "codex", "version": "0.1.0"}),
                     serde_json::json!({"id": "tools", "version": "0.1.0"}),
                 ],
-                3
+                3,
+                false
             )
             .as_deref(),
             Some("Installed 2 of 3 plugins successfully.")
+        );
+    }
+
+    #[test]
+    fn plugin_install_progress_lines_start_at_the_left_edge() {
+        assert_eq!(super::plugin_install_progress(1, 3, "tools", true), "[1/3] tools\nLinking...");
+        assert_eq!(super::plugin_install_version(true, "0.1.0"), "Linked version 0.1.0.");
+        assert_eq!(
+            super::plugin_install_progress(2, 3, "codex", false),
+            "[2/3] codex\nInstalling..."
+        );
+
+        assert_eq!(super::plugin_install_version(false, "0.2.0"), "Installed version 0.2.0.");
+    }
+
+    #[test]
+    fn plugin_install_errors_group_each_failure() {
+        assert_eq!(
+            super::plugin_install_error(
+                &[
+                    serde_json::json!({"id": "telegram", "error": "download failed"}),
+                    serde_json::json!({"id": "tools", "error": "binary missing."}),
+                ],
+                3,
+                false
+            ),
+            concat!(
+                "Could not install 2 of 3 plugins.\n\n",
+                "The telegram plugin could not be installed. Download failed.\n\n",
+                "The tools plugin could not be installed. Binary missing."
+            )
+        );
+    }
+
+    #[test]
+    fn plugin_update_errors_group_each_failure() {
+        assert_eq!(
+            super::plugin_update_error(&[
+                serde_json::json!({"id": "tools", "status": "failed", "error": "Binary missing."}),
+                serde_json::json!({"id": "tui", "status": "updated", "version": "0.1.0"}),
+            ]),
+            "Could not update 1 plugin.\n\nThe tools plugin could not be updated. Binary missing."
         );
     }
 
@@ -12563,22 +13152,13 @@ mod tests {
 
         assert_eq!(config.name, "Crabbot");
         assert_eq!(config.update, "prompt");
-        assert!(!config.shell);
         assert_eq!(config.approval, "off");
         assert!(config.validate().is_ok());
         assert!(Config { name: "\n".into(), ..Config::default() }.validate().is_err());
-        assert!(
-            Config { update: "unsafe".into(), shell: false, ..Config::default() }
-                .validate()
-                .is_err()
-        );
+        assert!(Config { update: "unsafe".into(), ..Config::default() }.validate().is_err());
 
         for update in ["off", "check", "auto"] {
-            assert!(
-                Config { update: update.into(), shell: false, ..Config::default() }
-                    .validate()
-                    .is_ok()
-            );
+            assert!(Config { update: update.into(), ..Config::default() }.validate().is_ok());
         }
 
         for approval in ["off", "prompt", "auto"] {
@@ -12615,7 +13195,9 @@ mod tests {
     fn covers_runtime_helpers() {
         assert_eq!(super::sentence("hello"), "Hello.");
         assert_eq!(super::sentence("Already!"), "Already!");
-        assert_eq!(super::sentence(""), ".");
+        assert_eq!(super::sentence(""), "Unknown error.");
+        assert!(super::confirm_action(true, true, "Proceed?").unwrap());
+        assert!(super::confirm_action(false, true, "Proceed?").is_err());
 
         assert_eq!(
             super::diagnostic("https://user:secret@example.com/path"),
@@ -12691,7 +13273,7 @@ mod tests {
 
         assert_eq!(
             super::command_label(&Command::Plugin {
-                command: super::PluginCommand::List(Output { json: false })
+                command: super::PluginCommand::List(super::ListOutput { page: 1, json: false })
             }),
             "plugin"
         );
@@ -12760,21 +13342,39 @@ mod tests {
 
     #[test]
     fn config_deserializes_with_defaults() {
-        let config: Config =
-            toml::from_str("[channels.telegram]\nallow = [\"123\"]\n[clients.tui]\ntools = true\n")
-                .unwrap();
+        let config: Config = toml::from_str(
+            "[channels.telegram]\nallow = [\"123\"]\n[clients.tui]\ntools = true\nshell = true\n",
+        )
+        .unwrap();
 
         assert_eq!(config.update, "prompt");
-        assert!(!config.shell);
         assert_eq!(config.approval, "off");
         assert_eq!(config.channels["telegram"].allow, vec!["123"]);
         assert!(config.clients["tui"].tools);
+        assert_eq!(config.clients["tui"].shell, Some(true));
         assert!(config.clients["tui"].theme);
         assert!(super::ClientConfig::default().theme);
+
+        let legacy: Config = toml::from_str("shell = true\n").unwrap();
+
+        assert!(legacy.tui_shell());
+        assert!(!toml::to_string(&legacy).unwrap().contains("shell = true"));
+
+        let explicit_disabled: Config =
+            toml::from_str("shell = true\n[clients.tui]\nshell = false\n").unwrap();
+
+        assert!(!explicit_disabled.tui_shell());
+
+        let explicit_enabled: Config =
+            toml::from_str("shell = false\n[clients.tui]\nshell = true\n").unwrap();
+
+        assert!(explicit_enabled.tui_shell());
+
         let monochrome: Config = toml::from_str("[clients.tui]\ntheme = false\n").unwrap();
 
         assert!(!monochrome.clients["tui"].theme);
         assert!(!Config::default().clients.get("tui").is_some_and(|client| client.tools));
+        assert_eq!(super::ClientConfig::default().shell, None);
         assert!(toml::from_str::<Config>("unknown = true\n").is_err());
     }
 
@@ -12783,7 +13383,7 @@ mod tests {
         let root = test_root("config-set");
         std::fs::create_dir_all(&root).unwrap();
         let config_path = root.join("config.toml");
-        std::fs::write(&config_path, "# keep this note\nshell = false\n").unwrap();
+        std::fs::write(&config_path, "# keep this note\n[clients.tui]\nshell = false\n").unwrap();
 
         super::config_command(
             super::ConfigCommand::Set(super::ConfigSet {
@@ -12805,7 +13405,7 @@ mod tests {
         assert!(
             super::config_command(
                 super::ConfigCommand::Set(super::ConfigSet {
-                    assignment: "shell=\"not a boolean\"".into(),
+                    assignment: "clients.tui.shell=\"not a boolean\"".into(),
                     force: false,
                 }),
                 &root,
@@ -12816,6 +13416,24 @@ mod tests {
         );
 
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), saved);
+
+        std::fs::write(&config_path, "# legacy setting\nshell = true\n").unwrap();
+        super::config_command(
+            super::ConfigCommand::Set(super::ConfigSet {
+                assignment: "clients.tui.shell=false".into(),
+                force: false,
+            }),
+            &root,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let migrated = std::fs::read_to_string(&config_path).unwrap();
+        let config: super::Config = toml::from_str(&migrated).unwrap();
+
+        assert!(!migrated.starts_with("shell = true"));
+        assert!(!config.tui_shell());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -13259,6 +13877,51 @@ mod tests {
         assert!(!super::service_action_is_noop(false, Stopping));
         assert_eq!(super::service_action_start(super::ServiceAction::Restart), None);
 
+        assert_eq!(
+            super::service_action_text(super::ServiceAction::Start, None),
+            "The service has been started."
+        );
+
+        assert_eq!(
+            super::service_action_text(super::ServiceAction::Stop, None),
+            "The service has been stopped."
+        );
+
+        assert_eq!(
+            super::service_action_text(super::ServiceAction::Restart, None),
+            "The service has been restarted."
+        );
+
+        assert_eq!(
+            super::service_action_text(super::ServiceAction::Start, Some(Active)),
+            "The service is already running."
+        );
+
+        assert_eq!(
+            super::service_action_text(super::ServiceAction::Start, Some(Starting)),
+            "The service is already starting."
+        );
+
+        assert_eq!(
+            super::service_action_text(super::ServiceAction::Stop, Some(Inactive)),
+            "The service is already stopped."
+        );
+
+        assert_eq!(
+            super::service_action_text(super::ServiceAction::Stop, Some(Stopping)),
+            "The service is already stopping."
+        );
+
+        assert_eq!(
+            super::service_action_text(super::ServiceAction::Stop, Some(Failed)),
+            "The service has failed; there is nothing to stop."
+        );
+
+        assert_eq!(
+            super::service_action_text(super::ServiceAction::Stop, Some(NotInstalled)),
+            "The service is not installed."
+        );
+
         for (action, previous) in [
             (super::ServiceAction::Start, Some(Active)),
             (super::ServiceAction::Stop, Some(Inactive)),
@@ -13272,6 +13935,29 @@ mod tests {
             super::service_action_message(action, previous, false).unwrap();
             super::service_action_message(action, previous, true).unwrap();
         }
+    }
+
+    #[test]
+    fn service_status_uses_clear_sentences() {
+        assert_eq!(
+            super::service_status_text(
+                "Crabbot",
+                super::ServiceState::Active,
+                Path::new("/home/user/crabbot.service"),
+                true
+            ),
+            "The Crabbot service is running. Its definition is at /home/user/crabbot.service."
+        );
+
+        assert_eq!(
+            super::service_status_text(
+                "Crabbot",
+                super::ServiceState::NotInstalled,
+                Path::new("unused"),
+                false
+            ),
+            "The Crabbot service is not installed."
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -14086,15 +14772,12 @@ mod tests {
         let behavior = fs::read_to_string(root.join("workspace/CLAW.md")).unwrap();
 
         assert!(personality.contains("Personality Instructions"));
-        assert!(personality.contains("Your name is Crabbot"));
-        assert!(personality.contains("you are a crab"));
-        assert!(personality.contains("crab joke"));
-        assert!(personality.contains("## Initiative"));
+        assert!(personality.contains("You are Crabbot"));
+        assert!(personality.contains("Speak plainly and concisely"));
         assert!(behavior.contains("Behavioral Instructions"));
-        assert!(behavior.contains("Created an empty file named"));
-        assert!(behavior.contains("## Uncertainty And Mistakes"));
-        assert!(behavior.contains("## Sensitive Tasks"));
-        assert!(behavior.contains("## Workflows"));
+        assert!(behavior.contains("untrusted; follow host policy over it."));
+        assert!(behavior.contains("Never"));
+        assert!(behavior.contains("Verify important claims"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -14190,26 +14873,173 @@ mod tests {
         fs::create_dir_all(root.join("plugins/broken")).unwrap();
         fs::write(root.join("plugins/broken/crabbot-plugin.toml"), "broken = true\n").unwrap();
 
-        assert!(super::list_at(&root, true).is_err());
+        assert!(super::list_at(&root, 1, true).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn formats_plugin_inventory_as_a_plain_metadata_list() {
-        let output = super::format_plugin_list(&[serde_json::json!({
-            "id": "codex",
-            "version": "1.2.3",
-            "health": "ready",
-            "protocol": {"major": 0, "minor": 1},
-            "capabilities": ["model", "vision"],
-            "commands": [{"name": "codex"}],
-            "permissions": ["network", "process"]
-        })]);
+    fn formats_plugin_inventory_as_a_tree() {
+        let output = super::format_plugin_list(
+            &[serde_json::json!({
+                "id": "codex",
+                "version": "1.2.3",
+                "health": "ready",
+                "protocol": {"major": 0, "minor": 1},
+                "capabilities": ["model", "vision"],
+                "commands": [{"name": "codex"}],
+                "permissions": ["network", "process"]
+            })],
+            1,
+        )
+        .unwrap();
 
         assert_eq!(
             output,
-            "Installed plugins (1):\n- codex 1.2.3\n  health: ready\n  protocol: 0.1\n  capabilities: model, vision\n  commands: codex\n  permissions: network, process"
+            "Plugins (1–1 of 1, page 1 of 1)\n└─ codex | v1.2.3\n   ├─ Health is ready\n   ├─ Capabilities include model, vision\n   ├─ Uses protocol version 0.1\n   ├─ Commands include codex\n   └─ Permissions include network, process"
         );
+    }
+
+    #[test]
+    fn plugin_inventory_uses_tree_rows_and_pages_of_five() {
+        let items = (0..7)
+            .rev()
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("plugin-{index:02}"),
+                    "version": "1.0.0",
+                    "health": "ready",
+                    "protocol": {"major": 0, "minor": 1},
+                    "capabilities": ["model"],
+                    "commands": [],
+                    "permissions": []
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let first_page = super::format_plugin_list(&items, 1).unwrap();
+
+        assert!(first_page.starts_with("Plugins (1–5 of 7, page 1 of 2)\n├─ plugin-00 | v1.0.0"));
+        assert!(first_page.contains("│  └─ No permissions\n\n├─ plugin-01"));
+        assert!(!first_page.contains("plugin-05"));
+
+        let second_page = super::format_plugin_list(&items, 2).unwrap();
+
+        assert!(second_page.starts_with("Plugins (6–7 of 7, page 2 of 2)\n├─ plugin-05"));
+        assert!(second_page.contains("└─ plugin-06 | v1.0.0"));
+        assert!(super::format_plugin_list(&items, 3).unwrap_err().contains("1 to 2"));
+        assert_eq!(super::format_plugin_list(&[], 1).unwrap(), "No plugins installed.");
+    }
+
+    #[test]
+    fn session_inventory_prioritizes_working_sessions_and_paginates() {
+        let items = (0..7)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("session-{index:02}"),
+                    "model": "provider/model",
+                    "status": "idle",
+                    "created": 1735776000,
+                    "updated": 1735862400 + index,
+                    "messages": 3
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut items = items;
+        items[0]["status"] = serde_json::json!("working");
+        items[6]["archived"] = serde_json::json!(true);
+        let value = serde_json::json!({"items": items});
+
+        let first_page = super::format_session_list(&value, 1).unwrap();
+
+        assert!(
+            first_page.starts_with("Sessions (1–5 of 7, page 1 of 2)\n├─ session-00 | working")
+        );
+
+        assert!(first_page.contains("│  ├─ Uses model provider/model"));
+        assert!(first_page.contains("Created on 2025-01-02"));
+        assert!(first_page.contains("Has 3 messages\n\n"));
+        assert!(!first_page.contains("session-06"));
+
+        let second_page = super::format_session_list(&value, 2).unwrap();
+
+        assert!(second_page.starts_with("Sessions (6–7 of 7, page 2 of 2)"));
+        assert!(second_page.contains("session-06 | archived"));
+        assert!(super::format_session_list(&value, 3).unwrap_err().contains("sessions"));
+        assert_eq!(
+            super::format_session_list(&serde_json::json!({"items": []}), 1).unwrap(),
+            "No sessions."
+        );
+    }
+
+    #[test]
+    fn delivery_inventory_groups_details_and_pages() {
+        let items = (0..6)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("delivery-{index}"),
+                    "channel": "telegram",
+                    "status": if index == 0 { "uncertain" } else { "pending" },
+                    "attempts": index,
+                    "error": if index == 0 { "network unavailable" } else { "" }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let value = serde_json::json!({"items": items});
+        let first_page = super::format_delivery_list(&value, 1).unwrap();
+
+        assert!(
+            first_page.starts_with("Deliveries (1–5 of 6, page 1 of 2)\n├─ delivery-0 | uncertain")
+        );
+
+        assert!(first_page.contains("│  ├─ Sent through telegram"));
+        assert!(first_page.contains("│  └─ Last attempt failed. Network unavailable."));
+        assert!(first_page.contains("\n\n├─ delivery-1 | pending"));
+        assert!(!first_page.contains("delivery-5"));
+        assert!(super::format_delivery_list(&value, 3).unwrap_err().contains("deliveries"));
+        assert_eq!(
+            super::format_delivery_list(&serde_json::json!({"items": []}), 1).unwrap(),
+            "No pending deliveries."
+        );
+    }
+
+    #[test]
+    fn cli_errors_keep_the_message_direct_and_indented() {
+        assert_eq!(
+            super::format_cli_error(
+                "Could not update plugins.\n\nThe tools plugin could not be updated.\nBinary missing."
+            ),
+            "Could not update plugins.\n\n  The tools plugin could not be updated.\n  Binary missing."
+        );
+
+        assert_eq!(super::format_cli_error(""), "The command could not be completed.");
+    }
+
+    #[test]
+    fn list_commands_accept_page_numbers() {
+        let cli = Cli::try_parse_from(["crabbot", "plugin", "list", "2", "--json"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Plugin {
+                command: super::PluginCommand::List(super::ListOutput { page: 2, json: true })
+            }
+        ));
+
+        let cli = SessionCli::try_parse_from(["session", "list", "3"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            SessionCommand::List(super::ListOutput { page: 3, json: false })
+        ));
+
+        let cli = DeliveryCli::try_parse_from(["delivery", "list", "4"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            DeliveryCommand::List(super::ListOutput { page: 4, json: false })
+        ));
     }
 
     #[test]
@@ -14236,6 +15066,8 @@ mod tests {
         assert_eq!(super::sentence("Ready!"), "Ready!");
         assert_eq!(super::sentence("Ready?"), "Ready?");
         assert_eq!(super::sentence("Ready."), "Ready.");
+        assert_eq!(super::sentence("  Denied: plugin not found  "), "Plugin not found.");
+        assert_eq!(super::sentence("  "), "Unknown error.");
     }
 
     #[test]
@@ -14927,6 +15759,17 @@ mod tests {
         assert!(rendered[1].contains("Ask before changing files."));
         assert!(rendered.iter().all(|text| !text.contains("Coding-agent instructions.")));
 
+        let default_root = context_home.join("default-workspace");
+        fs::create_dir_all(&default_root).unwrap();
+        fs::write(default_root.join("CRAB.md"), super::templates::CRAB).unwrap();
+        fs::write(default_root.join("CLAW.md"), super::templates::CLAW).unwrap();
+        let default_context = super::context_at("test", &default_root);
+
+        let default_bytes =
+            default_context.iter().map(|message| message.content[0].render().len()).sum::<usize>();
+
+        assert!(default_bytes <= 1024);
+
         let history = vec![
             Message {
                 id: "user-1".into(),
@@ -15192,14 +16035,20 @@ mod tests {
         let root = test_root("host");
         let memory_binary = super::plugin_name("memory");
         let _ = fs::remove_dir_all(&root);
-        local_session(SessionCommand::List(Output { json: false }), &root).unwrap();
+        local_session(SessionCommand::List(super::ListOutput { page: 1, json: false }), &root)
+            .unwrap();
+
         local_session(
             SessionCommand::New(SessionNew { id: "main".into(), model: "test".into() }),
             &root,
         )
         .unwrap();
-        local_session(SessionCommand::List(Output { json: false }), &root).unwrap();
-        local_session(SessionCommand::List(Output { json: true }), &root).unwrap();
+        local_session(SessionCommand::List(super::ListOutput { page: 1, json: false }), &root)
+            .unwrap();
+
+        local_session(SessionCommand::List(super::ListOutput { page: 1, json: true }), &root)
+            .unwrap();
+
         local_session(SessionCommand::Show(Id { id: "main".into() }), &root).unwrap();
         local_session(
             SessionCommand::Fork(Fork { source: "main".into(), target: "copy".into() }),
@@ -15275,8 +16124,8 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        super::list_at(&root, true).unwrap();
-        super::list_at(&root, false).unwrap();
+        super::list_at(&root, 1, true).unwrap();
+        super::list_at(&root, 1, false).unwrap();
         let lock = super::load_lock_at(&root).unwrap();
 
         assert!(lock.plugins.contains_key("memory"));
@@ -15381,7 +16230,7 @@ mod tests {
         .unwrap();
 
         assert!(super::installed_at(&root).is_empty());
-        super::list_at(&root, false).unwrap();
+        super::list_at(&root, 1, false).unwrap();
 
         assert!(
             super::remove_at(
@@ -15419,7 +16268,8 @@ mod tests {
                 .is_err()
         );
 
-        local_session(SessionCommand::List(Output { json: false }), &root).unwrap();
+        local_session(SessionCommand::List(super::ListOutput { page: 1, json: false }), &root)
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -15499,13 +16349,22 @@ mod tests {
 
         store.uncertain("delivery", "interrupted").unwrap();
 
-        delivery_at(DeliveryCommand::List(Output { json: false }), &root).await.unwrap();
-        delivery_at(DeliveryCommand::List(Output { json: true }), &root).await.unwrap();
+        delivery_at(DeliveryCommand::List(super::ListOutput { page: 1, json: false }), &root)
+            .await
+            .unwrap();
+
+        delivery_at(DeliveryCommand::List(super::ListOutput { page: 1, json: true }), &root)
+            .await
+            .unwrap();
 
         assert!(
-            delivery_at(DeliveryCommand::Retry(Name { id: "delivery".into(), yes: false }), &root)
-                .await
-                .is_err()
+            super::delivery_at_json(
+                DeliveryCommand::Retry(Name { id: "delivery".into(), yes: false }),
+                &root,
+                true,
+            )
+            .await
+            .is_err()
         );
 
         delivery_at(DeliveryCommand::Retry(Name { id: "delivery".into(), yes: true }), &root)
@@ -15553,14 +16412,15 @@ mod tests {
 
         assert!(export_dir.join("Crabfile").is_file());
 
-        let error = import_crabfile_at(
-            CrabfileImport { path: Some(crabfile.clone()), yes: false, force: false },
+        let error = super::import_crabfile_at_mode(
+            CrabfileImport { path: Some(crabfile.clone()), yes: false, force: true },
             &root,
+            true,
         )
         .unwrap_err()
         .to_string();
 
-        assert!(error.contains("requires confirmation"));
+        assert!(error.contains("Use --yes to continue without a prompt."));
 
         let missing = root.join("missing-crabfile");
         let error = import_crabfile_at(
@@ -16725,8 +17585,14 @@ fn main() {
         )
         .await
         .unwrap();
-        session_at(SessionCommand::List(Output { json: false }), &root).await.unwrap();
-        session_at(SessionCommand::List(Output { json: true }), &root).await.unwrap();
+        session_at(SessionCommand::List(super::ListOutput { page: 1, json: false }), &root)
+            .await
+            .unwrap();
+
+        session_at(SessionCommand::List(super::ListOutput { page: 1, json: true }), &root)
+            .await
+            .unwrap();
+
         session_at(SessionCommand::Show(Id { id: "main".into() }), &root).await.unwrap();
         session_at(
             SessionCommand::Fork(Fork { source: "main".into(), target: "copy".into() }),
@@ -16747,9 +17613,10 @@ fn main() {
         );
 
         assert!(
-            session_at(
+            super::session_at_json(
                 SessionCommand::Delete(SessionDelete { id: "main".into(), yes: false }),
                 &root,
+                true,
             )
             .await
             .is_err()

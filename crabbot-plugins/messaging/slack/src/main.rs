@@ -466,9 +466,14 @@ fn slack_timestamp_cmp(left: &str, right: &str) -> Ordering {
         .then_with(|| left.1.cmp(right.1))
 }
 
-#[tokio::main]
 #[cfg(not(test))]
-async fn main() -> crabbot_core::Result<()> {
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    crabbot_log::run_plugin("slack", plugin_main()).await
+}
+
+#[cfg(not(test))]
+async fn plugin_main() -> crabbot_core::Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(45))

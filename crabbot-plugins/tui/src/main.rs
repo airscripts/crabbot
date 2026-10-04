@@ -51,6 +51,20 @@ async fn main() -> std::process::ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
 
     if args.first().is_some_and(|value| value == "--crabbot-cli") {
+        let command_args = &args[1..];
+        let json = command_args.iter().any(|value| value == "--json");
+        let debug = command_args.iter().any(|value| value == "--debug");
+        let verbose = command_args.iter().any(|value| value == "--verbose");
+        let verbosity = if debug {
+            crabbot_log::Verbosity::Debug
+        } else if verbose {
+            crabbot_log::Verbosity::Verbose
+        } else {
+            crabbot_log::Verbosity::Quiet
+        };
+
+        crabbot_log::initialize(crabbot_log::Mode::Command { verbosity, json });
+
         return match run(&args[1..]).await {
             Ok(output) => {
                 if let Some(output) = output {
@@ -61,20 +75,13 @@ async fn main() -> std::process::ExitCode {
             }
 
             Err(error) => {
-                eprintln!("Error: {}", cli_error_message(&error));
+                eprintln!("{}", cli_error_message(&error));
                 std::process::ExitCode::FAILURE
             }
         };
     }
 
-    match serve_with(hello(), call).await {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-
-        Err(error) => {
-            eprintln!("Error: {}", cli_error_message(&error));
-            std::process::ExitCode::FAILURE
-        }
-    }
+    crabbot_log::run_plugin("tui", serve_with(hello(), call)).await
 }
 
 fn cli_error_message(error: &crabbot_core::Error) -> String {
@@ -266,10 +273,10 @@ async fn run(args: &[String]) -> crabbot_core::Result<Option<String>> {
         .or_else(|| std::env::var("CRABBOT_MODEL").ok())
         .unwrap_or_else(|| DEFAULT_MODEL.into());
 
-    let session = selected_session_id(options.session);
     let home = std::env::var("CRABBOT_HOME").unwrap_or_else(|_| ".config/crabbot".into());
 
     require_daemon(&home).await?;
+    let session = resolve_session_id(&home, options.session, daemon_control).await?;
 
     if let Some(prompt) = options.once {
         return run_once(home, plugin, model, model_override, session, prompt, daemon_control)
@@ -286,6 +293,52 @@ async fn run(args: &[String]) -> crabbot_core::Result<Option<String>> {
 
 fn selected_session_id(session: Option<String>) -> String {
     tui_session_id(&session.unwrap_or_else(|| DEFAULT_SESSION_ID.into()))
+}
+
+async fn resolve_session_id<C, F>(
+    home: &str,
+    session: Option<String>,
+    host: C,
+) -> crabbot_core::Result<String>
+where
+    C: Fn(String, String, Value) -> F + Copy + Send + Sync + 'static,
+    F: Future<Output = crabbot_core::Result<Value>> + Send + 'static,
+{
+    if session.is_some() {
+        return Ok(selected_session_id(session));
+    }
+
+    let response = host(home.to_owned(), "session.list".into(), Value::Null).await?;
+    let state_path = data::plugin_file(home, "tui", "last-session.json");
+    let last_session = data::load_last_session(&state_path);
+
+    Ok(resume_session_id(&response, last_session.as_deref()))
+}
+
+fn resume_session_id(sessions: &Value, last_session: Option<&str>) -> String {
+    let Some(items) = sessions["items"].as_array() else {
+        return selected_session_id(None);
+    };
+
+    let available = |item: &&Value| {
+        item["id"]
+            .as_str()
+            .is_some_and(|id| tui_session_name(id).is_some() && item["archived"] != true)
+    };
+
+    if let Some(last_session) = last_session
+        && items.iter().filter(available).any(|item| item["id"] == last_session)
+    {
+        return last_session.to_owned();
+    }
+
+    items
+        .iter()
+        .filter(available)
+        .max_by_key(|item| item["updated"].as_u64().unwrap_or_default())
+        .and_then(|item| item["id"].as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| selected_session_id(None))
 }
 
 fn tui_session_id(name: &str) -> String {
@@ -379,6 +432,8 @@ where
     let EngineEvents { session: session_events, engine: engine_events, streaming_host } = events;
     let input = BufReader::new(input);
     let initial_session = ensure_session(&home, &session, &model, host).await?;
+    let last_session_path = data::plugin_file(&home, "tui", "last-session.json");
+    data::save_last_session(&last_session_path, &session)?;
 
     model = if let Some(model_override) = model_override {
         host(
@@ -469,7 +524,7 @@ where
                 continue;
             }
 
-            if line == "/plugins" || line.starts_with("/plugins ") {
+            if line == "/plugin" || line.starts_with("/plugin ") {
                 let text = match parse_plugin_list_page(line) {
                     Ok(page) => {
                         let value = match host(
@@ -486,7 +541,7 @@ where
                         format!("{}\n> ", format_plugins(&value, page))
                     }
 
-                    Err(()) => "Usage: /plugins [page].\n> ".into(),
+                    Err(()) => "Usage: /plugin [page].\n> ".into(),
                 };
 
                 output.write_all(text.as_bytes()).await?;
@@ -603,6 +658,7 @@ where
                             let old_name = tui_session_name(&session).unwrap_or(&session);
                             output.write_all(format!("Renamed session {old_name} to {target}.\n> ").as_bytes()).await?;
                             session = tui_session_id(target);
+                            data::save_last_session(&last_session_path, &session)?;
                             let view = read_session(&home, &session, host).await?;
                             model = view.model.clone();
                             messages = view.messages.clone();
@@ -904,6 +960,7 @@ where
                     match read_session(&home, &target, host).await {
                         Ok(view) => {
                             session = target;
+                            data::save_last_session(&last_session_path, &session)?;
                             model = view.model.clone();
                             messages = view.messages.clone();
                             workspace = view.workspace.clone();
@@ -954,6 +1011,7 @@ where
                             let session_id = tui_session_id(value);
                             let view = read_session(&home, &session_id, host).await?;
                             session = session_id;
+                            data::save_last_session(&last_session_path, &session)?;
                             model = view.model.clone();
                             messages = view.messages.clone();
                             workspace = view.workspace.clone();
@@ -1698,8 +1756,9 @@ fn has_capability(home: &str, capability: &str) -> bool {
 fn command_help(home: &str, has_model: bool, daemon: bool) -> String {
     let commands = [
         ("/help", "Show commands available in this session."),
+        ("/history list|clear|help", "Show or clear saved TUI input history."),
         ("/status", "Show whether the background runtime is running."),
-        ("/plugins [page]", "Browse installed plugins."),
+        ("/plugin [page]", "Browse installed plugins."),
         ("/session help", "Show session commands."),
         ("/new <id>", "Create and switch to a session."),
         ("/workspace [path|reset]", "Show or change this session's filesystem root."),
@@ -2642,7 +2701,7 @@ fn parse_session_list_page(command: &str) -> Result<usize, ()> {
 fn parse_plugin_list_page(command: &str) -> Result<usize, ()> {
     let mut parts = command.split_whitespace();
 
-    if parts.next() != Some("/plugins") {
+    if parts.next() != Some("/plugin") {
         return Err(());
     }
 
@@ -2714,11 +2773,11 @@ fn format_sessions(
 
             let mut details = vec![format!("model: {model}")];
 
-            if let Some(created) = item["created"].as_u64().and_then(date::format_date) {
+            if let Some(created) = item["created"].as_u64().map(crabbot_date::format_date) {
                 details.push(format!("created: {created}"));
             }
 
-            if let Some(updated) = item["updated"].as_u64().and_then(date::format_date) {
+            if let Some(updated) = item["updated"].as_u64().map(crabbot_date::format_date) {
                 details.push(format!("updated: {updated}"));
             }
 
@@ -3047,6 +3106,33 @@ mod tests {
     }
 
     #[test]
+    fn resumes_last_session_or_most_recent_active_tui_session() {
+        let sessions = json!({
+            "items": [
+                {"id": "tui-old", "archived": false, "updated": 10},
+                {"id": "tui-recent", "archived": false, "updated": 20},
+                {"id": "tui-archived", "archived": true, "updated": 30},
+                {"id": "other", "archived": false, "updated": 40}
+            ]
+        });
+
+        assert_eq!(super::resume_session_id(&sessions, Some("tui-old")), "tui-old");
+        assert_eq!(super::resume_session_id(&sessions, Some("tui-missing")), "tui-recent");
+    }
+
+    #[test]
+    fn defaults_when_no_active_tui_session_exists() {
+        let sessions = json!({
+            "items": [
+                {"id": "tui-archived", "archived": true, "updated": 30},
+                {"id": "other", "archived": false, "updated": 40}
+            ]
+        });
+
+        assert_eq!(super::resume_session_id(&sessions, Some("tui-archived")), "tui-default");
+    }
+
+    #[test]
     fn does_not_assume_a_provider_model_by_default() {
         assert_eq!(super::DEFAULT_MODEL, "unset");
     }
@@ -3193,7 +3279,7 @@ mod tests {
 
         assert!(model_commands.contains("/model <help|list|show|set>"));
         assert!(model_commands.contains("/compact"));
-        assert!(model_commands.contains("/plugins [page]"));
+        assert!(model_commands.contains("/plugin [page]"));
         assert!(model_commands.contains("Conditional commands (shown only when usable):"));
         assert!(model_commands.contains("\n\nPlugin commands run in the CLI:"));
         assert!(!model_commands.contains("`crab"));
@@ -3506,11 +3592,11 @@ mod tests {
 
     #[test]
     fn parses_plugin_list_pages_and_rejects_invalid_input() {
-        assert_eq!(super::parse_plugin_list_page("/plugins"), Ok(1));
-        assert_eq!(super::parse_plugin_list_page("/plugins 3"), Ok(3));
-        assert!(super::parse_plugin_list_page("/plugins 0").is_err());
-        assert!(super::parse_plugin_list_page("/plugins next").is_err());
-        assert!(super::parse_plugin_list_page("/plugins 2 extra").is_err());
+        assert_eq!(super::parse_plugin_list_page("/plugin"), Ok(1));
+        assert_eq!(super::parse_plugin_list_page("/plugin 3"), Ok(3));
+        assert!(super::parse_plugin_list_page("/plugin 0").is_err());
+        assert!(super::parse_plugin_list_page("/plugin next").is_err());
+        assert!(super::parse_plugin_list_page("/plugin 2 extra").is_err());
     }
 
     #[test]
@@ -4067,7 +4153,7 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
         fs::write(
             &input_path,
             format!(
-                "/help\n/status\n/approval\n/approvals\n/approve 0123456789abcdef01234567\n/deny 0123456789abcdef01234567\n/session list\n/session help\n/deliveries\n/retry bad id\n/drop bad id\n/plugins\n/workspace\n/workspace {}\n/workspace reset\n/timer list\n/timer add 30 break\n/timer remove 7\n/memory list\n/memory remember drink=tea\n/memory forget drink\n/model \n/model test\n/session bad!\n/new two\n/session create test-one\n/session one\n/session rename renamed\n/session archive two\n/session unarchive two\n/session unarchive missing\n/session delete two -y\n/session delete renamed -y\n/session archive renamed\n/compact\n/clear\n\nhello\n/quit\n",
+                "/help\n/status\n/approval\n/approvals\n/approve 0123456789abcdef01234567\n/deny 0123456789abcdef01234567\n/session list\n/session help\n/deliveries\n/retry bad id\n/drop bad id\n/plugin\n/workspace\n/workspace {}\n/workspace reset\n/timer list\n/timer add 30 break\n/timer remove 7\n/memory list\n/memory remember drink=tea\n/memory forget drink\n/model \n/model test\n/session bad!\n/new two\n/session create test-one\n/session one\n/session rename renamed\n/session archive two\n/session unarchive two\n/session unarchive missing\n/session delete two -y\n/session delete renamed -y\n/session archive renamed\n/compact\n/clear\n\nhello\n/quit\n",
                 root.display()
             ),
         )

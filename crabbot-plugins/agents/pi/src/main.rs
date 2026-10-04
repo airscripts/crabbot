@@ -27,9 +27,14 @@ use tokio::{
 const LINE_LIMIT: usize = crabbot_core::jsonl::MAX / 2;
 const OUTPUT_LIMIT: usize = 512 * 1024;
 
-#[tokio::main]
 #[cfg(not(test))]
-async fn main() -> crabbot_core::Result<()> {
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    crabbot_log::run_plugin("pi", plugin_main()).await
+}
+
+#[cfg(not(test))]
+async fn plugin_main() -> crabbot_core::Result<()> {
     serve_events(
         Hello {
             protocol: Protocol::CURRENT,

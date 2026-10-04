@@ -15,8 +15,8 @@ disabled by default; enable them with `[clients.tui] tools = true` in the home
 Markdown fenced code blocks appear in a labeled panel in the transcript; the
 fence's language tag is shown above the code.
 Prefix a line with `!` to run it directly through the daemon's shell. This
-requires `shell = true`, but not the Tools plugin or a separate approval; the
-command is already an explicit user action and runs in the selected workspace.
+requires `[clients.tui] shell = true`, but not the Tools plugin or separate
+approval; it is an explicit user action in the selected workspace.
 Set `[clients.tui] theme = false` to use the terminal's default text color
 instead of TUI colors; the theme is enabled by default and changes apply on the
 next `crab tui` launch.
@@ -24,16 +24,21 @@ next `crab tui` launch.
 In an interactive terminal, use `/help`, `/status`, `/approval`, `/approvals`, `/approve <id>`,
 `/deny <id>`, `/session help`, `/session list`, `/deliveries`, `/retry <id>`,
 `/drop <id>`, `/model <name>`, `/new <id>`,
-`/plugins [page]`, `/workspace [path|reset]`, `/timer <list|add|remove>`, `/memory
+`/plugin [page]`, `/history <list|clear|help>`, `/workspace [path|reset]`,
+`/timer <list|add|remove>`, `/memory
 <list|remember|forget>`, `/compact`, `/clear`, and `/quit`. Plain lines are sent through
 the configured model plugin. Sessions, selected models, and completed turns
 are persisted through authenticated daemon IPC. `/session switch <id>` resumes
 an existing session; `/new <id>` creates and selects one. `/session rename`
 renames the active session without losing history. `/session archive` and
 `/session unarchive` accept multiple IDs or `--all`; `/session delete` accepts
-the same targets and requires `-y` or `--yes`. The active session is kept when
+the same targets and prompts before deletion; use `-y` or `--yes` to skip it.
+The active session is kept when
 archiving or deleting all sessions. `/workspace <path>` selects and persists a
 canonical existing directory for that session.
+Without `--session`, the TUI resumes the last session it opened, or starts the
+default session when none exist. Up/Down input history is saved under
+`<CRABBOT_HOME>/data/plugins/tui/history.json`.
 Multiple TUI windows following the same session refresh its saved transcript
 automatically once per second. A window shows the other client's
 messages as they are saved, reflects when another window is generating, and
@@ -57,6 +62,6 @@ remember <key>=<value>`, `/memory list`, and `/memory forget <key>` manage
 memories scoped to the selected session; explicitly entering `remember`
 authorizes a suggest-mode write.
 
-`/status`, `/session list [page]`, and `/plugins [page]` use authenticated daemon
+`/status`, `/session list [page]`, and `/plugin [page]` use authenticated daemon
 state over local IPC. Both lists are paginated and show compact status and
 metadata; the plugin view includes capabilities, commands, and permissions.

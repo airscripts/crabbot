@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crabbot-core",
+    "crabbot-libs/date",
+    "crabbot-libs/logging",
     "crabbot-libs/file",
     "crabbot-libs/process",
     "crabbot-runtime",
@@ -40,6 +42,8 @@ publish = false
 
 [workspace.dependencies]
 base64 = "0.23"
+crabbot-date = { path = "crabbot-libs/date" }
+crabbot-log = { path = "crabbot-libs/logging" }
 crossterm = "0.29"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
@@ -61,4 +65,4 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 toml = "1.1"
 toml_edit = "0.25"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

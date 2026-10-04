@@ -16,10 +16,9 @@ where
         Ok(()) => ExitCode::SUCCESS,
 
         Err(error) => {
-            tracing::error!(
-                error = %crabbot_runtime::redact_diagnostic(sentence(error.to_string())),
-                "Daemon failed."
-            );
+            let message = crabbot_runtime::redact_diagnostic(sentence(error.to_string()));
+            tracing::error!(error = %message, "Daemon failed.");
+            eprintln!("{message}");
             ExitCode::FAILURE
         }
     }

@@ -155,6 +155,6 @@ their child processes when the host cancels or restarts them.
 ## Security
 
 The host treats plugins as executable trust boundaries. Filesystem tools must
-stay below their configured root, shell is disabled by default, and every
+stay below their configured root, TUI shell access is disabled by default, and every
 mutating or risky action carries approval metadata. Logs must not contain
 credentials or authorization headers.

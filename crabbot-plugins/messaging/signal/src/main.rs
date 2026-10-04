@@ -220,9 +220,14 @@ fn save_inbox(inbox: &Inbox) -> crabbot_core::Result<()> {
     })
 }
 
-#[tokio::main]
 #[cfg(not(test))]
-async fn main() -> crabbot_core::Result<()> {
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    crabbot_log::run_plugin("signal", plugin_main()).await
+}
+
+#[cfg(not(test))]
+async fn plugin_main() -> crabbot_core::Result<()> {
     if inbox_path().is_none() {
         return Err(crabbot_core::Error::Denied(
             "CRABBOT_HOME is required for the Signal inbox.".into(),

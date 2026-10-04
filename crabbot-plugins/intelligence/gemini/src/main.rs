@@ -17,9 +17,14 @@ const DEFAULT_MODEL: &str = "gemini-3.8-flash";
 const LEGACY_MODEL: &str = "gemini-2.5-flash";
 const HOST_DEFAULT_MODEL: &str = "gpt-6-luna";
 
-#[tokio::main]
 #[cfg(not(test))]
-async fn main() -> crabbot_core::Result<()> {
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    crabbot_log::run_plugin("gemini", plugin_main()).await
+}
+
+#[cfg(not(test))]
+async fn plugin_main() -> crabbot_core::Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(120))

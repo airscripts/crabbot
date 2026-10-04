@@ -49,7 +49,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const ACCENT_COLOR: Color = Color::Rgb(255, 140, 0);
 const TRANSCRIPT_LIMIT: usize = 512 * 1024;
 const INTERACTION_LIMIT: usize = 12 * 1024;
-const INPUT_HISTORY_LIMIT: usize = 100;
+const INPUT_HISTORY_LIMIT: usize = super::data::HISTORY_LIMIT;
 const INPUT_MAX_ROWS: usize = 5;
 const COMPOSER_GAP_ROWS: u16 = 1;
 const MESSAGE_GAP_ROWS: usize = 2;
@@ -193,6 +193,7 @@ struct App {
     input: Vec<char>,
     cursor: usize,
     history: Vec<String>,
+    history_path: Option<PathBuf>,
     history_index: Option<usize>,
     history_draft: String,
     transcript_scroll: ScrollState,
@@ -409,6 +410,8 @@ where
     let statusline = preferences.statusline;
     let typewriter = preferences.typewriter;
     let theme_enabled = std::env::var("CRABBOT_TUI_THEME").as_deref() != Ok("off");
+    let history_path = super::data::plugin_file(&home, "tui", "history.json");
+    let history = super::data::load_history(&history_path);
 
     let engine_model = model.clone();
     let (session_tx, mut session_rx) = mpsc::unbounded_channel();
@@ -466,6 +469,8 @@ where
         context_usage: initial_session.context_usage,
         statusline_started: Some(Instant::now()),
         command_options,
+        history,
+        history_path: Some(history_path),
         workspace,
         session_working: initial_session.working,
         default_workspace,
@@ -651,14 +656,14 @@ where
 
                             Ok(Err(error)) => {
                                 app.status = "Session failed".into();
-                                let message = format!("\nError: {error}");
+                                let message = format!("\n{error}");
                                 app.capture_interaction_output(&message);
                                 app.push_output(message);
                             }
 
                             Err(error) => {
                                 app.status = "Session failed".into();
-                                let message = format!("\nError: {error}");
+                                let message = format!("\n{error}");
                                 app.capture_interaction_output(&message);
                                 app.push_output(message);
                             }
@@ -1026,24 +1031,27 @@ fn interrupt_generation(
 
 const TUI_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show commands available in this session."),
+    ("/history list", "List recent TUI input history."),
+    ("/history clear", "Clear saved TUI input history."),
+    ("/history help", "Show input history commands."),
     ("/status", "Show whether the background runtime is running."),
-    ("/plugins [page]", "Browse installed plugins."),
+    ("/plugin", "Browse installed plugins; optionally choose a page."),
     ("/session help", "Show session commands."),
-    ("/session list [page]", "List saved sessions."),
+    ("/session list", "List saved sessions; optionally choose a page."),
     ("/session create <id>", "Create and switch to a session."),
     ("/session switch <id>", "Switch to a saved session."),
     ("/session rename <new-id>", "Rename the active session."),
     ("/session archive <id>...|--all", "Archive saved sessions."),
     ("/session unarchive <id>...|--all", "Restore archived sessions."),
-    (
-        "/session delete <id>...|--all [-y] [--deep]",
-        "Permanently delete sessions; --deep also removes local and shared session data.",
-    ),
+    ("/session delete <id>...|--all", "Permanently delete sessions; optionally pass -y or --deep."),
     ("/new <id>", "Create and switch to a session."),
-    ("/workspace [path|reset]", "Show or change this session's filesystem root."),
+    (
+        "/workspace",
+        "Show or change this session's filesystem root; optionally set a path or reset it.",
+    ),
     ("/clear", "Clear this session's conversation."),
-    ("/statusline [reset]", "Choose which details appear in the statusline."),
-    ("/animation [on|off]", "Show or configure typewriter animation."),
+    ("/statusline", "Choose which details appear in the statusline; optionally reset it."),
+    ("/animation", "Show or configure typewriter animation; optionally turn it on or off."),
     ("/quit", "Leave the TUI."),
     ("/exit", "Leave the TUI."),
 ];
@@ -1440,6 +1448,13 @@ where
                     app.transcript_scroll.follow_latest();
                     app.push_user(&line);
                     app.remember_input(&line);
+
+                    if line == "/history" || line.starts_with("/history ") {
+                        let output = app.history_command(command);
+                        app.push_bot(format!("{output}\n"));
+                        app.complete_local_interaction(output);
+                        return Ok(false);
+                    }
 
                     if let Some(model) = line
                         .strip_prefix("/model set ")
@@ -2730,7 +2745,7 @@ fn wrap_transcript_line(line: &str, name: &str, width: usize) -> Vec<Line<'stati
         || line.starts_with("Plugins | ")
     {
         vec![(line.to_owned(), Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD))]
-    } else if line.starts_with("Error:") || line.starts_with("Session not found") {
+    } else if line.starts_with("Session not found") {
         vec![(line.to_owned(), Style::default().fg(ACCENT_COLOR))]
     } else if let Some((label, value)) = line.split_once(": ")
         && matches!(label, "Tool" | "Arguments" | "Command" | "Action" | "Approve" | "Deny")
@@ -3269,6 +3284,64 @@ impl App {
         }
 
         self.history_draft.clear();
+
+        if let Some(path) = &self.history_path
+            && let Err(error) = super::data::save_history(path, &self.history)
+        {
+            self.status = format!("Input history was not saved: {error}");
+        }
+    }
+
+    fn history_command(&mut self, command: &str) -> String {
+        let mut parts = command.split_whitespace();
+        let _ = parts.next();
+        let action = parts.next().unwrap_or("help");
+
+        if parts.next().is_some() {
+            return "Usage: /history [list|clear|help].".into();
+        }
+
+        match action {
+            "list" => {
+                if self.history.is_empty() {
+                    return "Input history is empty.".into();
+                }
+
+                let entries = self
+                    .history
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| {
+                        let entry = entry.replace('\n', " ↵ ").replace('\r', "");
+                        let mut clipped = entry.chars().take(160).collect::<String>();
+
+                        if clipped.chars().count() < entry.chars().count() {
+                            clipped.push('…');
+                        }
+
+                        format!("{:>3}  {clipped}", index + 1)
+                    })
+                    .collect::<Vec<_>>();
+
+                format!("Input history ({}):\n{}", entries.len(), entries.join("\n"))
+            }
+
+            "clear" => {
+                if let Some(path) = &self.history_path
+                    && let Err(error) = super::data::save_history(path, &[])
+                {
+                    return format!("Input history could not be cleared: {error}");
+                }
+
+                self.history.clear();
+                self.history_index = None;
+                self.history_draft.clear();
+                "Input history cleared.".into()
+            }
+
+            "help" => "Input history commands:\n  /history list   List saved inputs.\n  /history clear  Clear saved input history.\n  /history help   Show these commands.".into(),
+            _ => "Usage: /history [list|clear|help].".into(),
+        }
     }
 
     fn history_up(&mut self) {
@@ -3474,6 +3547,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_picker_omits_optional_argument_placeholders() {
+        let cases = [
+            ("/pl", "/plugin"),
+            ("/session l", "/session list"),
+            ("/work", "/workspace"),
+            ("/statusl", "/statusline"),
+            ("/anim", "/animation"),
+        ];
+
+        for (input, expected) in cases {
+            let (mut command_tx, _command_rx) = duplex(1024);
+            let mut app = App {
+                input: input.chars().collect(),
+                cursor: input.len(),
+                command_options: super::TUI_COMMANDS.to_vec(),
+                ..App::default()
+            };
+
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut app,
+                &mut command_tx,
+                false,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(app.input.iter().collect::<String>(), expected);
+        }
+
+        assert!(super::TUI_COMMANDS.iter().all(|(command, _)| !command.contains('[')));
+    }
+
+    #[test]
+    fn history_commands_list_help_and_clear_persisted_inputs() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = std::env::temp_dir()
+            .join(format!("crabbot-tui-history-{}-{nonce}", std::process::id()));
+
+        let history_path = super::super::data::plugin_file(&root, "tui", "history.json");
+        let mut app = App {
+            history: vec!["first input".into(), "second\ninput".into()],
+            history_path: Some(history_path.clone()),
+            ..App::default()
+        };
+
+        let listed = app.history_command("/history list");
+
+        assert!(listed.contains("first input"));
+        assert!(listed.contains("second ↵ input"));
+        assert!(app.history_command("/history help").contains("/history clear"));
+        assert_eq!(app.history_command("/history clear"), "Input history cleared.");
+        assert!(app.history.is_empty());
+        assert!(super::super::data::load_history(&history_path).is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn compact_submission_shows_the_wait_state_before_engine_response() {
         let (mut command_tx, mut command_rx) = duplex(1024);
         let mut app = App {
@@ -3541,7 +3677,7 @@ mod tests {
         for command in [
             "/session archive <id>...|--all",
             "/session unarchive <id>...|--all",
-            "/session delete <id>...|--all [-y] [--deep]",
+            "/session delete <id>...|--all",
             "/exit",
         ] {
             assert!(names.contains(&command), "missing command: {command}");
@@ -4965,7 +5101,7 @@ mod tests {
         super::persist_interaction(&home, saved, crate::local_aware).await.unwrap();
 
         app.begin_interaction("/session missing");
-        app.capture_interaction_output("\nError: Session was not found.");
+        app.capture_interaction_output("\nSession was not found.");
         let saved = app.finish_interactions().pop().unwrap();
         super::persist_interaction(&home, saved, crate::local_aware).await.unwrap();
 
@@ -4980,7 +5116,8 @@ mod tests {
         assert!(transcript.contains("hello without a model"));
         assert!(transcript.contains("No intelligence plugin is installed."));
         assert!(transcript.contains("/session missing"));
-        assert!(transcript.contains("Error: Session was not found."));
+        assert!(transcript.contains("Session was not found."));
+        assert!(!transcript.contains("Error:"));
 
         let bounded =
             super::bounded_interaction_text(&format!("{}é", "x".repeat(super::INTERACTION_LIMIT)));

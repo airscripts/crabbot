@@ -23,7 +23,7 @@ the foreground until polling, replies, and acknowledgements work as expected.
 cargo build -p crabbot-plugin-telegram --locked
 cargo install --path crabbot --locked
 cargo install --path crabbot-daemon --locked
-crabbot plugin install telegram --link --yes
+crabbot plugin install telegram --link
 crabbot doctor
 ```
 
@@ -40,10 +40,10 @@ The spacing formatter is idempotent and preserves the contents of Rust raw
 strings. Keep its inserted blank lines between adjacent multiline statements.
 
 Build only the plugins you plan to use. After changing a linked plugin, rebuild
-its package and run `crabbot plugin install <id> --link --yes`; the host health-checks the
+its package and run `crabbot plugin install <id> --link`; the host health-checks the
 staged executable and loads it into a running daemon without a restart.
-`crabbot plugin update` previews available changes. Run
-`crabbot plugin update --yes` to apply them. It reloads active plugins in
+`crabbot plugin update` previews available changes, then prompts to apply them
+in a terminal. Use `--yes` to skip that prompt. It reloads active plugins in
 place without restarting the daemon, and plugins that were inactive remain
 inactive.
 

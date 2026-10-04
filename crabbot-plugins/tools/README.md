@@ -30,8 +30,8 @@ root filesystem, dropped Linux capabilities, bounded CPU, memory, process and
 temporary-file resources, and a writable mount limited to the active workspace.
 The selected image must contain `sh` and allow its configured user to write the
 workspace. Runtime errors fail the command; they never fall back to host shell
-execution. Keep `shell = true` in the main configuration and retain an enabled
-channel approval mode before shell tools can run.
+execution. Set `[clients.tui] shell = true` to enable TUI shell access. Shell
+tools requested by an agent also require an enabled approval policy.
 
 Use a local Docker or Podman engine. Remote container contexts are unsupported
 because the active workspace mount must refer to this host's filesystem. The

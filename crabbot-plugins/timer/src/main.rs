@@ -42,7 +42,11 @@ struct Task {
 }
 
 #[tokio::main]
-async fn main() -> crabbot_core::Result<()> {
+async fn main() -> std::process::ExitCode {
+    crabbot_log::run_plugin("timer", plugin_main()).await
+}
+
+async fn plugin_main() -> crabbot_core::Result<()> {
     let tasks = load();
 
     serve_with(

@@ -96,9 +96,12 @@ supports Bash, Fish, PowerShell, and Zsh through `clap_complete`.
 
 ## Change Rules
 
-- Keep changelog bullets to one concise line of professional, user-facing English.
-  Describe features, not implementation details, tests, or CI work. Before the
-  first release, keep the unreleased section to `Added` entries only.
+- Record user-visible release behavior in `CHANGELOG.md`; omit refactors,
+  dependency updates, tests, CI work, and planned features.
+- Write one short line per entry, in plain English, naming the user value with
+  accurate capitalization and minimal detail.
+- Before the first release, keep `Unreleased` under `Added` only. Afterward,
+  use a category only when it has a user-visible entry; omit empty headings.
 - Keep the core capability-free and provider-neutral.
 - Add provider or channel behavior only in its plugin.
 - Keep plugin stdout as protocol-only JSONL and logs on stderr.

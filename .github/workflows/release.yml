@@ -4,9 +4,6 @@ on:
   push:
     tags: ["v*"]
 
-  workflow_dispatch:
-    # Dispatch from the release tag selected in GitHub Actions.
-
 permissions:
   contents: read
 

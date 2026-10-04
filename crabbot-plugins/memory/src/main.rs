@@ -73,7 +73,11 @@ impl Default for State {
 }
 
 #[tokio::main]
-async fn main() -> crabbot_core::Result<()> {
+async fn main() -> std::process::ExitCode {
+    crabbot_log::run_plugin("memory", plugin_main()).await
+}
+
+async fn plugin_main() -> crabbot_core::Result<()> {
     let items = load();
 
     serve_with(

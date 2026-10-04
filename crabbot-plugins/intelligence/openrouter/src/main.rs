@@ -17,7 +17,11 @@ const BODY_LIMIT: usize = crabbot_core::jsonl::MAX / 2;
 const TOOL_LIMIT: usize = 16;
 
 #[tokio::main]
-async fn main() -> crabbot_core::Result<()> {
+async fn main() -> std::process::ExitCode {
+    crabbot_log::run_plugin("openrouter", plugin_main()).await
+}
+
+async fn plugin_main() -> crabbot_core::Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(120))

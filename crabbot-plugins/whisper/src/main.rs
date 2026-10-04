@@ -21,7 +21,12 @@ const ERROR_LIMIT: usize = 4 * 1024;
 
 #[cfg(not(test))]
 #[tokio::main]
-async fn main() -> crabbot_core::Result<()> {
+async fn main() -> std::process::ExitCode {
+    crabbot_log::run_plugin("whisper", plugin_main()).await
+}
+
+#[cfg(not(test))]
+async fn plugin_main() -> crabbot_core::Result<()> {
     let root = media_root();
     let policy = Policy { root, ..Policy::default() };
     serve_with(hello(), move |request| {

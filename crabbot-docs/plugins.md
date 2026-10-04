@@ -128,7 +128,7 @@ Build the executable, then link it into a local Crabbot installation for
 development, or install a copy for regular use:
 
 ```sh
-crabbot plugin install hello --source ./hello --link --yes
+crabbot plugin install hello --source ./hello --link
 crabbot plugin list
 crabbot doctor
 crabbot hello
@@ -142,7 +142,7 @@ install it with a pinned revision:
 
 ```sh
 crabbot plugin install hello https://github.com/example/hello.git \
-  --revision COMMIT_SHA --yes
+  --revision COMMIT_SHA
 ```
 
 Private repositories work when Git authentication is already configured on the
