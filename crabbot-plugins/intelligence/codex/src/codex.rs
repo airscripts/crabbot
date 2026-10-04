@@ -687,16 +687,22 @@ impl Server {
         ticker.tick().await;
 
         loop {
-            let value = tokio::select! {
-                result = timeout_at(deadline, jsonl::read::<Value>(&mut self.input, jsonl::MAX)) => {
-                    result
-                        .map_err(|_| denied("Codex exceeded the turn time limit."))??
-                        .ok_or_else(|| denied("Codex app-server closed during a turn."))?
-                }
+            let value = {
+                let read = timeout_at(deadline, jsonl::read::<Value>(&mut self.input, jsonl::MAX));
+                tokio::pin!(read);
 
-                _ = ticker.tick(), if !pending.is_empty() => {
-                    emit(&mut pending, &mut stream_events, emitter).await?;
-                    continue;
+                loop {
+                    tokio::select! {
+                        result = &mut read => {
+                            break result
+                                .map_err(|_| denied("Codex exceeded the turn time limit."))??
+                                .ok_or_else(|| denied("Codex app-server closed during a turn."))?;
+                        }
+
+                        _ = ticker.tick(), if !pending.is_empty() => {
+                            emit(&mut pending, &mut stream_events, emitter).await?;
+                        }
+                    }
                 }
             };
 
