@@ -153,6 +153,14 @@ fn settings(
 }
 
 pub fn initialize(mode: Mode) {
+    let _ = initialize_with_command_log_enabled(mode, false);
+}
+
+pub fn initialize_with_command_log(mode: Mode) -> Option<PathBuf> {
+    initialize_with_command_log_enabled(mode, true)
+}
+
+fn initialize_with_command_log_enabled(mode: Mode, capture: bool) -> Option<PathBuf> {
     let settings = settings(
         mode,
         std::env::var("CRABBOT_LOG").ok().as_deref(),
@@ -163,10 +171,12 @@ pub fn initialize(mode: Mode) {
     let file_filter =
         EnvFilter::try_new(&settings.filter).unwrap_or_else(|_| EnvFilter::new(default_filter()));
 
-    let Some(writer) = LogFile::open(settings.format) else {
+    let Some(writer) = LogFile::open(settings.format, mode, capture) else {
         initialize_terminal(mode);
-        return;
+        return None;
     };
+
+    let command_path = writer.command_path.clone();
 
     let file_layer = match settings.format {
         Format::Text => tracing_subscriber::fmt::layer()
@@ -204,6 +214,8 @@ pub fn initialize(mode: Mode) {
             "Ignoring invalid logging configuration."
         );
     }
+
+    initialized.then_some(command_path).flatten()
 }
 
 fn initialize_terminal(mode: Mode) {
@@ -221,10 +233,11 @@ fn initialize_terminal(mode: Mode) {
 struct LogFile {
     directory: PathBuf,
     extension: &'static str,
+    command_path: Option<PathBuf>,
 }
 
 impl LogFile {
-    fn open(format: Format) -> Option<Self> {
+    fn open(format: Format, mode: Mode, capture: bool) -> Option<Self> {
         let home = std::env::var_os("CRABBOT_HOME").map(PathBuf::from).unwrap_or_else(|| {
             std::env::var_os("XDG_CONFIG_HOME")
                 .map(PathBuf::from)
@@ -244,36 +257,60 @@ impl LogFile {
             Format::Json => "jsonl",
         };
 
-        Some(Self { directory, extension })
+        let command_path = if capture
+            && let Mode::Command { verbosity, .. } = mode
+            && verbosity != Verbosity::Quiet
+        {
+            let label = if verbosity == Verbosity::Debug { "debug" } else { "verbose" };
+
+            let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+            let path = directory.join(format!(
+                "{}-{label}-{stamp}-{}.{}",
+                date_stamp(),
+                std::process::id(),
+                extension
+            ));
+
+            private_log_file(path.clone()).ok().map(|_| path)
+        } else {
+            None
+        };
+
+        Some(Self { directory, extension, command_path })
     }
 }
 
 impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogFile {
-    type Writer = BufferedLogWriter;
+    type Writer = LogWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
         let filename = format!("{}.{}", date_stamp(), self.extension);
 
-        BufferedLogWriter { path: self.directory.join(filename), buffer: Vec::new() }
+        LogWriter { path: self.directory.join(filename), command_path: self.command_path.clone() }
     }
 }
 
-struct BufferedLogWriter {
+struct LogWriter {
     path: PathBuf,
-    buffer: Vec<u8>,
+    command_path: Option<PathBuf>,
 }
 
-impl Write for BufferedLogWriter {
+impl Write for LogWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.buffer.extend_from_slice(bytes);
+        let mut daily = private_log_file(self.path.clone())?;
+        daily.write_all(bytes)?;
+        daily.flush()?;
+
+        if let Some(path) = &self.command_path {
+            let mut command = private_log_file(path.clone())?;
+            command.write_all(bytes)?;
+            command.flush()?;
+        }
+
         Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let mut file = private_log_file(self.path.clone())?;
-        file.write_all(&self.buffer)?;
-        file.flush()?;
-        self.buffer.clear();
         Ok(())
     }
 }
@@ -394,11 +431,12 @@ pub fn redact_bytes(value: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::Write;
 
     use super::{
-        Format, Mode, Settings, Verbosity, date_stamp_at, default_filter, redact_bytes, settings,
-        terminal_filter, timestamp,
+        Format, LogWriter, Mode, Settings, Verbosity, date_stamp_at, default_filter, redact_bytes,
+        settings, terminal_filter, timestamp,
     };
 
     #[test]
@@ -430,6 +468,34 @@ mod tests {
 
         assert_eq!(terminal_filter(Mode::Daemon), None);
         assert_eq!(terminal_filter(Mode::Plugin), None);
+    }
+
+    #[test]
+    fn command_log_receives_the_raw_application_log_lines() {
+        let root = std::env::temp_dir().join(format!(
+            "crabbot-command-log-{}-{}",
+            std::process::id(),
+            timestamp()
+        ));
+
+        fs::create_dir_all(&root).unwrap();
+        let daily = root.join("daily.log");
+        let command = root.join("command.log");
+        let mut writer = LogWriter { path: daily.clone(), command_path: Some(command.clone()) };
+
+        writer.write_all(b"DEBUG crabbot_runtime: turn started\n").unwrap();
+
+        assert_eq!(fs::read(&daily).unwrap(), b"DEBUG crabbot_runtime: turn started\n");
+        assert_eq!(fs::read(&command).unwrap(), b"DEBUG crabbot_runtime: turn started\n");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(fs::metadata(command).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -507,7 +573,7 @@ mod tests {
             timestamp()
         ));
 
-        let mut writer = super::BufferedLogWriter { path: path.clone(), buffer: Vec::new() };
+        let mut writer = super::LogWriter { path: path.clone(), command_path: None };
         writer.write_all(b"first record\n").unwrap();
         writer.flush().unwrap();
         writer.write_all(b"second record\n").unwrap();

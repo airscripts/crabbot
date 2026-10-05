@@ -5,7 +5,6 @@ mod templates;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     future::Future,
     io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
@@ -13,7 +12,7 @@ use std::{
     process::{ExitCode, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -1200,8 +1199,13 @@ pub async fn cli() -> ExitCode {
         }
     }
 
-    init_logging(cli.verbose, cli.debug, cli.json);
-    main_with(cli).await
+    let log_path = init_logging_with_command_log(cli.verbose, cli.debug, cli.json);
+
+    if let Some(path) = log_path {
+        main_with_log(cli, Some(path)).await
+    } else {
+        main_with(cli).await
+    }
 }
 
 fn root_help_requested(args: &[String]) -> bool {
@@ -1250,29 +1254,53 @@ pub fn init_logging(verbose: bool, debug_mode: bool, json: bool) {
     logging::initialize(logging::Mode::Command { verbosity, json });
 }
 
+fn init_logging_with_command_log(verbose: bool, debug_mode: bool, json: bool) -> Option<PathBuf> {
+    let verbosity = if debug_mode {
+        logging::Verbosity::Debug
+    } else if verbose {
+        logging::Verbosity::Verbose
+    } else {
+        logging::Verbosity::Quiet
+    };
+
+    logging::initialize_with_command_log(logging::Mode::Command { verbosity, json })
+}
+
 async fn main_with(cli: Cli) -> ExitCode {
+    main_with_log(cli, None).await
+}
+
+async fn main_with_log(cli: Cli, log_path: Option<PathBuf>) -> ExitCode {
     let json = cli.json;
     let debug = cli.debug;
     let verbose = cli.verbose;
     let command = command_label(&cli.command);
     let started = Instant::now();
 
-    if verbose {
+    if verbose || debug {
         info!(command, "Command started.");
 
-        if !json {
+        if verbose && !json {
             eprintln!("Running {command}…");
         }
     }
 
     match run(cli).await {
         Ok(()) => {
-            if verbose {
+            if verbose || debug {
                 let elapsed_ms = started.elapsed().as_millis();
                 info!(command, elapsed_ms, "Command completed.");
 
-                if !json {
+                if verbose && !json {
                     eprintln!("Finished {command} in {elapsed_ms} ms.");
+                }
+            }
+
+            if let Some(path) = log_path {
+                info!(command, path = %path.display(), "Command log written.");
+
+                if !json {
+                    eprintln!("Command log written to {}.", path.display());
                 }
             }
 
@@ -1280,12 +1308,44 @@ async fn main_with(cli: Cli) -> ExitCode {
         }
 
         Err(error) => {
-            let report =
-                debug.then(|| write_debug_report(command, error.as_ref(), started.elapsed()));
-
             if json {
                 let message = diagnostic(sentence(error.to_string()));
-                error!(command, error = %message, "Command failed.");
+
+                if debug {
+                    error!(command, elapsed_ms = started.elapsed().as_millis(), "Command failed.");
+
+                    let details =
+                        format!("{error:?}").split_whitespace().collect::<Vec<_>>().join(" ");
+
+                    debug!(
+                        command,
+                        error = %diagnostic(details),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "Command failure details."
+                    );
+                } else if verbose {
+                    let causes = error_causes(error.as_ref()).join(": ");
+
+                    if causes.is_empty() {
+                        error!(
+                            command,
+                            error = %message,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "Command failed."
+                        );
+                    } else {
+                        error!(
+                            command,
+                            error = %message,
+                            causes = %diagnostic(&causes),
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "Command failed."
+                        );
+                    }
+                } else {
+                    error!(command, error = %message, "Command failed.");
+                }
+
                 eprintln!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({"error": message}))
@@ -1304,9 +1364,11 @@ async fn main_with(cli: Cli) -> ExitCode {
 
                 if debug {
                     error!(command, elapsed_ms = started.elapsed().as_millis(), "Command failed.");
+                    let details =
+                        format!("{error:?}").split_whitespace().collect::<Vec<_>>().join(" ");
                     debug!(
                         command,
-                        error = %diagnostic(format!("{error:?}")),
+                        error = %diagnostic(details),
                         elapsed_ms = started.elapsed().as_millis(),
                         "Command failure details."
                     );
@@ -1332,19 +1394,11 @@ async fn main_with(cli: Cli) -> ExitCode {
                 }
             }
 
-            if let Some(report) = report {
-                match report {
-                    Ok(path) if !json => {
-                        info!(command, path = %path.display(), "Debug report written.")
-                    }
+            if let Some(path) = log_path {
+                info!(command, path = %path.display(), "Command log written.");
 
-                    Ok(_) => {}
-
-                    Err(report_error) if !json => {
-                        warn!(command, error = %diagnostic(report_error.to_string()), "Debug report could not be written.")
-                    }
-
-                    Err(_) => {}
+                if !json {
+                    eprintln!("Command log written to {}.", path.display());
                 }
             }
 
@@ -1373,59 +1427,6 @@ fn command_label(command: &Command) -> &'static str {
             _ => "external",
         },
     }
-}
-
-fn write_debug_report(
-    command: &str,
-    error: &(dyn std::error::Error + 'static),
-    elapsed: Duration,
-) -> std::io::Result<PathBuf> {
-    write_debug_report_at(&home(), command, error, elapsed)
-}
-
-fn write_debug_report_at(
-    root: &Path,
-    command: &str,
-    error: &(dyn std::error::Error + 'static),
-    elapsed: Duration,
-) -> std::io::Result<PathBuf> {
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    let directory = root.join("logs");
-    fs::create_dir_all(&directory)?;
-
-    #[cfg(unix)]
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-
-    let path = directory.join(format!(
-        "{}-debug-{stamp}-{}.log",
-        crabbot_log::date_stamp(),
-        std::process::id()
-    ));
-
-    let chain = redact(error_chain(error).as_bytes());
-    let details = redact(format!("{error:?}").as_bytes());
-    let backtrace = std::backtrace::Backtrace::capture();
-    let report = format!(
-        "Crabbot debug report\nversion: {VERSION}\ncommand: {command}\nos: {}\narch: {}\nelapsed_ms: {}\nerror: {chain}\ndetails: {details}\nbacktrace: {backtrace}\n",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        elapsed.as_millis(),
-    );
-
-    secure(&path, report.as_bytes())?;
-    Ok(path)
-}
-
-fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut messages = vec![error.to_string()];
-    let mut source = error.source();
-
-    while let Some(cause) = source {
-        messages.push(cause.to_string());
-        source = cause.source();
-    }
-
-    messages.join(": ")
 }
 
 fn error_causes(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
@@ -1692,6 +1693,8 @@ fn export_crabfile_at_mode(
         println!("Exported {}.", path.display());
     }
 
+    info!(plugins = file.plugins.len(), "Crabfile exported.");
+
     Ok(())
 }
 
@@ -1723,6 +1726,8 @@ fn validate_crabfile(
     } else {
         println!("Crabfile at {} is valid.", path.display());
     }
+
+    info!(plugins = file.plugins.len(), "Crabfile validated.");
 
     Ok(())
 }
@@ -1821,6 +1826,8 @@ fn import_crabfile_at_mode(
             path.display(),
         );
     }
+
+    info!(plugins = file.plugins.len(), "Crabfile imported.");
 
     Ok(())
 }
@@ -2106,6 +2113,12 @@ async fn delivery_at_json(
                 control_at("delivery.retry", serde_json::json!({"id": id, "yes": true}), root)
                     .await?
             {
+                info!(
+                    operation = "delivery.retry",
+                    source = "daemon",
+                    "Delivery queued for retry."
+                );
+
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
@@ -2121,6 +2134,7 @@ async fn delivery_at_json(
             let _offline_lock = offline_lock(root)?;
             let mut store = sessions_at(root)?;
             store.retry_delivery(&args.id)?;
+            info!(operation = "delivery.retry", source = "offline", "Delivery queued for retry.");
 
             if json {
                 println!(
@@ -2148,6 +2162,8 @@ async fn delivery_at_json(
                 control_at("delivery.drop", serde_json::json!({"id": id, "yes": true}), root)
                     .await?
             {
+                info!(operation = "delivery.drop", source = "daemon", "Delivery dropped.");
+
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
@@ -2160,6 +2176,7 @@ async fn delivery_at_json(
             let _offline_lock = offline_lock(root)?;
             let mut store = sessions_at(root)?;
             store.drop_delivery(&args.id)?;
+            info!(operation = "delivery.drop", source = "offline", "Delivery dropped.");
 
             if json {
                 println!(
@@ -2201,6 +2218,8 @@ async fn session_at_json(
                 control_at("session.new", serde_json::json!({"id": id, "model": model}), root)
                     .await?
             {
+                info!(operation = "session.create", source = "daemon", "Session created.");
+
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
@@ -2264,6 +2283,8 @@ async fn session_at_json(
             )
             .await?
             {
+                info!(operation = "session.fork", source = "daemon", "Session forked.");
+
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
@@ -2284,6 +2305,8 @@ async fn session_at_json(
                 control_at("session.model", serde_json::json!({"id": id, "model": model}), root)
                     .await?
             {
+                info!(operation = "session.model", source = "daemon", "Session model changed.");
+
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
@@ -2306,6 +2329,8 @@ async fn session_at_json(
             if let Some(value) =
                 control_at("session.cancel", serde_json::json!({"id": id}), root).await?
             {
+                info!(operation = "session.cancel", source = "daemon", "Session cancelled.");
+
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
@@ -2331,6 +2356,16 @@ async fn session_at_json(
             if let Some(value) =
                 control_at("session.delete", serde_json::json!({"id": id}), root).await?
             {
+                if value["worktree"]["status"] == "pending" {
+                    warn!(
+                        operation = "session.delete",
+                        source = "daemon",
+                        "Session deleted, but worktree cleanup is pending."
+                    );
+                } else {
+                    info!(operation = "session.delete", source = "daemon", "Session deleted.");
+                }
+
                 if json {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else if value["worktree"]["status"] == "pending" {
@@ -2387,6 +2422,7 @@ fn local_session_json(
             let id = args.id.clone();
             let model = args.model.clone();
             store.create(id.clone(), model.clone())?;
+            info!(operation = "session.create", source = "offline", "Session created.");
 
             if json {
                 println!(
@@ -2429,6 +2465,7 @@ fn local_session_json(
 
         SessionCommand::Fork(args) => {
             store.fork(&args.source, &args.target)?;
+            info!(operation = "session.fork", source = "offline", "Session forked.");
 
             if json {
                 println!(
@@ -2446,6 +2483,7 @@ fn local_session_json(
 
         SessionCommand::Model(args) => {
             store.set_model(&args.id, &args.model)?;
+            info!(operation = "session.model", source = "offline", "Session model changed.");
 
             if json {
                 println!(
@@ -2463,6 +2501,7 @@ fn local_session_json(
 
         SessionCommand::Cancel(args) => {
             store.cancel(&args.id)?;
+            info!(operation = "session.cancel", source = "offline", "Session cancelled.");
 
             if json {
                 println!(
@@ -2487,6 +2526,15 @@ fn local_session_json(
             store.remove(&args.id)?;
 
             let worktree_error = state::remove_worktree(&workspace_root(), &args.id).err();
+
+            if worktree_error.is_some() {
+                warn!(
+                    operation = "session.delete",
+                    "Session deleted, but worktree cleanup is pending."
+                );
+            } else {
+                info!(operation = "session.delete", source = "offline", "Session deleted.");
+            }
 
             if json {
                 let mut value = serde_json::json!({
@@ -2672,6 +2720,7 @@ async fn config_command(
             let config: Config = toml::from_str(&rendered)?;
             config.validate().map_err(|error| -> PluginError { error.into() })?;
             secure(&path, rendered.as_bytes())?;
+            info!(key, "Configuration value saved.");
 
             let hot = key == "clients.tui.tools";
             let next_launch = key == "clients.tui.theme";
@@ -2695,6 +2744,20 @@ async fn config_command(
             } else {
                 false
             };
+
+            let effect = if applied {
+                "applied"
+            } else if restarted {
+                "applied_after_restart"
+            } else if hot {
+                "apply_on_daemon_start"
+            } else if next_launch {
+                "apply_on_next_tui_launch"
+            } else {
+                "restart_required"
+            };
+
+            debug!(key, effect, "Configuration activation status determined.");
 
             if json {
                 println!(
@@ -2937,6 +3000,8 @@ fn init(
     } else {
         println!("Crabbot initialized at {}.", root.display());
     }
+
+    info!(reset_existing, "Crabbot home initialized.");
 
     Ok(())
 }
@@ -3468,7 +3533,7 @@ fn capture_plugin_stderr(plugin: String, mut stderr: tokio::sync::mpsc::Receiver
                 if *byte == b'\n' || line.len() == DIAGNOSTIC_LIMIT {
                     let diagnostic = String::from_utf8_lossy(&line);
                     let diagnostic = redact_diagnostic(diagnostic.trim());
-                    tracing::info!(plugin = %plugin, diagnostic, "Plugin diagnostic.");
+                    tracing::debug!(plugin = %plugin, diagnostic, "Plugin stderr.");
                     line.clear();
                 }
             }
@@ -3477,7 +3542,7 @@ fn capture_plugin_stderr(plugin: String, mut stderr: tokio::sync::mpsc::Receiver
         if !line.is_empty() {
             let diagnostic = String::from_utf8_lossy(&line);
             let diagnostic = redact_diagnostic(diagnostic.trim());
-            tracing::info!(plugin = %plugin, diagnostic, "Plugin diagnostic.");
+            tracing::debug!(plugin = %plugin, diagnostic, "Plugin stderr.");
         }
     });
 }
@@ -4101,6 +4166,7 @@ async fn bridge_with_media(
             match sent {
                 Ok(response) if response.error.is_none() && response.result.is_some() => {
                     sessions.lock().map_err(|_| "Session lock is poisoned.")?.ack(&delivery.id)?;
+                    debug!(channel = channel_id, "Channel delivery acknowledged.");
                 }
 
                 Ok(response) => {
@@ -5043,6 +5109,7 @@ async fn bridge_with_media(
                     .uncertain(&delivery_id, message)?;
             } else if sent.result.is_some() {
                 sessions.lock().map_err(|_| "Session lock is poisoned.")?.ack(&delivery_id)?;
+                debug!(channel = channel_id, "Channel delivery acknowledged.");
             }
 
             status_if_present(&sessions, &session_name, "idle")?;
@@ -6474,6 +6541,10 @@ async fn queue_during_turn(
                         } else {
                             return Err(error.into());
                         }
+                    }
+
+                    if !deferred {
+                        debug!(channel = channel_id, "Inbound message queued for processing.");
                     }
                 }
             }
@@ -7959,6 +8030,19 @@ fn doctor_at(
         crab_instructions_present,
         claw_instructions_present,
     );
+
+    if fix {
+        if repairs.is_empty() {
+            info!(healthy, "Doctor repair completed; no changes were needed.");
+        } else {
+            info!(repair_count = repairs.len(), healthy, "Doctor applied repairs.");
+        }
+    } else if healthy {
+        info!("Doctor check passed.");
+    } else {
+        warn!("Doctor check found unhealthy local state.");
+    }
+
     let health = if healthy {
         serde_json::json!({"status": "healthy"})
     } else {
@@ -8300,6 +8384,8 @@ fn service_at_with_status(
             #[cfg(not(target_os = "windows"))]
             secure(path, definition.as_bytes())?;
 
+            info!("Service installed.");
+
             if json {
                 println!(
                     "{}",
@@ -8334,6 +8420,12 @@ fn service_at_with_status(
                 std::fs::remove_file(path)?;
             }
 
+            if installed {
+                info!("Service uninstalled.");
+            } else {
+                debug!("Service uninstall skipped because no installation exists.");
+            }
+
             if json {
                 println!(
                     "{}",
@@ -8353,6 +8445,12 @@ fn service_at_with_status(
         ServiceCommand::Status => {
             let installed = path.is_file();
             let status = if installed { state()? } else { ServiceState::NotInstalled };
+
+            if status == ServiceState::Failed {
+                warn!("Service is in a failed state.");
+            } else {
+                debug!(installed, state = status.as_str(), "Service status checked.");
+            }
 
             if json {
                 println!(
@@ -8961,6 +9059,12 @@ fn service_action_message(
         (ServiceAction::Restart, _) => "restarted",
     };
 
+    if previous.is_some() {
+        debug!(action = action_name, status, "Service action required no transition.");
+    } else {
+        info!(action = action_name, "Service action completed.");
+    }
+
     if json {
         println!(
             "{}",
@@ -9291,12 +9395,19 @@ async fn status_command(json: bool) -> Result<(), Box<dyn std::error::Error + Se
         messaging_ready,
         conflicts,
     );
+    let daemon = if daemon { "running" } else { "stopped" };
+
+    if health == "healthy" {
+        debug!(health, daemon, "Status check completed.");
+    } else {
+        warn!(health, daemon, details = %health_details.join("; "), "Status check found unhealthy state.");
+    }
 
     let value = serde_json::json!({
         "version": VERSION,
         "health": health,
         "health_details": health_details,
-        "daemon": if daemon { "running" } else { "stopped" },
+        "daemon": daemon,
         "intelligence": capability_status(&lock, "model"),
         "messaging": capability_status(&lock, "channel"),
         "plugins": installed,
@@ -9911,6 +10022,8 @@ async fn plugin(
 
         PluginCommand::Install(install) => {
             let (linked, mut sources) = plugin_sources(install)?;
+            let working_dir = std::env::current_dir()?;
+            ensure_linkable_sources(linked, &sources, &working_dir)?;
             let root = home();
 
             let replacements = sources
@@ -9959,6 +10072,12 @@ async fn plugin(
                         Ok(activation) => {
                             let state = if activation.is_some() { "active" } else { "deferred" };
 
+                            if linked {
+                                info!(plugin = %manifest.id, version = %manifest.version, activation = state, "Plugin linked.");
+                            } else {
+                                info!(plugin = %manifest.id, version = %manifest.version, activation = state, "Plugin installed.");
+                            }
+
                             if !json && requested > 1 {
                                 println!("{}\n", plugin_install_version(linked, &manifest.version));
                             }
@@ -9974,11 +10093,13 @@ async fn plugin(
                         }
 
                         Err(error) => {
+                            warn!(plugin = %id, error = %diagnostic(sentence(error.to_string())), "Plugin activation failed.");
                             errors.push(serde_json::json!({"id": id, "error": error.to_string()}));
                         }
                     },
 
                     Err(error) => {
+                        warn!(plugin = %id, error = %diagnostic(sentence(error.to_string())), "Plugin installation failed.");
                         errors.push(serde_json::json!({"id": id, "error": error.to_string()}));
                     }
                 }
@@ -10075,6 +10196,8 @@ async fn plugin(
 
                 return Err(error);
             }
+
+            info!(plugin = %id, unloaded, "Plugin uninstalled.");
 
             if json {
                 println!(
@@ -10236,14 +10359,13 @@ fn plugin_install_error(errors: &[serde_json::Value], total: usize, linked: bool
 
     let action = if linked { "link" } else { "install" };
 
-    let mut message = format!("Could not {action} {failed} of {total} {noun}.");
+    let mut message = format!("Could not {action} {failed} of {total} {noun}:");
 
     for error in errors {
         let id = error["id"].as_str().unwrap_or("unknown");
         let detail = sentence(error["error"].as_str().unwrap_or("Installation failed."));
-        let verb = if linked { "linked" } else { "installed" };
 
-        message.push_str(&format!("\n\nThe {id} plugin could not be {verb}. {detail}"));
+        message.push_str(&format!("\n- {id}: {detail}"));
     }
 
     message
@@ -10578,6 +10700,15 @@ fn update_at_with_previews(
                     };
 
                     failed = true;
+                    let rollback_failed = !detail.is_empty();
+
+                    warn!(
+                        plugin = %id,
+                        error = %diagnostic(sentence(error.to_string())),
+                        rollback_failed,
+                        "Plugin update could not be committed."
+                    );
+
                     rows.push(serde_json::json!({
                         "id": id,
                         "status": "failed",
@@ -10585,6 +10716,7 @@ fn update_at_with_previews(
                     }));
                 } else {
                     finish_update(&update);
+                    info!(plugin = %id, version = %manifest.version, "Plugin updated.");
                     rows.push(serde_json::json!({
                         "id": id,
                         "version": manifest.version,
@@ -10595,6 +10727,12 @@ fn update_at_with_previews(
 
             Err(error) => {
                 failed = true;
+                warn!(
+                    plugin = %id,
+                    error = %diagnostic(sentence(error.to_string())),
+                    "Plugin update failed."
+                );
+
                 rows.push(serde_json::json!({
                     "id": id,
                     "status": "failed",
@@ -11297,6 +11435,28 @@ fn default_plugin_source(
         )
         .into()),
     }
+}
+
+fn ensure_linkable_sources(
+    linked: bool,
+    sources: &[Source],
+    working_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !linked || sources.iter().any(|source| source.source.is_some()) {
+        return Ok(());
+    }
+
+    let plugins_root = working_dir.join("crabbot-plugins");
+
+    if sources.iter().any(|source| default_plugin_source(&plugins_root, &source.id).is_ok()) {
+        return Ok(());
+    }
+
+    Err(concat!(
+        "No linkable plugins were found in the current working directory. ",
+        "Run this command from the repository root or specify a local plugin with --source PATH."
+    )
+    .into())
 }
 
 fn link_at(
@@ -12738,7 +12898,7 @@ mod tests {
         read_manifest, reclaim_worktrees, recover, recover_plugins, redact, resolve, restart_tool,
         revision, safe_archive, send_params, send_request, service_at, service_at_with,
         service_environment_from, service_name, service_path_value, service_text, session_at,
-        stream_fits, tool, update_at, validate_archive, verify_archive, write_debug_report_at,
+        stream_fits, tool, update_at, validate_archive, verify_archive,
     };
 
     #[cfg(target_os = "macos")]
@@ -12853,32 +13013,6 @@ mod tests {
         assert!(text.contains("Autonomous learning is enabled"));
         assert!(!text.contains("another conversation's secret"));
         stop_registry(&plugins).await;
-    }
-
-    #[test]
-    fn debug_report_is_redacted_and_private() {
-        let root = test_root("debug-report");
-        let error = std::io::Error::other(
-            "request failed at https://user:secret@example.com/path Authorization: Bearer token",
-        );
-        let path = write_debug_report_at(&root, "ask", &error, Duration::from_millis(12)).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-
-        assert!(path.starts_with(root.join("logs")));
-        assert!(
-            path.file_name().unwrap().to_string_lossy().starts_with(&crabbot_log::date_stamp())
-        );
-
-        assert!(text.contains("command: ask"));
-        assert!(text.contains("elapsed_ms: 12"));
-        assert!(!text.contains("secret"));
-        assert!(!text.contains("Bearer token"));
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
-        #[cfg(unix)]
-
-        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -13086,10 +13220,19 @@ mod tests {
                 false
             ),
             concat!(
-                "Could not install 2 of 3 plugins.\n\n",
-                "The telegram plugin could not be installed. Download failed.\n\n",
-                "The tools plugin could not be installed. Binary missing."
+                "Could not install 2 of 3 plugins:\n",
+                "- telegram: Download failed.\n",
+                "- tools: Binary missing."
             )
+        );
+
+        assert_eq!(
+            super::plugin_install_error(
+                &[serde_json::json!({"id": "codex", "error": "binary missing"})],
+                4,
+                true
+            ),
+            "Could not link 1 of 4 plugins:\n- codex: Binary missing."
         );
     }
 
@@ -14689,6 +14832,36 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn linked_plugin_install_requires_a_plugin_source_in_the_working_directory() {
+        let root = test_root("linkable-plugin-source");
+        let sources =
+            [super::Source { id: "memory".into(), source: None, revision: None, yes: true }];
+
+        assert_eq!(
+            super::ensure_linkable_sources(true, &sources, &root).unwrap_err().to_string(),
+            concat!(
+                "No linkable plugins were found in the current working directory. ",
+                "Run this command from the repository root or specify a local plugin with --source PATH."
+            )
+        );
+
+        let plugin = root.join("crabbot-plugins/memory");
+        fs::create_dir_all(&plugin).unwrap();
+        super::ensure_linkable_sources(true, &sources, &root).unwrap();
+        super::ensure_linkable_sources(false, &sources, &root).unwrap();
+
+        let explicit = [super::Source {
+            id: "memory".into(),
+            source: Some("./memory".into()),
+            revision: None,
+            yes: true,
+        }];
+        super::ensure_linkable_sources(true, &explicit, &root).unwrap();
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

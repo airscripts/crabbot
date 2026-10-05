@@ -55,10 +55,13 @@ Semantic Versioning.
 - Add plugin-contributed commands and capability-aware CLI help.
 - Add `crabbot ask` for one-shot prompts.
 - Add the `crab` alias, shell completions, and JSON command output.
-- Add redacted debug reports and structured command diagnostics.
+- Save raw per-command application logs for verbose and debug CLI runs.
+- Add structured command diagnostics.
 - Prompt before destructive actions, with `--yes` for non-interactive use.
 - Add native service management, including service restart.
 - Add verified plugin archives and installers for Linux, macOS, and Windows.
 - Protect provider credentials with private files or the operating system keyring.
 - Add severity-based logs for commands, the daemon, and plugins.
+- Record successful CLI state changes and safe message-processing outcomes at
+  appropriate log levels.
 - Report health with actionable reasons for incomplete local setups.

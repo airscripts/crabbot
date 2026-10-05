@@ -88,23 +88,29 @@ Command failures appear directly on stderr, with continuation lines indented
 and separate error groups divided by a blank line. `--verbose` and `--debug`
 also log failures at `ERROR`.
 Application logs are written to daily files in `CRABBOT_HOME/logs/`, named by
-UTC date as `YYYY-MM-DD.log` or `YYYY-MM-DD.jsonl`; they include all tracing levels by
-default. Command failures are recorded there even when diagnostics are hidden.
+UTC date as `YYYY-MM-DD.log` or `YYYY-MM-DD.jsonl`; they include all tracing
+levels by default. Command failures are recorded there even when diagnostics
+are hidden.
 Commands show only their human-readable output unless `--verbose` is set;
 verbose progress and error details are human-readable. `--debug` also prints
 internal logs (`DEBUG` and higher) to standard error. `--json` keeps diagnostics
-off standard output and standard error so structured command output stays clean.
+off standard output so structured command output stays clean; failures are
+reported as a JSON object on standard error.
 Unrecoverable failures use `ERROR`, recoverable problems use
 `WARN`, normal progress uses `INFO`, and `DEBUG` adds diagnostic details.
-Successful operations do not use a separate `OK` level.
+Successful state changes are recorded at `INFO`; routine message queue and
+delivery acknowledgements use `DEBUG`. These success events omit message
+content and user-supplied identifiers; configuration logs include the key but
+not its value. Successful operations do not use a separate `OK` level.
 Set `CRABBOT_LOG` to filter application logs, or use `RUST_LOG` as its fallback.
 Set `CRABBOT_LOG_FORMAT=json` for structured JSON file logs; the default is
 text. These settings apply to the daemon and plugin processes as well as the
 CLI.
-When `--debug` handles a failure, Crabbot also makes a redacted, private report
-under `CRABBOT_HOME/logs/` when the filesystem permits it. The report path is
-logged at info level; report creation is best effort and never replaces the
-original command error.
+When the filesystem permits, commands run with `--verbose` or `--debug` save
+their raw application log events to a private per-command file under
+`CRABBOT_HOME/logs/`. Non-JSON commands print the file path when they finish.
+The file uses the configured text or JSON log format; the daily application log
+continues to collect events as well. JSON mode keeps the path off the terminal.
 
 Destructive or duplicate-prone commands prompt in an interactive terminal.
 Use `--yes` or `-y` to skip the prompt. With `--json` or non-terminal input,
