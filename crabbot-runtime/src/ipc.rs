@@ -303,10 +303,20 @@ async fn session_answer(
         }
     }
 
-    let messages = super::turn_messages(id, &state.home, messages);
+    let mut messages = super::turn_messages(id, &state.home, messages);
+    let mut call_id = request.id;
+    let memory_scope = super::memory_scope("tui", id);
+    let legacy_memory_scope = format!("provider:tui:{id}");
+    super::append_memory_context_scopes(
+        &state.plugins,
+        &mut messages,
+        &[&memory_scope, &legacy_memory_scope],
+        &mut call_id,
+    )
+    .await;
+
     let cancel = super::cancellation(&state.cancels, id);
     let media_root = super::media_root_at(&state.home);
-    let mut call_id = request.id;
     let mut failed_tool = None;
 
     let answer = super::answer(

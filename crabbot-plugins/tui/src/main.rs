@@ -1804,7 +1804,7 @@ fn command_help(home: &str, has_model: bool, daemon: bool) -> String {
     }
 
     if daemon && has_capability(home, "memory") {
-        conditional.push(("/memory <list|remember|forget>", "Manage memories."));
+        conditional.push(("/memory", "Manage memories."));
     }
 
     if !conditional.is_empty() {
@@ -2201,10 +2201,55 @@ where
     C: Fn(String, String, Value) -> F + Copy,
     F: Future<Output = crabbot_core::Result<Value>>,
 {
+    if command.is_empty() || command == "help" {
+        return memory_help().into();
+    }
+
+    let local_scope = format!("tui:{session}");
     let result = if command == "list" {
-        capability(home, "memory", "list", serde_json::json!({"scope": session}), host)
-            .await
-            .map(|value| format_memories(&value))
+        let global = capability(
+            home.clone(),
+            "memory",
+            "list",
+            serde_json::json!({"scope": "global"}),
+            host,
+        )
+        .await;
+
+        match global {
+            Ok(global) => {
+                let local = capability(
+                    home.clone(),
+                    "memory",
+                    "list",
+                    serde_json::json!({"scope": local_scope}),
+                    host,
+                )
+                .await;
+
+                match local {
+                    Ok(local) => {
+                        let legacy_scope = format!("provider:tui:{session}");
+                        let legacy = capability(
+                            home,
+                            "memory",
+                            "list",
+                            serde_json::json!({"scope": legacy_scope}),
+                            host,
+                        )
+                        .await;
+
+                        legacy.map(|legacy| format_memories(&global, &local, &legacy))
+                    }
+
+                    Err(error) => Err(error),
+                }
+            }
+
+            Err(error) => {
+                return format!("Memory action failed: {}.\n> ", sentence(error.to_string()));
+            }
+        }
     } else if let Some(value) = command.strip_prefix("remember ") {
         match value.split_once('=') {
             Some((key, value)) if !key.trim().is_empty() && !value.trim().is_empty() => capability(
@@ -2214,7 +2259,7 @@ where
                 serde_json::json!({
                     "key": key.trim(),
                     "value": value.trim(),
-                    "scope": session,
+                    "scope": local_scope,
                     "mode": "suggest",
                     "approved": true
                 }),
@@ -2223,19 +2268,52 @@ where
             .await
             .map(|_| "Memory saved for this session.\n> ".into()),
 
-            _ => Ok("Usage: /memory remember <key>=<value>.\n> ".into()),
+            _ => Ok("Usage: /memory remember KEY=VALUE. Run /memory help for details.\n> ".into()),
         }
     } else if let Some(key) = command.strip_prefix("forget ") {
         if key.trim().is_empty() {
-            Ok("Usage: /memory forget <key>.\n> ".into())
+            Ok("Usage: /memory forget KEY or /memory forget global KEY. Run /memory help for details.\n> ".into())
         } else {
-            capability(
-                home,
-                "memory",
-                "forget",
-                serde_json::json!({"key": key.trim(), "scope": session}),
-                host,
-            )
+            let (scope, key) = key
+                .trim()
+                .strip_prefix("global ")
+                .map_or((local_scope.as_str(), key.trim()), |key| ("global", key.trim()));
+
+            async {
+                let forgotten = capability(
+                    home.clone(),
+                    "memory",
+                    "forget",
+                    serde_json::json!({"key": key, "scope": scope}),
+                    host,
+                )
+                .await;
+
+                if scope != "global" {
+                    let legacy_scope = format!("provider:tui:{session}");
+                    let legacy = capability(
+                        home,
+                        "memory",
+                        "forget",
+                        serde_json::json!({"key": key, "scope": legacy_scope}),
+                        host,
+                    )
+                    .await;
+
+                    if forgotten.as_ref().is_ok_and(|value| value["deleted"] == true)
+                        || legacy.as_ref().is_ok_and(|value| value["deleted"] == true)
+                    {
+                        return Ok(serde_json::json!({"deleted": true}));
+                    }
+
+                    match (forgotten, legacy) {
+                        (Err(error), _) | (_, Err(error)) => Err(error),
+                        (Ok(_), Ok(_)) => Ok(serde_json::json!({"deleted": false})),
+                    }
+                } else {
+                    forgotten
+                }
+            }
             .await
             .map(|value| {
                 if value["deleted"] == true {
@@ -2246,12 +2324,16 @@ where
             })
         }
     } else {
-        Ok("Usage: /memory <list|remember|forget>.\n> ".into())
+        Ok("Unknown memory command. Run /memory help for usage.\n> ".into())
     };
 
     result.unwrap_or_else(|error| {
         format!("Memory action failed: {}.\n> ", sentence(error.to_string()))
     })
+}
+
+fn memory_help() -> &'static str {
+    "Memory commands:\n  /memory list                 List global and this session's memories\n  /memory remember KEY=VALUE   Save a memory for this session\n  /memory forget KEY           Remove a memory from this session\n  /memory forget global KEY    Remove a global memory\n  /memory help                 Show this help\n\nSelecting /memory in the command picker shows this help.\n> "
 }
 
 fn format_timers(value: &Value) -> String {
@@ -2277,26 +2359,57 @@ fn format_timers(value: &Value) -> String {
     }
 }
 
-fn format_memories(value: &Value) -> String {
-    let Some(items) = value["items"].as_array() else {
-        return "Memories: none.\n> ".into();
+fn format_memories(global: &Value, session: &Value, legacy: &Value) -> String {
+    let format_items = |value: &Value| {
+        value["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(100)
+            .filter_map(|item| {
+                let key = item["key"].as_str()?;
+                let value = item["value"].as_str().unwrap_or_default();
+                Some(format!("    {} = {}", short(key), short(value)))
+            })
+            .collect::<Vec<_>>()
     };
 
-    let items = items
+    let global = format_items(global);
+    let mut session_items =
+        session["items"].as_array().into_iter().flatten().cloned().collect::<Vec<_>>();
+    let current_keys = session_items
         .iter()
-        .take(100)
-        .filter_map(|item| {
-            let key = item["key"].as_str()?;
-            let value = item["value"].as_str().unwrap_or_default();
-            Some(format!("{} = {}", short(key), short(value)))
-        })
-        .collect::<Vec<_>>();
+        .filter_map(|item| item["key"].as_str().map(str::to_owned))
+        .collect::<std::collections::BTreeSet<_>>();
 
-    if items.is_empty() {
-        "Memories: none.\n> ".into()
-    } else {
-        format!("Memories: {}.\n> ", items.join("; "))
+    session_items.extend(
+        legacy["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["key"].as_str().is_none_or(|key| !current_keys.contains(key)))
+            .cloned(),
+    );
+
+    let session = format_items(&serde_json::json!({"items": session_items}));
+
+    if global.is_empty() && session.is_empty() {
+        return "Memories: none.\n> ".into();
     }
+
+    let format_section = |name: &str, items: &[String]| {
+        if items.is_empty() {
+            format!("  {name}: none")
+        } else {
+            format!("  {name}:\n{}", items.join("\n"))
+        }
+    };
+
+    format!(
+        "Memories:\n{}\n{}\n> ",
+        format_section("Global", &global),
+        format_section("This session", &session)
+    )
 }
 
 fn short(value: &str) -> String {
@@ -3042,6 +3155,70 @@ mod tests {
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[tokio::test]
+    async fn forgets_matching_session_memories_from_both_scopes() {
+        let legacy_called = std::sync::atomic::AtomicBool::new(false);
+        let host = |_: String, method: String, params: serde_json::Value| {
+            let legacy_called = &legacy_called;
+
+            async move {
+                assert_eq!(method, "capability.call");
+                assert_eq!(params["service"], "memory");
+                assert_eq!(params["method"], "forget");
+
+                if params["params"]["scope"] == "tui:default" {
+                    assert_eq!(params["params"]["key"], "duplicate");
+                }
+
+                if params["params"]["scope"] == "provider:tui:default" {
+                    legacy_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+
+                Ok(serde_json::json!({"deleted": true}))
+            }
+        };
+
+        let response = super::memory_command(
+            "/tmp/crabbot".into(),
+            "default".into(),
+            "forget duplicate",
+            host,
+        )
+        .await;
+
+        assert_eq!(response, "Memory removed.\n> ");
+        assert!(legacy_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn saves_session_memories_outside_the_global_scope() {
+        let scoped = std::sync::atomic::AtomicBool::new(false);
+        let host = |_: String, method: String, params: serde_json::Value| {
+            let scoped = &scoped;
+
+            async move {
+                assert_eq!(method, "capability.call");
+                assert_eq!(params["service"], "memory");
+                assert_eq!(params["method"], "remember");
+                assert_eq!(params["params"]["scope"], "tui:global");
+                scoped.store(true, std::sync::atomic::Ordering::SeqCst);
+
+                Ok(serde_json::json!({"ok": true}))
+            }
+        };
+
+        let response = super::memory_command(
+            "/tmp/crabbot".into(),
+            "global".into(),
+            "remember favorite=tea",
+            host,
+        )
+        .await;
+
+        assert_eq!(response, "Memory saved for this session.\n> ");
+        assert!(scoped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     #[test]
     fn persists_message_timestamps_as_utc_epoch_milliseconds() {
         let before =
@@ -3337,8 +3514,21 @@ mod tests {
         std::fs::write(plugin.join("crabbot-plugin.toml"), "capabilities = ['timer']\n").unwrap();
         std::fs::write(plugin.join("bin").join(binary), "test").unwrap();
 
+        let memory = root.join("plugins/memory");
+        let memory_binary = crabbot_core::plugin::binary_name("memory");
+
+        std::fs::create_dir_all(memory.join("bin")).unwrap();
+        std::fs::write(memory.join("crabbot-plugin.toml"), "capabilities = ['memory']\n").unwrap();
+
+        std::fs::write(memory.join("bin").join(memory_binary), "test").unwrap();
+
         assert!(super::has_capability(root.to_str().unwrap(), "timer"));
-        assert!(!super::has_capability(root.to_str().unwrap(), "memory"));
+        assert!(super::has_capability(root.to_str().unwrap(), "memory"));
+
+        let help = super::command_help(root.to_str().unwrap(), true, true);
+
+        assert!(help.contains("/memory"));
+        assert!(!help.contains("/memory <"));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3697,8 +3887,21 @@ mod tests {
         );
 
         assert_eq!(
-            super::format_memories(&json!({"items": [{"key": "drink", "value": "tea"}]})),
-            "Memories: drink = tea.\n> "
+            super::format_memories(
+                &json!({"items": [{"key": "close-up", "value": "banana"}]}),
+                &json!({"items": [{"key": "drink", "value": "tea"}]}),
+                &json!({"items": [{"key": "legacy", "value": "saved before upgrade"}]}),
+            ),
+            "Memories:\n  Global:\n    close-up = banana\n  This session:\n    drink = tea\n    legacy = saved before upgrade\n> "
+        );
+
+        assert_eq!(
+            super::format_memories(
+                &json!({"items": []}),
+                &json!({"items": []}),
+                &json!({"items": []}),
+            ),
+            "Memories: none.\n> "
         );
     }
 
@@ -3823,11 +4026,40 @@ mod tests {
 
                 (Some("timer"), Some("add")) => Ok(json!({"id": params["params"]["id"]})),
                 (Some("timer"), Some("remove")) => Ok(json!({"deleted": true})),
-                (Some("memory"), Some("list")) => Ok(json!({
-                    "items": [{"key": "drink", "value": "tea"}]
-                })),
+
+                (Some("memory"), Some("list")) if params["params"]["scope"] == "global" => {
+                    Ok(json!({"items": [{"key": "close-up", "value": "banana at the end"}]}))
+                }
+
+                (Some("memory"), Some("list"))
+                    if params["params"]["scope"] == "provider:tui:default" =>
+                {
+                    Ok(json!({"items": [{"key": "old-note", "value": "saved before upgrade"}]}))
+                }
+
+                (Some("memory"), Some("list")) if params["params"]["scope"] == "tui:default" => {
+                    Ok(json!({"items": [{"key": "drink", "value": "tea"}]}))
+                }
+
+                (Some("memory"), Some("list")) => {
+                    Ok(json!({"items": [{"key": "drink", "value": "tea"}]}))
+                }
 
                 (Some("memory"), Some("remember")) => Ok(json!({"ok": true})),
+                (Some("memory"), Some("forget"))
+                    if params["params"]["key"] == "old-note"
+                        && params["params"]["scope"] == "tui:default" =>
+                {
+                    Ok(json!({"deleted": false}))
+                }
+
+                (Some("memory"), Some("forget"))
+                    if params["params"]["key"] == "old-note"
+                        && params["params"]["scope"] == "provider:tui:default" =>
+                {
+                    Ok(json!({"deleted": true}))
+                }
+
                 (Some("memory"), Some("forget")) => Ok(json!({"deleted": true})),
                 _ => Err(crabbot_core::Error::Denied("Method not found.".into())),
             },
@@ -4153,7 +4385,7 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
         fs::write(
             &input_path,
             format!(
-                "/help\n/status\n/approval\n/approvals\n/approve 0123456789abcdef01234567\n/deny 0123456789abcdef01234567\n/session list\n/session help\n/deliveries\n/retry bad id\n/drop bad id\n/plugin\n/workspace\n/workspace {}\n/workspace reset\n/timer list\n/timer add 30 break\n/timer remove 7\n/memory list\n/memory remember drink=tea\n/memory forget drink\n/model \n/model test\n/session bad!\n/new two\n/session create test-one\n/session one\n/session rename renamed\n/session archive two\n/session unarchive two\n/session unarchive missing\n/session delete two -y\n/session delete renamed -y\n/session archive renamed\n/compact\n/clear\n\nhello\n/quit\n",
+                "/help\n/status\n/approval\n/approvals\n/approve 0123456789abcdef01234567\n/deny 0123456789abcdef01234567\n/session list\n/session help\n/deliveries\n/retry bad id\n/drop bad id\n/plugin\n/workspace\n/workspace {}\n/workspace reset\n/timer list\n/timer add 30 break\n/timer remove 7\n/memory\n/memory help\n/memory list\n/memory remember drink=tea\n/memory forget drink\n/memory forget old-note\n/model \n/model test\n/session bad!\n/new two\n/session create test-one\n/session one\n/session rename renamed\n/session archive two\n/session unarchive two\n/session unarchive missing\n/session delete two -y\n/session delete renamed -y\n/session archive renamed\n/compact\n/clear\n\nhello\n/quit\n",
                 root.display()
             ),
         )
@@ -4213,9 +4445,12 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
         assert!(text.contains("Timers: 7 (due 42): call back."));
         assert!(text.contains("was scheduled."));
         assert!(text.contains("Timer 7 was removed."));
-        assert!(text.contains("Memories: drink = tea."));
+        assert!(text.contains("Global:\n    close-up = banana at the end"));
+        assert!(text.contains("This session:\n    drink = tea"));
+        assert!(text.contains("old-note = saved before upgrade"));
+        assert!(text.matches("Memory commands:").count() >= 2);
         assert!(text.contains("Memory saved for this session."));
-        assert!(text.contains("Memory removed."));
+        assert!(text.matches("Memory removed.").count() >= 2);
 
         let one_shot = super::run_once(
             root.display().to_string(),

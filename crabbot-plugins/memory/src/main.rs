@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -19,6 +19,9 @@ const LIMIT: usize = 1_000;
 const VALUE_LIMIT: usize = 256 * 1024;
 const BYTE_LIMIT: usize = 32 * 1024 * 1024;
 const FRAME_HEADROOM: usize = 64 * 1024;
+const INDEX_LIMIT: usize = 32;
+const GLOBAL_INDEX_RESERVE: usize = INDEX_LIMIT / 2;
+const CONFLICT_LIMIT: usize = 32;
 
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -109,6 +112,58 @@ fn call_at(
     request: Request,
     location: Option<&Path>,
 ) -> crabbot_core::Result<Option<Response>> {
+    let operation = interaction_name(&request);
+
+    let result = call_inner_at(items, request, location);
+
+    match &result {
+        Ok(Some(response)) if response.error.is_none() => {
+            tracing::info!(operation, "Memory interaction completed.");
+        }
+
+        Ok(None) => {}
+
+        Ok(Some(_)) | Err(_) => {
+            tracing::warn!(operation, "Memory interaction failed.");
+        }
+    }
+
+    result
+}
+
+fn interaction_name(request: &Request) -> &'static str {
+    let Request::Call { method, params, .. } = request else {
+        return "notification";
+    };
+
+    let operation = if method == "command" {
+        params["args"].as_array().and_then(|args| args.first()).and_then(|value| value.as_str())
+    } else {
+        Some(method.as_str())
+    };
+
+    match operation {
+        Some("status") => "status",
+        Some("search") => "search",
+        Some("list") => "list",
+        Some("show" | "recall") => "show",
+        Some("remember") => "remember",
+        Some("edit") => "edit",
+        Some("forget") => "forget",
+        Some("audit") => "audit",
+        Some("converge") => "converge",
+        Some("learning") => "learning",
+        Some("help") | None if method == "command" => "help",
+        Some("index") => "index",
+        _ => "unknown",
+    }
+}
+
+fn call_inner_at(
+    items: &Arc<Mutex<State>>,
+    request: Request,
+    location: Option<&Path>,
+) -> crabbot_core::Result<Option<Response>> {
     let (id, method, params) = match request {
         Request::Call { id, method, params, .. } => (id, method, params),
         Request::Note { .. } => return Ok(None),
@@ -176,7 +231,7 @@ fn call_at(
                 ));
             }
 
-            let at = now();
+            let at = next_timestamp(&state);
             let previous = state.clone();
             let storage = storage(scope, key);
             let created = state.items.get(&storage).map_or(at, |entry| entry.created);
@@ -243,13 +298,49 @@ fn call_at(
 
         "index" => {
             let scope = params["scope"].as_str();
-            let mut entries = state
-                .items
-                .values()
-                .filter(|entry| scope.is_none_or(|value| value == entry.scope))
-                .collect::<Vec<_>>();
+            let mut entries = if let Some(scope) = scope.filter(|scope| *scope != "global") {
+                let mut scoped =
+                    state.items.values().filter(|entry| entry.scope == scope).collect::<Vec<_>>();
+
+                scoped.sort_by_key(|entry| std::cmp::Reverse(entry.updated));
+
+                let mut global = state
+                    .items
+                    .values()
+                    .filter(|entry| entry.scope == "global")
+                    .collect::<Vec<_>>();
+                global.sort_by_key(|entry| std::cmp::Reverse(entry.updated));
+
+                let reserved_globals = global.len().min(GLOBAL_INDEX_RESERVE);
+                let scoped_limit = INDEX_LIMIT - reserved_globals;
+                scoped.truncate(scoped_limit);
+
+                let mut entries = global.iter().take(reserved_globals).copied().collect::<Vec<_>>();
+
+                entries.extend(scoped);
+                entries.extend(
+                    global.iter().skip(reserved_globals).take(INDEX_LIMIT - entries.len()).copied(),
+                );
+
+                entries
+            } else if scope == Some("global") {
+                let mut entries = state
+                    .items
+                    .values()
+                    .filter(|entry| entry.scope == "global")
+                    .collect::<Vec<_>>();
+
+                entries.sort_by_key(|entry| std::cmp::Reverse(entry.updated));
+                entries.truncate(INDEX_LIMIT);
+                entries
+            } else {
+                let mut entries = state.items.values().collect::<Vec<_>>();
+                entries.sort_by_key(|entry| std::cmp::Reverse(entry.updated));
+                entries.truncate(INDEX_LIMIT);
+                entries
+            };
+
             entries.sort_by_key(|entry| std::cmp::Reverse(entry.updated));
-            entries.truncate(32);
 
             json!({
                 "learning": state.learning,
@@ -258,6 +349,8 @@ fn call_at(
                     .map(|entry| json!({
                         "key": summary(&entry.key),
                         "summary": summary(&entry.value),
+                        "scope": entry.scope,
+                        "updated": entry.updated,
                         "record": entry.record,
                     }))
                     .collect::<Vec<_>>()
@@ -274,7 +367,11 @@ fn call_at(
             let mut entries = state
                 .items
                 .values()
-                .filter(|entry| scope.is_none_or(|value| value == entry.scope))
+                .filter(|entry| {
+                    scope.is_none_or(|value| {
+                        value == entry.scope || (value != "global" && entry.scope == "global")
+                    })
+                })
                 .filter(|entry| {
                     entry.key.to_lowercase().contains(&query)
                         || entry.value.to_lowercase().contains(&query)
@@ -388,13 +485,7 @@ fn call_at(
 
     let response = Response::ok(id, result);
 
-    if serde_json::to_vec(&response)?.len().saturating_add(1 + FRAME_HEADROOM)
-        > crabbot_core::jsonl::MAX
-    {
-        return Err(crabbot_core::Error::Denied(
-            "Memory response exceeds the protocol frame limit.".into(),
-        ));
-    }
+    ensure_response_fits(&response)?;
 
     Ok(Some(response))
 }
@@ -474,11 +565,21 @@ fn load_at(path: Option<&std::path::Path>) -> Arc<Mutex<State>> {
 }
 
 fn path() -> Option<PathBuf> {
-    std::env::var_os("CRABBOT_MEMORY").map(PathBuf::from).or_else(|| {
-        std::env::var_os("CRABBOT_HOME")
-            .map(PathBuf::from)
-            .map(|root| root.join("memory").join("index.json"))
-    })
+    std::env::var_os("CRABBOT_MEMORY")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CRABBOT_HOME").map(PathBuf::from).map(default_path))
+}
+
+fn default_path(root: PathBuf) -> PathBuf {
+    let current = root.join("data").join("memories").join("index.json");
+
+    if current.is_file() {
+        return current;
+    }
+
+    let legacy = root.join("memory").join("index.json");
+
+    if legacy.is_file() { legacy } else { current }
 }
 
 fn storage(scope: &str, key: &str) -> String {
@@ -492,11 +593,7 @@ fn record_ref(scope: &str, key: &str) -> String {
     let mut key_hash = Sha256::new();
     key_hash.update(key.as_bytes());
 
-    format!(
-        "memory-records/{}/{}.md",
-        hex_digest(scope_hash.finalize()),
-        hex_digest(key_hash.finalize())
-    )
+    format!("records/{}/{}.md", hex_digest(scope_hash.finalize()), hex_digest(key_hash.finalize()))
 }
 
 fn summary(value: &str) -> String {
@@ -535,10 +632,7 @@ fn command_at(
         .collect::<crabbot_core::Result<Vec<_>>>()?;
 
     let Some(command) = args.first().map(String::as_str) else {
-        return Ok(Some(Response::ok(
-            id,
-            json!({"usage": "memory <status|search|list|show|remember|edit|forget|audit|learning>"}),
-        )));
+        return Ok(Some(Response::ok(id, json!(memory_help()))));
     };
 
     let json_output = params["json"] == true;
@@ -565,7 +659,24 @@ fn command_at(
         }
     }
 
+    if command == "converge" {
+        let state = items
+            .lock()
+            .map_err(|_| crabbot_core::Error::Denied("Memory lock is poisoned.".into()))?;
+
+        let result = detect_conflicts(&state, &scope);
+        let result = if json_output { result } else { json!(command_text(command, &result)) };
+
+        let response = Response::ok(id, result);
+
+        ensure_response_fits(&response)?;
+
+        return Ok(Some(response));
+    }
+
     let (method, operation) = match command {
+        "help" => return Ok(Some(Response::ok(id, json!(memory_help())))),
+
         "status" => {
             let state = items
                 .lock()
@@ -577,7 +688,14 @@ fn command_at(
                 if json_output {
                     result
                 } else {
-                    json!(format!("Learning: {}. Memories: {}.", state.learning, state.items.len()))
+                    json!(format!(
+                        "{:<width$}{}\n{:<width$}{}",
+                        "Learning:",
+                        state.learning,
+                        "Memories:",
+                        state.items.len(),
+                        width = "Learning:".len().max("Memories:".len()) + 1
+                    ))
                 },
             )));
         }
@@ -638,7 +756,7 @@ fn command_at(
         }
     };
 
-    let response = call_at(items, Request::call(id, method, operation), location)?
+    let response = call_inner_at(items, Request::call(id, method, operation), location)?
         .ok_or_else(|| crabbot_core::Error::Denied("Memory command is unavailable.".into()))?;
 
     let result = response
@@ -650,21 +768,184 @@ fn command_at(
     Ok(Some(Response::ok(id, result)))
 }
 
+fn memory_help() -> &'static str {
+    r#"Usage: crab memory <command> [arguments...]
+
+Commands:
+  status                         Show learning mode and memory count
+  search <text> [--scope ID]     Search saved memories
+  list [--scope ID]              List saved memories
+  show <key> [--scope ID]        Show one memory
+  remember <key> <text>          Save a memory
+  edit <key> <text>              Replace a memory
+  forget <key>                   Delete a memory
+  audit [key]                    Show memory change history
+  converge [--scope ID]         Review likely conflicting memories
+  learning <guided|autonomous>   Set the learning mode
+  help                           Show this help
+
+Commands use the global scope by default. Use --scope ID to select a different scope.
+Converge uses text matching, not a model. It reports candidates but makes no changes.
+Each result includes a command to remove the older memory if you choose.
+Guided learning saves only when you explicitly ask Crabbot to remember something."#
+}
+
+fn detect_conflicts(state: &State, scope: &str) -> serde_json::Value {
+    let mut entries = state.items.values().filter(|entry| entry.scope == scope).collect::<Vec<_>>();
+
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.updated));
+
+    let words = entries.iter().map(|entry| preference_words(&entry.value)).collect::<Vec<_>>();
+    let negated = entries.iter().map(|entry| has_negation(&entry.value)).collect::<Vec<_>>();
+
+    let mut conflicts = Vec::new();
+    let mut truncated = false;
+
+    for newer_index in 0..entries.len() {
+        for older_index in newer_index + 1..entries.len() {
+            let newer = entries[newer_index];
+            let older = entries[older_index];
+
+            if !memories_conflict(
+                newer,
+                &words[newer_index],
+                negated[newer_index],
+                older,
+                &words[older_index],
+                negated[older_index],
+            ) {
+                continue;
+            }
+
+            if conflicts.len() == CONFLICT_LIMIT {
+                truncated = true;
+                break;
+            }
+
+            if newer.updated == older.updated {
+                conflicts.push(json!({
+                    "scope": summary(scope),
+                    "ordering": "ambiguous",
+                    "memories": [
+                        {"key": summary(&newer.key), "value": summary(&newer.value), "updated": newer.updated},
+                        {"key": summary(&older.key), "value": summary(&older.value), "updated": older.updated},
+                    ],
+                }));
+            } else {
+                conflicts.push(json!({
+                    "scope": summary(scope),
+                    "newer": {"key": summary(&newer.key), "value": summary(&newer.value), "updated": newer.updated},
+                    "older": {"key": summary(&older.key), "value": summary(&older.value), "updated": older.updated},
+                }));
+            }
+        }
+
+        if truncated {
+            break;
+        }
+    }
+
+    json!({"items": conflicts, "truncated": truncated})
+}
+
+fn ensure_response_fits(response: &Response) -> crabbot_core::Result<()> {
+    if serde_json::to_vec(response)?.len().saturating_add(1 + FRAME_HEADROOM)
+        > crabbot_core::jsonl::MAX
+    {
+        return Err(crabbot_core::Error::Denied(
+            "Memory response exceeds the protocol frame limit.".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn memories_conflict(
+    left: &Entry,
+    left_words: &std::collections::BTreeSet<String>,
+    left_negated: bool,
+    right: &Entry,
+    right_words: &std::collections::BTreeSet<String>,
+    right_negated: bool,
+) -> bool {
+    if left.key == right.key && left.value != right.value {
+        return true;
+    }
+
+    let shared_words = left_words.intersection(right_words).count();
+    let polarity_differs = left_negated != right_negated;
+    polarity_differs && shared_words >= 2
+}
+
+fn preference_words(value: &str) -> std::collections::BTreeSet<String> {
+    value
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|word| {
+            word.len() > 2
+                && !matches!(
+                    word.as_str(),
+                    "the"
+                        | "and"
+                        | "for"
+                        | "with"
+                        | "that"
+                        | "this"
+                        | "from"
+                        | "into"
+                        | "when"
+                        | "every"
+                        | "after"
+                        | "before"
+                        | "response"
+                        | "answer"
+                )
+        })
+        .collect()
+}
+
+fn has_negation(value: &str) -> bool {
+    value
+        .split(|character: char| !character.is_alphanumeric() && character != '\'')
+        .map(str::to_lowercase)
+        .any(|word| {
+            matches!(word.as_str(), "not" | "never" | "don't" | "dont" | "avoid" | "without")
+        })
+}
+
+fn forget_suggestion(scope: &str, key: &str) -> String {
+    let mut command = format!("crab memory forget {}", shell_word(key));
+
+    if scope != "global" {
+        command.push_str(&format!(" --scope {}", shell_word(scope)));
+    }
+
+    command
+}
+
+fn shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn command_text(command: &str, result: &serde_json::Value) -> String {
     match command {
-        "list" | "search" => result["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|item| {
-                format!(
-                    "{}: {}",
-                    item["key"].as_str().unwrap_or(""),
-                    item["value"].as_str().unwrap_or("")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+        "list" | "search" => {
+            let items = result["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|item| {
+                    format!(
+                        "{}: {}",
+                        item["key"].as_str().unwrap_or(""),
+                        item["value"].as_str().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            if items.is_empty() { "No memories found.".into() } else { items.join("\n") }
+        }
+
         "show" => result["item"]["value"].as_str().unwrap_or("Memory not found.").into(),
         "remember" | "edit" => "Memory saved.".into(),
 
@@ -677,7 +958,61 @@ fn command_text(command: &str, result: &serde_json::Value) -> String {
         }
 
         "audit" => {
-            format!("{} memory audit record(s).", result["items"].as_array().map_or(0, Vec::len))
+            let count = result["items"].as_array().map_or(0, Vec::len);
+            let noun = if count == 1 { "record" } else { "records" };
+
+            format!("{count} memory audit {noun}.")
+        }
+
+        "converge" => {
+            let conflicts = result["items"].as_array().cloned().unwrap_or_default();
+
+            if conflicts.is_empty() {
+                return "No memory conflicts found to converge.".into();
+            }
+
+            let scope = conflicts[0]["scope"].as_str().unwrap_or("selected scope");
+            let heading = if conflicts.len() == 1 {
+                format!("Found 1 possible memory conflict in {scope}:")
+            } else {
+                format!("Found {} possible memory conflicts in {scope}:", conflicts.len())
+            };
+
+            let details = conflicts
+                .iter()
+                .map(|conflict| {
+                    if conflict["ordering"] == "ambiguous" {
+                        return format!(
+                            "Ordering is ambiguous because both memories have the same timestamp:\n  {first_key}:\n    {first_value}\n  {second_key}:\n    {second_value}",
+                            first_key = conflict["memories"][0]["key"].as_str().unwrap_or(""),
+                            first_value = conflict["memories"][0]["value"].as_str().unwrap_or(""),
+                            second_key = conflict["memories"][1]["key"].as_str().unwrap_or(""),
+                            second_value = conflict["memories"][1]["value"].as_str().unwrap_or(""),
+                        );
+                    }
+
+                    format!(
+                        "Newer memory (takes precedence):\n  {newer_key}:\n    {newer_value}\n\nOlder memory (kept for review):\n  {older_key}:\n    {older_value}\n\nTo remove the older memory, run:\n  {forget_command}",
+                        newer_key = conflict["newer"]["key"].as_str().unwrap_or(""),
+                        newer_value = conflict["newer"]["value"].as_str().unwrap_or(""),
+                        older_key = conflict["older"]["key"].as_str().unwrap_or(""),
+                        older_value = conflict["older"]["value"].as_str().unwrap_or(""),
+                        forget_command = forget_suggestion(
+                            conflict["scope"].as_str().unwrap_or("global"),
+                            conflict["older"]["key"].as_str().unwrap_or(""),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n");
+
+            let truncation = if result["truncated"] == true {
+                "\n\nAdditional conflicts were omitted. Narrow the scope or review the memory list."
+            } else {
+                ""
+            };
+
+            format!("{heading}\n\n{details}{truncation}\n\nNo records changed.")
         }
 
         _ => result.to_string(),
@@ -765,15 +1100,26 @@ fn remove_orphan_records(path: Option<&Path>, before: &State, after: &State) {
     };
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-
-    for (key, entry) in &before.items {
-        if !after.items.contains_key(key) {
-            let record = if entry.record.is_empty() {
+    let after_records = after
+        .items
+        .values()
+        .map(|entry| {
+            if entry.record.is_empty() {
                 record_ref(&entry.scope, &entry.key)
             } else {
                 entry.record.clone()
-            };
+            }
+        })
+        .collect::<BTreeSet<_>>();
 
+    for entry in before.items.values() {
+        let record = if entry.record.is_empty() {
+            record_ref(&entry.scope, &entry.key)
+        } else {
+            entry.record.clone()
+        };
+
+        if !after_records.contains(&record) {
             let _ = std::fs::remove_file(parent.join(record));
         }
     }
@@ -782,7 +1128,13 @@ fn remove_orphan_records(path: Option<&Path>, before: &State, after: &State) {
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |value| value.as_secs())
+        .map_or(0, |value| value.as_millis().min(u64::MAX as u128) as u64)
+}
+
+fn next_timestamp(state: &State) -> u64 {
+    let latest = state.items.values().map(|entry| entry.updated).max().unwrap_or(0);
+
+    now().max(latest.saturating_add(1))
 }
 
 fn nonce() -> u128 {
@@ -794,8 +1146,9 @@ fn nonce() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BYTE_LIMIT, Entry, LIMIT, State, VALUE_LIMIT, call, call_at, command_at, load, load_at,
-        path, persist_at, record_ref, storage,
+        BYTE_LIMIT, CONFLICT_LIMIT, Entry, GLOBAL_INDEX_RESERVE, INDEX_LIMIT, LIMIT, State,
+        VALUE_LIMIT, call, call_at, command_at, default_path, load, load_at, path, persist_at,
+        record_ref, storage,
     };
 
     use crabbot_core::types::Request;
@@ -944,7 +1297,7 @@ mod tests {
             std::env::temp_dir().join(format!("crabbot-memory-lazy-{}", std::process::id()));
 
         let _ = std::fs::remove_dir_all(&lazy_root);
-        let lazy_path = lazy_root.join("memory/index.json");
+        let lazy_path = lazy_root.join("data/memories/index.json");
 
         assert!(!lazy_path.parent().unwrap().exists());
         persist_at(Some(&lazy_path), &state).unwrap();
@@ -980,6 +1333,7 @@ mod tests {
         for (id, scope, key, value) in [
             (1, "telegram:dm:42", "preference", "likes concise answers"),
             (2, "slack:dm:42", "project", "works on a compiler"),
+            (3, "global", "general", "prefers direct answers about a compiler"),
         ] {
             call_at(
                 &state,
@@ -1003,11 +1357,16 @@ mod tests {
         .result
         .unwrap();
 
-        assert_eq!(telegram_index["items"].as_array().unwrap().len(), 1);
-        assert_eq!(telegram_index["items"][0]["key"], "preference");
+        assert_eq!(telegram_index["items"].as_array().unwrap().len(), 2);
+        let entries = telegram_index["items"].as_array().unwrap();
+        let global = entries.iter().find(|entry| entry["key"] == "general").unwrap();
+        let preference = entries.iter().find(|entry| entry["key"] == "preference").unwrap();
+
+        assert_eq!(global["scope"], "global");
+        assert!(preference["record"].as_str().unwrap().starts_with("records/"));
         assert_eq!(telegram_index["learning"], "guided");
 
-        let record = root.join(telegram_index["items"][0]["record"].as_str().unwrap());
+        let record = root.join(preference["record"].as_str().unwrap());
 
         assert!(std::fs::read_to_string(&record).unwrap().contains("likes concise answers"));
 
@@ -1021,7 +1380,11 @@ mod tests {
         .result
         .unwrap();
 
-        assert_eq!(search["items"].as_array().unwrap().len(), 0);
+        let search_entries = search["items"].as_array().unwrap();
+
+        assert_eq!(search_entries.len(), 1);
+        assert_eq!(search_entries[0]["key"], "general");
+        assert_eq!(search_entries[0]["scope"], "global");
 
         call_at(
             &state,
@@ -1032,6 +1395,153 @@ mod tests {
 
         assert!(!record.exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn updating_a_migrated_memory_removes_its_old_record() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-memory-migration-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let index = root.join("index.json");
+        let old_record = "memory-records/legacy.md";
+        let old_path = root.join(old_record);
+        std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        std::fs::write(&old_path, "# favorite\n\nold value\n").unwrap();
+
+        let state = items();
+        state.lock().unwrap().items.insert(
+            storage("global", "favorite"),
+            Entry {
+                key: "favorite".into(),
+                value: "old value".into(),
+                scope: "global".into(),
+                created: 1,
+                updated: 1,
+                record: old_record.into(),
+            },
+        );
+
+        call_at(
+            &state,
+            Request::call(
+                1,
+                "remember",
+                json!({"key": "favorite", "value": "new value", "approved": true}),
+            ),
+            Some(&index),
+        )
+        .unwrap();
+
+        assert!(!old_path.exists());
+        let current_path = root.join(record_ref("global", "favorite"));
+        assert!(std::fs::read_to_string(&current_path).unwrap().contains("new value"));
+
+        call_at(&state, Request::call(2, "forget", json!({"key": "favorite"})), Some(&index))
+            .unwrap();
+
+        assert!(!current_path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn memory_index_reserves_space_for_conversation_memories() {
+        let state = items();
+
+        {
+            let mut state = state.lock().unwrap();
+
+            for index in 0..32 {
+                let key = format!("global-{index}");
+                state.items.insert(
+                    storage("global", &key),
+                    Entry {
+                        key,
+                        value: "global memory".into(),
+                        scope: "global".into(),
+                        created: index,
+                        updated: 100 + index,
+                        record: String::new(),
+                    },
+                );
+            }
+
+            state.items.insert(
+                storage("telegram:dm:42", "conversation"),
+                Entry {
+                    key: "conversation".into(),
+                    value: "conversation memory".into(),
+                    scope: "telegram:dm:42".into(),
+                    created: 1,
+                    updated: 1,
+                    record: String::new(),
+                },
+            );
+        }
+
+        let result =
+            call_at(&state, Request::call(1, "index", json!({"scope": "telegram:dm:42"})), None)
+                .unwrap()
+                .unwrap()
+                .result
+                .unwrap();
+
+        let entries = result["items"].as_array().unwrap();
+
+        assert_eq!(entries.len(), 32);
+        assert!(entries.iter().any(|entry| entry["key"] == "conversation"));
+        assert_eq!(entries[0]["key"], "global-31");
+    }
+
+    #[test]
+    fn memory_index_keeps_global_memories_when_conversation_is_full() {
+        let state = items();
+
+        {
+            let mut state = state.lock().unwrap();
+
+            for index in 0..32 {
+                for (scope, updated) in [("global", index), ("telegram:dm:42", 100 + index)] {
+                    let key = format!("{scope}-{index}");
+                    state.items.insert(
+                        storage(scope, &key),
+                        Entry {
+                            key,
+                            value: "memory".into(),
+                            scope: scope.into(),
+                            created: index,
+                            updated,
+                            record: String::new(),
+                        },
+                    );
+                }
+            }
+        }
+
+        let result =
+            call_at(&state, Request::call(1, "index", json!({"scope": "telegram:dm:42"})), None)
+                .unwrap()
+                .unwrap()
+                .result
+                .unwrap();
+
+        let entries = result["items"].as_array().unwrap();
+        let global_count = entries.iter().filter(|entry| entry["scope"] == "global").count();
+        let conversation_count =
+            entries.iter().filter(|entry| entry["scope"] == "telegram:dm:42").count();
+
+        assert_eq!(entries.len(), INDEX_LIMIT);
+        assert_eq!(global_count, GLOBAL_INDEX_RESERVE);
+        assert_eq!(conversation_count, INDEX_LIMIT - GLOBAL_INDEX_RESERVE);
+    }
+
+    #[test]
+    fn memory_status_uses_aligned_rows() {
+        let response =
+            command_at(&items(), 1, &json!({"args": ["status"]}), None).unwrap().unwrap();
+
+        assert_eq!(response.result.unwrap(), "Learning: guided\nMemories: 0");
     }
 
     #[test]
@@ -1077,10 +1587,254 @@ mod tests {
 
         assert_eq!(human.result.unwrap(), "Memory saved.");
 
+        let no_matches =
+            command_at(&state, 2, &json!({"args": ["search", "missing"]}), None).unwrap().unwrap();
+
+        assert_eq!(no_matches.result.unwrap(), "No memories found.");
+
         let machine =
-            command_at(&state, 2, &json!({"args": ["list"], "json": true}), None).unwrap().unwrap();
+            command_at(&state, 3, &json!({"args": ["list"], "json": true}), None).unwrap().unwrap();
 
         assert_eq!(machine.result.unwrap()["items"][0]["value"], "Ada");
+
+        let help = command_at(&state, 4, &json!({"args": ["help"]}), None).unwrap().unwrap();
+
+        assert!(help.result.unwrap().as_str().unwrap().contains("search <text>"));
+        assert!(super::memory_help().contains("converge [--scope ID]"));
+        assert!(super::memory_help().contains("text matching, not a model"));
+    }
+
+    #[test]
+    fn memory_converge_reports_newer_records_without_deleting_either() {
+        let state = items();
+
+        {
+            let mut state = state.lock().unwrap();
+            state.items.insert(
+                super::storage("global", "close-up"),
+                super::Entry {
+                    key: "close-up".into(),
+                    value: "Write banana at the end of every response.".into(),
+                    scope: "global".into(),
+                    created: 1,
+                    updated: 10,
+                    record: String::new(),
+                },
+            );
+
+            state.items.insert(
+                super::storage("global", "close-down"),
+                super::Entry {
+                    key: "close-down".into(),
+                    value: "Do not answer with banana at the end of a response.".into(),
+                    scope: "global".into(),
+                    created: 2,
+                    updated: 20,
+                    record: String::new(),
+                },
+            );
+
+            state.items.insert(
+                super::storage("telegram:dm:42", "unrelated"),
+                super::Entry {
+                    key: "unrelated".into(),
+                    value: "Do not answer with banana at the end of a response.".into(),
+                    scope: "telegram:dm:42".into(),
+                    created: 3,
+                    updated: 30,
+                    record: String::new(),
+                },
+            );
+        }
+
+        let result = command_at(&state, 1, &json!({"args": ["converge"]}), None).unwrap().unwrap();
+
+        let output = result.result.unwrap();
+
+        assert!(
+            output.as_str().unwrap().contains("Newer memory (takes precedence):\n  close-down:")
+        );
+
+        assert!(output.as_str().unwrap().contains("Older memory (kept for review):\n  close-up:"));
+        assert!(output.as_str().unwrap().contains("crab memory forget 'close-up'"));
+        assert!(output.as_str().unwrap().contains("No records changed."));
+        assert_eq!(state.lock().unwrap().items.len(), 3);
+
+        let empty = command_at(&items(), 2, &json!({"args": ["converge"], "json": false}), None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(empty.result.unwrap(), "No memory conflicts found to converge.");
+
+        let machine = command_at(&state, 3, &json!({"args": ["converge"], "json": true}), None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(machine.result.unwrap()["items"][0]["newer"]["key"], "close-down");
+    }
+
+    #[test]
+    fn memory_converge_marks_tied_timestamps_ambiguous() {
+        let state = items();
+
+        {
+            let mut state = state.lock().unwrap();
+
+            for (key, value) in [
+                ("close-up", "Write banana at the end of every response."),
+                ("close-down", "Do not answer with banana at the end of a response."),
+            ] {
+                state.items.insert(
+                    super::storage("global", key),
+                    super::Entry {
+                        key: key.into(),
+                        value: value.into(),
+                        scope: "global".into(),
+                        created: 1,
+                        updated: 10,
+                        record: String::new(),
+                    },
+                );
+            }
+        }
+
+        let machine = command_at(&state, 1, &json!({"args": ["converge"], "json": true}), None)
+            .unwrap()
+            .unwrap();
+
+        let conflict = &machine.result.unwrap()["items"][0];
+
+        assert_eq!(conflict["ordering"], "ambiguous");
+        assert_eq!(conflict["memories"].as_array().unwrap().len(), 2);
+        assert!(conflict.get("newer").is_none());
+        assert!(conflict.get("older").is_none());
+
+        let human = command_at(&state, 2, &json!({"args": ["converge"]}), None).unwrap().unwrap();
+        let output = human.result.unwrap();
+        let output = output.as_str().unwrap();
+
+        assert!(
+            output.contains("Ordering is ambiguous because both memories have the same timestamp")
+        );
+
+        assert!(!output.contains("takes precedence"));
+        assert!(!output.contains("To remove the older memory"));
+        assert!(!output.contains("crab memory forget"));
+    }
+
+    #[test]
+    fn memory_converge_bounds_conflicts_and_response_size() {
+        let state = items();
+        let value = format!("{} likes concise answers", "x\"".repeat((VALUE_LIMIT - 32) / 2));
+
+        {
+            let mut state = state.lock().unwrap();
+
+            for index in 0..12 {
+                for (suffix, polarity) in [("yes", ""), ("no", "not ")] {
+                    let key = format!("{index}-{suffix}");
+                    state.items.insert(
+                        storage("global", &key),
+                        Entry {
+                            key,
+                            value: format!("{polarity}{value}"),
+                            scope: "global".into(),
+                            created: index,
+                            updated: index,
+                            record: String::new(),
+                        },
+                    );
+                }
+            }
+        }
+
+        let response = command_at(&state, 1, &json!({"args": ["converge"], "json": true}), None)
+            .unwrap()
+            .unwrap();
+
+        let serialized = serde_json::to_vec(&response).unwrap();
+
+        assert_eq!(
+            response.result.as_ref().unwrap()["items"].as_array().unwrap().len(),
+            CONFLICT_LIMIT
+        );
+
+        assert_eq!(response.result.unwrap()["truncated"], true);
+        assert!(serialized.len() < crabbot_core::jsonl::MAX);
+    }
+
+    #[test]
+    fn memory_default_path_keeps_existing_legacy_index() {
+        let root = std::env::temp_dir().join(format!("crabbot-memory-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let legacy = root.join("memory/index.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "{}").unwrap();
+
+        assert_eq!(default_path(root.clone()), legacy);
+
+        let current = root.join("data/memories/index.json");
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&current, "{}").unwrap();
+
+        assert_eq!(default_path(root.clone()), current);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn memory_saves_have_a_stable_newest_first_order() {
+        let state = items();
+
+        call_at(
+            &state,
+            Request::call(
+                1,
+                "remember",
+                json!({"key": "first", "value": "first preference", "approved": true}),
+            ),
+            None,
+        )
+        .unwrap();
+
+        call_at(
+            &state,
+            Request::call(
+                2,
+                "remember",
+                json!({"key": "second", "value": "second preference", "approved": true}),
+            ),
+            None,
+        )
+        .unwrap();
+
+        let state = state.lock().unwrap();
+        let first = &state.items[&super::storage("global", "first")];
+        let second = &state.items[&super::storage("global", "second")];
+
+        assert!(second.updated > first.updated);
+    }
+
+    #[test]
+    fn memory_interaction_log_labels_exclude_record_contents() {
+        let request =
+            Request::call(1, "command", json!({"args": ["search", "private search text"]}));
+
+        assert_eq!(super::interaction_name(&request), "search");
+
+        let request = Request::call(2, "command", json!({"args": ["converge"]}));
+
+        assert_eq!(super::interaction_name(&request), "converge");
+    }
+
+    #[test]
+    fn forget_suggestions_quote_keys_and_scopes_for_the_shell() {
+        assert_eq!(
+            super::forget_suggestion("provider:telegram:dm:42", "user's choice"),
+            "crab memory forget 'user'\\''s choice' --scope 'provider:telegram:dm:42'"
+        );
+
+        assert_eq!(super::forget_suggestion("global", "close-up"), "crab memory forget 'close-up'");
     }
 
     #[test]

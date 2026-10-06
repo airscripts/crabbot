@@ -216,10 +216,11 @@ excluding secrets and sensitive inferences. Both modes preserve audit history,
 and records can be listed, searched, edited, recalled, or forgotten through
 the registered `memory` command. Memory tools are exposed only when the plugin
 is installed and channel tool policy permits them. The plugin lazily creates
-`CRABBOT_HOME/memory/` on its first persisted setting or record;
+`CRABBOT_HOME/data/memories/` on its first persisted setting or record;
 `CRABBOT_MEMORY` can override the JSON index path. Markdown record files are linked from the index,
-scoped by provider and conversation, and only a bounded summary is added to a
-model turn.
+stored under `records/`. Global memories apply across conversations, while
+provider and TUI memories stay within their conversation. The model receives
+only a bounded summary of global and current-conversation memories.
 
 The timer plugin persists one-shot and repeating tasks atomically. It validates
 five-field cron expressions and resolves IANA timezones through the system

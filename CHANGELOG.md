@@ -23,6 +23,11 @@ Semantic Versioning.
 - Add a SQLite plugin for persistent sessions and reliable delivery.
 - Add a memory plugin with scoped search and guided or autonomous learning.
 - Manage persistent memory as editable Markdown records.
+- Store memory files in Crabbot's data directory.
+- Use saved global and conversation memories in TUI replies.
+- Include saved global memories in one-shot requests and require an explicit provider.
+- Add memory command help and clear empty-search feedback.
+- Add `crab memory converge` to find likely preference conflicts and identify newer memories.
 - Add a timer plugin for calendar reminders with IANA time zones.
 - Add a tools plugin for confined files and approved shell access.
 - Add optional Docker and Podman sandboxes for shell commands.
@@ -37,6 +42,7 @@ Semantic Versioning.
 - Render labeled Markdown code blocks in the TUI.
 - Show context usage in configurable TUI statuslines.
 - Add TUI controls for session-scoped memory and timers.
+- Add TUI memory help and show global and session memories in the memory list.
 - Add workspace file reading, listing, searching, and session-specific roots.
 - Run approved `!<command>` shell commands through the daemon.
 - Fetch public web pages over HTTPS.

@@ -153,7 +153,7 @@ All Crabbot configuration variables use the `CRABBOT_` prefix:
 | `CRABBOT_CHANNEL` | Default messaging plugin ID |
 | `CRABBOT_MODEL_PLUGIN` | Default intelligence plugin ID |
 | `CRABBOT_MODEL` | Default model identifier |
-| `CRABBOT_MEMORY` | Override the optional memory plugin's JSON index path; Markdown records live beside it |
+| `CRABBOT_MEMORY` | Override the optional memory plugin's JSON index path; Markdown records live under a sibling `records/` directory |
 | `CRABBOT_TIMER` | Timer plugin persistence path |
 | `CRABBOT_DB` | SQLite plugin database path |
 | `CRABBOT_MEDIA` | Private media cache directory |

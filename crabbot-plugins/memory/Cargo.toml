@@ -13,4 +13,5 @@ crabbot-file = { path = "../../crabbot-libs/file" }
 serde_json.workspace = true
 serde.workspace = true
 sha2.workspace = true
+tracing.workspace = true
 tokio.workspace = true

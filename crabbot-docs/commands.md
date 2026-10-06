@@ -14,7 +14,7 @@ crabbot plugin list [<page>] [--json]
 crabbot plugin install <id>... [--source <path-or-url>] [--revision <rev>] [--link] [-y|--yes] [--json]
 crabbot plugin update [-y|--yes] [--json]
 crabbot plugin uninstall <id> [-y|--yes] [--force] [--json]
-crabbot memory <status|search|list|show|remember|edit|forget|audit|learning> [arguments...]
+crabbot memory <status|search|list|show|remember|edit|forget|audit|converge|learning|help> [arguments...]
 crabbot session new <id> [--model <name>] [--json]
 crabbot session list [<page>] [--json]
 crabbot session show <id> [--json]
@@ -261,9 +261,14 @@ are reported for later cleanup. `--force` does not purge state when another
 available plugin of the same capability remains.
 
 The memory command supports `status`, `search <text>`, `list`, `show <key>`,
-`remember <key> <text>`, `edit <key> <text>`, `forget <key>`, `audit`, and
-`learning <guided|autonomous>`. Use `--scope <id>` on supported operations to
-select a scope; JSON output is available through the global `--json` flag.
+`remember <key> <text>`, `edit <key> <text>`, `forget <key>`, `audit`,
+`converge`, and `learning <guided|autonomous>`. `converge` reports likely
+contradictions within the selected scope and identifies the newer record; it
+uses text matching rather than a model, and does not delete or modify memories.
+Each result includes a `crab memory forget` command for the older record if you
+choose to remove it. Newer saved preferences take precedence when relevant preferences conflict. Use
+`--scope <id>` on supported operations to select a scope; JSON output is available
+through the global `--json` flag.
 Learning defaults to `guided`, where the agent stores a memory only after an
 explicit user request. `autonomous` lets it retain stable, useful facts while
 excluding secrets and sensitive inferences. These instructions do not override
@@ -271,12 +276,13 @@ tool availability or channel policy.
 
 When an installed model plugin is available, Crabbot also exposes the
 host-managed `crabbot ask` command as a conditional command. It accepts
-`--plugin <id>`, `--model <name>`, and prompt words, and selects a configured or
-available model plugin when `--plugin` is omitted. The command is absent when
-no installed model plugin can run, so the CLI does not advertise an unusable
-intelligence path. `session` is exposed under the same condition; `delivery`
-is exposed when an installed messaging plugin is available. These conditional
-commands remain runtime-owned even though their availability depends on plugins.
+the required `--provider <id>`, optional `--model <name>`, and prompt words.
+The provider must identify an installed model plugin. The command is absent
+when no installed model plugin can run, so the CLI does not advertise an
+unusable intelligence path. `session` is exposed under the same condition;
+`delivery` is exposed when an installed messaging plugin is available. These
+conditional commands remain runtime-owned even though their availability
+depends on plugins.
 
 Inside the terminal client, `/help` lists controls, `/status` reports the
 authenticated daemon state, and `/approval` reports the daemon approval mode.
@@ -338,10 +344,13 @@ guarantee that every plugin is confined to it. `/clear` removes the selected
 session's transcript when it is idle.
 `/timer add <seconds> <text>` schedules a reminder; `/timer list` and
 `/timer remove <id>` inspect or remove reminders through authenticated daemon
-IPC. `/memory remember <key>=<value>`, `/memory list`, and `/memory forget
-<key>` manage memories scoped to the selected session through the same host
-contract. Entering the `remember` command explicitly approves a guided memory
-write. `/quit` and `/exit` close the terminal client.
+IPC. `/memory list` shows both global memories and memories scoped to the
+selected session. `/memory remember KEY=VALUE` saves to the current session;
+`/memory forget KEY` removes a current-session record, while `/memory forget
+global KEY` removes a global record. `/memory help` shows the available
+commands, and selecting `/memory` from the command picker shows the same help.
+Entering the `remember` command explicitly approves a guided memory write.
+`/quit` and `/exit` close the terminal client.
 
 `session list [page]` shows up to five sessions in a tree view, with working
 sessions first and archived sessions last. `session list --json` returns the
@@ -449,7 +458,7 @@ and a two-minute execution deadline. Deleting an idle session reports whether
 its Git worktree was reclaimed; failed cleanup is retried when the daemon next
 starts.
 
-For a one-shot local request, use `crabbot ask --plugin <id> --model <model>
+For a one-shot local request, use `crabbot ask --provider <id> --model <model>
 <prompt...>` when an installed model plugin is available. This bypasses channel
 routing and uses the selected model plugin directly. It still applies provider
 validation and protocol limits, but it does not create a durable chat session.
