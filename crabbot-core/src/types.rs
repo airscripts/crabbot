@@ -23,7 +23,7 @@ pub enum Capability {
     Channel,
     Store,
     Memory,
-    Timer,
+    Scheduler,
     Tool,
     Mcp,
     Speech,

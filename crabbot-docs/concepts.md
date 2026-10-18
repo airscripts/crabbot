@@ -2,7 +2,7 @@
 
 Crabbot separates the agent loop from the capabilities that make it useful.
 The background runtime receives normalized events, the core executes a bounded turn, and
-plugins provide models, channels, storage, memory, timers, tools, or clients.
+plugins provide models, channels, storage, memory, schedules, tools, or clients.
 
 ## Runtime And Service Terms
 

@@ -332,6 +332,7 @@ async fn session_answer(
         workspace.as_deref().map(std::path::Path::new).or(Some(state.root.as_path())),
         &media_root,
         state.tui_tools.load(Ordering::Acquire),
+        true,
         state.tui_shell.load(Ordering::Acquire),
         state.config.approval_mode(),
         Arc::clone(&state.pending),
@@ -340,7 +341,10 @@ async fn session_answer(
         tokio::time::Instant::now() + super::TURN_LIMIT,
         &mut call_id,
         &mut failed_tool,
+        None,
         notices,
+        None,
+        None,
     );
 
     tokio::pin!(answer);
@@ -1212,7 +1216,10 @@ async fn capability_call(request: &IpcRequest, state: &State) -> IpcResponse {
     }
 
     let (capability, allowed) = match service {
-        "timer" => (Capability::Timer, ["add", "list", "remove"].as_slice()),
+        "scheduler" => (
+            Capability::Scheduler,
+            ["add", "approve", "list", "pause", "remove", "resume", "run", "retry"].as_slice(),
+        ),
         "memory" => (
             Capability::Memory,
             ["audit", "forget", "index", "learning", "list", "recall", "remember", "search"]
@@ -2717,7 +2724,7 @@ done"##;
         let state = state_at("capability-call");
         let binary = PathBuf::from(format!("/tmp/crabbot-ipc-capability-{}", std::process::id()));
         let script = r#"#!/bin/sh
-while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); case "$line" in *'"method":"hello"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol":{"major":0,"minor":1},"id":"timer","version":"0.1.0","capabilities":["timer"]}}' ;; *'"method":"list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"items":[{"id":7,"text":"reminder"}]}}' ;; *'"method":"shutdown"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}'; exit 0 ;; esac; done"#;
+while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); case "$line" in *'"method":"hello"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol":{"major":0,"minor":1},"id":"scheduler","version":"0.1.0","capabilities":["scheduler"]}}' ;; *'"method":"list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"items":[{"id":7,"text":"scheduled task"}]}}' ;; *'"method":"run"'*|*'"method":"retry"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"id":7,"status":"active"}}' ;; *'"method":"shutdown"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}'; exit 0 ;; esac; done"#;
 
         std::fs::write(&binary, script).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2729,7 +2736,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
                 1,
                 "secret",
                 "capability.call",
-                json!({"service": "timer", "method": "list", "params": {}}),
+                json!({"service": "scheduler", "method": "list", "params": {}}),
             ),
             &state,
         )
@@ -2737,12 +2744,27 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
 
         assert_eq!(response.result.unwrap()["items"][0]["id"], 7);
 
+        for (id, method) in [(4, "run"), (5, "retry")] {
+            let response = capability_call(
+                &IpcRequest::call(
+                    id,
+                    "secret",
+                    "capability.call",
+                    json!({"service": "scheduler", "method": method, "params": {}}),
+                ),
+                &state,
+            )
+            .await;
+
+            assert_eq!(response.result.unwrap()["status"], "active");
+        }
+
         let denied = capability_call(
             &IpcRequest::call(
                 2,
                 "secret",
                 "capability.call",
-                json!({"service": "timer", "method": "due", "params": {}}),
+                json!({"service": "scheduler", "method": "due", "params": {}}),
             ),
             &state,
         )
@@ -2763,7 +2785,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
 
         assert_eq!(bad_service.error.unwrap().code, -32602);
 
-        if let Some(plugin) = state.plugins.remove("timer").await {
+        if let Some(plugin) = state.plugins.remove("scheduler").await {
             plugin.stop().await.unwrap();
         }
 

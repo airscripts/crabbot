@@ -37,10 +37,13 @@ crabbot <plugin-command> [arguments...]
 `crabbot help` and `crabbot --help` show the command tree and Crabbot banner.
 Native commands, conditional commands, and plugin-contributed commands are
 shown in separate lists. The conditional list is rebuilt from installed
-capabilities; `ask` and `session` require an intelligence plugin, while
-`delivery` requires a messaging plugin. Plugin commands are rebuilt from the
-installed plugin registry, so the list includes commands added by newly
-installed or linked plugins.
+capabilities: `session` requires an intelligence plugin, `delivery` requires a
+messaging plugin, and `schedule`, `memory`, and `tui` require their respective
+plugins. `ask` is always listed because its command workflow belongs to
+Crabbot; it reports an actionable error when no intelligence provider is
+installed and ready. Plugin commands are rebuilt from the installed plugin
+registry, so the list includes commands added by newly installed or linked
+plugins.
 Running `crabbot service` without a subcommand prints native service help,
 including the global options; use `crabbot service status` to inspect the
 installed service and its state.
@@ -108,9 +111,17 @@ text. These settings apply to the daemon and plugin processes as well as the
 CLI.
 When the filesystem permits, commands run with `--verbose` or `--debug` save
 their raw application log events to a private per-command file under
-`CRABBOT_HOME/logs/`. Non-JSON commands print the file path when they finish.
+`CRABBOT_HOME/logs/debug/`. Non-JSON commands print the file path when they finish.
 The file uses the configured text or JSON log format; the daily application log
 continues to collect events as well. JSON mode keeps the path off the terminal.
+Daily aggregate logs remain directly under `CRABBOT_HOME/logs/` with date-only
+names. Schedule outcomes are stored in
+`CRABBOT_HOME/logs/schedules/<schedule-name>-<id>.jsonl`; each file is an
+append-only JSONL history with no fixed outcome-count limit. Records include a
+schema version, RFC 3339 timestamp, schedule and run IDs, status, attempt and
+retry details, scheduled/next-run times, captured provider/model/workspace, and
+redacted result text bounded to 4,000 characters. They can be read directly
+without the history command.
 
 Destructive or duplicate-prone commands prompt in an interactive terminal.
 Use `--yes` or `-y` to skip the prompt. With `--json` or non-terminal input,
@@ -186,7 +197,7 @@ preferences.
 The conversation uses the available screen without an outer frame. Crabbot
 replies appear in rounded orange bubbles on the left, while your messages appear
 in rounded green bubbles on the right; the input border uses matching rounded
-corners. Saved user and assistant messages show UTC timestamps, and generation
+corners. Saved user and assistant messages show local timestamps, and generation
 status includes elapsed time.
 When Codex emits multiple assistant messages in one turn, each is separated
 from the next by a blank line.
@@ -240,13 +251,15 @@ changing installed plugins. Confirm in the terminal to apply the preview, or
 use `--yes` to skip the prompt. Only changed plugins are replaced, and only
 active plugins are unloaded and reloaded. Inactive plugins stay inactive.
 
-Plugin-contributed commands are registered by installed plugins. The Pi agent
-plugin registers `crabbot code`, the TUI plugin registers `crabbot tui`, the
-Codex plugin registers `crabbot codex`, and the memory plugin registers
-`crabbot memory`. Native command names are reserved, including those whose
-availability depends on an installed capability, and duplicate plugin command
-names are rejected during installation or update. Plugin-contributed commands
-are available only when their owning plugin is installed.
+Conditional commands are defined by the native CLI and appear when their
+implementing plugin is installed; their feature code stays in that plugin.
+This includes `crabbot schedule`, `crabbot memory`, and `crabbot tui`. Other
+plugin-contributed commands are registered by installed plugins: the Pi agent
+plugin registers `crabbot code`, and the Codex plugin registers
+`crabbot codex`. Native command names are reserved, including conditional
+commands, and duplicate plugin command names are rejected during installation
+or update. Plugin-contributed commands are available only when their owning
+plugin is installed.
 
 Uninstalling the last installed intelligence plugin is blocked while persisted
 sessions remain; delete them with `crabbot session delete <id> --yes` first.
@@ -266,23 +279,23 @@ The memory command supports `status`, `search <text>`, `list`, `show <key>`,
 contradictions within the selected scope and identifies the newer record; it
 uses text matching rather than a model, and does not delete or modify memories.
 Each result includes a `crab memory forget` command for the older record if you
-choose to remove it. Newer saved preferences take precedence when relevant preferences conflict. Use
-`--scope <id>` on supported operations to select a scope; JSON output is available
-through the global `--json` flag.
+choose to remove it. Newer saved preferences take precedence when relevant
+preferences conflict. Run `crab memory help` for command syntax and available
+options. `list [PAGE] --type global|session` filters paginated results by type;
+use `--scope <id>` on supported operations to select a scope. JSON output is
+available through the global `--json` flag.
 Learning defaults to `guided`, where the agent stores a memory only after an
 explicit user request. `autonomous` lets it retain stable, useful facts while
 excluding secrets and sensitive inferences. These instructions do not override
 tool availability or channel policy.
 
-When an installed model plugin is available, Crabbot also exposes the
-host-managed `crabbot ask` command as a conditional command. It accepts
-the required `--provider <id>`, optional `--model <name>`, and prompt words.
-The provider must identify an installed model plugin. The command is absent
-when no installed model plugin can run, so the CLI does not advertise an
-unusable intelligence path. `session` is exposed under the same condition;
-`delivery` is exposed when an installed messaging plugin is available. These
-conditional commands remain runtime-owned even though their availability
-depends on plugins.
+The native `crabbot ask` command requires `--provider <id>` and `--model <name>`,
+followed by prompt words. The provider must identify an installed model plugin.
+If no model provider is installed and ready, `ask` prints an installation hint.
+`session` is exposed as a conditional command
+when an intelligence plugin is available; `delivery` is exposed when an
+installed messaging plugin is available. These conditional commands remain
+runtime-owned even though their availability depends on plugins.
 
 Inside the terminal client, `/help` lists controls, `/status` reports the
 authenticated daemon state, and `/approval` reports the daemon approval mode.
@@ -342,14 +355,140 @@ session. The workspace is the filesystem root/current working area used by
 file-oriented tools; it is separate from conversation history and is not a
 guarantee that every plugin is confined to it. `/clear` removes the selected
 session's transcript when it is idle.
-`/timer add <seconds> <text>` schedules a reminder; `/timer list` and
-`/timer remove <id>` inspect or remove reminders through authenticated daemon
-IPC. `/memory list` shows both global memories and memories scoped to the
-selected session. `/memory remember KEY=VALUE` saves to the current session;
-`/memory forget KEY` removes a current-session record, while `/memory forget
-global KEY` removes a global record. `/memory help` shows the available
-commands, and selecting `/memory` from the command picker shows the same help.
-Entering the `remember` command explicitly approves a guided memory write.
+`/schedule help` shows schedule controls. `/schedule add` accepts the same
+`--after`, `--at`, `--every`, `--cron`, `--timezone`, `--missed`, `--retries`,
+and `--on-failure` options as `crab schedule add`; it also accepts the legacy
+`/schedule add <seconds> <instruction>` form. A schedule is activated
+immediately. `/schedule list [page]` shows 20 tasks per page, their next run,
+and the most recent outcome; each row uses a short schedule name rather than
+the full instruction. Unnamed schedules get a unique random adjective-animal
+name; pass `--name` to choose your own. Names cannot contain spaces and can be
+used instead of numeric IDs for run, retry, pause, resume, remove, and history.
+`--after` and `--every` accept human-readable durations
+such as `5m`, `1m30s`, `1mo`, or `"1 month"`. Months are treated as 30 days
+and years as 365 days. CLI-created schedules require explicit `--provider` and
+`--model` values, captured for every run. They also capture the directory where
+`crab schedule add` was run as their workspace, so file paths are resolved
+relative to that directory and the confined file tools cannot escape it. When
+local shell access is explicitly enabled for a task, it can also search the
+daemon machine for requested folders, files, and binaries using read-only
+commands. It searches the current directory and home first, then other readable
+locations, and skips virtual system trees. It inspects only relevant results
+and avoids credentials and unrelated private files. A change outside the
+captured workspace must be specifically requested by the scheduled
+instruction. Without shell access, discovery is limited to the captured
+workspace. Use `/schedule pause <id>` if you need to stop one.
+`/schedule run <id-or-name>` runs a
+task immediately: a one-time task completes, while a recurring task keeps its
+normal schedule. Completed and skipped one-time tasks can be run again; a rerun
+may repeat side effects. `/schedule retry <id-or-name>` retries a task paused
+after failure or a one-time task skipped while the daemon was offline. Retrying
+a skipped task runs its missed action now and may repeat side effects.
+`/schedule pause <id-or-name>`, `/schedule resume
+<id-or-name>`, and `/schedule remove <id-or-name>` control it through authenticated daemon IPC.
+Removing a task stops future runs. If an action is already running, removal
+requests cancellation and interrupts the agent turn; side effects that already
+happened cannot be undone, so the result reports that possibility.
+Schedules run as isolated agent turns with the captured provider,
+model, and workspace. When tools were enabled for the originating client, the
+agent can use the confined workspace tools; shell commands and scripts are
+available only when shell access is enabled in configuration. Enable TUI tools
+with `crab config set clients.tui.tools=true`; shell access uses
+`crab config set clients.tui.shell=true` and takes effect after a daemon
+restart. For messaging-channel schedules, set `tools = true` and `shell = true`
+under the channel's `[channels.<id>]` table and set global `approval` to
+`prompt` or `auto`. These settings let authorized channel turns schedule local
+scripts; shell remains disabled for channels by default. Shell tasks run on the
+machine hosting the daemon, so they can use
+local scripts, command line tools, and configured services such as `mail` or
+`sendmail`. Scheduled tasks can send a message only when task creation captures
+the exact channel, recipient, recipient type, and optional thread authorized by
+the user. They can also deliver a message to an explicitly requested local TUI
+session; phrases such as "default TUI chat" target `tui-default`. The task cannot
+send to another destination, and messaging is unavailable when no destination
+was captured. External messages use the normal durable delivery queue and can be inspected
+with `/deliveries` or `crab delivery list`. Results appear in the originating
+TUI session or are delivered back to the originating messaging conversation;
+CLI results are available with `crab schedule history <id-or-name>`. Schedule
+listings show a concise outcome and history command instead of the agent's full
+reply. An explicitly requested agent schedule becomes active immediately
+without another approval prompt. At run time, the daemon
+does not wait for an interactive approval that may have no user present:
+scheduling authorizes the task to use only its captured, enabled capabilities.
+A missing capability or uncertain side effect pauses the task and reports why.
+Pending tasks, if any, can still be activated with the approve command.
+
+That authorization is for the specific scheduled instruction and its captured
+capabilities; it does not guarantee that the machine, daemon, provider, channel,
+or external service will be available at the due time. Keep the daemon running
+and configure the required tools and recipients before scheduling. If the
+machine is offline when work becomes due, `--missed` decides whether to skip,
+catch up once, or replay up to five occurrences. Retries cover reported failures
+before a mutating action may have happened. If an email, message, or other side
+effect might already have happened, the task pauses for review to avoid
+duplicating it; Crabbot cannot promise exactly-once execution or delivery.
+
+CLI users can create one-time or recurring tasks with `crab schedule add
+--after`, `--at`, `--every`, or `--cron`. `--every` creates a fixed interval;
+combine it with `--after` or `--at` to choose the first run time. Add `--retries 1` through
+`--retries 5` to opt into bounded retries with exponential backoff for failures
+before a mutating action starts. If an action may already have happened, the
+task pauses for review instead of retrying automatically. Manual retries may
+repeat side effects, so tasks that send mail or perform other irreversible
+actions should be written to detect work they already completed. Workspace
+tools are captured when the tools plugin is installed. Add `--shell` to enable
+local shell access for a CLI-created schedule when shell access is enabled in
+the Crabbot configuration; otherwise, `--shell` is rejected. Without it,
+CLI-created tasks do not get shell access. TUI and messaging schedules capture their respective
+client or channel tool settings. With the shell sandbox off, commands run on the
+daemon host and can use its installed mail client and scripts. If Docker or
+Podman shell isolation is configured, commands run inside that container and
+cannot use host-installed mail clients by default.
+To authorize a CLI-created scheduled message, provide `--message-channel`
+`CHANNEL`, `--message-chat` `CHAT`, and `--message-kind private|group` together.
+Add `--message-thread` `THREAD` when sending to a channel thread. The exact
+destination is captured with the task and cannot be changed by the agent.
+For recurring tasks, `--on-failure continue` skips an occurrence after its
+retries are exhausted and keeps the next run active; the default is to pause
+the schedule. Uncertain side effects still pause for review.
+`--missed skip|coalesce|replay` controls tasks that became due while the daemon
+was offline: skip drops missed work,
+coalesce runs once to catch up, and replay runs up to five missed occurrences.
+This policy does not control failed-task retries.
+
+For example:
+
+```sh
+crab schedule add --after 5m --provider codex --model gpt-6-luna --name project-backup "Create a backup of the project in the configured workspace"
+crab schedule add --at "2026-10-20 09:00" --timezone Europe/Rome --missed replay --shell --provider codex --model gpt-6-luna "Send the daily report by email using the configured local mail client"
+crab schedule add --after 5s --message-channel telegram --message-chat 12345 --message-kind private --provider codex --model gpt-6-luna "Send a private Telegram message to chat 12345: Hey there"
+crab schedule add --after 5s --provider codex --model gpt-6-luna "Ping me on the default TUI chat"
+crab schedule add --every 5m --provider codex --model gpt-6-luna "Check the backup and report any missing files"
+crab schedule add --every 1d --at 2026-10-20T09:00:00+02:00 --provider codex --model gpt-6-luna "Create the daily report"
+crab schedule add --after 5m --shell --provider codex --model gpt-6-luna "Use the configured local mail client to email the daily report to me"
+crab schedule add --cron '0 9 * * *' --timezone Europe/Rome --provider codex --model gpt-6-luna "Review the daily report"
+crab schedule add --after 5m --retries 2 --provider codex --model gpt-6-luna "Check the backup and report any missing files"
+```
+
+`--at` accepts `YYYY-MM-DD HH:MM` in `--timezone`, `scheduler.timezone`, or the
+machine's timezone, as well as an RFC 3339 timestamp with an explicit UTC offset.
+Quote local date/time values so the shell passes them as one argument.
+Agent-proposed one-time tasks can use RFC 3339 timestamps. Fixed intervals use `--every`;
+calendar schedules use cron and a timezone. Every CLI-created task needs both
+`--provider` and `--model`, for example `--provider codex --model gpt-6-luna`.
+
+The Telegram plugin must be installed and configured for the Telegram example.
+Local email commands need a configured mail client or script on the daemon's machine.
+`/memory list [PAGE] [--type global|session]` shows up to five global
+and session memories in a paginated tree. Each row is labeled `type: global` or
+`type: session`; use `--type` to filter the list. `/memory remember KEY=VALUE`
+saves to the current session.
+`/memory forget KEY` removes a unique matching record from either scope;
+`/memory forget global KEY` and `/memory forget session KEY` select a scope
+explicitly. If the key exists in both scopes, choose one explicitly. `/memory
+help` shows the available commands, and selecting `/memory` from the command
+picker shows the same help. Entering the `remember` command explicitly approves
+a guided memory write.
 `/quit` and `/exit` close the terminal client.
 
 `session list [page]` shows up to five sessions in a tree view, with working
@@ -440,7 +579,7 @@ filter can narrow those entries further under `[channels.telegram]` or
 thread values are platform IDs represented as strings.
 
 The core reports capability-specific guidance when a requested provider,
-channel, store, timer, tool, speech plugin, or client is not installed.
+channel, store, scheduler, tool, speech plugin, or client is not installed.
 Plugin installation and linking stage the manifest and binary before
 atomically replacing an existing plugin. Sources may be local directories,
 Git URLs with an optional `--revision`, or verified `.tar`, `.tar.gz`, `.tgz`,

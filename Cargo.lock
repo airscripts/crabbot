@@ -542,6 +542,9 @@ dependencies = [
 [[package]]
 name = "crabbot-date"
 version = "0.1.0"
+dependencies = [
+ "jiff",
+]
 
 [[package]]
 name = "crabbot-file"
@@ -681,6 +684,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabbot-plugin-scheduler"
+version = "0.1.0"
+dependencies = [
+ "crabbot-core",
+ "crabbot-file",
+ "crabbot-log",
+ "getrandom 0.4.3",
+ "jiff",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "crabbot-plugin-signal"
 version = "0.1.0"
 dependencies = [
@@ -729,19 +746,6 @@ dependencies = [
  "futures-util",
  "keyring",
  "reqwest",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-plugin-timer"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-file",
- "crabbot-log",
- "jiff",
- "serde",
  "serde_json",
  "tokio",
 ]
@@ -820,10 +824,12 @@ dependencies = [
  "clap",
  "clap_complete",
  "crabbot-core",
+ "crabbot-date",
  "crabbot-file",
  "crabbot-log",
  "crabbot-process",
  "getrandom 0.4.3",
+ "jiff",
  "keyring",
  "ring",
  "rustix",

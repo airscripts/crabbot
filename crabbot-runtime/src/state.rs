@@ -555,6 +555,64 @@ impl Store {
         self.push_with_status(id, message, true, false)
     }
 
+    pub fn append_notice(&mut self, id: &str, message: Message) -> std::io::Result<()> {
+        if !self.sessions.contains_key(id) || message.session != id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Originating session was not found.",
+            ));
+        }
+
+        self.change(|store| {
+            if let Some(session) = store.sessions.get_mut(id) {
+                session.messages.push(message);
+                compact_messages(&mut session.messages);
+                session.updated = now();
+            }
+        })
+    }
+
+    pub fn queue_delivery(
+        &mut self,
+        id: impl Into<String>,
+        channel: impl Into<String>,
+        chat: impl Into<String>,
+        private: bool,
+        thread: Option<String>,
+        text: impl Into<String>,
+    ) -> std::io::Result<()> {
+        if self.outbox.len() >= LIMIT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Delivery outbox is full; no message was discarded.",
+            ));
+        }
+
+        let id = id.into();
+
+        let channel = channel.into();
+        let chat = chat.into();
+        let text = text.into();
+        self.change(|store| {
+            if !store.outbox.iter().any(|delivery| delivery.id == id) {
+                store.outbox.push(Delivery {
+                    id,
+                    channel,
+                    chat,
+                    private,
+                    thread,
+                    text,
+                    attempts: 0,
+                    created: now(),
+                    status: DeliveryStatus::Pending,
+                    last_error: None,
+                    message_id: None,
+                    updated: now(),
+                });
+            }
+        })
+    }
+
     pub fn append_reserved(
         &mut self,
         id: &str,
@@ -2423,6 +2481,40 @@ mod tests {
             sender: None,
             content: vec![Content::Text { text: "hello".into() }],
         }
+    }
+
+    #[test]
+    fn scheduled_results_preserve_session_state_and_delivery_privacy() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-schedule-state-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut store = Store::load(root.join("sessions.json")).unwrap();
+        store.create("origin", "model").unwrap();
+        store
+            .append_notice(
+                "origin",
+                Message {
+                    id: "notice".into(),
+                    session: "origin".into(),
+                    role: Role::System,
+                    sender: None,
+                    content: vec![Content::Text { text: "completed".into() }],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.sessions["origin"].status, "idle");
+        assert_eq!(store.sessions["origin"].messages.last().unwrap().id, "notice");
+
+        store.queue_delivery("schedule-1", "telegram", "-123", false, None, "completed").unwrap();
+
+        assert!(!store.outbox.last().unwrap().private);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

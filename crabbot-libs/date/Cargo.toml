@@ -9,3 +9,4 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+jiff.workspace = true

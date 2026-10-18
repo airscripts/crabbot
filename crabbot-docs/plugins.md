@@ -222,12 +222,24 @@ stored under `records/`. Global memories apply across conversations, while
 provider and TUI memories stay within their conversation. The model receives
 only a bounded summary of global and current-conversation memories.
 
-The timer plugin persists one-shot and repeating tasks atomically. It validates
-five-field cron expressions and resolves IANA timezones through the system
-timezone database on Unix and the platform bundle where a system database is
-unavailable. Cron entries therefore calculate calendar and daylight-saving
-transitions. Its `due` operation claims ready work exactly once for one-shot
-tasks.
+The scheduler plugin persists pending tasks and active schedules atomically
+under `CRABBOT_HOME/data/schedules/`. Explicit schedule requests become active
+immediately; agent scheduling tool calls are authorized before activation.
+The daemon executes active tasks as
+isolated agent turns using their captured provider, model, and workspace, then
+reports results to the originating conversation and records append-only JSONL
+history under `CRABBOT_HOME/logs/schedules/<schedule-name>-<id>.jsonl`. Each
+record includes a schema version, RFC 3339 timestamp, schedule/run identifiers,
+status, attempt/retry details, scheduled/next-run times, captured
+provider/model/workspace, and redacted result text bounded to 4,000 characters.
+The outcome history has no fixed record-count limit and can be inspected
+directly. Tasks support one-time delays and
+exact RFC 3339 run times, plus five-field cron expressions in IANA timezones,
+including daylight-saving transitions. Active tasks can be run immediately;
+failed tasks can opt into up to five retries with exponential backoff or be
+retried manually after pausing. Interrupted runs pause for review because an
+action may already have happened. Missed recurring runs default to `skip`;
+schedules can choose `coalesce` or bounded `replay`.
 
 The Whisper plugin is an optional local adapter. It invokes an explicitly
 configured executable against a root-confined path and returns text, keeping

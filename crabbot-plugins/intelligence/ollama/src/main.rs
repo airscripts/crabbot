@@ -7,7 +7,7 @@ use crabbot_core::{
 
 #[cfg(not(test))]
 use crabbot_core::{
-    plugin::serve_events,
+    plugin::serve_events_concurrent,
     types::{Capability, Hello, Protocol},
 };
 
@@ -32,7 +32,7 @@ async fn plugin_main() -> crabbot_core::Result<()> {
         .build()
         .map_err(|error| crabbot_core::Error::Denied(format!("Ollama client failed: {error}.")))?;
 
-    serve_events(
+    serve_events_concurrent(
         Hello {
             protocol: Protocol { major: 0, minor: 1 },
             id: "ollama".into(),

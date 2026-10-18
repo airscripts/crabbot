@@ -3,7 +3,7 @@
 use crabbot_core::types::{Content, Event, ModelReply, ModelRequest, Request, Response, Role};
 #[cfg(not(test))]
 use crabbot_core::{
-    plugin::serve_events,
+    plugin::serve_events_concurrent,
     types::{Capability, Hello, Protocol},
 };
 
@@ -31,7 +31,7 @@ async fn plugin_main() -> crabbot_core::Result<()> {
         .build()
         .map_err(|error| crabbot_core::Error::Denied(format!("Gemini client failed: {error}.")))?;
 
-    serve_events(
+    serve_events_concurrent(
         Hello {
             protocol: Protocol::CURRENT,
             id: "gemini".into(),

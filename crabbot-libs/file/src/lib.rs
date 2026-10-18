@@ -129,6 +129,33 @@ pub fn save(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> io::Result<()>
     Ok(())
 }
 
+pub fn append(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> io::Result<()> {
+    let path = path.as_ref();
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    reject_link(path)?;
+
+    let mut options = OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
+
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Append path must be a regular file.",
+        ));
+    }
+
+    private(path)?;
+    file.write_all(content.as_ref())?;
+    file.sync_all()
+}
+
 pub fn recover(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref();
     let Some(parent) = path.parent() else {
@@ -307,7 +334,7 @@ fn nonce() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Transaction, check, credential, load, private, recover, save};
+    use super::{Transaction, append, check, credential, load, private, recover, save};
 
     use std::fs;
 
@@ -327,6 +354,38 @@ mod tests {
         assert_eq!(load(&path, 16).unwrap().as_deref(), Some(&b"hello"[..]));
         check(&path).unwrap();
         private(&path).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn appends_to_private_files_without_replacing_existing_content() {
+        let root = root("append");
+        let path = root.join("logs/schedule.jsonl");
+
+        append(&path, b"{\"run\":1}\n").unwrap();
+        append(&path, b"{\"run\":2}\n").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"{\"run\":1}\n{\"run\":2}\n");
+        check(&path).unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = root("append-link");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target");
+        let link = root.join("link");
+        fs::write(&target, b"original").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(append(&link, b"unsafe").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+
         let _ = fs::remove_dir_all(root);
     }
 
