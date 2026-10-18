@@ -4040,10 +4040,35 @@ mod tests {
         assert_eq!(scheduled_turn, milliseconds);
         assert_eq!(system_command, milliseconds);
         assert_eq!(interaction, milliseconds);
+        assert!(milliseconds.as_deref().unwrap().starts_with("2023-"));
         assert!(nanoseconds.is_some());
         assert_eq!(super::message_timestamp("schedule-notice-1792380000000000000-9"), None);
         assert_eq!(super::message_timestamp("schedule-policy-1792380000000000000"), None);
         assert_eq!(super::message_timestamp("tui-compact-1792380000000000000"), None);
+    }
+
+    #[test]
+    fn scheduled_result_timestamp_uses_the_recorded_date_on_hover() {
+        let timestamp = super::message_timestamp("schedule-notice-at-1700000000000-7-9").unwrap();
+        let transcript =
+            format!("Crabbot | {timestamp}\nScheduled task completed (schedule 7):\nFinished.");
+        let row_text =
+            |row: &Line<'_>| row.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+
+        let hidden = super::wrap_transcript_layout(&transcript, "Crabbot", 80, None)
+            .0
+            .iter()
+            .map(row_text)
+            .collect::<String>();
+        let hovered = super::wrap_transcript_layout(&transcript, "Crabbot", 80, Some(0))
+            .0
+            .iter()
+            .map(row_text)
+            .collect::<String>();
+
+        assert!(timestamp.starts_with("2023-"));
+        assert!(!hidden.contains(&timestamp));
+        assert!(hovered.contains(&format!("Crabbot, {timestamp}")));
     }
 
     #[test]

@@ -7,7 +7,8 @@ Semantic Versioning.
 
 ### Fixed
 
-- Show scheduled TUI result timestamps from the recorded outcome time and ignore opaque schedule IDs when formatting message dates.
+- Show scheduled TUI result timestamps from the recorded outcome time on hover and ignore opaque schedule IDs when formatting message dates.
+- Start each scheduled run with only its current instruction, without prior run messages in the model context.
 
 ### Changed
 

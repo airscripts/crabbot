@@ -5283,6 +5283,32 @@ async fn lock_scheduled_workspace(
     lock.lock_owned().await
 }
 
+fn scheduled_messages(
+    task_id: u64,
+    session: &str,
+    home_root: &Path,
+    instruction: Message,
+    workspace: &Path,
+    origin: &Value,
+    shell_enabled: bool,
+) -> Vec<Message> {
+    let mut messages = turn_messages(session, home_root, vec![instruction]);
+    messages.insert(
+        0,
+        Message {
+            id: format!("schedule-policy-{task_id}"),
+            session: session.into(),
+            role: Role::System,
+            sender: None,
+            content: vec![Content::Text {
+                text: scheduled_policy(workspace, origin, shell_enabled),
+            }],
+        },
+    );
+
+    messages
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_scheduled_task(
     task_id: u64,
@@ -5324,39 +5350,28 @@ async fn execute_scheduled_task(
 
     let session = format!("schedule-{task_id}");
     let instruction = task["text"].as_str().ok_or("Scheduled instruction is missing.")?;
+    let user = Message {
+        id: format!("schedule-user-{}", now()),
+        session: session.clone(),
+        role: Role::User,
+        sender: Some("scheduler".into()),
+        content: vec![Content::Text { text: instruction.to_owned() }],
+    };
+
     {
         let mut store = sessions.lock().map_err(|_| "Session lock is poisoned.")?;
         store.ensure(&session, model)?;
-        let user = Message {
-            id: format!("schedule-user-{}", now()),
-            session: session.clone(),
-            role: Role::User,
-            sender: Some("scheduler".into()),
-            content: vec![Content::Text { text: instruction.to_owned() }],
-        };
-
-        store.begin_with_roles(&session, user, Vec::new())?;
+        store.begin_with_roles(&session, user.clone(), Vec::new())?;
     }
 
-    let history = sessions
-        .lock()
-        .map_err(|_| "Session lock is poisoned.")?
-        .sessions
-        .get(&session)
-        .map(|value| value.messages.clone())
-        .unwrap_or_default();
-    let mut messages = turn_messages(&session, home_root, history);
-    messages.insert(
-        0,
-        Message {
-            id: format!("schedule-policy-{task_id}"),
-            session: session.clone(),
-            role: Role::System,
-            sender: None,
-            content: vec![Content::Text {
-                text: scheduled_policy(&workspace, &context["origin"], shell_enabled),
-            }],
-        },
+    let mut messages = scheduled_messages(
+        task_id,
+        &session,
+        home_root,
+        user,
+        &workspace,
+        &context["origin"],
+        shell_enabled,
     );
 
     append_memory_context(plugins, &mut messages, "global", call).await;
@@ -18155,6 +18170,38 @@ done
 
         assert!(host_discovery.contains("do not read credentials"));
         assert!(host_discovery.contains("do not append its name again"));
+    }
+
+    #[test]
+    fn scheduled_turn_starts_with_only_the_current_instruction() {
+        let root = test_root("scheduled-fresh-context");
+        fs::create_dir_all(&root).unwrap();
+        let instruction = Message {
+            id: "schedule-user-current".into(),
+            session: "schedule-7".into(),
+            role: Role::User,
+            sender: Some("scheduler".into()),
+            content: vec![Content::Text { text: "Recreate the deleted report.".into() }],
+        };
+
+        let messages = super::scheduled_messages(
+            7,
+            "schedule-7",
+            &root,
+            instruction,
+            Path::new("/workspace"),
+            &serde_json::json!({"channel": "cli"}),
+            false,
+        );
+        let user_messages =
+            messages.iter().filter(|message| message.role == Role::User).collect::<Vec<_>>();
+
+        assert_eq!(user_messages.len(), 1);
+        assert!(user_messages[0].content.iter().any(
+            |content| matches!(content, Content::Text { text } if text == "Recreate the deleted report.")
+        ));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
