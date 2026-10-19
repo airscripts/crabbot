@@ -1,6 +1,6 @@
 [package]
 name = "crabbot-date"
-description = "Shared UTC date formatting for Crabbot"
+description = "Shared date and time formatting for Crabbot"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

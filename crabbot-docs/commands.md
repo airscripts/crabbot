@@ -118,10 +118,15 @@ Daily aggregate logs remain directly under `CRABBOT_HOME/logs/` with date-only
 names. Schedule outcomes are stored in
 `CRABBOT_HOME/logs/schedules/<schedule-name>-<id>.jsonl`; each file is an
 append-only JSONL history with no fixed outcome-count limit. Records include a
-schema version, RFC 3339 timestamp, schedule and run IDs, status, attempt and
-retry details, scheduled/next-run times, captured provider/model/workspace, and
-redacted result text bounded to 4,000 characters. They can be read directly
-without the history command.
+schema version, RFC 3339 timestamp, schedule ID, name and timezone, run ID,
+status, attempt and retry details, scheduled/next-run times, captured
+provider/model/workspace, and redacted result text bounded to 4,000 characters.
+`crab schedule history <id-or-name> [PAGE]` shows five runs per page in a readable
+format; add `--all` to show every run or `--raw` to print the original JSONL.
+`/schedule history <id-or-name> [PAGE]` provides the same paginated view in the
+TUI. The output also shows the log path for direct inspection. Scheduled times
+show the schedule's timezone and UTC reference. Use `--json` for parsed records
+as a JSON array.
 
 Destructive or duplicate-prone commands prompt in an interactive terminal.
 Use `--yes` or `-y` to skip the prompt. With `--json` or non-terminal input,
@@ -360,7 +365,9 @@ session's transcript when it is idle.
 and `--on-failure` options as `crab schedule add`; it also accepts the legacy
 `/schedule add <seconds> <instruction>` form. A schedule is activated
 immediately. `/schedule list [page]` shows 20 tasks per page, their next run,
-and the most recent outcome; each row uses a short schedule name rather than
+and the most recent outcome; `/schedule history <id-or-name> [page]` shows five
+execution records per page. Upcoming run and retry times show the schedule's
+timezone with a UTC reference. Each row uses a short schedule name rather than
 the full instruction. Unnamed schedules get a unique random adjective-animal
 name; pass `--name` to choose your own. Names cannot contain spaces and can be
 used instead of numeric IDs for run, retry, pause, resume, remove, and history.
@@ -411,7 +418,9 @@ with `/deliveries` or `crab delivery list`. Results appear in the originating
 TUI session or are delivered back to the originating messaging conversation;
 CLI results are available with `crab schedule history <id-or-name>`. Schedule
 listings show a concise outcome and history command instead of the agent's full
-reply. An explicitly requested agent schedule becomes active immediately
+reply. Each run starts with the scheduled instruction and does not include
+messages or tool results from earlier runs in its model context. An explicitly
+requested agent schedule becomes active immediately
 without another approval prompt. At run time, the daemon
 does not wait for an interactive approval that may have no user present:
 scheduling authorizes the task to use only its captured, enabled capabilities.

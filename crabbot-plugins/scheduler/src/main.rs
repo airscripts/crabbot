@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod cron;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -12,10 +14,10 @@ use crabbot_core::{
 };
 
 use crabbot_file::{load as load_file, save as save_file};
-use jiff::{
-    Timestamp,
-    tz::{Offset, TimeZone},
-};
+use cron::{next, validate_cron, validate_zone};
+
+#[cfg(test)]
+use cron::{CronSchedule, parse_field, timezone};
 
 use serde_json::json;
 
@@ -31,7 +33,7 @@ const FRAME_HEADROOM: usize = 64 * 1024;
 struct Task {
     #[serde(default)]
     name: String,
-    text: String,
+    text: Arc<str>,
     delay: u64,
     #[serde(default)]
     due: u64,
@@ -44,7 +46,7 @@ struct Task {
     #[serde(default = "pending")]
     status: String,
     #[serde(default)]
-    context: serde_json::Value,
+    context: Arc<serde_json::Value>,
     #[serde(default)]
     last_result: Option<String>,
     #[serde(default)]
@@ -79,6 +81,15 @@ struct Task {
     report_pending: bool,
     #[serde(default)]
     imported_timer_id: Option<u64>,
+}
+
+type Tasks = BTreeMap<u64, Arc<Task>>;
+
+impl Task {
+    fn ready_for_claim_at(&self, at: u64) -> bool {
+        self.status == "active"
+            && (self.manual_run || self.retry_at.map_or(self.due <= at, |retry_at| retry_at <= at))
+    }
 }
 
 fn pending() -> String {
@@ -120,11 +131,12 @@ fn schedule_name() -> String {
 }
 
 fn valid_schedule_name(name: &str) -> bool {
-    let mut characters = name.chars();
+    let mut characters = name.bytes();
 
-    characters.next().is_some_and(|character| character.is_ascii_alphanumeric())
+    name.len() <= 80
+        && characters.next().is_some_and(|character| character.is_ascii_alphanumeric())
         && characters.all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            character.is_ascii_alphanumeric() || matches!(character, b'-' | b'_' | b'.')
         })
 }
 
@@ -151,15 +163,14 @@ fn unique_schedule_name(names: &BTreeSet<String>) -> String {
     }
 }
 
-fn normalize_schedule_names(tasks: &mut BTreeMap<u64, Task>) -> bool {
+fn normalize_schedule_names(tasks: &mut Tasks) -> bool {
     let mut names = BTreeSet::new();
     let mut changed = false;
 
-    for task in tasks.values_mut() {
-        if task.name.chars().count() > 80
-            || !valid_schedule_name(&task.name)
-            || names.contains(&task.name)
-        {
+    for shared_task in tasks.values_mut() {
+        let task = Arc::make_mut(shared_task);
+
+        if !valid_schedule_name(&task.name) || names.contains(&task.name) {
             task.name = unique_schedule_name(&names);
             changed = true;
         }
@@ -195,14 +206,14 @@ async fn plugin_main() -> crabbot_core::Result<()> {
 }
 
 async fn call(
-    tasks: &Arc<Mutex<BTreeMap<u64, Task>>>,
+    tasks: &Arc<Mutex<Tasks>>,
     request: Request,
 ) -> crabbot_core::Result<Option<Response>> {
     call_at(tasks, request, path().as_deref()).await
 }
 
 async fn call_at(
-    tasks: &Arc<Mutex<BTreeMap<u64, Task>>>,
+    tasks: &Arc<Mutex<Tasks>>,
     request: Request,
     location: Option<&Path>,
 ) -> crabbot_core::Result<Option<Response>> {
@@ -241,7 +252,7 @@ async fn call_at(
                     unique_schedule_name(&names)
                 });
 
-            if name.chars().count() > 80 || !valid_schedule_name(&name) {
+            if !valid_schedule_name(&name) {
                 return Err(crabbot_core::Error::Denied(
                     "Schedule names must start with a letter or number and contain only letters, numbers, hyphens, underscores, or dots (up to 80 characters).".into(),
                 ));
@@ -375,16 +386,16 @@ async fn call_at(
                 let previous = tasks.clone();
                 tasks.insert(
                     id,
-                    Task {
+                    Arc::new(Task {
                         name: name.clone(),
-                        text: text.into(),
+                        text: Arc::from(text),
                         delay,
                         due,
                         repeat,
                         cron: cron.clone(),
                         zone: zone.clone(),
                         status: status.into(),
-                        context,
+                        context: Arc::new(context),
                         last_result: None,
                         last_outcome: None,
                         missed,
@@ -402,7 +413,7 @@ async fn call_at(
                         finish_result: None,
                         report_pending: false,
                         imported_timer_id: None,
-                    },
+                    }),
                 );
 
                 previous
@@ -455,8 +466,7 @@ async fn call_at(
             let mut tasks = tasks
                 .lock()
                 .map_err(|_| crabbot_core::Error::Denied("Scheduler lock is poisoned.".into()))?;
-            let mut next_tasks = tasks.clone();
-            let Some(task) = next_tasks.get_mut(&task_id) else {
+            let Some(task) = tasks.get(&task_id) else {
                 return Err(crabbot_core::Error::Denied("Scheduled task was not found.".into()));
             };
 
@@ -466,6 +476,15 @@ async fn call_at(
                 ));
             }
 
+            if !task.report_pending {
+                return Ok(Some(checked_response(id, json!({"id": task_id, "reported": true}))?));
+            }
+
+            let mut next_tasks = tasks.clone();
+            let task = next_tasks.get_mut(&task_id).ok_or_else(|| {
+                crabbot_core::Error::Denied("Scheduled task was not found.".into())
+            })?;
+            let task = Arc::make_mut(task);
             task.report_pending = false;
             persist_locked_at(location, &next_tasks)?;
             *tasks = next_tasks;
@@ -537,13 +556,9 @@ async fn call_at(
                 .map_err(|_| crabbot_core::Error::Denied("Scheduler lock is poisoned.".into()))?;
             let due = tasks
                 .iter()
-                .filter(|(_, task)| {
-                    task.status == "active"
-                        && (task.manual_run
-                            || task.retry_at.map_or(task.due <= at, |retry_at| retry_at <= at))
-                })
-                .map(|(id, task)| (*id, task.clone()))
-                .min_by_key(|(_, task)| task.due);
+                .filter(|(_, task)| task.ready_for_claim_at(at))
+                .min_by_key(|(_, task)| task.due)
+                .map(|(id, task)| (*id, task.clone()));
 
             let Some((task_id, task)) = due else {
                 return checked_response(id, json!({"item": null})).map(Some);
@@ -567,6 +582,7 @@ async fn call_at(
                     let current = next_tasks.get_mut(&task_id).ok_or_else(|| {
                         crabbot_core::Error::Denied("Scheduled task was not found.".into())
                     })?;
+                    let current = Arc::make_mut(current);
                     current.due = next_due;
                     current.replay_count = 0;
                     current.last_result =
@@ -576,6 +592,7 @@ async fn call_at(
                     let current = next_tasks.get_mut(&task_id).ok_or_else(|| {
                         crabbot_core::Error::Denied("Scheduled task was not found.".into())
                     })?;
+                    let current = Arc::make_mut(current);
                     current.status = "skipped".into();
                     current.last_result = Some(
                         "Task skipped because it was due while the daemon was offline.".into(),
@@ -593,6 +610,7 @@ async fn call_at(
             }
 
             if let Some(current) = next_tasks.get_mut(&task_id) {
+                let current = Arc::make_mut(current);
                 current.status = "running".into();
                 current.run_id = Some(run_id);
                 current.manual_origin |= current.manual_run && !current.manual_retry;
@@ -624,31 +642,36 @@ async fn call_at(
             let mut tasks = tasks
                 .lock()
                 .map_err(|_| crabbot_core::Error::Denied("Scheduler lock is poisoned.".into()))?;
-            let mut next_tasks = tasks.clone();
-            let Some(task) = next_tasks.get_mut(&task_id) else {
+            let Some(current) = tasks.get(&task_id) else {
                 return Err(crabbot_core::Error::Denied("Scheduled task was not found.".into()));
             };
 
             let run_id = params["run_id"]
                 .as_u64()
-                .or(task.run_id)
+                .or(current.run_id)
                 .ok_or_else(|| crabbot_core::Error::Denied("finish.run_id is required.".into()))?;
 
-            if task.finished_run_id == Some(run_id)
-                && let Some(result) = task.finish_result.clone()
+            if current.finished_run_id == Some(run_id)
+                && let Some(result) = current.finish_result.clone()
             {
                 return checked_response(id, result).map(Some);
             }
 
-            if task.status != "running" {
+            if current.status != "running" {
                 return Err(crabbot_core::Error::Denied("Scheduled task is not running.".into()));
             }
 
-            if task.run_id != Some(run_id) {
+            if current.run_id != Some(run_id) {
                 return Err(crabbot_core::Error::Denied(
                     "finish.run_id does not match the active execution.".into(),
                 ));
             }
+
+            let mut next_tasks = tasks.clone();
+            let task = next_tasks.get_mut(&task_id).ok_or_else(|| {
+                crabbot_core::Error::Denied("Scheduled task was not found.".into())
+            })?;
+            let task = Arc::make_mut(task);
 
             task.last_result = Some(result.chars().take(2_000).collect());
 
@@ -788,34 +811,20 @@ async fn call_at(
             let mut tasks = tasks
                 .lock()
                 .map_err(|_| crabbot_core::Error::Denied("Scheduler lock is poisoned.".into()))?;
-            let mut next_tasks = tasks.clone();
-            let Some(task) = next_tasks.get_mut(&task_id) else {
+            let Some(current) = tasks.get(&task_id) else {
                 return Err(crabbot_core::Error::Denied("Scheduled task was not found.".into()));
             };
 
             let status = match method.as_str() {
-                "approve" if task.status == "pending" => "active",
-                "pause" if task.status == "active" => "paused",
-                "resume" if task.status == "paused" => "active",
+                "approve" if current.status == "pending" => "active",
+                "pause" if current.status == "active" => "paused",
+                "resume" if current.status == "paused" => "active",
 
-                "run" if matches!(task.status.as_str(), "active" | "completed" | "skipped") => {
-                    task.manual_run = true;
-                    task.manual_retry = false;
-                    task.manual_origin = true;
-                    task.cancel_requested = false;
-                    task.retry_at = None;
-                    task.attempts = 0;
+                "run" if matches!(current.status.as_str(), "active" | "completed" | "skipped") => {
                     "active"
                 }
 
-                "retry" if matches!(task.status.as_str(), "paused" | "skipped") => {
-                    task.manual_run = true;
-                    task.manual_retry = true;
-                    task.cancel_requested = false;
-                    task.retry_at = None;
-                    task.attempts = 0;
-                    "active"
-                }
+                "retry" if matches!(current.status.as_str(), "paused" | "skipped") => "active",
 
                 "approve" => {
                     return Err(crabbot_core::Error::Denied(
@@ -849,21 +858,48 @@ async fn call_at(
                 }
             };
 
-            if method == "resume" {
-                task.attempts = 0;
-                task.retry_at = None;
-                task.manual_run = false;
-                task.manual_retry = false;
-                task.manual_origin = false;
-                task.cancel_requested = false;
-            }
+            let mut next_tasks = tasks.clone();
+            let task = next_tasks.get_mut(&task_id).ok_or_else(|| {
+                crabbot_core::Error::Denied("Scheduled task was not found.".into())
+            })?;
+            let task = Arc::make_mut(task);
 
-            if method == "pause" {
-                task.attempts = 0;
-                task.retry_at = None;
-                task.manual_run = false;
-                task.manual_retry = false;
-                task.manual_origin = false;
+            match method.as_str() {
+                "run" => {
+                    task.manual_run = true;
+                    task.manual_retry = false;
+                    task.manual_origin = true;
+                    task.cancel_requested = false;
+                    task.retry_at = None;
+                    task.attempts = 0;
+                }
+
+                "retry" => {
+                    task.manual_run = true;
+                    task.manual_retry = true;
+                    task.cancel_requested = false;
+                    task.retry_at = None;
+                    task.attempts = 0;
+                }
+
+                "resume" => {
+                    task.attempts = 0;
+                    task.retry_at = None;
+                    task.manual_run = false;
+                    task.manual_retry = false;
+                    task.manual_origin = false;
+                    task.cancel_requested = false;
+                }
+
+                "pause" => {
+                    task.attempts = 0;
+                    task.retry_at = None;
+                    task.manual_run = false;
+                    task.manual_retry = false;
+                    task.manual_origin = false;
+                }
+
+                _ => {}
             }
 
             task.status = status.into();
@@ -886,27 +922,28 @@ async fn call_at(
             let mut recovered = 0;
             let mut cancelled = 0;
 
-            next_tasks.retain(|id, task| {
-                if task.status != "running" || active.contains(id) {
-                    return true;
+            next_tasks.retain(|id, task| match task.status.as_str() {
+                "running" if !active.contains(id) => {
+                    recovered += 1;
+
+                    if task.cancel_requested {
+                        cancelled += 1;
+                        return false;
+                    }
+
+                    let task = Arc::make_mut(task);
+                    task.status = "paused".into();
+                    task.retry_at = None;
+                    task.manual_run = false;
+                    task.manual_retry = false;
+                    task.cancel_requested = false;
+                    task.last_result =
+                        Some("Execution was interrupted; review before resuming.".into());
+                    task.last_outcome = Some("failed".into());
+                    true
                 }
 
-                recovered += 1;
-
-                if task.cancel_requested {
-                    cancelled += 1;
-                    return false;
-                }
-
-                task.status = "paused".into();
-                task.retry_at = None;
-                task.manual_run = false;
-                task.manual_retry = false;
-                task.cancel_requested = false;
-                task.last_result =
-                    Some("Execution was interrupted; review before resuming.".into());
-                task.last_outcome = Some("failed".into());
-                true
+                _ => true,
             });
 
             if recovered > 0 || cancelled > 0 {
@@ -938,6 +975,7 @@ async fn call_at(
                 let cancel_requested = if let Some(task) = tasks.get_mut(&id)
                     && task.status == "running"
                 {
+                    let task = Arc::make_mut(task);
                     task.cancel_requested = true;
                     true
                 } else {
@@ -987,14 +1025,14 @@ fn checked_response(id: u64, result: serde_json::Value) -> crabbot_core::Result<
     Ok(response)
 }
 
-fn load() -> crabbot_core::Result<Arc<Mutex<BTreeMap<u64, Task>>>> {
+fn load() -> crabbot_core::Result<Arc<Mutex<Tasks>>> {
     load_with_legacy_at(path().as_deref(), legacy_path().as_deref())
 }
 
 fn load_with_legacy_at(
     schedule_path: Option<&std::path::Path>,
     legacy_path: Option<&std::path::Path>,
-) -> crabbot_core::Result<Arc<Mutex<BTreeMap<u64, Task>>>> {
+) -> crabbot_core::Result<Arc<Mutex<Tasks>>> {
     let Some(schedule_path) = schedule_path else {
         return load_at(None);
     };
@@ -1049,7 +1087,7 @@ fn load_with_legacy_at(
         );
     }
 
-    let mut tasks: BTreeMap<u64, Task> = match schedule {
+    let mut tasks: Tasks = match schedule {
         Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
             crabbot_core::Error::Denied(format!(
                 "Scheduler state {} is corrupt; repair it before restarting the scheduler.",
@@ -1066,7 +1104,7 @@ fn load_with_legacy_at(
         ))
     })?;
 
-    let legacy_tasks: BTreeMap<u64, Task> = serde_json::from_str(&text).map_err(|_| {
+    let legacy_tasks: Tasks = serde_json::from_str(&text).map_err(|_| {
         crabbot_core::Error::Denied(format!(
             "Legacy timer state {} is corrupt; repair it before restarting the scheduler.",
             legacy_path.display()
@@ -1082,7 +1120,9 @@ fn load_with_legacy_at(
 
     let mut imported = 0;
 
-    for (legacy_id, mut task) in legacy_tasks {
+    for (legacy_id, shared_task) in legacy_tasks {
+        let mut task = (*shared_task).clone();
+
         if tasks.values().any(|current| current.imported_timer_id == Some(legacy_id)) {
             continue;
         }
@@ -1107,7 +1147,7 @@ fn load_with_legacy_at(
         task.status = "active".into();
         task.missed = "coalesce".into();
         task.imported_timer_id = Some(legacy_id);
-        tasks.insert(id, task);
+        tasks.insert(id, Arc::new(task));
         imported += 1;
     }
 
@@ -1130,10 +1170,7 @@ fn load_with_legacy_at(
     Ok(Arc::new(Mutex::new(tasks)))
 }
 
-fn load_bytes(
-    path: &std::path::Path,
-    bytes: Vec<u8>,
-) -> crabbot_core::Result<Arc<Mutex<BTreeMap<u64, Task>>>> {
+fn load_bytes(path: &std::path::Path, bytes: Vec<u8>) -> crabbot_core::Result<Arc<Mutex<Tasks>>> {
     let text = String::from_utf8(bytes).map_err(|_| {
         crabbot_core::Error::Denied(format!(
             "Scheduler state {} is not valid UTF-8; repair it before restarting the scheduler.",
@@ -1155,9 +1192,7 @@ fn load_bytes(
     Ok(Arc::new(Mutex::new(tasks)))
 }
 
-fn load_at(
-    path: Option<&std::path::Path>,
-) -> crabbot_core::Result<Arc<Mutex<BTreeMap<u64, Task>>>> {
+fn load_at(path: Option<&std::path::Path>) -> crabbot_core::Result<Arc<Mutex<Tasks>>> {
     let Some(path) = path else {
         return Ok(Arc::new(Mutex::new(BTreeMap::new())));
     };
@@ -1207,7 +1242,7 @@ fn legacy_path() -> Option<PathBuf> {
 
 fn persist_at(
     path: Option<&std::path::Path>,
-    tasks: &Arc<Mutex<BTreeMap<u64, Task>>>,
+    tasks: &Arc<Mutex<Tasks>>,
 ) -> crabbot_core::Result<()> {
     let Some(path) = path else {
         return Ok(());
@@ -1226,10 +1261,7 @@ fn persist_at(
     persist_locked_at(Some(path), &tasks)
 }
 
-fn persist_locked_at(
-    path: Option<&std::path::Path>,
-    tasks: &BTreeMap<u64, Task>,
-) -> crabbot_core::Result<()> {
+fn persist_locked_at(path: Option<&std::path::Path>, tasks: &Tasks) -> crabbot_core::Result<()> {
     let Some(path) = path else {
         return Ok(());
     };
@@ -1241,176 +1273,6 @@ fn persist_locked_at(
     }
 
     save_file(path, text).map_err(Into::into)
-}
-
-fn validate_cron(value: &str) -> crabbot_core::Result<()> {
-    let fields = value.split_whitespace().collect::<Vec<_>>();
-
-    if fields.len() != 5 {
-        return Err(crabbot_core::Error::Denied("Cron must contain five fields.".into()));
-    }
-
-    for (field, (minimum, maximum)) in
-        fields.iter().zip([(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)])
-    {
-        parse_field(field, minimum, maximum)?;
-    }
-
-    Ok(())
-}
-
-fn parse_field(value: &str, minimum: u32, maximum: u32) -> crabbot_core::Result<Vec<u32>> {
-    let mut values = Vec::new();
-
-    for item in value.split(',') {
-        let (base, step) = item
-            .split_once('/')
-            .map_or((item, 1), |(base, step)| (base, step.parse::<u32>().unwrap_or(0)));
-
-        if step == 0 {
-            return Err(crabbot_core::Error::Denied("Cron step must be positive.".into()));
-        }
-
-        let (start, end) = if base == "*" || base == "?" {
-            (minimum, maximum)
-        } else if let Some((start, end)) = base.split_once('-') {
-            let start = start.parse::<u32>().map_err(|_| {
-                crabbot_core::Error::Denied("Cron range endpoint is invalid.".into())
-            })?;
-
-            let end = end.parse::<u32>().map_err(|_| {
-                crabbot_core::Error::Denied("Cron range endpoint is invalid.".into())
-            })?;
-
-            (start, end)
-        } else if item.contains('/') {
-            let point = base.parse::<u32>().unwrap_or(u32::MAX);
-            (point, maximum)
-        } else {
-            let point = base.parse::<u32>().unwrap_or(u32::MAX);
-            (point, point)
-        };
-
-        if start < minimum || end > maximum || start > end {
-            return Err(crabbot_core::Error::Denied(
-                "Cron field is outside its valid range.".into(),
-            ));
-        }
-
-        values.extend((start..=end).step_by(step as usize));
-    }
-
-    if values.is_empty() {
-        return Err(crabbot_core::Error::Denied("Cron field cannot be empty.".into()));
-    }
-
-    values.sort_unstable();
-    values.dedup();
-    Ok(values)
-}
-
-fn cron_match(value: &str, fields: &[u32; 5]) -> crabbot_core::Result<bool> {
-    let parsed = [
-        parse_field(value.split_whitespace().next().unwrap_or_default(), 0, 59)?,
-        parse_field(value.split_whitespace().nth(1).unwrap_or_default(), 0, 23)?,
-        parse_field(value.split_whitespace().nth(2).unwrap_or_default(), 1, 31)?,
-        parse_field(value.split_whitespace().nth(3).unwrap_or_default(), 1, 12)?,
-        parse_field(value.split_whitespace().nth(4).unwrap_or_default(), 0, 7)?,
-    ];
-
-    let minute = parsed[0].contains(&fields[0]);
-    let hour = parsed[1].contains(&fields[1]);
-    let month = parsed[3].contains(&fields[3]);
-    let day = parsed[2].contains(&fields[2]);
-    let weekday = parsed[4].contains(&fields[4]) || (fields[4] == 0 && parsed[4].contains(&7));
-    let day_field = value.split_whitespace().nth(2).unwrap_or_default();
-    let weekday_field = value.split_whitespace().nth(4).unwrap_or_default();
-    let day_any = day_field == "*" || day_field == "?";
-    let weekday_any = weekday_field == "*" || weekday_field == "?";
-    let calendar = match (day_any, weekday_any) {
-        (true, true) => true,
-        (true, false) => weekday,
-        (false, true) => day,
-        (false, false) => day || weekday,
-    };
-
-    Ok(minute && hour && month && calendar)
-}
-
-fn timezone(value: &str) -> crabbot_core::Result<TimeZone> {
-    if value == "UTC" {
-        return Ok(TimeZone::UTC);
-    }
-
-    if let Some(offset) = value.strip_prefix('+').or_else(|| value.strip_prefix('-')) {
-        if offset.len() != 5 || offset.as_bytes().get(2) != Some(&b':') {
-            return Err(crabbot_core::Error::Denied("Scheduler zone offset is invalid.".into()));
-        }
-
-        let hours = offset[..2]
-            .parse::<i32>()
-            .map_err(|_| crabbot_core::Error::Denied("Scheduler zone offset is invalid.".into()))?;
-
-        let minutes = offset[3..]
-            .parse::<i32>()
-            .map_err(|_| crabbot_core::Error::Denied("Scheduler zone offset is invalid.".into()))?;
-
-        if hours > 23 || minutes > 59 {
-            return Err(crabbot_core::Error::Denied("Scheduler zone offset is invalid.".into()));
-        }
-
-        let sign = if value.starts_with('-') { -1 } else { 1 };
-
-        let seconds = sign * (hours * 3_600 + minutes * 60);
-        return Offset::from_seconds(seconds).map(TimeZone::fixed).map_err(|error| {
-            crabbot_core::Error::Denied(format!("Scheduler zone is invalid: {error}."))
-        });
-    }
-
-    TimeZone::get(value).map_err(|error| {
-        crabbot_core::Error::Denied(format!("Scheduler zone is invalid: {error}."))
-    })
-}
-
-fn validate_zone(value: &str) -> crabbot_core::Result<()> {
-    timezone(value).map(|_| ())
-}
-
-fn next(cron: &str, zone: &str, after: u64) -> crabbot_core::Result<u64> {
-    validate_cron(cron)?;
-
-    let zone = timezone(zone)?;
-    let start = after.saturating_add(60 - after % 60);
-
-    if start > i64::MAX as u64 {
-        return Ok(u64::MAX);
-    }
-
-    for minute in 0..(8_u64 * 366 * 24 * 60) {
-        let seconds = start.saturating_add(minute.saturating_mul(60));
-        let timestamp = Timestamp::from_second(i64::try_from(seconds).map_err(|_| {
-            crabbot_core::Error::Denied("Scheduler timestamp exceeded its supported range.".into())
-        })?)
-        .map_err(|error| {
-            crabbot_core::Error::Denied(format!("Scheduler timestamp is invalid: {error}."))
-        })?;
-
-        let local = timestamp.to_zoned(zone.clone());
-        let weekday = local.weekday().to_sunday_zero_offset();
-        let values = [
-            u32::try_from(local.minute()).unwrap_or_default(),
-            u32::try_from(local.hour()).unwrap_or_default(),
-            u32::try_from(local.day()).unwrap_or_default(),
-            u32::try_from(local.month()).unwrap_or_default(),
-            u32::try_from(weekday).unwrap_or_default(),
-        ];
-
-        if cron_match(cron, &values)? {
-            return Ok(seconds);
-        }
-    }
-
-    Err(crabbot_core::Error::Denied("Cron has no occurrence in the search window.".into()))
 }
 
 fn zone() -> String {
@@ -1426,9 +1288,8 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BYTE_LIMIT, LIMIT, TEXT_LIMIT, Task, call, call_at, cron_match, load_at,
-        load_with_legacy_at, next, now, parse_field, path, persist_at, timezone, validate_cron,
-        validate_zone,
+        BYTE_LIMIT, LIMIT, TEXT_LIMIT, Task, Tasks, call, call_at, load_at, load_with_legacy_at,
+        next, now, parse_field, path, persist_at, timezone, validate_cron, validate_zone,
     };
 
     use crabbot_core::types::Request;
@@ -1438,8 +1299,65 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    fn tasks() -> Arc<Mutex<BTreeMap<u64, Task>>> {
+    fn tasks() -> Arc<Mutex<Tasks>> {
         Arc::new(Mutex::new(BTreeMap::new()))
+    }
+
+    #[tokio::test]
+    async fn task_clones_share_large_immutable_fields() {
+        let tasks = tasks();
+        let context = json!({"value": "x".repeat(super::CONTEXT_LIMIT - 20)});
+        let context_for_request = context.clone();
+
+        call(
+            &tasks,
+            Request::call(
+                1,
+                "add",
+                json!({"id": 1, "text": "x".repeat(super::TEXT_LIMIT), "context": context_for_request}),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let tasks = tasks.lock().unwrap();
+        let task = tasks.get(&1).unwrap();
+        let map_snapshot = tasks.clone();
+        let clone = Task::clone(task.as_ref());
+
+        assert!(Arc::ptr_eq(task, map_snapshot.get(&1).unwrap()));
+        assert!(Arc::ptr_eq(&task.text, &clone.text));
+        assert!(Arc::ptr_eq(&task.context, &clone.context));
+        assert_eq!(serde_json::to_value(task).unwrap()["text"], "x".repeat(super::TEXT_LIMIT));
+        assert_eq!(serde_json::to_value(task).unwrap()["context"], context);
+    }
+
+    #[tokio::test]
+    async fn task_snapshots_copy_on_write_only_changed_tasks() {
+        let tasks = tasks();
+
+        for id in 1..=2 {
+            call(
+                &tasks,
+                Request::call(10 + id, "add", json!({"id": id, "text": "task", "activate": true})),
+            )
+            .await
+            .unwrap();
+        }
+
+        let snapshot = tasks.lock().unwrap().clone();
+
+        {
+            let mut live = tasks.lock().unwrap();
+            Arc::make_mut(live.get_mut(&1).unwrap()).status = "paused".into();
+        }
+
+        let live = tasks.lock().unwrap();
+
+        assert_eq!(snapshot[&1].status, "active");
+        assert_eq!(live[&1].status, "paused");
+        assert!(!Arc::ptr_eq(&snapshot[&1], &live[&1]));
+        assert!(Arc::ptr_eq(&snapshot[&2], &live[&2]));
     }
 
     #[tokio::test]
@@ -1560,6 +1478,23 @@ mod tests {
 
         call(&tasks, Request::call(6, "report", json!({"id": 30, "run_id": 9001}))).await.unwrap();
 
+        let missing_parent = std::env::temp_dir()
+            .join(format!("crabbot-scheduler-report-{}", std::process::id()))
+            .join("missing/state.json");
+
+        let repeated_report = call_at(
+            &tasks,
+            Request::call(8, "report", json!({"id": 30, "run_id": 9001})),
+            Some(&missing_parent),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .result
+        .unwrap();
+
+        assert_eq!(repeated_report["reported"], true);
+
         let reports = call(&tasks, Request::call(7, "reports", json!({})))
             .await
             .unwrap()
@@ -1582,7 +1517,7 @@ mod tests {
             cron: None,
             zone: "UTC".into(),
             status: "completed".into(),
-            context: json!({"value": "x".repeat(super::CONTEXT_LIMIT - 20)}),
+            context: Arc::new(json!({"value": "x".repeat(super::CONTEXT_LIMIT - 20)})),
             last_result: Some("done".into()),
             last_outcome: Some("completed".into()),
             missed: "skip".into(),
@@ -1604,7 +1539,7 @@ mod tests {
 
         for id in 1..=45 {
             task.finished_run_id = Some(id);
-            tasks.lock().unwrap().insert(id, task.clone());
+            tasks.lock().unwrap().insert(id, Arc::new(task.clone()));
         }
 
         let first = call(&tasks, Request::call(1, "reports", json!({})))
@@ -1708,8 +1643,11 @@ mod tests {
     fn schedule_names_are_unique_selectable_and_reject_spaces() {
         assert!(super::valid_schedule_name("mighty-raccoon"));
         assert!(super::valid_schedule_name("backup_2.daily"));
+        assert!(super::valid_schedule_name(&"a".repeat(80)));
         assert!(!super::valid_schedule_name("my backup"));
         assert!(!super::valid_schedule_name("-backup"));
+        assert!(!super::valid_schedule_name(&"a".repeat(81)));
+        assert!(!super::valid_schedule_name("mïghty-raccoon"));
 
         let names = BTreeSet::from(["mighty-raccoon".to_owned()]);
 
@@ -1776,16 +1714,16 @@ mod tests {
         for id in 1..=LIMIT as u64 {
             tasks.lock().unwrap().insert(
                 id,
-                Task {
+                Arc::new(Task {
                     name: format!("task {id}"),
-                    text: format!("task {id}"),
+                    text: format!("task {id}").into(),
                     delay: 60,
                     due: id,
                     repeat: 0,
                     cron: None,
                     zone: "UTC".into(),
                     status: "active".into(),
-                    context: serde_json::Value::Null,
+                    context: Arc::new(serde_json::Value::Null),
                     last_result: None,
                     last_outcome: None,
                     missed: "skip".into(),
@@ -1803,7 +1741,7 @@ mod tests {
                     finish_result: None,
                     report_pending: false,
                     imported_timer_id: None,
-                },
+                }),
             );
         }
 
@@ -1816,14 +1754,14 @@ mod tests {
 
         assert!(error.to_string().contains("Remove a task before adding another"));
         assert_eq!(tasks.lock().unwrap().len(), LIMIT);
-        assert_eq!(tasks.lock().unwrap()[&1].text, "task 1");
+        assert_eq!(tasks.lock().unwrap()[&1].text.as_ref(), "task 1");
 
         let error = call(&tasks, Request::call(2, "add", json!({"id": 1, "text": "replace task"})))
             .await
             .unwrap_err();
 
         assert!(error.to_string().contains("already exists"));
-        assert_eq!(tasks.lock().unwrap()[&1].text, "task 1");
+        assert_eq!(tasks.lock().unwrap()[&1].text.as_ref(), "task 1");
     }
 
     #[tokio::test]
@@ -2309,7 +2247,7 @@ mod tests {
         .unwrap();
 
         call_at(&tasks, Request::call(2, "approve", json!({"id": 44})), None).await.unwrap();
-        tasks.lock().unwrap().get_mut(&44).unwrap().due = 100;
+        Arc::make_mut(tasks.lock().unwrap().get_mut(&44).unwrap()).due = 100;
 
         let skipped =
             call_at(&tasks, Request::call(3, "claim", json!({"at": 200, "since": 150})), None)
@@ -2383,7 +2321,7 @@ mod tests {
         .await
         .unwrap();
 
-        tasks.lock().unwrap().get_mut(&61).unwrap().due = 100;
+        Arc::make_mut(tasks.lock().unwrap().get_mut(&61).unwrap()).due = 100;
         call_at(&tasks, Request::call(7, "claim", json!({"at": 200, "since": 150})), None)
             .await
             .unwrap();
@@ -2423,7 +2361,7 @@ mod tests {
         .await
         .unwrap();
 
-        tasks.lock().unwrap().get_mut(&62).unwrap().due = 100;
+        Arc::make_mut(tasks.lock().unwrap().get_mut(&62).unwrap()).due = 100;
         call_at(&tasks, Request::call(2, "claim", json!({"at": 200, "since": 150})), None)
             .await
             .unwrap();
@@ -2605,7 +2543,7 @@ mod tests {
         let tasks = tasks();
         tasks.lock().unwrap().insert(
             1,
-            Task {
+            Arc::new(Task {
                 name: "check".into(),
                 text: "check".into(),
                 delay: 2,
@@ -2614,7 +2552,7 @@ mod tests {
                 cron: None,
                 zone: "UTC".into(),
                 status: "active".into(),
-                context: serde_json::Value::Null,
+                context: Arc::new(serde_json::Value::Null),
                 last_result: None,
                 last_outcome: None,
                 missed: "skip".into(),
@@ -2632,14 +2570,14 @@ mod tests {
                 finish_result: None,
                 report_pending: false,
                 imported_timer_id: None,
-            },
+            }),
         );
 
         let template = tasks.lock().unwrap()[&1].clone();
 
         for id in 2..=LIMIT as u64 + 1 {
             let mut task = template.clone();
-            task.due = id;
+            Arc::make_mut(&mut task).due = id;
             tasks.lock().unwrap().insert(id, task);
         }
 
@@ -2647,7 +2585,7 @@ mod tests {
 
         let loaded = load_at(Some(&path)).unwrap();
 
-        assert_eq!(loaded.lock().unwrap()[&1].text, "check");
+        assert_eq!(loaded.lock().unwrap()[&1].text.as_ref(), "check");
         assert_eq!(loaded.lock().unwrap().len(), LIMIT + 1);
         std::fs::write(&path, "broken").unwrap();
 
@@ -2682,8 +2620,7 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.iter().all(|name| super::valid_schedule_name(name)));
 
-        let persisted: BTreeMap<u64, Task> =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let persisted: Tasks = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
 
         assert!(persisted.values().all(|task| !task.name.is_empty()));
 
@@ -2725,16 +2662,16 @@ mod tests {
         let loaded = load_with_legacy_at(Some(&scheduler_path), Some(&timer_path)).unwrap();
         {
             let guard = loaded.lock().unwrap();
-            let task = guard.values().find(|task| task.text == "remind me").unwrap();
+            let task = guard.values().find(|task| task.text.as_ref() == "remind me").unwrap();
 
-            assert_eq!(task.text, "remind me");
+            assert_eq!(task.text.as_ref(), "remind me");
             assert_eq!(task.delay, 60);
             assert_eq!(task.due, 1234);
             assert_eq!(task.repeat, 300);
             assert_eq!(task.status, "active");
             assert_eq!(task.missed, "coalesce");
             assert_eq!(guard.len(), 2);
-            assert_eq!(guard[&42].text, "existing");
+            assert_eq!(guard[&42].text.as_ref(), "existing");
         }
 
         let loaded_again = load_with_legacy_at(Some(&scheduler_path), Some(&timer_path)).unwrap();
@@ -2745,14 +2682,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .values()
-                .any(|task| { task.text == "remind me" && task.status == "active" })
+                .any(|task| { task.text.as_ref() == "remind me" && task.status == "active" })
         );
 
         let imported_id = loaded_again
             .lock()
             .unwrap()
             .iter()
-            .find_map(|(id, task)| (task.text == "remind me").then_some(*id))
+            .find_map(|(id, task)| (task.text.as_ref() == "remind me").then_some(*id))
             .unwrap();
 
         call_at(
@@ -2766,7 +2703,9 @@ mod tests {
         let after_removal = load_with_legacy_at(Some(&scheduler_path), Some(&timer_path)).unwrap();
 
         assert_eq!(after_removal.lock().unwrap().len(), 1);
-        assert!(!after_removal.lock().unwrap().values().any(|task| task.text == "remind me"));
+        assert!(
+            !after_removal.lock().unwrap().values().any(|task| task.text.as_ref() == "remind me")
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2785,10 +2724,24 @@ mod tests {
         let after = 1_700_000_000;
         let due = next("*/15 * * * *", "Europe/Rome", after).unwrap();
         let sunday = next("0 9 * * 7", "UTC", after).unwrap();
+        let after_spring_transition = 1_678_597_200;
+        let after_first_fall_occurrence = 1_699_163_100;
+        let spring_due = next("0 2 * * *", "America/New_York", after_spring_transition).unwrap();
+        let fall_due = next("30 1 * * *", "America/New_York", after_first_fall_occurrence).unwrap();
 
-        assert!(due > after);
-        assert_eq!(due % 60, 0);
+        assert_eq!(due, 1_700_000_100);
         assert!(sunday > after);
+        assert_eq!(spring_due, 1_678_687_200);
+        assert_eq!(fall_due, 1_699_165_800);
+    }
+
+    #[test]
+    fn cron_search_jumps_between_allowed_minutes() {
+        let schedule = super::CronSchedule::parse("5,20,50 * * * *").unwrap();
+
+        assert_eq!(schedule.minutes_until_next(4), 1);
+        assert_eq!(schedule.minutes_until_next(5), 15);
+        assert_eq!(schedule.minutes_until_next(50), 15);
     }
 
     #[test]
@@ -2803,7 +2756,7 @@ mod tests {
         }
 
         assert!(validate_cron("0 12 ? * 1-5").is_ok());
-        assert!(cron_match("0 9 * * 7", &[0, 9, 19, 11, 0]).unwrap());
+        assert!(super::CronSchedule::parse("0 9 * * 7").unwrap().matches(&[0, 9, 19, 11, 0]));
 
         for value in ["* * * *", "* * * * * *", "0 0 0 0 0", "*/0 * * * *"] {
             assert!(validate_cron(value).is_err(), "{value} should be rejected");
@@ -2815,8 +2768,10 @@ mod tests {
         assert!(validate_zone("+24:00").is_err());
         assert!(validate_zone("Not/AZone").is_err());
         assert!(timezone("UTC").is_ok());
-        assert!(cron_match("0 12 * * 1-5", &[0, 12, 1, 1, 1]).unwrap());
-        assert!(!cron_match("0 12 * * 1-5", &[1, 12, 1, 1, 1]).unwrap());
+        let weekday_noon = super::CronSchedule::parse("0 12 * * 1-5").unwrap();
+
+        assert!(weekday_noon.matches(&[0, 12, 1, 1, 1]));
+        assert!(!weekday_noon.matches(&[1, 12, 1, 1, 1]));
     }
 
     #[tokio::test]
@@ -2837,6 +2792,7 @@ mod tests {
         call(&tasks, Request::call(4, "approve", json!({"id": 2}))).await.unwrap();
 
         for task in tasks.lock().unwrap().values_mut() {
+            let task = Arc::make_mut(task);
             task.due = 0;
         }
 
@@ -2891,7 +2847,7 @@ mod tests {
             call(&tasks, Request::call(10 + id, "approve", json!({"id": id}))).await.unwrap();
             let mut tasks = tasks.lock().unwrap();
             let task = tasks.get_mut(&id).unwrap();
-            task.due = 100;
+            Arc::make_mut(task).due = 100;
         }
 
         let skipped = call(&tasks, Request::call(20, "claim", json!({"at": 200, "since": 150})))
@@ -2928,16 +2884,16 @@ mod tests {
             for id in 0..33 {
                 scheduled.insert(
                     id,
-                    Task {
+                    Arc::new(Task {
                         name: "scheduled task".into(),
-                        text: text.clone(),
+                        text: text.clone().into(),
                         delay: 0,
                         due: 0,
                         repeat: 0,
                         cron: None,
                         zone: "UTC".into(),
                         status: "active".into(),
-                        context: serde_json::Value::Null,
+                        context: Arc::new(serde_json::Value::Null),
                         last_result: None,
                         last_outcome: None,
                         missed: "skip".into(),
@@ -2955,7 +2911,7 @@ mod tests {
                         finish_result: None,
                         report_pending: false,
                         imported_timer_id: None,
-                    },
+                    }),
                 );
             }
         }

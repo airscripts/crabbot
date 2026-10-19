@@ -18,7 +18,7 @@ pub fn parse_datetime(value: &str, timezone: Option<&str>) -> Result<u64, String
     })?;
 
     let timezone = match timezone {
-        Some(timezone) => jiff::tz::TimeZone::get(timezone)
+        Some(timezone) => parse_timezone(timezone)
             .map_err(|error| format!("The schedule timezone is invalid: {error}."))?,
         None => jiff::tz::TimeZone::system(),
     };
@@ -167,6 +167,55 @@ pub fn format_datetime(timestamp: u64) -> String {
     format!("{date} {hour:02}:{minute:02}:{second:02} UTC")
 }
 
+/// Formats a timestamp in a configured timezone and includes its UTC equivalent.
+pub fn format_datetime_in_timezone(timestamp: u64, timezone: &str) -> String {
+    if timezone == "UTC" {
+        return format_datetime(timestamp);
+    }
+
+    let Ok(timestamp_second) = i64::try_from(timestamp) else {
+        return format_datetime(timestamp);
+    };
+
+    let Ok(timestamp_value) = jiff::Timestamp::from_second(timestamp_second) else {
+        return format_datetime(timestamp);
+    };
+
+    let Ok(zone) = parse_timezone(timezone) else {
+        return format_datetime(timestamp);
+    };
+
+    let local = timestamp_value.to_zoned(zone);
+    let local_time = local.strftime("%Y-%m-%d %H:%M:%S %:z");
+
+    format!("{local_time} ({timezone}; {})", format_datetime(timestamp))
+}
+
+fn parse_timezone(value: &str) -> Result<jiff::tz::TimeZone, String> {
+    if let Some(offset) = value.strip_prefix('+').or_else(|| value.strip_prefix('-')) {
+        if offset.len() != 5 || offset.as_bytes().get(2) != Some(&b':') {
+            return Err("UTC offset must use the form +HH:MM or -HH:MM".into());
+        }
+
+        let hours = offset[..2].parse::<i32>().map_err(|error| error.to_string())?;
+        let minutes = offset[3..].parse::<i32>().map_err(|error| error.to_string())?;
+
+        if hours > 23 || minutes > 59 {
+            return Err("UTC offset is outside the valid range".into());
+        }
+
+        let sign = if value.starts_with('-') { -1 } else { 1 };
+
+        let seconds = sign * (hours * 3_600 + minutes * 60);
+
+        return jiff::tz::Offset::from_seconds(seconds)
+            .map(jiff::tz::TimeZone::fixed)
+            .map_err(|error| error.to_string());
+    }
+
+    jiff::tz::TimeZone::get(value).map_err(|error| error.to_string())
+}
+
 fn civil_date_from_unix_days(days_since_unix_epoch: i64) -> CivilDate {
     let days_since_civil_epoch = days_since_unix_epoch + DAYS_BEFORE_UNIX_EPOCH;
     let era = days_since_civil_epoch / DAYS_PER_ERA;
@@ -202,7 +251,10 @@ fn month_and_day(day_of_year: i64) -> (i64, i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_date, format_datetime, format_duration, parse_datetime, parse_duration};
+    use super::{
+        format_date, format_datetime, format_datetime_in_timezone, format_duration, parse_datetime,
+        parse_duration,
+    };
 
     #[test]
     fn formats_epoch_leap_days_and_year_boundaries() {
@@ -223,6 +275,36 @@ mod tests {
         assert_eq!(format_datetime(0), "1970-01-01 00:00:00 UTC");
         assert_eq!(format_datetime(1_709_164_800), "2024-02-29 00:00:00 UTC");
         assert_eq!(format_datetime(1_700_000_000), "2023-11-14 22:13:20 UTC");
+    }
+
+    #[test]
+    fn formats_named_timezone_with_utc_reference() {
+        assert_eq!(
+            format_datetime_in_timezone(1_700_000_000, "Europe/Rome"),
+            "2023-11-14 23:13:20 +01:00 (Europe/Rome; 2023-11-14 22:13:20 UTC)"
+        );
+
+        assert_eq!(format_datetime_in_timezone(1_700_000_000, "UTC"), "2023-11-14 22:13:20 UTC");
+        assert_eq!(
+            format_datetime_in_timezone(1_700_000_000, "+03:00"),
+            "2023-11-15 01:13:20 +03:00 (+03:00; 2023-11-14 22:13:20 UTC)"
+        );
+
+        let first_fall_occurrence =
+            "2024-11-03T05:30:00Z".parse::<jiff::Timestamp>().unwrap().as_second() as u64;
+
+        let second_fall_occurrence =
+            "2024-11-03T06:30:00Z".parse::<jiff::Timestamp>().unwrap().as_second() as u64;
+
+        assert_eq!(
+            format_datetime_in_timezone(first_fall_occurrence, "America/New_York"),
+            "2024-11-03 01:30:00 -04:00 (America/New_York; 2024-11-03 05:30:00 UTC)"
+        );
+
+        assert_eq!(
+            format_datetime_in_timezone(second_fall_occurrence, "America/New_York"),
+            "2024-11-03 01:30:00 -05:00 (America/New_York; 2024-11-03 06:30:00 UTC)"
+        );
     }
 
     #[test]
@@ -255,6 +337,11 @@ mod tests {
         assert_eq!(
             parse_datetime("2030-10-20 09:00", Some("UTC")).unwrap(),
             "2030-10-20T09:00:00Z".parse::<jiff::Timestamp>().unwrap().as_second() as u64
+        );
+
+        assert_eq!(
+            parse_datetime("2030-10-20 09:00", Some("+02:00")).unwrap(),
+            "2030-10-20T07:00:00Z".parse::<jiff::Timestamp>().unwrap().as_second() as u64
         );
 
         assert!(parse_datetime("tomorrow morning", Some("UTC")).is_err());

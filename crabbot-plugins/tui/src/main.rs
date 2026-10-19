@@ -22,7 +22,13 @@ use crabbot_core::types::ToolSpec;
 use serde_json::Value;
 #[cfg(test)]
 use std::sync::Arc;
-use std::{future::Future, path::PathBuf, pin::Pin};
+use std::{
+    future::Future,
+    io::{BufRead, Read},
+    path::PathBuf,
+    pin::Pin,
+};
+
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, duplex,
 };
@@ -38,6 +44,7 @@ const DEFAULT_NAME: &str = "Crabbot";
 const DEFAULT_SESSION_ID: &str = "default";
 const SESSION_LIST_PAGE_SIZE: usize = 5;
 const PLUGIN_LIST_PAGE_SIZE: usize = 5;
+const SCHEDULE_HISTORY_PAGE_SIZE: usize = 5;
 const STREAMING_TURN_TIMEOUT: Duration = Duration::from_secs(310);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const COMPACTION_TIMEOUT: Duration = Duration::from_secs(305);
@@ -2184,37 +2191,60 @@ where
             Ok((mut params, instruction)) => {
                 let id = schedule_id();
                 params["id"] = Value::from(id);
-                params["text"] = Value::String(instruction);
+                params["text"] = Value::String(instruction.clone());
                 params["activate"] = Value::Bool(true);
                 params["context"] = serde_json::json!({
-                    "provider": provider,
-                    "model": model,
-                    "workspace": workspace,
+                    "provider": provider.clone(),
+                    "model": model.clone(),
+                    "workspace": workspace.clone(),
                     "tools": configured_tui_tools(&home),
                     "shell": configured_tui_shell(&home),
                     "origin": {"channel": "tui", "session": session}
                 });
-
-                let tools_access =
-                    if params["context"]["tools"] == true { "enabled" } else { "disabled" };
-
-                let shell_access =
-                    if params["context"]["tools"] == true && params["context"]["shell"] == true {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    };
 
                 capability(home.clone(), "scheduler", "add", params, host)
                     .await
                     .map(|value| {
                         let next_run = value["due"]
                             .as_u64()
-                            .map(crabbot_date::format_datetime)
+                            .map(|due| {
+                                crabbot_date::format_datetime_in_timezone(
+                                    due,
+                                    value["zone"].as_str().unwrap_or("UTC"),
+                                )
+                            })
                             .unwrap_or_else(|| "unknown time".into());
+                        let name = value["name"].as_str().unwrap_or("Scheduled task");
+                        let tools_access = if value["context"]["tools"] == true {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        };
+
+                        let shell_access = if value["context"]["tools"] == true
+                            && value["context"]["shell"] == true
+                        {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        };
+
+                        let frequency = if let Some(repeat) =
+                            value["repeat"].as_u64().filter(|repeat| *repeat > 0)
+                        {
+                            format!("\nFrequency: every {}", crabbot_date::format_duration(repeat))
+                        } else if let Some(cron) = value["cron"].as_str() {
+                            format!(
+                                "\nFrequency: {cron} ({})",
+                                value["zone"].as_str().unwrap_or("UTC")
+                            )
+                        } else {
+                            String::new()
+                        };
+
                         format!(
-                            "Schedule {id} ({}) is active. Next run: {next_run}. Workspace tools: {tools_access}; local shell: {shell_access}. Use /schedule pause {id} to stop it.\n> ",
-                            value["name"].as_str().unwrap_or("Scheduled task")
+                            "Schedule {name} ({id}) is active.\n\nInstruction: {instruction}\nProvider: {provider}; model: {model}.\nWorkspace: {}\nTools: {tools_access}\nShell: {shell_access}\nNext run: {next_run}{frequency}\n\nCheck it with /schedule list; pause it with /schedule pause {id}.\n> ",
+                            workspace.as_deref().unwrap_or("configured workspace")
                         )
                     })
             }
@@ -2222,19 +2252,52 @@ where
             Err(error) => Ok(format!("{error}\n> ")),
         },
 
+        "history" => {
+            let mut arguments = remaining.split_whitespace();
+            let selector = arguments.next();
+            let page_value = arguments.next();
+            let page = match page_value.map(str::parse::<usize>).transpose() {
+                Ok(Some(page)) if page > 0 => page,
+                Ok(None) => 1,
+                _ => return "Usage: /schedule history ID|NAME [PAGE].\n> ".into(),
+            };
+
+            if selector.is_none() || arguments.next().is_some() {
+                Ok("Usage: /schedule history ID|NAME [PAGE].\n> ".into())
+            } else {
+                let selector = selector.unwrap_or_default();
+
+                match schedule_history_selector(&home, selector, host).await {
+                    Ok((id, name)) => read_schedule_history(&home, id, page)
+                        .map(|(records, total, path)| {
+                            if page > total.div_ceil(SCHEDULE_HISTORY_PAGE_SIZE).max(1) {
+                                return format!(
+                                    "Schedule history page {page} is out of range. There are {} page(s).\n> ",
+                                    total.div_ceil(SCHEDULE_HISTORY_PAGE_SIZE).max(1)
+                                );
+                            }
+
+                            format_schedule_history(&records, total, id, &name, page, &path)
+                        })
+                        .map_err(crabbot_core::Error::Denied),
+                    Err(error) => Ok(format!("{error}\n> ")),
+                }
+            }
+        }
+
         "remove" => match parts.next() {
             Some(selector) if parts.next().is_none() => {
-                match schedule_selector_id(&home, selector, host).await {
-                    Ok(id) => {
+                match schedule_selector(&home, selector, host).await {
+                    Ok((id, name)) => {
                         capability(home, "scheduler", "remove", serde_json::json!({"id": id}), host)
                             .await
                             .map(|value| {
                                 if value["cancel_requested"] == true {
-                                    format!("Cancellation requested for schedule {selector}. Its current action will be interrupted; a side effect may already have happened.\n> ")
+                                    format!("Cancellation requested for schedule {name} ({id}). Its current action will be interrupted; a side effect may already have happened.\n> ")
                                 } else if value["deleted"] == true {
-                                    format!("Schedule {selector} was removed.\n> ")
+                                    format!("Schedule {name} ({id}) was removed.\n> ")
                                 } else {
-                                    format!("Schedule {selector} was not found.\n> ")
+                                    format!("Schedule {name} ({id}) was not found.\n> ")
                                 }
                             })
                     }
@@ -2254,16 +2317,16 @@ where
             } else {
                 let selector = selector.unwrap_or_default();
 
-                match schedule_selector_id(&home, selector, host).await {
-                    Ok(id) => capability(home, "scheduler", action, serde_json::json!({"id": id}), host)
+                match schedule_selector(&home, selector, host).await {
+                    Ok((id, name)) => capability(home, "scheduler", action, serde_json::json!({"id": id}), host)
                         .await
                         .map(|value| match action {
-                            "run" => format!("Schedule {selector} queued to run now. Check its result with /schedule list.\n> "),
-                            "retry" => format!("Schedule {selector} retry queued.\n> "),
+                            "run" => format!("Schedule {name} ({id}) queued to run now. Check its result with /schedule list.\n> "),
+                            "retry" => format!("Schedule {name} ({id}) retry queued.\n> "),
 
                             _ => {
                                 let status = value["status"].as_str().unwrap_or(action);
-                                format!("Schedule {selector} is {status}.\n> ")
+                                format!("Schedule {name} ({id}) is {status}.\n> ")
                             }
                         }),
 
@@ -2280,14 +2343,25 @@ where
     })
 }
 
+#[cfg(test)]
 async fn schedule_selector_id<C, F>(home: &str, selector: &str, host: C) -> Result<u64, String>
 where
     C: Fn(String, String, Value) -> F + Copy,
     F: Future<Output = crabbot_core::Result<Value>>,
 {
-    if let Ok(id) = selector.parse::<u64>() {
-        return Ok(id);
-    }
+    schedule_selector(home, selector, host).await.map(|(id, _)| id)
+}
+
+async fn schedule_selector<C, F>(
+    home: &str,
+    selector: &str,
+    host: C,
+) -> Result<(u64, String), String>
+where
+    C: Fn(String, String, Value) -> F + Copy,
+    F: Future<Output = crabbot_core::Result<Value>>,
+{
+    let id = selector.parse::<u64>().ok();
 
     let mut page = 1;
 
@@ -2304,16 +2378,310 @@ where
         let items =
             value["items"].as_array().ok_or("The scheduler returned an invalid task list.")?;
 
-        if let Some(item) = items.iter().find(|item| item["name"].as_str() == Some(selector)) {
-            return item["id"].as_u64().ok_or_else(|| "The schedule has an invalid ID.".into());
+        if let Some(item) = items
+            .iter()
+            .find(|item| item["name"].as_str() == Some(selector) || item["id"].as_u64() == id)
+        {
+            let id = item["id"].as_u64().ok_or("The schedule has an invalid ID.")?;
+            let name = item["name"].as_str().unwrap_or("Scheduled task").to_owned();
+
+            return Ok((id, name));
         }
 
         if page >= value["pages"].as_u64().unwrap_or(1) {
-            return Err(format!("No schedule named {selector} was found."));
+            return Err(format!("No schedule named or numbered {selector} was found."));
         }
 
         page += 1;
     }
+}
+
+async fn schedule_history_selector<C, F>(
+    home: &str,
+    selector: &str,
+    host: C,
+) -> Result<(u64, String), String>
+where
+    C: Fn(String, String, Value) -> F + Copy,
+    F: Future<Output = crabbot_core::Result<Value>>,
+{
+    if let Ok(id) = selector.parse::<u64>() {
+        return Ok((id, selector.to_owned()));
+    }
+
+    let live_error = match schedule_selector(home, selector, host).await {
+        Ok(schedule) => return Ok(schedule),
+        Err(error) => error,
+    };
+
+    let directory = PathBuf::from(home).join("logs/schedules");
+    let prefix = format!("{selector}-");
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(live_error),
+        Err(error) => return Err(format!("Could not list schedule history: {error}.")),
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let Some(filename) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+
+        if let Some(id) = filename
+            .strip_prefix(&prefix)
+            .and_then(|suffix| suffix.strip_suffix(".jsonl"))
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            return Ok((id, selector.to_owned()));
+        }
+    }
+
+    Err(live_error)
+}
+
+fn read_schedule_history(
+    home: &str,
+    id: u64,
+    page: usize,
+) -> Result<(Vec<Value>, usize, PathBuf), String> {
+    let directory = PathBuf::from(home).join("logs/schedules");
+    let suffix = format!("-{id}.jsonl");
+    let path = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&suffix))
+            })
+            .unwrap_or_else(|| directory.join(format!("{id}.jsonl"))),
+
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            directory.join(format!("{id}.jsonl"))
+        }
+
+        Err(error) => return Err(format!("Could not list schedule history: {error}.")),
+    };
+
+    let retained_limit = page
+        .checked_mul(SCHEDULE_HISTORY_PAGE_SIZE)
+        .ok_or_else(|| "Schedule history page is too large.".to_owned())?;
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), 0, path));
+        }
+
+        Err(error) => return Err(format!("Could not open schedule history: {error}.")),
+    };
+
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    let mut records = std::collections::VecDeque::new();
+    let mut line_number = 0;
+    let mut total = 0_usize;
+
+    loop {
+        line.clear();
+
+        let read = (&mut reader)
+            .take(64 * 1024 + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("Could not read schedule history: {error}."))?;
+
+        if read == 0 {
+            break;
+        }
+
+        line_number += 1;
+
+        if read > 64 * 1024 {
+            return Err(format!("Schedule history line {line_number} exceeds the 64 KiB limit."));
+        }
+
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+
+        let text = std::str::from_utf8(&line).map_err(|error| {
+            format!("Schedule history line {line_number} is not UTF-8: {error}.")
+        })?;
+        let record: Value = serde_json::from_str(text).map_err(|error| {
+            format!("Schedule history line {line_number} is invalid JSON: {error}.")
+        })?;
+
+        if !record.is_object() {
+            return Err(format!("Schedule history line {line_number} is not a JSON object."));
+        }
+
+        total += 1;
+
+        if records.len() == retained_limit {
+            records.pop_front();
+        }
+
+        records.push_back(record);
+    }
+
+    let skip = (page - 1).saturating_mul(SCHEDULE_HISTORY_PAGE_SIZE);
+    let count = total.saturating_sub(skip).min(SCHEDULE_HISTORY_PAGE_SIZE);
+    let start = records.len().saturating_sub(skip.saturating_add(count));
+    let page_records = records.into_iter().skip(start).take(count).collect();
+
+    Ok((page_records, total, path))
+}
+
+fn format_schedule_history(
+    records: &[Value],
+    total: usize,
+    id: u64,
+    name: &str,
+    page: usize,
+    path: &std::path::Path,
+) -> String {
+    let pages = total.div_ceil(SCHEDULE_HISTORY_PAGE_SIZE).max(1);
+    let start = if total == 0 { 0 } else { (page - 1) * SCHEDULE_HISTORY_PAGE_SIZE + 1 };
+
+    let end = (start + records.len()).saturating_sub(1).min(total);
+    let name = records
+        .last()
+        .and_then(|record| record["schedule"]["name"].as_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(name);
+    let mut output =
+        format!("Schedule history: {name} | {start}–{end} of {total} | page {page}/{pages}:\n");
+
+    if records.is_empty() {
+        output.push_str("No execution history has been recorded.\n");
+    } else {
+        output.push('\n');
+        let displayed = records.iter().rev().collect::<Vec<_>>();
+
+        for (index, record) in displayed.iter().enumerate() {
+            let run = &record["run"];
+            let run_id =
+                run["id"].as_u64().map_or_else(|| "Run".to_owned(), |id| format!("Run {id}"));
+            let outcome = run["status"]
+                .as_str()
+                .or_else(|| record["status"].as_str())
+                .map(schedule_outcome_label)
+                .unwrap_or("outcome unknown");
+            let mut details = Vec::new();
+
+            if let Some(timestamp) = record["timestamp"].as_str() {
+                let recorded = timestamp
+                    .parse::<jiff::Timestamp>()
+                    .ok()
+                    .and_then(|timestamp| u64::try_from(timestamp.as_second()).ok())
+                    .map(crabbot_date::format_datetime)
+                    .unwrap_or_else(|| schedule_history_text(timestamp));
+                details.push(format!("Recorded: {recorded}"));
+            }
+
+            let timezone = record["schedule"]["timezone"].as_str().unwrap_or("UTC");
+
+            for (field, label) in [
+                ("scheduled_for", "Scheduled for"),
+                ("next_run_at", "Next run"),
+                ("retry_at", "Retry at"),
+            ] {
+                if let Some(timestamp) = run[field].as_u64() {
+                    details.push(format!(
+                        "{label}: {}",
+                        crabbot_date::format_datetime_in_timezone(timestamp, timezone)
+                    ));
+                }
+            }
+
+            if let Some(attempt) = run["attempt"].as_u64() {
+                details.push(format!(
+                    "Attempt: {attempt} (retries configured: {})",
+                    run["retry_limit"].as_u64().unwrap_or_default()
+                ));
+            }
+
+            if run["manual"] == true {
+                details.push("Trigger: manual run".into());
+            } else if run["retry"] == true {
+                details.push("Trigger: manual retry".into());
+            }
+
+            if let Some(policy) = run["missed_policy"].as_str() {
+                details.push(format!("Missed-run policy: {}", schedule_history_text(policy)));
+            }
+
+            if let Some(provider) = record["agent"]["provider"].as_str() {
+                let model = record["agent"]["model"].as_str().map(schedule_history_text);
+                details.push(format!(
+                    "Agent: {}{}",
+                    schedule_history_text(provider),
+                    model.map_or_else(String::new, |model| format!(" ({model})"))
+                ));
+            }
+
+            if let Some(workspace) = record["agent"]["workspace"].as_str() {
+                details.push(format!("Workspace: {}", schedule_history_text(workspace)));
+            }
+
+            let result = schedule_history_text(record["result"].as_str().unwrap_or_default());
+            details.push(if result.is_empty() {
+                "Result: (no result text)".into()
+            } else {
+                format!("Result: {result}")
+            });
+
+            output.push_str(&format_tree_entry(
+                &format!("{run_id} | {outcome}"),
+                &details,
+                index + 1 == displayed.len(),
+            ));
+
+            if index + 1 < displayed.len() {
+                output.push_str("\n\n");
+            }
+        }
+    }
+
+    output.push_str(&format!(
+        "\nRaw JSONL: {}\nUse `crab schedule history {id} --raw` to print the raw log.\n> ",
+        schedule_history_text(&path.display().to_string())
+    ));
+    output
+}
+
+fn schedule_outcome_label(outcome: &str) -> &'static str {
+    match outcome {
+        "completed" => "completed successfully",
+        "retrying" => "failed; retry queued",
+        "continuing" => "failed; next occurrence remains scheduled",
+        "cancelled" => "cancelled",
+        "skipped" => "skipped",
+        _ => "failed; task paused",
+    }
+}
+
+fn schedule_history_text(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                character.is_whitespace().then_some(' ')
+            } else if character == '—' {
+                Some('-')
+            } else {
+                Some(character)
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn schedule_help() -> &'static str {
@@ -2322,6 +2690,7 @@ fn schedule_help() -> &'static str {
 Commands:
   /schedule help                          Show this help
   /schedule list [PAGE]                   List schedules and latest outcomes
+  /schedule history ID|NAME [PAGE]        Show schedule run history
   /schedule add TIMING [options] TEXT      Add a one-time or recurring task
   /schedule run ID|NAME                    Run a task now
   /schedule retry ID|NAME                  Retry a paused task
@@ -2892,7 +3261,13 @@ fn format_schedules(value: &Value) -> String {
             let mut details = Vec::new();
 
             if let Some(due) = item["due"].as_u64() {
-                details.push(format!("Next run: {}", crabbot_date::format_datetime(due)));
+                details.push(format!(
+                    "Next run: {}",
+                    crabbot_date::format_datetime_in_timezone(
+                        due,
+                        item["zone"].as_str().unwrap_or("UTC"),
+                    )
+                ));
             } else {
                 details.push("No upcoming run".into());
             }
@@ -2921,7 +3296,13 @@ fn format_schedules(value: &Value) -> String {
             }
 
             if let Some(retry_at) = item["retry_at"].as_u64() {
-                details.push(format!("Next retry: {}", crabbot_date::format_datetime(retry_at)));
+                details.push(format!(
+                    "Next retry: {}",
+                    crabbot_date::format_datetime_in_timezone(
+                        retry_at,
+                        item["zone"].as_str().unwrap_or("UTC"),
+                    )
+                ));
             }
 
             if item["run_requested"] == true {
@@ -4574,6 +4955,21 @@ mod tests {
             "Schedules (1–1 of 1, page 1 of 1)\n└─ 7 | Scheduled task | pending\n   ├─ Next run: 1970-01-01 00:00:42 UTC\n   └─ Automatic retries are off\n> "
         );
 
+        let local = super::format_schedules(&json!({
+            "items": [{
+                "id": 8,
+                "name": "rome-report",
+                "due": 1_700_000_000,
+                "cron": "0 9 * * *",
+                "zone": "Europe/Rome",
+                "status": "active"
+            }]
+        }));
+
+        assert!(local.contains(
+            "Next run: 2023-11-14 23:13:20 +01:00 (Europe/Rome; 2023-11-14 22:13:20 UTC)"
+        ));
+
         assert_eq!(
             super::format_memories(&json!({
                 "items": [
@@ -4592,6 +4988,80 @@ mod tests {
             super::format_memories(&json!({"items": [], "total": 0, "page": 1, "pages": 1})),
             "Memories | 0–0 of 0 | page 1/1:\nNo memories found.\n> "
         );
+    }
+
+    #[test]
+    fn tui_schedule_history_paginates_five_runs() {
+        let root = std::env::temp_dir()
+            .join(format!("crabbot-tui-schedule-history-{}", std::process::id()));
+        let directory = root.join("logs/schedules");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("morning-check-42.jsonl");
+        let records = (1..=12)
+            .map(|run_id| {
+                json!({
+                    "timestamp": "2026-10-19T14:00:00Z",
+                    "schedule": {"id": 42, "name": "morning-check", "timezone": "UTC"},
+                    "run": {"id": run_id, "status": "completed", "scheduled_for": 1_800_000_000},
+                    "agent": {"provider": "codex", "model": "gpt-6-luna"},
+                    "result": format!("run-{run_id}")
+                })
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(
+            &path,
+            records.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"),
+        )
+        .unwrap();
+
+        let (page, total, found_path) =
+            super::read_schedule_history(root.to_str().unwrap(), 42, 2).unwrap();
+        let output =
+            super::format_schedule_history(&page, total, 42, "morning-check", 2, &found_path);
+
+        assert_eq!(page.len(), 5);
+        assert_eq!(total, 12);
+        assert!(output.contains("Schedule history: morning-check | 6–10 of 12 | page 2/3:"));
+        assert!(
+            output.find("Run 7 | completed successfully").unwrap()
+                < output.find("Run 3 | completed successfully").unwrap()
+        );
+
+        assert!(output.contains("Raw JSONL: "));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tui_schedule_add_shows_name_access_and_frequency() {
+        let host = |_: String, _: String, _: serde_json::Value| async move {
+            Ok(json!({
+                "id": 77,
+                "name": "morning-check",
+                "status": "active",
+                "due": 1_800_000_000_u64,
+                "repeat": 300,
+                "zone": "UTC",
+                "context": {"tools": false, "shell": false}
+            }))
+        };
+
+        let output = super::schedule_command(
+            "/tmp/crabbot".into(),
+            "add --every 5m --name morning-check Review the report",
+            "default".into(),
+            "codex".into(),
+            "gpt-6-luna".into(),
+            Some("/work/reports".into()),
+            host,
+        )
+        .await;
+
+        assert!(output.starts_with("Schedule morning-check ("));
+        assert!(output.contains(") is active.\n\nInstruction: Review the report"));
+        assert!(output.contains("\nTools: disabled\nShell: disabled\n"));
+        assert!(output.contains("Frequency: every 5 minutes"));
+        assert!(output.contains("\n\nCheck it with /schedule list;"));
     }
 
     #[tokio::test]
@@ -4807,7 +5277,18 @@ mod tests {
     #[tokio::test]
     async fn manual_schedule_controls_use_scheduler_ipc_methods() {
         let host = |_: String, _: String, params: serde_json::Value| async move {
-            Ok(json!({"id": params["params"]["id"], "status": "active"}))
+            if params["method"] == "list" {
+                Ok(json!({
+                    "items": [
+                        {"id": 7, "name": "morning-check"},
+                        {"id": 8, "name": "evening-check"},
+                        {"id": 9, "name": "night-check"}
+                    ],
+                    "pages": 1
+                }))
+            } else {
+                Ok(json!({"id": params["params"]["id"], "status": "active"}))
+            }
         };
 
         let run = super::schedule_command(
@@ -4830,8 +5311,15 @@ mod tests {
             host,
         )
         .await;
-        let remove_host = |_: String, _: String, _: serde_json::Value| async move {
-            Ok(json!({"deleted": false, "cancel_requested": true}))
+        let remove_host = |_: String, _: String, params: serde_json::Value| async move {
+            if params["method"] == "list" {
+                Ok(json!({
+                    "items": [{"id": 9, "name": "night-check"}],
+                    "pages": 1
+                }))
+            } else {
+                Ok(json!({"deleted": false, "cancel_requested": true}))
+            }
         };
 
         let remove = super::schedule_command(
@@ -4845,9 +5333,9 @@ mod tests {
         )
         .await;
 
-        assert!(run.contains("Schedule 7 queued to run now."));
-        assert!(retry.contains("Schedule 8 retry queued."));
-        assert!(remove.contains("Cancellation requested for schedule 9."));
+        assert!(run.contains("Schedule morning-check (7) queued to run now."), "{run}");
+        assert!(retry.contains("Schedule evening-check (8) retry queued."));
+        assert!(remove.contains("Cancellation requested for schedule night-check (9)."));
         assert!(remove.contains("side effect may already have happened"));
     }
 
@@ -4989,7 +5477,7 @@ mod tests {
 
             "capability.call" => match (params["service"].as_str(), params["method"].as_str()) {
                 (Some("scheduler"), Some("list")) => Ok(json!({
-                    "items": [{"id": 7, "due": 42, "text": "call back"}]
+                    "items": [{"id": 7, "name": "morning-check", "due": 42, "text": "call back"}]
                 })),
 
                 (Some("scheduler"), Some("add")) => Ok(json!({"id": params["params"]["id"]})),
@@ -5427,12 +5915,12 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
         assert!(text.contains(&format!("Workspace changed to: {}", root.display())));
         assert!(
             text.contains(
-                "Schedules (1–1 of 1, page 1 of 1)\n└─ 7 | Scheduled task | pending\n   ├─ Next run: 1970-01-01 00:00:42 UTC\n   └─ Automatic retries are off"
+                "Schedules (1–1 of 1, page 1 of 1)\n└─ 7 | morning-check | pending\n   ├─ Next run: 1970-01-01 00:00:42 UTC\n   └─ Automatic retries are off"
             )
         );
 
         assert!(text.contains("is active."));
-        assert!(text.contains("Schedule 7 was removed."));
+        assert!(text.contains("Schedule morning-check (7) was removed."));
         assert!(text.contains("Memories | 1–3 of 3 | page 1/1:"));
         assert!(text.contains("├─ close-up\n│  ├─ type: global\n│  └─ banana at the end"));
         assert!(text.contains("├─ drink\n│  ├─ type: session\n│  └─ tea"));
