@@ -88,6 +88,7 @@ type Tasks = BTreeMap<u64, Arc<Task>>;
 impl Task {
     fn ready_for_claim_at(&self, at: u64) -> bool {
         self.status == "active"
+            && !self.report_pending
             && (self.manual_run || self.retry_at.map_or(self.due <= at, |retry_at| retry_at <= at))
     }
 }
@@ -187,6 +188,8 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn plugin_main() -> crabbot_core::Result<()> {
+    prepare_state_directory(path().as_deref())?;
+
     let tasks = load()?;
 
     serve_with(
@@ -568,12 +571,16 @@ async fn call_at(
             let run_id = params["lease"].as_u64().unwrap_or(id);
             let scheduled_run = !task.manual_run && task.retry_at.is_none() && !task.manual_retry;
             let was_missed = scheduled_run && since > 0 && task.due < since;
+            let was_overdue = scheduled_run && task.due < at;
             let was_retry = task.retry_at.is_some() || task.manual_retry;
             let manual_origin = task.manual_origin || (task.manual_run && !task.manual_retry);
             let replay_exhausted =
                 scheduled_run && task.missed == "replay" && task.replay_count >= 5;
 
             if (was_missed && task.missed == "skip") || replay_exhausted {
+                let report_run_id = params["lease"].as_u64().unwrap_or(id);
+                let result = "Missed occurrence skipped because the daemon was offline.";
+
                 if task.cron.is_some() || task.repeat > 0 {
                     let next_due = task.cron.as_deref().map_or_else(
                         || Ok(at.saturating_add(task.repeat)),
@@ -585,8 +592,7 @@ async fn call_at(
                     let current = Arc::make_mut(current);
                     current.due = next_due;
                     current.replay_count = 0;
-                    current.last_result =
-                        Some("Missed occurrence skipped because the daemon was offline.".into());
+                    current.last_result = Some(result.into());
                     current.last_outcome = Some("skipped".into());
                 } else {
                     let current = next_tasks.get_mut(&task_id).ok_or_else(|| {
@@ -594,15 +600,27 @@ async fn call_at(
                     })?;
                     let current = Arc::make_mut(current);
                     current.status = "skipped".into();
-                    current.last_result = Some(
-                        "Task skipped because it was due while the daemon was offline.".into(),
-                    );
+                    current.last_result = Some(result.into());
                     current.last_outcome = Some("skipped".into());
                 }
 
+                let current = next_tasks.get_mut(&task_id).ok_or_else(|| {
+                    crabbot_core::Error::Denied("Scheduled task was not found.".into())
+                })?;
+                let current = Arc::make_mut(current);
+                current.finished_run_id = Some(report_run_id);
+                current.finish_result = Some(json!({
+                    "status": "skipped",
+                    "success": false,
+                    "finished_at": at,
+                    "scheduled_for": task.due,
+                    "result": result
+                }));
+                current.report_pending = true;
+
                 let response = checked_response(
                     id,
-                    json!({"item": {"id": task_id, "name": task.name, "text": task.text, "context": task.context, "scheduled_for": task.due, "skipped_at": at, "skipped": true, "missed": task.missed}}),
+                    json!({"item": {"id": task_id, "name": task.name, "text": task.text, "context": task.context, "scheduled_for": task.due, "skipped_at": at, "run_id": report_run_id, "skipped": true, "missed": task.missed}}),
                 )?;
                 persist_locked_at(location, &next_tasks)?;
                 *tasks = next_tasks;
@@ -619,7 +637,7 @@ async fn call_at(
                 current.retry_at = None;
                 current.attempts = current.attempts.saturating_add(1);
 
-                if was_missed && current.missed == "replay" {
+                if was_overdue && current.missed == "replay" {
                     current.replay_count = current.replay_count.saturating_add(1);
                 }
             }
@@ -940,6 +958,18 @@ async fn call_at(
                     task.last_result =
                         Some("Execution was interrupted; review before resuming.".into());
                     task.last_outcome = Some("failed".into());
+                    let run_id = task.run_id.take().unwrap_or(*id);
+                    task.finished_run_id = Some(run_id);
+                    task.finish_result = Some(json!({
+                        "finished": true,
+                        "status": "paused",
+                        "success": false,
+                        "cancelled": false,
+                        "finished_at": now(),
+                        "scheduled_for": task.due,
+                        "result": task.last_result
+                    }));
+                    task.report_pending = true;
                     true
                 }
 
@@ -1234,6 +1264,73 @@ fn path() -> Option<PathBuf> {
     std::env::var_os("CRABBOT_HOME")
         .map(PathBuf::from)
         .map(|home| home.join("data/schedules/schedules.json"))
+}
+
+fn prepare_state_directory(schedule_path: Option<&Path>) -> crabbot_core::Result<()> {
+    let Some(schedule_path) = schedule_path else {
+        return Ok(());
+    };
+
+    let data = schedule_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| crabbot_core::Error::Denied("Scheduler state path is invalid.".into()))?;
+
+    let schedules = schedule_path
+        .parent()
+        .ok_or_else(|| crabbot_core::Error::Denied("Scheduler state path is invalid.".into()))?;
+
+    for directory in [data, schedules] {
+        match std::fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(crabbot_core::Error::Denied(format!(
+                    "Scheduler state path must be a real directory: {}.",
+                    directory.display()
+                )));
+            }
+
+            Ok(_) => {}
+
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(directory).map_err(|error| {
+                    crabbot_core::Error::Denied(format!(
+                        "Could not create scheduler state directory {}: {error}",
+                        directory.display()
+                    ))
+                })?;
+            }
+
+            Err(error) => {
+                return Err(crabbot_core::Error::Denied(format!(
+                    "Could not inspect scheduler state directory {}: {error}",
+                    directory.display()
+                )));
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(directory)
+                .map_err(|error| {
+                    crabbot_core::Error::Denied(format!(
+                        "Could not inspect scheduler state directory {}: {error}",
+                        directory.display()
+                    ))
+                })?
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(directory, permissions).map_err(|error| {
+                crabbot_core::Error::Denied(format!(
+                    "Could not secure scheduler state directory {}: {error}",
+                    directory.display()
+                ))
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 fn legacy_path() -> Option<PathBuf> {
@@ -1571,6 +1668,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recurring_task_waits_for_report_acknowledgement_before_next_run() {
+        let tasks = tasks();
+        call(
+            &tasks,
+            Request::call(
+                1,
+                "add",
+                json!({"id": 46, "text": "check", "delay": 0, "repeat": 10, "activate": true}),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let first = call(&tasks, Request::call(2, "claim", json!({"at": u64::MAX})))
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap()["item"]
+            .clone();
+
+        let run_id = first["run_id"].as_u64().unwrap();
+
+        call(
+            &tasks,
+            Request::call(
+                3,
+                "finish",
+                json!({"id": 46, "run_id": run_id, "success": true, "result": "done"}),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let blocked = call(&tasks, Request::call(4, "claim", json!({"at": u64::MAX})))
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+
+        assert!(blocked["item"].is_null());
+
+        call(&tasks, Request::call(5, "report", json!({"id": 46, "run_id": run_id})))
+            .await
+            .unwrap();
+
+        let next = call(&tasks, Request::call(6, "claim", json!({"at": u64::MAX})))
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+
+        assert_eq!(next["item"]["id"], 46);
+        assert_ne!(next["item"]["run_id"], run_id);
+    }
+
+    #[tokio::test]
     async fn explicit_schedule_creation_activates_the_task_immediately() {
         let tasks = tasks();
         let added = call(
@@ -1801,6 +1957,14 @@ mod tests {
         .await
         .unwrap();
 
+        call_at(
+            &tasks,
+            Request::call(6, "report", json!({"id": 10, "run_id": run["run_id"]})),
+            None,
+        )
+        .await
+        .unwrap();
+
         let retry_at = tasks.lock().unwrap()[&10].retry_at.unwrap();
 
         assert_eq!(tasks.lock().unwrap()[&10].status, "active");
@@ -1857,10 +2021,18 @@ mod tests {
 
         assert_eq!(tasks.lock().unwrap()[&10].status, "paused");
 
-        call_at(&tasks, Request::call(9, "retry", json!({"id": 10})), None).await.unwrap();
+        call_at(
+            &tasks,
+            Request::call(9, "report", json!({"id": 10, "run_id": retry["run_id"]})),
+            None,
+        )
+        .await
+        .unwrap();
+
+        call_at(&tasks, Request::call(10, "retry", json!({"id": 10})), None).await.unwrap();
 
         let manually_retried =
-            call_at(&tasks, Request::call(10, "claim", json!({"at": 1, "since": 1})), None)
+            call_at(&tasks, Request::call(11, "claim", json!({"at": 1, "since": 1})), None)
                 .await
                 .unwrap()
                 .unwrap()
@@ -2096,6 +2268,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_reports_interrupted_run_once() {
+        let tasks = tasks();
+        call_at(
+            &tasks,
+            Request::call(
+                1,
+                "add",
+                json!({"id": 23, "text": "create a backup", "delay": 60, "activate": true}),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        call_at(&tasks, Request::call(2, "claim", json!({"at": u64::MAX, "lease": 700})), None)
+            .await
+            .unwrap();
+
+        call_at(&tasks, Request::call(3, "recover", json!({})), None).await.unwrap();
+
+        let reports = call_at(&tasks, Request::call(4, "reports", json!({})), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+
+        assert_eq!(reports["items"][0]["run_id"], 700);
+        assert_eq!(reports["items"][0]["finish"]["status"], "paused");
+        assert_eq!(reports["items"][0]["finish"]["success"], false);
+
+        call_at(&tasks, Request::call(5, "report", json!({"id": 23, "run_id": 700})), None)
+            .await
+            .unwrap();
+
+        let reports = call_at(&tasks, Request::call(6, "reports", json!({})), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+
+        assert!(reports["items"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn rejects_retry_limits_above_five() {
         let tasks = tasks();
 
@@ -2292,6 +2510,10 @@ mod tests {
         .await
         .unwrap();
 
+        call_at(&tasks, Request::call(4, "report", json!({"id": 60, "run_id": 2})), None)
+            .await
+            .unwrap();
+
         call_at(&tasks, Request::call(4, "run", json!({"id": 60})), None).await.unwrap();
         let completed = call_at(&tasks, Request::call(5, "claim", json!({"at": u64::MAX})), None)
             .await
@@ -2326,9 +2548,13 @@ mod tests {
             .await
             .unwrap();
 
-        call_at(&tasks, Request::call(8, "run", json!({"id": 61})), None).await.unwrap();
+        call_at(&tasks, Request::call(8, "report", json!({"id": 61, "run_id": 7})), None)
+            .await
+            .unwrap();
+
+        call_at(&tasks, Request::call(9, "run", json!({"id": 61})), None).await.unwrap();
         let skipped =
-            call_at(&tasks, Request::call(9, "claim", json!({"at": 200, "since": 150})), None)
+            call_at(&tasks, Request::call(10, "claim", json!({"at": 200, "since": 150})), None)
                 .await
                 .unwrap()
                 .unwrap()
@@ -2367,10 +2593,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(tasks.lock().unwrap()[&62].status, "skipped");
-        call_at(&tasks, Request::call(3, "retry", json!({"id": 62})), None).await.unwrap();
+        call_at(&tasks, Request::call(3, "report", json!({"id": 62, "run_id": 2})), None)
+            .await
+            .unwrap();
+
+        call_at(&tasks, Request::call(4, "retry", json!({"id": 62})), None).await.unwrap();
 
         let claimed =
-            call_at(&tasks, Request::call(4, "claim", json!({"at": 200, "since": 150})), None)
+            call_at(&tasks, Request::call(5, "claim", json!({"at": 200, "since": 150})), None)
                 .await
                 .unwrap()
                 .unwrap()
@@ -2384,7 +2614,7 @@ mod tests {
 
         call_at(
             &tasks,
-            Request::call(5, "finish", json!({"id": 62, "success": true, "result": "sent"})),
+            Request::call(6, "finish", json!({"id": 62, "success": true, "result": "sent"})),
             None,
         )
         .await
@@ -2600,6 +2830,34 @@ mod tests {
     }
 
     #[test]
+    fn startup_prepares_private_state_directory() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-scheduler-startup-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let schedule_path = root.join("data/schedules/schedules.json");
+
+        super::prepare_state_directory(Some(&schedule_path)).unwrap();
+
+        let data = root.join("data");
+        let schedules = data.join("schedules");
+
+        assert!(data.is_dir());
+        assert!(schedules.is_dir());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(std::fs::metadata(data).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::metadata(schedules).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn missing_legacy_names_are_generated_uniquely_and_persisted() {
         let root =
             std::env::temp_dir().join(format!("crabbot-scheduler-names-{}", std::process::id()));
@@ -2772,6 +3030,14 @@ mod tests {
 
         assert!(weekday_noon.matches(&[0, 12, 1, 1, 1]));
         assert!(!weekday_noon.matches(&[1, 12, 1, 1, 1]));
+
+        let weekday_with_full_day = super::CronSchedule::parse("0 9 */1 * 1-5").unwrap();
+        let full_weekday_with_day_range = super::CronSchedule::parse("0 9 1-5 * */1").unwrap();
+
+        assert!(weekday_with_full_day.matches(&[0, 9, 1, 1, 1]));
+        assert!(!weekday_with_full_day.matches(&[0, 9, 4, 1, 0]));
+        assert!(full_weekday_with_day_range.matches(&[0, 9, 4, 1, 1]));
+        assert!(!full_weekday_with_day_range.matches(&[0, 9, 7, 1, 0]));
     }
 
     #[tokio::test]
@@ -2856,7 +3122,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(skipped.result.unwrap()["item"]["skipped"], true);
+        let reports = call(&tasks, Request::call(23, "reports", json!({})))
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+
+        assert_eq!(reports["items"][0]["id"], 1);
+        assert_eq!(reports["items"][0]["run_id"], 20);
+        assert_eq!(reports["items"][0]["finish"]["status"], "skipped");
         assert_eq!(tasks.lock().unwrap()[&1].due, 210);
+
+        call(&tasks, Request::call(24, "report", json!({"id": 1, "run_id": 20}))).await.unwrap();
+
+        let reports = call(&tasks, Request::call(25, "reports", json!({})))
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+
+        assert!(reports["items"].as_array().unwrap().is_empty());
 
         let coalesced = call(&tasks, Request::call(21, "claim", json!({"at": 200, "since": 150})))
             .await
@@ -2872,6 +3159,54 @@ mod tests {
 
         assert_eq!(replayed.result.unwrap()["item"]["id"], 3);
         assert_eq!(tasks.lock().unwrap()[&3].replay_count, 1);
+    }
+
+    #[tokio::test]
+    async fn replay_limit_counts_occurrences_that_become_overdue_after_startup() {
+        let tasks = tasks();
+        call(
+            &tasks,
+            Request::call(
+                1,
+                "add",
+                json!({
+                    "id": 1,
+                    "text": "run",
+                    "repeat": 10,
+                    "missed": "replay",
+                    "activate": true
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+
+        Arc::make_mut(tasks.lock().unwrap().get_mut(&1).unwrap()).due = 160;
+        call(&tasks, Request::call(2, "claim", json!({"at": 200, "since": 150}))).await.unwrap();
+
+        assert_eq!(tasks.lock().unwrap()[&1].replay_count, 1);
+        call(&tasks, Request::call(4, "finish", json!({"id": 1, "run_id": 2, "success": true})))
+            .await
+            .unwrap();
+
+        call(&tasks, Request::call(5, "report", json!({"id": 1, "run_id": 2}))).await.unwrap();
+
+        {
+            let mut scheduled = tasks.lock().unwrap();
+            let task = scheduled.get_mut(&1).unwrap();
+            let task = Arc::make_mut(task);
+            task.due = 190;
+            task.replay_count = 5;
+        }
+
+        let exhausted = call(&tasks, Request::call(3, "claim", json!({"at": 200, "since": 150})))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(exhausted.result.unwrap()["item"]["skipped"], true);
+        assert_eq!(tasks.lock().unwrap()[&1].due, 210);
+        assert_eq!(tasks.lock().unwrap()[&1].replay_count, 0);
     }
 
     #[tokio::test]

@@ -28,6 +28,9 @@ every permission and external endpoint so installation and updates can show
 the operator what changes. Command names must be unique across installed plugins
 and cannot shadow native commands. Capability, permission, and secret lists are
 validated for known, unique values before a plugin can be installed or started.
+Protocol minor versions are backward-compatible: this host accepts plugins
+declaring 0.0 or 0.1, while plugins that use capabilities introduced in 0.2
+must declare 0.2.
 
 `plugins.lock` records the canonical source, revision marker, SHA-256 of the
 manifest and executable, protocol, version, capabilities, permissions, and

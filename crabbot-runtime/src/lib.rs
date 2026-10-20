@@ -6,7 +6,7 @@ mod templates;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
-    io::{BufRead, BufReader, IsTerminal, Read, Write},
+    io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     pin::Pin,
     process::{ExitCode, Stdio},
@@ -29,7 +29,7 @@ use crabbot_core::{
     },
 };
 
-use crabbot_file::{append as append_file, save as save_file};
+use crabbot_file::{append_jsonl as append_jsonl_file, save as save_file};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -849,7 +849,7 @@ struct SessionNew {
     #[arg(help = "Session identifier.")]
     id: String,
     #[arg(long, help = "Model identifier.")]
-    model: String,
+    model: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1222,7 +1222,7 @@ impl Manifest {
                         | "client"
                         | "resource"
                         | "agent"
-                )
+                ) && !(self.id == "timer" && capability == "timer")
             })
         {
             return Err("Plugin capabilities must be known and unique.".into());
@@ -2114,6 +2114,10 @@ fn model_plugin_available(id: &str, entry: &Entry, root: &Path) -> bool {
 
 fn model_selection(provider: Option<String>, model: Option<String>) -> (String, String) {
     (provider.unwrap_or_else(|| "codex".into()), model.unwrap_or_else(|| "unset".into()))
+}
+
+fn session_model(model: Option<String>) -> String {
+    model.unwrap_or_else(|| std::env::var("CRABBOT_MODEL").unwrap_or_else(|_| "unset".into()))
 }
 
 fn capture_model_selection(
@@ -3242,11 +3246,17 @@ fn schedule_outcome_label(outcome: &str) -> &'static str {
 }
 
 fn parse_schedule_history(content: &str) -> Result<Vec<Value>, String> {
-    content
-        .lines()
+    let lines = content.split_terminator('\n').collect::<Vec<_>>();
+
+    lines
+        .iter()
         .enumerate()
         .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, line)| parse_schedule_record(line, index + 1))
+        .filter_map(|(index, line)| match parse_schedule_record(line, index + 1) {
+            Ok(record) => Some(Ok(record)),
+            Err(_) if index + 1 == lines.len() && !content.ends_with('\n') => None,
+            Err(error) => Some(Err(error)),
+        })
         .collect()
 }
 
@@ -3334,7 +3344,9 @@ fn read_schedule_history_page(path: &Path, page: usize) -> Result<(Vec<Value>, u
             ));
         }
 
-        if line.last() == Some(&b'\n') {
+        let terminated = line.last() == Some(&b'\n');
+
+        if terminated {
             line.pop();
         }
 
@@ -3342,10 +3354,22 @@ fn read_schedule_history_page(path: &Path, page: usize) -> Result<(Vec<Value>, u
             continue;
         }
 
-        let line_text = std::str::from_utf8(&line).map_err(|error| {
-            format!("Schedule history line {line_number} is not valid UTF-8: {error}.")
-        })?;
-        let record = parse_schedule_record(line_text, line_number)?;
+        let line_text = match std::str::from_utf8(&line) {
+            Ok(line_text) => line_text,
+            Err(_) if !terminated => break,
+
+            Err(error) => {
+                return Err(format!(
+                    "Schedule history line {line_number} is not valid UTF-8: {error}."
+                ));
+            }
+        };
+
+        let record = match parse_schedule_record(line_text, line_number) {
+            Ok(record) => record,
+            Err(_) if !terminated => break,
+            Err(error) => return Err(error),
+        };
 
         total += 1;
 
@@ -3646,7 +3670,7 @@ async fn session_at_json(
     match command {
         SessionCommand::New(args) => {
             let id = args.id.clone();
-            let model = args.model.clone();
+            let model = session_model(args.model.clone());
 
             if let Some(value) =
                 control_at("session.new", serde_json::json!({"id": id, "model": model}), root)
@@ -3854,7 +3878,7 @@ fn local_session_json(
     match command {
         SessionCommand::New(args) => {
             let id = args.id.clone();
-            let model = args.model.clone();
+            let model = session_model(args.model);
             store.create(id.clone(), model.clone())?;
             info!(operation = "session.create", source = "offline", "Session created.");
 
@@ -4849,8 +4873,27 @@ async fn run_scheduler(
             };
 
             match result {
-                Ok(_) => {
+                Ok(response) if response.error.is_none() && response.result.is_some() => {
                     recovered_scheduler = Some((Arc::clone(&scheduler), generation));
+                }
+
+                Ok(response) => {
+                    let error = response.error.map_or_else(
+                        || "Scheduler returned no result.".into(),
+                        |error| error.message,
+                    );
+                    warn!(plugin = scheduler_id, error = %error, "Scheduler recovery check failed.");
+
+                    scheduler_call_id = scheduler_call_id.saturating_add(1);
+                    tokio::select! {
+                        _ = stop.notified() => return,
+
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+
+                        _ = plugins.changed.notified() => {}
+                    }
+
+                    continue;
                 }
 
                 Err(error) => {
@@ -4923,11 +4966,13 @@ async fn run_scheduler(
 
                 Ok(response) => {
                     warn!(plugin = scheduler_id, error = %response.error.map_or_else(|| "Scheduler returned no result.".into(), |error| error.message), "Scheduler task claim failed.");
+                    recovered_scheduler = None;
                     None
                 }
 
                 Err(error) => {
                     warn!(plugin = scheduler_id, error = %diagnostic(sentence(error.to_string())), "Scheduler task claim failed.");
+                    recovered_scheduler = None;
 
                     if stop.is_signaled() {
                         return;
@@ -4945,17 +4990,15 @@ async fn run_scheduler(
             let task_id = task["id"].as_u64().unwrap_or_default();
 
             if task["skipped"] == true {
-                let result = "This occurrence was skipped because the daemon was offline.";
-                scheduler_log(&home_root, &task, "skipped", result, None);
-                report_scheduled_result(
-                    &task,
-                    task_id,
-                    None,
-                    task["skipped_at"].as_u64(),
-                    "skipped",
-                    result,
+                process_skipped_schedule(
+                    &plugins,
                     &sessions,
-                );
+                    &home_root,
+                    &task,
+                    &stop,
+                    &mut scheduler_call_id,
+                )
+                .await;
                 info!(schedule = task_id, "Missed scheduled occurrence skipped by policy.");
                 continue;
             }
@@ -5164,14 +5207,17 @@ async fn run_scheduled_task(
 
             scheduler_log(home_root, task, status_text, &report_text, Some(&finish_result));
 
-            if report_scheduled_result(
-                task,
-                task_id,
-                task["run_id"].as_u64(),
-                finish_result["finished_at"].as_u64(),
-                status_text,
-                &report_text,
-                sessions,
+            if matches!(
+                report_scheduled_result(
+                    task,
+                    task_id,
+                    task["run_id"].as_u64(),
+                    finish_result["finished_at"].as_u64(),
+                    status_text,
+                    &report_text,
+                    sessions,
+                ),
+                ScheduleReportOutcome::Delivered
             ) {
                 acknowledge_schedule_report(
                     plugins,
@@ -5269,12 +5315,12 @@ async fn process_pending_schedule_reports(
     home_root: &Path,
     stop: &Stop,
     call: &mut u64,
-) {
+) -> bool {
     let mut after = None;
 
     loop {
         let Some((scheduler_id, scheduler)) = plugins.find(Capability::Scheduler).await else {
-            return;
+            return false;
         };
 
         let request_id = *call;
@@ -5289,29 +5335,30 @@ async fn process_pending_schedule_reports(
         )
         .await
         else {
-            return;
+            return false;
         };
 
         if let Some(error) = response.error {
             warn!(plugin = scheduler_id, error = %error.message, "Pending schedule reports could not be loaded.");
-            return;
+
+            return error.code == -32601;
         }
 
         let reports =
             response.result.unwrap_or_default()["items"].as_array().cloned().unwrap_or_default();
 
         if reports.is_empty() {
-            return;
+            return false;
         }
 
         let Some(next_after) = reports.last().and_then(|report| report["id"].as_u64()) else {
             warn!(plugin = scheduler_id, "Pending schedule report page had no valid final ID.");
-            return;
+            return false;
         };
 
         if after.is_some_and(|after| next_after <= after) {
             warn!(plugin = scheduler_id, "Pending schedule report page did not advance.");
-            return;
+            return false;
         }
 
         after = Some(next_after);
@@ -5350,18 +5397,45 @@ async fn process_pending_schedule_reports(
 
             scheduler_log(home_root, &report, status_text, &report_text, Some(finish));
 
-            if report_scheduled_result(
-                &report,
-                task_id,
-                run_id,
-                finish["finished_at"].as_u64(),
-                status_text,
-                &report_text,
-                sessions,
+            if !matches!(
+                report_scheduled_result(
+                    &report,
+                    task_id,
+                    run_id,
+                    finish["finished_at"].as_u64(),
+                    status_text,
+                    &report_text,
+                    sessions,
+                ),
+                ScheduleReportOutcome::Retry
             ) {
                 acknowledge_schedule_report(plugins, task_id, run_id, stop, call).await;
             }
         }
+    }
+}
+
+async fn process_skipped_schedule(
+    plugins: &Plugins,
+    sessions: &Arc<Mutex<state::Store>>,
+    home_root: &Path,
+    task: &Value,
+    stop: &Stop,
+    call: &mut u64,
+) {
+    if process_pending_schedule_reports(plugins, sessions, home_root, stop, call).await {
+        let task_id = task["id"].as_u64().unwrap_or_default();
+        let result = "This occurrence was skipped because the daemon was offline.";
+        scheduler_log(home_root, task, "skipped", result, None);
+        report_scheduled_result(
+            task,
+            task_id,
+            None,
+            task["skipped_at"].as_u64(),
+            "skipped",
+            result,
+            sessions,
+        );
     }
 }
 
@@ -5748,7 +5822,7 @@ async fn execute_scheduled_task(
 
     {
         let mut store = sessions.lock().map_err(|_| "Session lock is poisoned.")?;
-        store.ensure(&session, model)?;
+        store.ensure_schedule(&session, model)?;
         store.begin_with_roles(&session, user.clone(), Vec::new())?;
     }
 
@@ -5857,24 +5931,87 @@ fn schedule_log_filename(name: &str, task_id: u64) -> String {
 fn schedule_log_path(home_root: &Path, task_id: u64) -> std::io::Result<PathBuf> {
     let directory = home_root.join("logs/schedules");
     let suffix = format!("-{task_id}.jsonl");
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
 
-    if let Some(path) =
-        std::fs::read_dir(&directory)?.filter_map(|entry| entry.ok()).find_map(|entry| {
-            let path = entry.path();
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(&suffix))
-                .then_some(path)
-        })
-    {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(directory.join(format!("{task_id}.jsonl")));
+        }
+
+        Err(error) => return Err(error),
+    };
+
+    if let Some(path) = entries.filter_map(|entry| entry.ok()).find_map(|entry| {
+        let path = entry.path();
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&suffix))
+            .then_some(path)
+    }) {
         return Ok(path);
     }
 
     Ok(directory.join(format!("{task_id}.jsonl")))
 }
 
+static SCHEDULE_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+const SCHEDULE_HISTORY_LIMIT: u64 = 256 * 1024;
+
+fn schedule_history_tail(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(SCHEDULE_HISTORY_LIMIT);
+    file.seek(SeekFrom::Start(start))?;
+
+    let mut reader = BufReader::new(file);
+
+    if start > 0 {
+        let mut previous = [0_u8; 1];
+        reader.get_mut().seek(SeekFrom::Start(start - 1))?;
+        reader.get_mut().read_exact(&mut previous)?;
+        reader.get_mut().seek(SeekFrom::Start(start))?;
+
+        if previous[0] != b'\n' {
+            let mut remaining = SCHEDULE_HISTORY_LIMIT;
+
+            loop {
+                let (count, ended_record) = {
+                    let buffer = reader.fill_buf()?;
+
+                    if buffer.is_empty() {
+                        return Ok(Vec::new());
+                    }
+
+                    match buffer.iter().position(|byte| *byte == b'\n') {
+                        Some(index) => (index + 1, true),
+                        None => (buffer.len(), false),
+                    }
+                };
+
+                reader.consume(count);
+                remaining = remaining.saturating_sub(count as u64);
+
+                if ended_record {
+                    break;
+                }
+
+                if remaining == 0 {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+    }
+
+    let mut tail = Vec::new();
+    reader.read_to_end(&mut tail)?;
+
+    Ok(tail)
+}
+
 fn scheduler_log(home_root: &Path, task: &Value, status: &str, text: &str, finish: Option<&Value>) {
     let task_id = task["id"].as_u64().unwrap_or_default();
+    let run_id = task["run_id"].as_u64();
     let name = task["name"].as_str().unwrap_or_default();
     let directory = home_root.join("logs/schedules");
     let filename = schedule_log_filename(name, task_id);
@@ -5893,8 +6030,43 @@ fn scheduler_log(home_root: &Path, task: &Value, status: &str, text: &str, finis
     }
 
     let context = &task["context"];
+
     let empty_finish = Value::Null;
     let finish = finish.unwrap_or(&empty_finish);
+
+    let _guard = match SCHEDULE_LOG_LOCK.lock() {
+        Ok(guard) => guard,
+
+        Err(_) => {
+            warn!(schedule = task_id, "Schedule history lock is poisoned.");
+            return;
+        }
+    };
+
+    if let Some(run_id) = run_id {
+        match schedule_history_tail(&path) {
+            Ok(history)
+                if history.split(|byte| *byte == b'\n').any(|line| {
+                    serde_json::from_slice::<Value>(line).is_ok_and(|entry| {
+                        entry["schedule"]["id"].as_u64() == Some(task_id)
+                            && entry["run"]["id"].as_u64() == Some(run_id)
+                    })
+                }) =>
+            {
+                return;
+            }
+
+            Ok(_) => {}
+
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+
+            Err(error) => {
+                warn!(schedule = task_id, error = %diagnostic(sentence(error.to_string())), "Schedule history could not be checked for a duplicate run.");
+                return;
+            }
+        }
+    }
+
     let entry = serde_json::json!({
         "schema_version": 1,
         "timestamp": jiff::Timestamp::now().to_string(),
@@ -5930,9 +6102,40 @@ fn scheduler_log(home_root: &Path, task: &Value, status: &str, text: &str, finis
     let mut content = entry.to_string();
     content.push('\n');
 
-    if let Err(error) = append_file(path, content.as_bytes()) {
-        warn!(schedule = task_id, error = %diagnostic(sentence(error.to_string())), "Schedule history could not be written.");
+    match append_jsonl_file(&path, content.as_bytes()) {
+        Ok(()) => match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > SCHEDULE_HISTORY_LIMIT => {
+                match schedule_history_tail(&path) {
+                    Ok(history) => {
+                        if let Err(error) = save_file(&path, history) {
+                            warn!(schedule = task_id, error = %diagnostic(sentence(error.to_string())), "Schedule history could not be rotated.");
+                        }
+                    }
+
+                    Err(error) => {
+                        warn!(schedule = task_id, error = %diagnostic(sentence(error.to_string())), "Schedule history could not be read for rotation.");
+                    }
+                }
+            }
+
+            Ok(_) => {}
+
+            Err(error) => {
+                warn!(schedule = task_id, error = %diagnostic(sentence(error.to_string())), "Schedule history size could not be checked.");
+            }
+        },
+
+        Err(error) => {
+            warn!(schedule = task_id, error = %diagnostic(sentence(error.to_string())), "Schedule history could not be written.");
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScheduleReportOutcome {
+    Delivered,
+    Unavailable,
+    Retry,
 }
 
 fn report_scheduled_result(
@@ -5943,29 +6146,34 @@ fn report_scheduled_result(
     status: &str,
     text: &str,
     sessions: &Arc<Mutex<state::Store>>,
-) -> bool {
+) -> ScheduleReportOutcome {
     let origin = &task["context"]["origin"];
+
     let Some(channel) = origin["channel"].as_str() else {
-        return false;
+        return ScheduleReportOutcome::Unavailable;
     };
 
     if channel == "cli" {
-        return true;
+        return ScheduleReportOutcome::Delivered;
     }
 
     let heading = scheduled_result_heading(status);
     let text = format!("{heading} (schedule {task_id}):\n{}", clip(text.to_owned(), 3_000));
     let mut store = match sessions.lock() {
         Ok(store) => store,
-        Err(_) => return false,
+        Err(_) => return ScheduleReportOutcome::Retry,
     };
 
     let report_id = format!("schedule-{task_id}-{}", run_id.unwrap_or_default());
 
     if channel == "tui" {
         let Some(session) = origin["session"].as_str() else {
-            return false;
+            return ScheduleReportOutcome::Unavailable;
         };
+
+        if !store.sessions.contains_key(session) {
+            return ScheduleReportOutcome::Unavailable;
+        }
 
         let id = finished_at.map_or_else(
             || format!("schedule-notice-{task_id}-{}", run_id.unwrap_or_default()),
@@ -5977,6 +6185,7 @@ fn report_scheduled_result(
                 )
             },
         );
+
         let message = Message {
             id,
             session: session.into(),
@@ -5990,14 +6199,14 @@ fn report_scheduled_result(
             .get(session)
             .is_some_and(|item| item.messages.iter().any(|existing| existing.id == message.id))
         {
-            return true;
+            return ScheduleReportOutcome::Delivered;
         }
 
         if let Err(error) = store.append_notice(session, message) {
             warn!(schedule = task_id, error = %diagnostic(sentence(error.to_string())), "Schedule result could not be added to its originating session.");
-            false
+            ScheduleReportOutcome::Retry
         } else {
-            true
+            ScheduleReportOutcome::Delivered
         }
     } else if let (Some(chat), Some(session)) =
         (origin["chat"].as_str(), origin["session"].as_str())
@@ -6012,12 +6221,12 @@ fn report_scheduled_result(
             text,
         ) {
             warn!(schedule = task_id, error = %diagnostic(sentence(error.to_string())), "Schedule result could not be queued for delivery.");
-            false
+            ScheduleReportOutcome::Retry
         } else {
-            true
+            ScheduleReportOutcome::Delivered
         }
     } else {
-        false
+        ScheduleReportOutcome::Unavailable
     }
 }
 
@@ -6492,7 +6701,9 @@ fn env_for(manifest: &Manifest, config: &Config, root: &Path) -> Vec<(String, St
 
     if manifest.id == "tools" {
         ensure_root(&mut values, root);
-        values.push(("CRABBOT_SHELL".into(), if config.tui_shell() { "on" } else { "off" }.into()));
+        let shell_enabled = config.tui_shell()
+            || config.channels.values().any(|channel| channel.tools && channel.shell);
+        values.push(("CRABBOT_SHELL".into(), if shell_enabled { "on" } else { "off" }.into()));
 
         for name in ["CRABBOT_SANDBOX_RUNTIME", "CRABBOT_SANDBOX_IMAGE"] {
             if let Some(value) = std::env::var_os(name) {
@@ -11095,7 +11306,11 @@ async fn execute_tool(
     schedule_run_id: Option<u64>,
     tool_call: usize,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    if name == "schedule_propose" && !schedule_enabled {
+    if name == "shell" && !shell_enabled {
+        return Err("Shell access is not authorized for this turn.".into());
+    }
+
+    if name.starts_with("schedule_") && !schedule_enabled {
         return Err("Scheduling is not authorized for this sender.".into());
     }
 
@@ -11479,7 +11694,7 @@ async fn host_tool(
         ));
     }
 
-    if name == "schedule_propose" && !schedule_enabled {
+    if name.starts_with("schedule_") && !schedule_enabled {
         return Ok(Response::fail(id, -32000, "Scheduling is not authorized for this sender."));
     }
 
@@ -16757,7 +16972,7 @@ done
             Arc::new(Mutex::new(super::state::Store::load(root.join("sessions.json")).unwrap()));
         {
             let mut store = sessions.lock().unwrap();
-            store.ensure("schedule-42", "test").unwrap();
+            store.ensure_schedule("schedule-42", "test").unwrap();
             store
                 .begin_with_roles(
                     "schedule-42",
@@ -16867,7 +17082,7 @@ done
             Arc::new(Mutex::new(super::state::Store::load(root.join("sessions.json")).unwrap()));
         {
             let mut store = sessions.lock().unwrap();
-            store.ensure("schedule-51", "test").unwrap();
+            store.ensure_schedule("schedule-51", "test").unwrap();
             store.ensure("tui-default", "test").unwrap();
             store
                 .begin_with_roles(
@@ -16984,7 +17199,7 @@ done
             Arc::new(Mutex::new(super::state::Store::load(root.join("sessions.json")).unwrap()));
         {
             let mut store = sessions.lock().unwrap();
-            store.ensure("schedule-52", "test").unwrap();
+            store.ensure_schedule("schedule-52", "test").unwrap();
             store.ensure("tui-default", "test").unwrap();
             store
                 .begin_with_roles(
@@ -17981,8 +18196,8 @@ while IFS= read -r line; do
     id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\),"method".*/\1/p')
     case "$line" in
         *'"method":"hello"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol":{"major":0,"minor":1},"id":"scheduler","version":"0.1.0","capabilities":["scheduler"]}}' ;;
-        *'"method":"reports"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"items":[{"id":7,"run_id":9,"context":{"origin":{"channel":"tui","session":"origin"}},"finish":{"status":"completed","success":true,"finished_at":1700000000,"result":"Recovered result."}}]}}' ;;
-        *'"method":"report"'*) touch "ACKNOWLEDGEMENT"; printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"reported":true}}' ;;
+        *'"method":"reports"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"items":[{"id":7,"run_id":9,"context":{"origin":{"channel":"tui","session":"origin"}},"finish":{"status":"completed","success":true,"finished_at":1700000000,"result":"Recovered result."}},{"id":8,"run_id":10,"context":{"origin":{"channel":"tui","session":"deleted"}},"finish":{"status":"completed","success":true,"finished_at":1700000001,"result":"Destination deleted."}}]}}' ;;
+        *'"method":"report"'*) printf '%s\n' "$line" >> "ACKNOWLEDGEMENT"; printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"reported":true}}' ;;
         *'"method":"shutdown"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}'; exit 0 ;;
     esac
 done
@@ -18008,6 +18223,62 @@ done
         }));
 
         assert!(acknowledgement.is_file());
+        assert_eq!(fs::read_to_string(&acknowledgement).unwrap().lines().count(), 2);
+
+        let missing_destination_log =
+            fs::read_to_string(home.join("logs/schedules/schedule-8.jsonl")).unwrap();
+        assert_eq!(missing_destination_log.lines().count(), 1);
+
+        stop_registry(&plugins).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skipped_schedule_falls_back_when_scheduler_has_no_reports_method() {
+        let root = test_root("scheduled-legacy-skip");
+        let home = root.join("home");
+        fs::create_dir_all(home.join("data/sessions")).unwrap();
+
+        let script = r#"
+while IFS= read -r line; do
+    id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\),"method".*/\1/p')
+    case "$line" in
+        *'"method":"hello"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol":{"major":0,"minor":1},"id":"scheduler","version":"0.1.0","capabilities":["scheduler"]}}' ;;
+        *'"method":"reports"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32601,"message":"method not found"}}' ;;
+        *'"method":"shutdown"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}'; exit 0 ;;
+    esac
+done
+"#;
+        let scheduler = Process::start_with("sh", ["-c", script]).await.unwrap();
+        let plugins = registry([scheduler]).await;
+        let mut store = super::state::Store::load(home.join("data/sessions/index.json")).unwrap();
+        store.create("origin", "model").unwrap();
+        let sessions = Arc::new(Mutex::new(store));
+        let stop = Stop::new();
+        let mut call = 1;
+        let task = serde_json::json!({
+            "id": 17,
+            "name": "legacy-task",
+            "skipped": true,
+            "skipped_at": 1_700_000_000,
+            "context": {"origin": {"channel": "tui", "session": "origin"}}
+        });
+
+        super::process_skipped_schedule(&plugins, &sessions, &home, &task, &stop, &mut call).await;
+
+        let messages = sessions.lock().unwrap().sessions["origin"].messages.clone();
+
+        assert!(messages.iter().any(|message| {
+            message.id == "schedule-notice-at-1700000000000-17-0"
+                && message.content.iter().any(|content| {
+                    matches!(content, Content::Text { text } if text.contains("skipped because the daemon was offline"))
+                })
+        }));
+
+        let history = fs::read_to_string(home.join("logs/schedules/legacy-task-17.jsonl")).unwrap();
+
+        assert!(history.contains("\"status\":\"skipped\""));
 
         stop_registry(&plugins).await;
         let _ = fs::remove_dir_all(root);
@@ -18030,35 +18301,44 @@ done
             }
         });
 
-        assert!(super::report_scheduled_result(
-            &task,
-            7,
-            Some(9),
-            Some(1_700_000_000),
-            "completed",
-            "DONE: Finished.",
-            &sessions
-        ));
+        assert_eq!(
+            super::report_scheduled_result(
+                &task,
+                7,
+                Some(9),
+                Some(1_700_000_000),
+                "completed",
+                "DONE: Finished.",
+                &sessions
+            ),
+            super::ScheduleReportOutcome::Delivered
+        );
 
-        assert!(super::report_scheduled_result(
-            &task,
-            7,
-            Some(9),
-            Some(1_700_000_000),
-            "completed",
-            "DONE: Finished.",
-            &sessions
-        ));
+        assert_eq!(
+            super::report_scheduled_result(
+                &task,
+                7,
+                Some(9),
+                Some(1_700_000_000),
+                "completed",
+                "DONE: Finished.",
+                &sessions
+            ),
+            super::ScheduleReportOutcome::Delivered
+        );
 
-        assert!(super::report_scheduled_result(
-            &task,
-            8,
-            Some(10),
-            None,
-            "completed",
-            "Legacy scheduler report.",
-            &sessions
-        ));
+        assert_eq!(
+            super::report_scheduled_result(
+                &task,
+                8,
+                Some(10),
+                None,
+                "completed",
+                "Legacy scheduler report.",
+                &sessions
+            ),
+            super::ScheduleReportOutcome::Delivered
+        );
 
         let history = sessions.lock().unwrap().sessions["origin"].messages.clone();
 
@@ -18115,7 +18395,7 @@ done
         fs::create_dir_all(&root).unwrap();
         let sessions =
             Arc::new(Mutex::new(super::state::Store::load(root.join("sessions.json")).unwrap()));
-        sessions.lock().unwrap().ensure("schedule-71", "test").unwrap();
+        sessions.lock().unwrap().ensure_schedule("schedule-71", "test").unwrap();
         let stop = Stop::new();
         let mut call = 1;
         let mut failed_tool = None;
@@ -18542,6 +18822,14 @@ done
     }
 
     #[test]
+    fn session_model_uses_the_requested_or_configured_model() {
+        let configured = std::env::var("CRABBOT_MODEL").unwrap_or_else(|_| "unset".into());
+
+        assert_eq!(super::session_model(None), configured);
+        assert_eq!(super::session_model(Some("explicit".into())), "explicit");
+    }
+
+    #[test]
     fn scheduled_policy_explores_the_machine_only_with_enabled_shell_access() {
         let workspace = Path::new("/home/airscript/repos/personal/crabbot");
         let origin = &serde_json::json!({"channel": "cli", "session": ""});
@@ -18684,10 +18972,59 @@ done
         assert_eq!(record["run"]["scheduled_for"], 1_800_000_000_u64);
         assert_eq!(record["agent"]["provider"], "codex");
         assert_eq!(record["agent"]["model"], "gpt-6-luna");
+
+        let mut duplicate = task.clone();
+        duplicate["run_id"] = serde_json::json!(1);
+        super::scheduler_log(&home, &duplicate, "completed", "done", Some(&finish));
+
+        assert_eq!(fs::read_to_string(&named).unwrap().lines().count(), 106);
         assert_eq!(record["agent"]["workspace"], "/work/reports");
         assert_eq!(record["result"], "done\nAuthorization: [redacted]");
         assert!(!legacy.exists());
         assert_eq!(super::schedule_log_path(&home, 42).unwrap(), named);
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn schedule_history_rotation_bounds_file_and_duplicate_scan() {
+        let home = test_root("schedule-history-rotation");
+        let directory = home.join("logs/schedules");
+        fs::create_dir_all(&directory).unwrap();
+
+        let path = directory.join("42.jsonl");
+        let old_record = format!("{{\"payload\":\"{}\"}}\n", "x".repeat(200));
+        let history = old_record.repeat(2_000);
+        fs::write(&path, history).unwrap();
+
+        let task = serde_json::json!({
+            "id": 42,
+            "run_id": 9_999,
+            "name": "mighty-raccoon",
+            "zone": "UTC",
+            "context": {"provider": "codex", "model": "test", "workspace": "/work"}
+        });
+
+        super::scheduler_log(&home, &task, "completed", "done", None);
+
+        let path = directory.join("mighty-raccoon-42.jsonl");
+        let metadata = fs::metadata(&path).unwrap();
+        let tail = super::schedule_history_tail(&path).unwrap();
+
+        assert!(metadata.len() <= super::SCHEDULE_HISTORY_LIMIT);
+        assert!(tail.len() as u64 <= super::SCHEDULE_HISTORY_LIMIT);
+        assert!(String::from_utf8(tail).unwrap().contains("9999"));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn schedule_history_without_log_directory_is_empty() {
+        let home = test_root("schedule-history-missing-directory");
+        let path = super::schedule_log_path(&home, 42).unwrap();
+
+        assert_eq!(path, home.join("logs/schedules/42.jsonl"));
+        assert_eq!(super::read_schedule_history_page(&path, 1).unwrap(), (Vec::new(), 0));
 
         let _ = fs::remove_dir_all(home);
     }
@@ -18773,6 +19110,24 @@ done
         let error = super::parse_schedule_history("{}\nnot-json\n").unwrap_err();
 
         assert!(error.contains("line 2"));
+    }
+
+    #[test]
+    fn schedule_history_ignores_a_torn_final_record() {
+        let home = test_root("schedule-history-torn-final-record");
+        let path = home.join("history.jsonl");
+        let valid = r#"{"run":{"id":1}}"#;
+
+        fs::create_dir_all(&home).unwrap();
+        fs::write(&path, format!("{valid}\n{{\"run\":")).unwrap();
+
+        let (records, total) = super::read_schedule_history_page(&path, 1).unwrap();
+
+        assert_eq!(total, 1);
+        assert_eq!(records[0]["run"]["id"], 1);
+        assert_eq!(super::parse_schedule_history("{}\n{\"run\":").unwrap().len(), 1);
+
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -19021,6 +19376,95 @@ done
         run.await.unwrap();
 
         assert_eq!(fs::read_to_string(log).unwrap().lines().count(), 2);
+
+        stop_registry(&plugins).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scheduler_retries_recovery_after_rpc_and_claim_errors() {
+        let root = test_root("scheduler-recovery-rpc-errors");
+        let home = root.join("home");
+        fs::create_dir_all(home.join("data/sessions")).unwrap();
+        fs::create_dir_all(home.join("logs/schedules")).unwrap();
+
+        let log = root.join("scheduler.log");
+        let script = format!(
+            r#"
+recoveries=0
+claims=0
+while IFS= read -r line; do
+    id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\),"method".*/\1/p')
+    case "$line" in
+        *'"method":"hello"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"protocol":{{"major":0,"minor":1}},"id":"scheduler","version":"0.1.0","capabilities":["scheduler"]}}}}' ;;
+        *'"method":"recover"'*)
+            recoveries=$((recoveries + 1))
+            printf '%s\n' recover >> '{}'
+            if [ "$recoveries" = 1 ]; then
+                printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"error":{{"code":-32000,"message":"temporary recovery failure"}}}}'
+            else
+                printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"recovered":0}}}}'
+            fi ;;
+        *'"method":"reports"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"items":[]}}}}' ;;
+        *'"method":"claim"'*)
+            claims=$((claims + 1))
+            printf '%s\n' claim >> '{}'
+            if [ "$claims" = 1 ]; then
+                printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"error":{{"code":-32000,"message":"temporary claim failure"}}}}'
+            else
+                printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"item":null}}}}'
+            fi ;;
+        *'"method":"shutdown"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"ok":true}}}}'; exit 0 ;;
+    esac
+done
+"#,
+            log.display(),
+            log.display()
+        );
+        let process = Process::start_with("sh", ["-c", script.as_str()]).await.unwrap();
+        let plugins = registry([process]).await;
+        let sessions = Arc::new(Mutex::new(
+            super::state::Store::load(home.join("data/sessions/index.json")).unwrap(),
+        ));
+        let stop = Arc::new(Stop::new());
+        let scheduler_plugins = plugins.clone();
+        let scheduler_stop = Arc::clone(&stop);
+        let scheduler_home = home.clone();
+        let scheduler_root = root.clone();
+        let run = tokio::spawn(async move {
+            super::run_scheduler(
+                scheduler_plugins,
+                sessions,
+                scheduler_stop,
+                scheduler_home,
+                scheduler_root.join("workspace"),
+                scheduler_root.join("media"),
+                "codex".into(),
+                "test".into(),
+                Arc::new(super::AsyncMutex::new(super::approval::Gate::new().unwrap())),
+            )
+            .await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if fs::read_to_string(&log).is_ok_and(|contents| contents.lines().count() >= 5) {
+                    break;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduler should recover after recovery and claim errors");
+        stop.signal();
+        run.await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(log).unwrap().lines().collect::<Vec<_>>(),
+            ["recover", "recover", "claim", "recover", "claim"]
+        );
 
         stop_registry(&plugins).await;
         let _ = fs::remove_dir_all(root);
@@ -19468,6 +19912,14 @@ done
         invalid.capabilities = vec!["unknown".into()];
 
         assert!(invalid.validate().is_err());
+        invalid.id = "timer".into();
+        invalid.capabilities = vec!["timer".into()];
+
+        assert!(invalid.validate().is_ok());
+        invalid.id = "other".into();
+
+        assert!(invalid.validate().is_err());
+        invalid.id = "tools".into();
         invalid.capabilities = vec!["tool".into()];
         invalid.permissions = vec!["unknown".into()];
 
@@ -19508,6 +19960,27 @@ done
                 .iter()
                 .any(|(key, value)| { key == "CRABBOT_ROOT" && Path::new(value) == expected_root })
         );
+
+        let mut config = Config::default();
+        config.channels.insert(
+            "telegram".into(),
+            super::ChannelConfig { tools: true, shell: true, ..super::ChannelConfig::default() },
+        );
+        let values = env_for(
+            &Manifest {
+                id: "tools".into(),
+                version: "0.1.0".into(),
+                protocol: Protocol::CURRENT,
+                capabilities: vec!["tool".into()],
+                permissions: Vec::new(),
+                secrets: Vec::new(),
+                commands: Vec::new(),
+            },
+            &config,
+            test_home,
+        );
+
+        assert!(values.iter().any(|(key, value)| key == "CRABBOT_SHELL" && value == "on"));
 
         let values = env_for(
             &Manifest {
@@ -20751,6 +21224,10 @@ done
 
         assert!(session.json);
 
+        let session = SessionCli::try_parse_from(["session", "new", "main"]).unwrap();
+
+        assert!(matches!(session.command, SessionCommand::New(SessionNew { model: None, .. })));
+
         let session = SessionCli::try_parse_from(["session", "show", "main", "--json"]).unwrap();
 
         assert!(session.json);
@@ -21774,6 +22251,43 @@ done
     }
 
     #[tokio::test]
+    async fn execute_tool_rejects_shell_when_turn_permission_is_disabled() {
+        let sessions = Arc::new(Mutex::new(super::state::Store::default()));
+        let mut failed_tool = None;
+        let result = super::execute_tool(
+            &Plugins::default(),
+            1,
+            "shell",
+            serde_json::json!({"command": "true"}),
+            "codex",
+            "test",
+            super::ApprovalMode::Auto,
+            Arc::new(super::AsyncMutex::new(super::approval::Gate::new().unwrap())),
+            "scheduler",
+            "42",
+            None,
+            "schedule-42",
+            &sessions,
+            None,
+            true,
+            false,
+            false,
+            tokio::sync::mpsc::channel(1).0,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            &mut failed_tool,
+            None,
+            Some(9),
+            0,
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Shell access is not authorized for this turn."
+        );
+    }
+
+    #[tokio::test]
     async fn schedule_proposals_fail_only_when_the_scheduler_is_missing() {
         let sessions = Arc::new(Mutex::new(super::state::Store::default()));
         sessions.lock().unwrap().ensure("tui-default", "test").unwrap();
@@ -22503,7 +23017,7 @@ done
             .unwrap();
 
         local_session(
-            SessionCommand::New(SessionNew { id: "main".into(), model: "test".into() }),
+            SessionCommand::New(SessionNew { id: "main".into(), model: Some("test".into()) }),
             &root,
         )
         .unwrap();
@@ -24045,7 +24559,7 @@ fn main() {
         let root = test_root("session");
         let _ = fs::remove_dir_all(&root);
         session_at(
-            SessionCommand::New(SessionNew { id: "main".into(), model: "first".into() }),
+            SessionCommand::New(SessionNew { id: "main".into(), model: Some("first".into()) }),
             &root,
         )
         .await
@@ -25326,6 +25840,39 @@ done
         .unwrap();
 
         assert!(disabled.error.unwrap().message.contains("disabled"));
+
+        let calls_before_scheduler = calls.load(std::sync::atomic::Ordering::Relaxed);
+        let scheduler_disabled = super::host_tool(
+            Request::call(
+                11,
+                "host/tool",
+                serde_json::json!({"name": "schedule_run", "args": {"id": 1}}),
+            ),
+            &plugins,
+            &sessions,
+            "room",
+            "codex",
+            "test",
+            None,
+            false,
+            false,
+            false,
+            super::ApprovalMode::Auto,
+            Arc::clone(&approvals),
+            "telegram",
+            "8",
+            None,
+            notices.clone(),
+            Arc::clone(&calls),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(scheduler_disabled.error.unwrap().message.contains("Scheduling is not authorized"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), calls_before_scheduler);
 
         let approved = super::host_tool(
             Request::call(

@@ -720,12 +720,13 @@ fn summary(value: &str) -> String {
     let mut summary = value.split_whitespace().collect::<Vec<_>>().join(" ");
 
     if summary.len() > 240 {
-        summary.truncate(240);
+        let mut boundary = 240;
 
-        while !summary.is_char_boundary(summary.len()) {
-            summary.pop();
+        while !summary.is_char_boundary(boundary) {
+            boundary -= 1;
         }
 
+        summary.truncate(boundary);
         summary.push('…');
     }
 
@@ -1415,6 +1416,29 @@ mod tests {
             call(&items, Request::call(4, "forget", json!({"key": "name"}))).unwrap().unwrap();
 
         assert_eq!(forget.result.unwrap()["deleted"], true);
+    }
+
+    #[test]
+    fn memory_list_truncates_values_at_a_utf8_boundary() {
+        let items = items();
+        let value = format!("{}é", "a".repeat(239));
+
+        items.lock().unwrap().items.insert(
+            storage("global", "long"),
+            Entry {
+                key: "long".into(),
+                value,
+                scope: "global".into(),
+                created: 0,
+                updated: 1,
+                record: String::new(),
+            },
+        );
+
+        let list =
+            call(&items, Request::call(1, "list", json!({}))).unwrap().unwrap().result.unwrap();
+
+        assert_eq!(list["items"][0]["value"], format!("{}…", "a".repeat(239)));
     }
 
     #[test]

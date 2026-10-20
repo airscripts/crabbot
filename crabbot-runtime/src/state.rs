@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const LIMIT: usize = 100;
+const SCHEDULE_SESSION_LIMIT: usize = 1_000;
 const SEEN_LIMIT: usize = 10_000;
 const SEEN_KEY_LIMIT: usize = 4 * 1024;
 const BYTE_LIMIT: u64 = 32 * 1024 * 1024;
@@ -76,6 +77,8 @@ fn message_group(messages: &[Message], index: usize) -> (usize, usize) {
 pub struct Session {
     pub id: String,
     pub model: String,
+    #[serde(default)]
+    pub scheduled: bool,
     #[serde(default)]
     pub workspace: Option<String>,
     #[serde(default)]
@@ -227,7 +230,9 @@ impl Store {
         let mut store: Self =
             serde_json::from_value(document.clone()).map_err(std::io::Error::other)?;
 
-        let mut changed = migrate_delivery_routes(
+        let mut changed = migrate_schedule_sessions(&mut store, document.get("sessions"));
+
+        changed |= migrate_delivery_routes(
             &mut store.outbox,
             document.get("outbox"),
             &store.sessions,
@@ -305,21 +310,25 @@ impl Store {
             }
         }
 
-        if store.sessions.len() > LIMIT {
-            let excess = store.sessions.len() - LIMIT;
-            let ids = {
-                let mut values = store.sessions.values().collect::<Vec<_>>();
-                values.sort_by_key(|session| session.updated);
-                values
-                    .into_iter()
-                    .take(excess)
-                    .map(|session| session.id.clone())
-                    .collect::<Vec<_>>()
-            };
+        let mut users =
+            store.sessions.values().filter(|session| !session.scheduled).collect::<Vec<_>>();
 
-            for id in ids {
-                store.sessions.remove(&id);
-            }
+        let mut schedules =
+            store.sessions.values().filter(|session| session.scheduled).collect::<Vec<_>>();
+
+        users.sort_by_key(|session| session.updated);
+        schedules.sort_by_key(|session| session.updated);
+
+        let discarded = users
+            .iter()
+            .take(users.len().saturating_sub(LIMIT))
+            .chain(schedules.iter().take(schedules.len().saturating_sub(SCHEDULE_SESSION_LIMIT)))
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+
+        for id in discarded {
+            store.sessions.remove(&id);
+            changed = true;
         }
 
         if store.outbox.len() > LIMIT {
@@ -375,13 +384,26 @@ impl Store {
         id: impl Into<String>,
         model: impl Into<String>,
     ) -> std::io::Result<()> {
-        let id = id.into();
-        let model = model.into();
+        self.create_session(id.into(), model.into(), false)
+    }
 
+    fn create_session(
+        &mut self,
+        id: String,
+        model: String,
+        scheduled: bool,
+    ) -> std::io::Result<()> {
         if !valid(&id) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Session ID must contain lowercase letters, digits, or hyphens.",
+            ));
+        }
+
+        if is_schedule_session(&id) != scheduled {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Scheduled session IDs are reserved.",
             ));
         }
 
@@ -399,11 +421,22 @@ impl Store {
             ));
         }
 
-        if self.sessions.len() >= LIMIT {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
+        let (count, limit, full_message) = if scheduled {
+            (
+                self.schedule_session_count(),
+                SCHEDULE_SESSION_LIMIT,
+                "Scheduled session capacity is full.",
+            )
+        } else {
+            (
+                self.user_session_count(),
+                LIMIT,
                 "Session limit reached; remove an old session first.",
-            ));
+            )
+        };
+
+        if count >= limit {
+            return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, full_message));
         }
 
         let now = now();
@@ -413,6 +446,7 @@ impl Store {
                 Session {
                     id,
                     model,
+                    scheduled,
                     workspace: None,
                     archived: false,
                     channel: None,
@@ -453,6 +487,64 @@ impl Store {
         Ok(())
     }
 
+    pub fn ensure_schedule(
+        &mut self,
+        id: impl Into<String>,
+        model: impl Into<String>,
+    ) -> std::io::Result<()> {
+        let id = id.into();
+
+        if !is_schedule_session(&id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Scheduled session ID is invalid.",
+            ));
+        }
+
+        if let Some(session) = self.sessions.get(&id) {
+            if session.scheduled {
+                return Ok(());
+            }
+
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "Session ID is already used by a non-scheduled session.",
+            ));
+        }
+
+        if self.schedule_session_count() >= SCHEDULE_SESSION_LIMIT {
+            let oldest = self
+                .sessions
+                .values()
+                .filter(|session| session.scheduled)
+                .filter(|session| session.status != "working" && session.inflight.is_none())
+                .min_by_key(|session| session.updated)
+                .map(|session| session.id.clone())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "Scheduled session capacity is full.",
+                    )
+                })?;
+
+            self.remove_deep(&oldest)?;
+        }
+
+        self.create_scheduled(id, model)
+    }
+
+    fn user_session_count(&self) -> usize {
+        self.sessions.values().filter(|session| !session.scheduled).count()
+    }
+
+    fn schedule_session_count(&self) -> usize {
+        self.sessions.values().filter(|session| session.scheduled).count()
+    }
+
+    fn create_scheduled(&mut self, id: String, model: impl Into<String>) -> std::io::Result<()> {
+        self.create_session(id, model.into(), true)
+    }
+
     pub fn rename_session(&mut self, source: &str, target: &str) -> std::io::Result<()> {
         if !valid(source) || !valid(target) || source == target {
             return Err(std::io::Error::new(
@@ -472,6 +564,20 @@ impl Store {
             std::io::Error::new(std::io::ErrorKind::NotFound, "Session was not found.")
         })?;
 
+        if session.scheduled {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "A scheduled session cannot be renamed.",
+            ));
+        }
+
+        if is_schedule_session(target) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Scheduled session IDs are reserved.",
+            ));
+        }
+
         if session.channel.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -487,6 +593,7 @@ impl Store {
         }
 
         session.id = target.to_owned();
+
         session.updated = now();
 
         for message in session.messages.iter_mut().chain(session.queued.iter_mut()) {
@@ -1367,7 +1474,14 @@ impl Store {
             std::io::Error::new(std::io::ErrorKind::NotFound, "Source session was not found.")
         })?;
 
-        if self.sessions.len() >= LIMIT {
+        if is_schedule_session(target) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Scheduled session IDs are reserved.",
+            ));
+        }
+
+        if self.user_session_count() >= LIMIT {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "Session capacity is full.",
@@ -1375,6 +1489,7 @@ impl Store {
         }
 
         let now = now();
+
         let target = target.to_owned();
         self.change(|store| {
             let messages = source
@@ -1401,6 +1516,7 @@ impl Store {
                 Session {
                     id: target,
                     model: source.model,
+                    scheduled: false,
                     workspace: source.workspace,
                     archived: false,
                     channel: source.channel,
@@ -1814,6 +1930,12 @@ impl Store {
     }
 }
 
+fn is_schedule_session(id: &str) -> bool {
+    id.strip_prefix("schedule-").is_some_and(|task_id| {
+        !task_id.is_empty() && task_id.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 pub fn valid(id: &str) -> bool {
     !id.is_empty()
         && id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
@@ -2165,6 +2287,7 @@ fn load_catalog(path: &Path) -> std::io::Result<Store> {
 
     let root = path.parent().expect("catalog has parent");
     let mut store = Store { path: Some(path.to_path_buf()), ..Store::default() };
+    let mut changed = false;
 
     for (id, key) in index.sessions {
         if !valid(&id) || key.len() != 64 || key.bytes().any(|byte| !byte.is_ascii_hexdigit()) {
@@ -2179,13 +2302,22 @@ fn load_catalog(path: &Path) -> std::io::Result<Store> {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "Session record is missing.")
         })?;
 
-        let session: Session = serde_json::from_slice(&record).map_err(std::io::Error::other)?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&record).map_err(std::io::Error::other)?;
+
+        let mut session: Session =
+            serde_json::from_value(value.clone()).map_err(std::io::Error::other)?;
 
         if session.id != id || session_record_key(&record) != key {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Session record ID does not match its catalog entry.",
             ));
+        }
+
+        if value.get("scheduled").is_none() && is_schedule_session(&id) {
+            session.scheduled = true;
+            changed = true;
         }
 
         store.sessions.insert(id, session);
@@ -2234,7 +2366,34 @@ fn load_catalog(path: &Path) -> std::io::Result<Store> {
         }
     }
 
+    if changed {
+        save_catalog(path, &store)?;
+    }
+
     Ok(store)
+}
+
+fn migrate_schedule_sessions(
+    store: &mut Store,
+    persisted_sessions: Option<&serde_json::Value>,
+) -> bool {
+    let Some(persisted_sessions) = persisted_sessions.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+
+    let mut changed = false;
+
+    for (id, session) in &mut store.sessions {
+        let legacy =
+            persisted_sessions.get(id).is_some_and(|value| value.get("scheduled").is_none());
+
+        if legacy && is_schedule_session(id) {
+            session.scheduled = true;
+            changed = true;
+        }
+    }
+
+    changed
 }
 
 fn save_catalog(path: &Path, store: &Store) -> std::io::Result<()> {
@@ -2468,7 +2627,10 @@ fn seen_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeliveryStatus, LIMIT, Session, Store, compact_messages, save_file, valid};
+    use super::{
+        DeliveryStatus, LIMIT, SCHEDULE_SESSION_LIMIT, Session, Store, compact_messages, save_file,
+        valid,
+    };
 
     use crabbot_core::types::{Content, ContextUsage, Message, Role};
     use std::collections::BTreeMap;
@@ -2627,6 +2789,122 @@ mod tests {
         }
 
         assert!(store.fork("main", "copy").is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scheduled_sessions_have_bounded_capacity_without_using_user_slots() {
+        let mut store = Store::default();
+
+        for id in 0..LIMIT {
+            store.create(format!("user-{id}"), "local").unwrap();
+        }
+
+        for id in 0..SCHEDULE_SESSION_LIMIT {
+            store.ensure_schedule(format!("schedule-{id}"), "local").unwrap();
+        }
+
+        assert_eq!(store.sessions.len(), LIMIT + SCHEDULE_SESSION_LIMIT);
+        assert!(store.create("another-user", "local").is_err());
+
+        store.ensure_schedule("schedule-1000", "local").unwrap();
+
+        assert!(!store.sessions.contains_key("schedule-0"));
+        assert!(store.sessions.contains_key("schedule-1000"));
+        assert!(store.sessions.contains_key("user-0"));
+        assert_eq!(store.schedule_session_count(), SCHEDULE_SESSION_LIMIT);
+        assert_eq!(store.user_session_count(), LIMIT);
+    }
+
+    #[test]
+    fn scheduled_session_identity_is_persisted_and_reserved() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-state-schedule-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("sessions.json");
+        let mut store = Store::load(&path).unwrap();
+
+        assert!(store.create("schedule-42", "local").is_err());
+        assert!(store.ensure("schedule-42", "local").is_err());
+
+        store.create("user-session", "local").unwrap();
+        let mut user_session = store.sessions.remove("user-session").unwrap();
+        user_session.id = "schedule-42".into();
+        store.sessions.insert(user_session.id.clone(), user_session);
+        store.save().unwrap();
+
+        let mut store = Store::load(&path).unwrap();
+
+        assert!(!store.sessions["schedule-42"].scheduled);
+        assert!(store.ensure_schedule("schedule-42", "local").is_err());
+
+        store.remove("schedule-42").unwrap();
+        store.ensure_schedule("schedule-42", "local").unwrap();
+
+        let loaded = Store::load(&path).unwrap();
+
+        assert!(loaded.sessions["schedule-42"].scheduled);
+        assert!(store.ensure_schedule("schedule-42", "local").is_ok());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_schedule_sessions_are_migrated_when_loaded() {
+        let root = std::env::temp_dir()
+            .join(format!("crabbot-state-legacy-schedule-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        let flat_path = root.join("sessions.json");
+        let mut flat = Store::load(&flat_path).unwrap();
+        flat.ensure_schedule("schedule-42", "local").unwrap();
+        flat.save().unwrap();
+
+        let mut flat_document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&flat_path).unwrap()).unwrap();
+
+        flat_document["sessions"]["schedule-42"].as_object_mut().unwrap().remove("scheduled");
+        save_file(&flat_path, serde_json::to_vec(&flat_document).unwrap()).unwrap();
+
+        let mut loaded_flat = Store::load(&flat_path).unwrap();
+
+        assert!(loaded_flat.sessions["schedule-42"].scheduled);
+        assert!(loaded_flat.ensure_schedule("schedule-42", "local").is_ok());
+
+        let catalog_path = root.join("data/sessions/index.json");
+        let mut catalog = Store::load(&catalog_path).unwrap();
+        catalog.ensure_schedule("schedule-43", "local").unwrap();
+        catalog.save().unwrap();
+
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
+
+        let key = index["sessions"]["schedule-43"].as_str().unwrap().to_owned();
+        let record_path =
+            catalog_path.parent().unwrap().join("records").join(format!("{key}.json"));
+
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+
+        record.as_object_mut().unwrap().remove("scheduled");
+        let record = serde_json::to_vec(&record).unwrap();
+        let migrated_key = super::session_record_key(&record);
+        save_file(
+            catalog_path.parent().unwrap().join("records").join(format!("{migrated_key}.json")),
+            &record,
+        )
+        .unwrap();
+
+        index["sessions"]["schedule-43"] = migrated_key.into();
+        save_file(&catalog_path, serde_json::to_vec(&index).unwrap()).unwrap();
+
+        let mut loaded_catalog = Store::load(&catalog_path).unwrap();
+
+        assert!(loaded_catalog.sessions["schedule-43"].scheduled);
+        assert!(loaded_catalog.ensure_schedule("schedule-43", "local").is_ok());
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2798,6 +3076,7 @@ mod tests {
             Session {
                 id: "safe".into(),
                 model: "model".into(),
+                scheduled: false,
                 workspace: None,
                 archived: false,
                 channel: None,

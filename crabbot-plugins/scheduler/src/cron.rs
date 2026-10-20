@@ -35,8 +35,8 @@ impl CronSchedule {
             days,
             months,
             weekdays,
-            day_any: fields[2] == "*" || fields[2] == "?",
-            weekday_any: fields[4] == "*" || fields[4] == "?",
+            day_any: wildcard_field(fields[2]),
+            weekday_any: wildcard_field(fields[4]),
         })
     }
 
@@ -66,6 +66,16 @@ impl CronSchedule {
             u64::from(60 - current + self.minutes[0])
         }
     }
+}
+
+fn wildcard_field(value: &str) -> bool {
+    value == "*"
+        || value == "?"
+        || value.split(',').any(|item| {
+            item.split_once('/').is_some_and(|(base, step)| {
+                (base == "*" || base == "?") && step.parse::<u32>().ok() == Some(1)
+            })
+        })
 }
 
 pub(super) fn validate_cron(value: &str) -> crabbot_core::Result<()> {

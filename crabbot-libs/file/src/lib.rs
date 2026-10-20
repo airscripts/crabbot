@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -153,6 +153,85 @@ pub fn append(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> io::Result<(
 
     private(path)?;
     file.write_all(content.as_ref())?;
+    file.sync_all()
+}
+
+pub fn append_jsonl(path: impl AsRef<Path>, record: impl AsRef<[u8]>) -> io::Result<()> {
+    let record = record.as_ref();
+
+    if record.last() != Some(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "JSONL record must end with a newline.",
+        ));
+    }
+
+    let path = path.as_ref();
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    reject_link(path)?;
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
+
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Append path must be a regular file.",
+        ));
+    }
+
+    private(path)?;
+
+    let length = file.metadata()?.len();
+
+    if length > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0_u8; 1];
+        file.read_exact(&mut last)?;
+
+        if last[0] != b'\n' {
+            let mut start = length;
+            let mut chunk = [0_u8; 8192];
+
+            while start > 0 {
+                let chunk_start = start.saturating_sub(chunk.len() as u64);
+                let count = (start - chunk_start) as usize;
+                file.seek(SeekFrom::Start(chunk_start))?;
+                file.read_exact(&mut chunk[..count])?;
+
+                if let Some(index) = chunk[..count].iter().rposition(|byte| *byte == b'\n') {
+                    start = chunk_start + index as u64 + 1;
+                    break;
+                }
+
+                start = chunk_start;
+            }
+
+            file.seek(SeekFrom::Start(start))?;
+
+            if serde_json::from_reader::<_, serde_json::Value>(
+                (&mut file).take(length.saturating_sub(start)),
+            )
+            .is_ok()
+            {
+                file.seek(SeekFrom::End(0))?;
+
+                file.write_all(b"\n")?;
+            } else {
+                file.set_len(start)?;
+            }
+        }
+    }
+
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(record)?;
     file.sync_all()
 }
 
@@ -334,7 +413,9 @@ fn nonce() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Transaction, append, check, credential, load, private, recover, save};
+    use super::{
+        Transaction, append, append_jsonl, check, credential, load, private, recover, save,
+    };
 
     use std::fs;
 
@@ -367,6 +448,25 @@ mod tests {
 
         assert_eq!(fs::read(&path).unwrap(), b"{\"run\":1}\n{\"run\":2}\n");
         check(&path).unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn jsonl_append_discards_a_torn_trailing_record() {
+        let root = root("append-jsonl-torn");
+        let path = root.join("logs/schedule.jsonl");
+
+        append_jsonl(&path, b"{\"run\":1}\n").unwrap();
+        append(&path, b"{\"run\":").unwrap();
+        append_jsonl(&path, b"{\"run\":2}\n").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"{\"run\":1}\n{\"run\":2}\n");
+
+        fs::write(&path, b"{\"run\":3}").unwrap();
+        append_jsonl(&path, b"{\"run\":4}\n").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"{\"run\":3}\n{\"run\":4}\n");
 
         let _ = fs::remove_dir_all(root);
     }
