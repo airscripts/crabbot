@@ -17384,10 +17384,11 @@ done
             .unwrap();
         let stop = Arc::new(Stop::new());
         let signal = Arc::clone(&stop);
-        let marker_for_signal = marker.clone();
+        let sessions_for_signal = Arc::clone(&sessions);
+
         let notifier = tokio::spawn(async move {
-            for _ in 0..200 {
-                if marker_for_signal.is_file() {
+            for _ in 0..300 {
+                if sessions_for_signal.lock().unwrap().outbox.is_empty() {
                     break;
                 }
 
