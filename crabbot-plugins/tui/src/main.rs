@@ -163,6 +163,7 @@ enum EngineEvent {
     CompactionFinished,
     AssistantText(String),
     SystemText(String),
+    RequestFailed(String),
     SystemNotice(String),
     AssistantFinished,
     GenerationFinished { interrupted: bool },
@@ -1266,6 +1267,8 @@ where
 
             let _ = reservation.release().await;
 
+            let request_succeeded = response.is_ok();
+
             match response {
                 Ok(value) => {
                     let reply = value["text"].as_str().unwrap_or_default();
@@ -1279,6 +1282,13 @@ where
                 Err(error) => {
                     if interrupted {
                         output.write_all(b"Generation interrupted.\n").await?;
+                    } else if let Some(events) = &engine_events {
+                        let message = format!(
+                            "Request failed: {}.",
+                            sentence(error.to_string())
+                        );
+
+                        let _ = events.send(EngineEvent::RequestFailed(message));
                     } else {
                         output
                             .write_all(format!("Request failed: {}.\n", sentence(error.to_string())).as_bytes())
@@ -1287,7 +1297,8 @@ where
                 }
             }
 
-            if streaming_turn
+            if request_succeeded
+                && streaming_turn
                 && let Some(events) = &engine_events
             {
                 let _ = events.send(EngineEvent::AssistantFinished);

@@ -616,6 +616,10 @@ where
                         app.push_system_output(&text);
                     }
 
+                    Some(crate::EngineEvent::RequestFailed(text)) => {
+                        app.push_request_failure(&text);
+                    }
+
                     Some(crate::EngineEvent::SystemNotice(text)) => {
                         app.push_system(&text);
                     }
@@ -732,6 +736,8 @@ where
                 }
 
                 crate::EngineEvent::SystemText(text) => app.push_system_output(&text),
+
+                crate::EngineEvent::RequestFailed(text) => app.push_request_failure(&text),
 
                 crate::EngineEvent::AssistantFinished => {
                     app.finish_streamed_interactions();
@@ -3268,6 +3274,17 @@ impl App {
         self.show_output(value);
     }
 
+    fn push_request_failure(&mut self, value: &str) {
+        if let Some(interaction) = self.pending_interactions.back_mut() {
+            interaction.system = true;
+        }
+
+        self.reply_pending = true;
+        self.push_system_output(value);
+        let completed = self.finish_interactions();
+        self.completed_interactions.extend(completed);
+    }
+
     fn push_system_label(&mut self) {
         let label = format_role_label("System", Some(&current_timestamp()));
         self.push_label(&label);
@@ -3443,6 +3460,31 @@ mod tests {
         assert!(app.pending_interactions.is_empty());
         assert!(app.completed_interactions.is_empty());
         assert!(!app.reply_pending);
+    }
+
+    #[test]
+    fn failed_model_request_keeps_prompt_and_persists_system_error() {
+        let mut app = App {
+            name: "Crabbot".into(),
+            generation_active: true,
+            reply_pending: true,
+            ..App::default()
+        };
+
+        app.begin_interaction("ping");
+        app.push_user("ping");
+        app.push_request_failure("Request failed: Codex supplied too many tools.");
+        app.finish_generation(false);
+
+        let saved = app.take_persistable_interactions();
+
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].input, "ping");
+        assert_eq!(saved[0].output, "Request failed: Codex supplied too many tools.");
+        assert!(saved[0].system);
+        assert!(app.transcript.contains("ping"));
+        assert!(app.transcript.contains("System |"));
+        assert!(!app.transcript.contains("Crabbot |"));
     }
 
     #[test]

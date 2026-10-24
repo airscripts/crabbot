@@ -8,7 +8,7 @@ pub struct Protocol {
 }
 
 impl Protocol {
-    pub const CURRENT: Self = Self { major: 0, minor: 2 };
+    pub const CURRENT: Self = Self { major: 0, minor: 1 };
 
     pub const fn compatible(self, other: Self) -> bool {
         self.major == other.major && self.minor >= other.minor
@@ -297,9 +297,12 @@ mod tests {
     #[test]
     fn protocol_requires_matching_major_and_supported_minor() {
         assert!(Protocol::CURRENT.compatible(Protocol { major: 0, minor: 1 }));
+
         assert!(Protocol::CURRENT.compatible(Protocol { major: 0, minor: 0 }));
+
         assert!(!Protocol::CURRENT.compatible(Protocol { major: 1, minor: 0 }));
-        assert!(!Protocol { major: 0, minor: 1 }.compatible(Protocol::CURRENT));
+
+        assert!(!Protocol::CURRENT.compatible(Protocol { major: 0, minor: 2 }));
     }
 
     #[test]

@@ -29,8 +29,8 @@ the operator what changes. Command names must be unique across installed plugins
 and cannot shadow native commands. Capability, permission, and secret lists are
 validated for known, unique values before a plugin can be installed or started.
 Protocol minor versions are backward-compatible: this host accepts plugins
-declaring 0.0 or 0.1, while plugins that use capabilities introduced in 0.2
-must declare 0.2.
+declaring 0.0 or 0.1. The current protocol is 0.1, and all bundled plugins
+declare 0.1.
 
 `plugins.lock` records the canonical source, revision marker, SHA-256 of the
 manifest and executable, protocol, version, capabilities, permissions, and
@@ -176,8 +176,9 @@ After `install` commits the plugin and lock entry, the CLI asks a
 running daemon to start it through authenticated local IPC. The plugin becomes
 available without restarting the daemon or reinstalling the core. When no
 daemon is running, it is discovered at the next daemon start. A selected model
-or channel plugin is loaded only when its required credentials are ready; an
-activation error leaves the verified plugin installed and reports the reason.
+plugin loads when installed and reports missing authentication when a request
+needs it. Channel plugins load only when their required credentials are ready;
+an activation error leaves the verified plugin installed and reports the reason.
 `plugin uninstall` unloads an active process before deleting its files. `plugin
 update` unloads active plugin processes before replacing their files, then
 starts those plugins again through IPC. Inactive plugins remain inactive, and

@@ -4727,7 +4727,7 @@ async fn serve_inner(
             warn!(plugin = channel_id, error = %diagnostic(sentence(error.to_string())), "Plugin failed to start.");
         }
 
-        if (force || ready(model_id))
+        if binary_at(model_id, root).is_some()
             && let Err(error) =
                 load_plugin(root, model_id, Some(Capability::Model), force, &config, &plugins).await
         {
@@ -4751,6 +4751,7 @@ async fn serve_inner(
         Arc::clone(&sessions),
         Arc::clone(&stop),
         root.to_owned(),
+        config.clone(),
         workspace_root_at(root),
         media_root_at(root),
         model_id.to_owned(),
@@ -4805,6 +4806,7 @@ async fn run_scheduler(
     sessions: Arc<Mutex<state::Store>>,
     stop: Arc<Stop>,
     home_root: PathBuf,
+    config: Config,
     configured_workspace: PathBuf,
     media_root: PathBuf,
     default_provider: String,
@@ -5009,6 +5011,7 @@ async fn run_scheduler(
             let worker_sessions = Arc::clone(&sessions);
             let worker_stop = Arc::clone(&stop);
             let worker_home = home_root.clone();
+            let worker_config = config.clone();
             let worker_workspace = configured_workspace.clone();
             let worker_media = media_root.clone();
             let worker_provider = default_provider.clone();
@@ -5026,6 +5029,7 @@ async fn run_scheduler(
                         &worker_sessions,
                         &worker_stop,
                         &worker_home,
+                        &worker_config,
                         &worker_workspace,
                         &worker_media,
                         &worker_provider,
@@ -5088,6 +5092,7 @@ async fn run_scheduled_task(
     sessions: &Arc<Mutex<state::Store>>,
     stop: &Arc<Stop>,
     home_root: &Path,
+    config: &Config,
     configured_workspace: &Path,
     media_root: &Path,
     default_provider: &str,
@@ -5122,6 +5127,7 @@ async fn run_scheduled_task(
         default_model,
         cancellation,
         approvals,
+        config,
         task["run_id"].as_u64(),
         &mut call,
     )
@@ -5785,15 +5791,35 @@ async fn execute_scheduled_task(
     default_model: &str,
     cancellation: Arc<Cancellation>,
     approvals: Arc<AsyncMutex<approval::Gate>>,
+    config: &Config,
     run_id: Option<u64>,
     call: &mut u64,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let context = &task["context"];
     let provider_id = context["provider"].as_str().unwrap_or(default_provider);
     let model = context["model"].as_str().unwrap_or(default_model);
-    let provider = plugins.get(provider_id).await.ok_or_else(|| {
-        format!("PAUSED: Configured model provider {provider_id} is not available.")
-    })?;
+    let provider = match plugins.get(provider_id).await {
+        Some(provider) => provider,
+
+        None if binary_at(provider_id, home_root).is_some() => {
+            load_plugin(home_root, provider_id, Some(Capability::Model), false, config, plugins)
+                .await
+                .map_err(|error| {
+                    format!("PAUSED: Configured model provider {provider_id} could not be loaded: {error}")
+                })?;
+
+            plugins.get(provider_id).await.ok_or_else(|| {
+                format!("PAUSED: Configured model provider {provider_id} is not available.")
+            })?
+        }
+
+        None => {
+            return Err(format!(
+                "PAUSED: Configured model provider {provider_id} is not installed."
+            )
+            .into());
+        }
+    };
 
     if !provider.supports(Capability::Model) {
         return Err(
@@ -6365,8 +6391,7 @@ async fn launch(
         .ok_or("Plugin manifest path is invalid.")?
         .join("crabbot-plugin.toml");
 
-    let manifest = read_manifest(manifest_path.parent().unwrap_or(Path::new(".")))
-        .ok_or_else(|| format!("Plugin manifest is invalid: {}.", manifest_path.display()))?;
+    let manifest = read_manifest_checked(manifest_path.parent().unwrap_or(Path::new(".")))?;
 
     let mut expected_capabilities = manifest.capabilities.clone();
     expected_capabilities.sort();
@@ -13655,8 +13680,7 @@ fn verify_plugin_integrity(
         .ok_or("Plugin manifest path is invalid.")?
         .join("crabbot-plugin.toml");
 
-    let manifest = read_manifest(manifest_path.parent().unwrap_or(Path::new(".")))
-        .ok_or_else(|| format!("Plugin manifest is invalid: {}.", manifest_path.display()))?;
+    let manifest = read_manifest_checked(manifest_path.parent().unwrap_or(Path::new(".")))?;
 
     let lock = load_lock_at(root)?;
     let entry = lock.plugins.get(id).ok_or_else(|| format!("Plugin {id} is not locked."))?;
@@ -13940,6 +13964,7 @@ async fn plugin(
 
             let mut installed = Vec::new();
             let mut errors = Vec::new();
+            let mut activation_errors = Vec::new();
             let mut activations = Vec::new();
             let requested = sources.len();
 
@@ -13959,35 +13984,48 @@ async fn plugin(
                 }
 
                 match link(source, linked) {
-                    Ok(manifest) => match activate_at(&root, &manifest.id).await {
-                        Ok(activation) => {
-                            let state = if activation.is_some() { "active" } else { "deferred" };
+                    Ok(manifest) => {
+                        let state = match activate_at(&root, &manifest.id).await {
+                            Ok(activation) => {
+                                let state =
+                                    if activation.is_some() { "active" } else { "deferred" };
 
-                            if linked {
-                                info!(plugin = %manifest.id, version = %manifest.version, activation = state, "Plugin linked.");
-                            } else {
-                                info!(plugin = %manifest.id, version = %manifest.version, activation = state, "Plugin installed.");
+                                activations.push((manifest.id.clone(), activation.clone()));
+                                state
                             }
 
-                            if !json && requested > 1 {
-                                println!("{}\n", plugin_install_version(linked, &manifest.version));
+                            Err(error) if plugin_activation_is_deferred(&error.to_string()) => {
+                                debug!(plugin = %id, "Plugin installed; activation is deferred.");
+                                "deferred"
                             }
 
-                            activations.push((manifest.id.clone(), activation));
+                            Err(error) => {
+                                warn!(plugin = %id, error = %diagnostic(sentence(error.to_string())), "Plugin activation failed after installation.");
+                                activation_errors.push(serde_json::json!({
+                                    "id": id,
+                                    "error": error.to_string()
+                                }));
+                                "failed"
+                            }
+                        };
 
-                            installed.push(serde_json::json!({
-                                "id": manifest.id,
-                                "version": manifest.version,
-                                "activation": state,
-                                "linked": linked
-                            }));
+                        if linked {
+                            info!(plugin = %manifest.id, version = %manifest.version, activation = state, "Plugin linked.");
+                        } else {
+                            info!(plugin = %manifest.id, version = %manifest.version, activation = state, "Plugin installed.");
                         }
 
-                        Err(error) => {
-                            warn!(plugin = %id, error = %diagnostic(sentence(error.to_string())), "Plugin activation failed.");
-                            errors.push(serde_json::json!({"id": id, "error": error.to_string()}));
+                        if !json && requested > 1 {
+                            println!("{}\n", plugin_install_version(linked, &manifest.version));
                         }
-                    },
+
+                        installed.push(serde_json::json!({
+                            "id": manifest.id,
+                            "version": manifest.version,
+                            "activation": state,
+                            "linked": linked
+                        }));
+                    }
 
                     Err(error) => {
                         warn!(plugin = %id, error = %diagnostic(sentence(error.to_string())), "Plugin installation failed.");
@@ -14004,7 +14042,8 @@ async fn plugin(
                     serde_json::to_string_pretty(&serde_json::json!({
                         "action": "install",
                         "items": &installed,
-                        "errors": &errors
+                        "errors": &errors,
+                        "activation_errors": &activation_errors
                     }))?
                 );
 
@@ -14034,6 +14073,12 @@ async fn plugin(
                     if let Some(note) = activation_note(&id, activation, needs_daemon) {
                         follow_up.push(note);
                     }
+                }
+
+                for failure in &activation_errors {
+                    let id = failure["id"].as_str().unwrap_or("unknown");
+                    let detail = failure["error"].as_str().unwrap_or("Activation failed.");
+                    println!("\nPlugin {id} was installed, but could not be activated: {detail}");
                 }
 
                 if !follow_up.is_empty() {
@@ -14260,6 +14305,10 @@ fn plugin_install_error(errors: &[serde_json::Value], total: usize, linked: bool
     }
 
     message
+}
+
+fn plugin_activation_is_deferred(error: &str) -> bool {
+    error.contains("Channel credentials are not ready.")
 }
 
 fn plugin_update_error(rows: &[serde_json::Value]) -> String {
@@ -16748,9 +16797,14 @@ fn read_manifest_checked(
             format!("could not read manifest at {}: {error}", path.display())
         }
     })?;
-    let manifest: Manifest =
-        toml::from_slice(&bytes).map_err(|error| format!("manifest parse failed: {error}"))?;
-    manifest.validate().map_err(|error| format!("manifest validation failed: {error}"))?;
+
+    let manifest: Manifest = toml::from_slice(&bytes)
+        .map_err(|error| format!("manifest parse failed at {}: {error}", path.display()))?;
+
+    manifest
+        .validate()
+        .map_err(|error| format!("manifest validation failed at {}: {error}", path.display()))?;
+
     Ok(manifest)
 }
 
@@ -16802,10 +16856,10 @@ mod tests {
         delivery_at, delivery_request, download, embedded, ensure_home, ensure_root, env_for,
         export_crabfile_at, generate_completion, import_crabfile_at, init_at, installed_at,
         isolate_at, local_session, memory_scope, memory_tools, model_content, plugin_binary,
-        read_manifest, reclaim_worktrees, recover, recover_plugins, redact, resolve, restart_tool,
-        revision, safe_archive, send_params, send_request, service_at, service_at_with,
-        service_environment_from, service_name, service_path_value, service_text, session_at,
-        stream_fits, tool, turn_messages, update_at, validate_archive, verify_archive,
+        read_manifest, read_manifest_checked, reclaim_worktrees, recover, recover_plugins, redact,
+        resolve, restart_tool, revision, safe_archive, send_params, send_request, service_at,
+        service_at_with, service_environment_from, service_name, service_path_value, service_text,
+        session_at, stream_fits, tool, turn_messages, update_at, validate_archive, verify_archive,
     };
 
     #[cfg(target_os = "macos")]
@@ -17680,6 +17734,13 @@ done
             ),
             "Could not link 1 of 4 plugins:\n- codex: Binary missing."
         );
+    }
+
+    #[test]
+    fn plugin_install_defers_activation_when_provider_is_not_ready() {
+        assert!(!super::plugin_activation_is_deferred("Model credentials are not ready."));
+        assert!(super::plugin_activation_is_deferred("Channel credentials are not ready."));
+        assert!(!super::plugin_activation_is_deferred("Plugin protocol is incompatible."));
     }
 
     #[test]
@@ -19328,6 +19389,7 @@ done
                 scheduler_sessions,
                 scheduler_stop,
                 scheduler_home,
+                super::Config::default(),
                 scheduler_root.join("workspace"),
                 scheduler_root.join("media"),
                 "codex".into(),
@@ -19440,6 +19502,7 @@ done
                 sessions,
                 scheduler_stop,
                 scheduler_home,
+                super::Config::default(),
                 scheduler_root.join("workspace"),
                 scheduler_root.join("media"),
                 "codex".into(),
@@ -19669,6 +19732,7 @@ done
             sessions,
             Arc::clone(&stop),
             home.clone(),
+            super::Config::default(),
             root.join("workspace"),
             home.join("media"),
             "codex".into(),
@@ -19792,6 +19856,7 @@ done
             Arc::clone(&sessions),
             Arc::clone(&stop),
             home.clone(),
+            super::Config::default(),
             workspace,
             home.join("media"),
             "codex".into(),
@@ -21642,6 +21707,21 @@ done
         fs::write(root.join("crabbot-plugin.toml"), "broken = true\n").unwrap();
 
         assert!(read_manifest(&root).is_none());
+        let error = read_manifest_checked(&root).unwrap_err().to_string();
+
+        assert!(error.contains("manifest parse failed at"));
+        assert!(error.contains("crabbot-plugin.toml"));
+
+        fs::write(
+            root.join("crabbot-plugin.toml"),
+            "id = 'Echo'\nversion = '0.1.0'\nprotocol = { major = 0, minor = 1 }\ncapabilities = ['model']\n",
+        )
+        .unwrap();
+
+        let error = read_manifest_checked(&root).unwrap_err().to_string();
+
+        assert!(error.contains("manifest validation failed at"));
+        assert!(error.contains("Plugin IDs must contain lowercase letters"));
         let _ = fs::remove_dir_all(root);
     }
 
