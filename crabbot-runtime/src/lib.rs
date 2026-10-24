@@ -1208,7 +1208,7 @@ impl Manifest {
 
         if capabilities.len() != self.capabilities.len()
             || self.capabilities.iter().any(|capability| {
-                !matches!(
+                !(matches!(
                     capability.as_str(),
                     "model"
                         | "vision"
@@ -1222,7 +1222,7 @@ impl Manifest {
                         | "client"
                         | "resource"
                         | "agent"
-                ) && !(self.id == "timer" && capability == "timer")
+                ) || self.id == "timer" && capability == "timer")
             })
         {
             return Err("Plugin capabilities must be known and unique.".into());
@@ -10683,9 +10683,9 @@ async fn answer(
                 return Err("The turn exceeded its tool-call limit.".into());
             }
 
-            if !tools_enabled
-                && !name.starts_with("schedule_")
-                && !(name == "message_send" && channel == "scheduler")
+            if !(tools_enabled
+                || name.starts_with("schedule_")
+                || name == "message_send" && channel == "scheduler")
             {
                 return Err("Tool access is disabled for this channel.".into());
             }
