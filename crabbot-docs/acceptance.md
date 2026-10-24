@@ -13,7 +13,7 @@ same host bridge and persistence paths used by a running daemon.
 | Telegram Voice Handling | `transcribes_voice_with_the_speech_plugin_and_removes_raw_audio`, `omits_unsafe_voice_files_without_leaking_their_paths` |
 | Telegram Tools And Approvals | `runs_a_tool_turn_before_replying`, `prompts_for_signed_approval_before_mutating_tools`, `denied_prompt_never_dispatches_a_mutating_tool` |
 | Discord Media And Uploads | Discord normalization and media confinement tests, including text files, images, and voice-message audio |
-| Memory And Timers | `memory_can_remember_list_and_forget`, `timer_can_add_list_wait_and_remove` |
+| Memory And Schedules | `memory_can_remember_list_and_forget`, scheduler lifecycle, retry, recovery, and execution tests |
 | Discord Routing And Authorization | Discord `classifies_gateway_events`, `normalizes_gateway_messages`, and `prepares_approval_controls_and_normalizes_interactions` |
 | Isolated Worktrees | `isolates_group_workspaces` |
 | Provider And Model Switching | `manages_local_sessions_and_plugins`, `runs_session_commands_without_daemon` |

@@ -701,7 +701,7 @@ mod tests {
         assert_eq!(session["workspace"], root.canonicalize().unwrap().to_string_lossy().as_ref());
 
         assert_eq!(session["messages"].as_array().unwrap().len(), 0);
-        assert!(control(&home, "timer.list", json!({})).await.is_err());
+        assert!(control(&home, "scheduler.list", json!({})).await.is_err());
         assert!(control(&home, "unsupported", json!({})).await.is_err());
 
         let _ = fs::remove_dir_all(root);

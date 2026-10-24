@@ -22,7 +22,13 @@ use crabbot_core::types::ToolSpec;
 use serde_json::Value;
 #[cfg(test)]
 use std::sync::Arc;
-use std::{future::Future, path::PathBuf, pin::Pin};
+use std::{
+    future::Future,
+    io::{BufRead, Read},
+    path::PathBuf,
+    pin::Pin,
+};
+
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, duplex,
 };
@@ -38,13 +44,14 @@ const DEFAULT_NAME: &str = "Crabbot";
 const DEFAULT_SESSION_ID: &str = "default";
 const SESSION_LIST_PAGE_SIZE: usize = 5;
 const PLUGIN_LIST_PAGE_SIZE: usize = 5;
+const SCHEDULE_HISTORY_PAGE_SIZE: usize = 5;
 const STREAMING_TURN_TIMEOUT: Duration = Duration::from_secs(310);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const COMPACTION_TIMEOUT: Duration = Duration::from_secs(305);
 #[cfg(test)]
 const SAVED_REPLY_LIMIT: usize = 16 * 1024;
 // 365 days (one year), expressed in seconds.
-const MAX_TIMER_DELAY_SECONDS: u64 = 31_536_000;
+const MAX_SCHEDULE_DELAY_SECONDS: u64 = 31_536_000;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -156,6 +163,7 @@ enum EngineEvent {
     CompactionFinished,
     AssistantText(String),
     SystemText(String),
+    RequestFailed(String),
     SystemNotice(String),
     AssistantFinished,
     GenerationFinished { interrupted: bool },
@@ -506,9 +514,18 @@ where
                 continue;
             }
 
-            if line == "/timer" || line.starts_with("/timer ") {
-                let command = line.strip_prefix("/timer").unwrap_or_default().trim();
-                let text = timer_command(home.clone(), command, host).await;
+            if line == "/schedule" || line.starts_with("/schedule ") {
+                let command = line.strip_prefix("/schedule").unwrap_or_default().trim();
+                let text = schedule_command(
+                    home.clone(),
+                    command,
+                    session.clone(),
+                    plugin.clone(),
+                    model.clone(),
+                    workspace.clone(),
+                    host,
+                )
+                .await;
 
                 output.write_all(text.as_bytes()).await?;
                 output.flush().await?;
@@ -1250,6 +1267,8 @@ where
 
             let _ = reservation.release().await;
 
+            let request_succeeded = response.is_ok();
+
             match response {
                 Ok(value) => {
                     let reply = value["text"].as_str().unwrap_or_default();
@@ -1263,6 +1282,13 @@ where
                 Err(error) => {
                     if interrupted {
                         output.write_all(b"Generation interrupted.\n").await?;
+                    } else if let Some(events) = &engine_events {
+                        let message = format!(
+                            "Request failed: {}.",
+                            sentence(error.to_string())
+                        );
+
+                        let _ = events.send(EngineEvent::RequestFailed(message));
                     } else {
                         output
                             .write_all(format!("Request failed: {}.\n", sentence(error.to_string())).as_bytes())
@@ -1271,7 +1297,8 @@ where
                 }
             }
 
-            if streaming_turn
+            if request_succeeded
+                && streaming_turn
                 && let Some(events) = &engine_events
             {
                 let _ = events.send(EngineEvent::AssistantFinished);
@@ -1799,8 +1826,8 @@ fn command_help(home: &str, has_model: bool, daemon: bool) -> String {
         ]);
     }
 
-    if daemon && has_capability(home, "timer") {
-        conditional.push(("/timer <list|add|remove>", "Manage timers."));
+    if daemon && has_capability(home, "scheduler") {
+        conditional.push(("/schedule", "Manage schedules."));
     }
 
     if daemon && has_capability(home, "memory") {
@@ -2132,68 +2159,886 @@ where
     .await
 }
 
-async fn timer_command<C, F>(home: String, command: &str, host: C) -> String
+async fn schedule_command<C, F>(
+    home: String,
+    command: &str,
+    session: String,
+    provider: String,
+    model: String,
+    workspace: Option<String>,
+    host: C,
+) -> String
 where
     C: Fn(String, String, Value) -> F + Copy,
     F: Future<Output = crabbot_core::Result<Value>>,
 {
+    if command.is_empty() || command == "help" {
+        return schedule_help().into();
+    }
+
     let mut parts = command.splitn(3, ' ');
     let action = parts.next().unwrap_or_default();
+    let remaining = command.strip_prefix(action).unwrap_or_default().trim();
     let result = match action {
-        "list" if parts.next().is_none() => {
-            capability(home, "timer", "list", serde_json::json!({}), host)
-                .await
-                .map(|value| format_timers(&value))
-        }
+        "list" => {
+            let requested = parts.next();
 
-        "add" => match (parts.next(), parts.next()) {
-            (Some(delay), Some(text)) => match delay.parse::<u64>() {
-                Ok(delay)
-                    if (1..=MAX_TIMER_DELAY_SECONDS).contains(&delay)
-                        && !text.trim().is_empty() =>
-                {
-                    let id = timer_id();
-                    capability(
-                        home,
-                        "timer",
-                        "add",
-                        serde_json::json!({"id": id, "delay": delay, "text": text.trim()}),
-                        host,
-                    )
-                    .await
-                    .map(|_| format!("Timer {id} was scheduled.\n> "))
-                }
-
-                _ => Ok(format!(
-                    "Timer delay must be between 1 and {MAX_TIMER_DELAY_SECONDS} seconds, with a reminder text.\n> "
-                )),
-            },
-
-            _ => Ok("Usage: /timer add <seconds> <text>.\n> ".into()),
-        },
-
-        "remove" => match parts.next().and_then(|id| id.parse::<u64>().ok()) {
-            Some(id) if parts.next().is_none() => {
-                capability(home, "timer", "remove", serde_json::json!({"id": id}), host).await.map(
-                    |value| {
-                        if value["deleted"] == true {
-                            format!("Timer {id} was removed.\n> ")
-                        } else {
-                            format!("Timer {id} was not found.\n> ")
-                        }
-                    },
-                )
+            if parts.next().is_some() {
+                return "Usage: /schedule list [PAGE].\n> ".into();
             }
 
-            _ => Ok("Usage: /timer remove <id>.\n> ".into()),
+            let page = match requested.map(str::parse::<u64>).transpose() {
+                Ok(Some(page)) if page > 0 => page,
+                Ok(None) => 1,
+                _ => return "Usage: /schedule list [PAGE].\n> ".into(),
+            };
+
+            capability(home, "scheduler", "list", serde_json::json!({"page": page}), host)
+                .await
+                .map(|value| format_schedules(&value))
+        }
+
+        "add" => match parse_schedule_add(remaining, &home) {
+            Ok((mut params, instruction)) => {
+                let id = schedule_id();
+                params["id"] = Value::from(id);
+                params["text"] = Value::String(instruction.clone());
+                params["activate"] = Value::Bool(true);
+                params["context"] = serde_json::json!({
+                    "provider": provider.clone(),
+                    "model": model.clone(),
+                    "workspace": workspace.clone(),
+                    "tools": configured_tui_tools(&home),
+                    "shell": configured_tui_shell(&home),
+                    "origin": {"channel": "tui", "session": session}
+                });
+
+                capability(home.clone(), "scheduler", "add", params, host)
+                    .await
+                    .map(|value| {
+                        let next_run = value["due"]
+                            .as_u64()
+                            .map(|due| {
+                                crabbot_date::format_datetime_in_timezone(
+                                    due,
+                                    value["zone"].as_str().unwrap_or("UTC"),
+                                )
+                            })
+                            .unwrap_or_else(|| "unknown time".into());
+                        let name = value["name"].as_str().unwrap_or("Scheduled task");
+                        let tools_access = if value["context"]["tools"] == true {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        };
+
+                        let shell_access = if value["context"]["tools"] == true
+                            && value["context"]["shell"] == true
+                        {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        };
+
+                        let frequency = if let Some(repeat) =
+                            value["repeat"].as_u64().filter(|repeat| *repeat > 0)
+                        {
+                            format!("\nFrequency: every {}", crabbot_date::format_duration(repeat))
+                        } else if let Some(cron) = value["cron"].as_str() {
+                            format!(
+                                "\nFrequency: {cron} ({})",
+                                value["zone"].as_str().unwrap_or("UTC")
+                            )
+                        } else {
+                            String::new()
+                        };
+
+                        format!(
+                            "Schedule {name} ({id}) is active.\n\nInstruction: {instruction}\nProvider: {provider}; model: {model}.\nWorkspace: {}\nTools: {tools_access}\nShell: {shell_access}\nNext run: {next_run}{frequency}\n\nCheck it with /schedule list; pause it with /schedule pause {id}.\n> ",
+                            workspace.as_deref().unwrap_or("configured workspace")
+                        )
+                    })
+            }
+
+            Err(error) => Ok(format!("{error}\n> ")),
         },
 
-        _ => Ok("Usage: /timer <list|add|remove>.\n> ".into()),
+        "history" => {
+            let mut arguments = remaining.split_whitespace();
+            let selector = arguments.next();
+            let page_value = arguments.next();
+            let page = match page_value.map(str::parse::<usize>).transpose() {
+                Ok(Some(page)) if page > 0 => page,
+                Ok(None) => 1,
+                _ => return "Usage: /schedule history ID|NAME [PAGE].\n> ".into(),
+            };
+
+            if selector.is_none() || arguments.next().is_some() {
+                Ok("Usage: /schedule history ID|NAME [PAGE].\n> ".into())
+            } else {
+                let selector = selector.unwrap_or_default();
+
+                match schedule_history_selector(&home, selector, host).await {
+                    Ok((id, name)) => read_schedule_history(&home, id, page)
+                        .map(|(records, total, path)| {
+                            if page > total.div_ceil(SCHEDULE_HISTORY_PAGE_SIZE).max(1) {
+                                return format!(
+                                    "Schedule history page {page} is out of range. There are {} page(s).\n> ",
+                                    total.div_ceil(SCHEDULE_HISTORY_PAGE_SIZE).max(1)
+                                );
+                            }
+
+                            format_schedule_history(&records, total, id, &name, page, &path)
+                        })
+                        .map_err(crabbot_core::Error::Denied),
+                    Err(error) => Ok(format!("{error}\n> ")),
+                }
+            }
+        }
+
+        "remove" => match parts.next() {
+            Some(selector) if parts.next().is_none() => {
+                match schedule_selector(&home, selector, host).await {
+                    Ok((id, name)) => {
+                        capability(home, "scheduler", "remove", serde_json::json!({"id": id}), host)
+                            .await
+                            .map(|value| {
+                                if value["cancel_requested"] == true {
+                                    format!("Cancellation requested for schedule {name} ({id}). Its current action will be interrupted; a side effect may already have happened.\n> ")
+                                } else if value["deleted"] == true {
+                                    format!("Schedule {name} ({id}) was removed.\n> ")
+                                } else {
+                                    format!("Schedule {name} ({id}) was not found.\n> ")
+                                }
+                            })
+                    }
+
+                    Err(error) => Ok(format!("{error}\n> ")),
+                }
+            }
+
+            _ => Ok("Usage: /schedule remove <id-or-name>.\n> ".into()),
+        },
+
+        "approve" | "pause" | "resume" | "run" | "retry" => {
+            let selector = parts.next();
+
+            if selector.is_none() || parts.next().is_some() {
+                Ok(format!("Usage: /schedule {action} ID|NAME.\n> "))
+            } else {
+                let selector = selector.unwrap_or_default();
+
+                match schedule_selector(&home, selector, host).await {
+                    Ok((id, name)) => capability(home, "scheduler", action, serde_json::json!({"id": id}), host)
+                        .await
+                        .map(|value| match action {
+                            "run" => format!("Schedule {name} ({id}) queued to run now. Check its result with /schedule list.\n> "),
+                            "retry" => format!("Schedule {name} ({id}) retry queued.\n> "),
+
+                            _ => {
+                                let status = value["status"].as_str().unwrap_or(action);
+                                format!("Schedule {name} ({id}) is {status}.\n> ")
+                            }
+                        }),
+
+                    Err(error) => Ok(format!("{error}\n> ")),
+                }
+            }
+        }
+
+        _ => Ok("Unknown schedule command. Run /schedule help for usage.\n> ".into()),
     };
 
     result.unwrap_or_else(|error| {
-        format!("Timer action failed: {}.\n> ", sentence(error.to_string()))
+        format!("Scheduler action failed: {}.\n> ", sentence(error.to_string()))
     })
+}
+
+#[cfg(test)]
+async fn schedule_selector_id<C, F>(home: &str, selector: &str, host: C) -> Result<u64, String>
+where
+    C: Fn(String, String, Value) -> F + Copy,
+    F: Future<Output = crabbot_core::Result<Value>>,
+{
+    schedule_selector(home, selector, host).await.map(|(id, _)| id)
+}
+
+async fn schedule_selector<C, F>(
+    home: &str,
+    selector: &str,
+    host: C,
+) -> Result<(u64, String), String>
+where
+    C: Fn(String, String, Value) -> F + Copy,
+    F: Future<Output = crabbot_core::Result<Value>>,
+{
+    let id = selector.parse::<u64>().ok();
+
+    let mut page = 1;
+
+    loop {
+        let value = capability(
+            home.to_owned(),
+            "scheduler",
+            "list",
+            serde_json::json!({"page": page}),
+            host,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let items =
+            value["items"].as_array().ok_or("The scheduler returned an invalid task list.")?;
+
+        if let Some(item) = items
+            .iter()
+            .find(|item| item["name"].as_str() == Some(selector) || item["id"].as_u64() == id)
+        {
+            let id = item["id"].as_u64().ok_or("The schedule has an invalid ID.")?;
+            let name = item["name"].as_str().unwrap_or("Scheduled task").to_owned();
+
+            return Ok((id, name));
+        }
+
+        if page >= value["pages"].as_u64().unwrap_or(1) {
+            return Err(format!("No schedule named or numbered {selector} was found."));
+        }
+
+        page += 1;
+    }
+}
+
+async fn schedule_history_selector<C, F>(
+    home: &str,
+    selector: &str,
+    host: C,
+) -> Result<(u64, String), String>
+where
+    C: Fn(String, String, Value) -> F + Copy,
+    F: Future<Output = crabbot_core::Result<Value>>,
+{
+    if let Ok(id) = selector.parse::<u64>() {
+        return Ok((id, selector.to_owned()));
+    }
+
+    let live_error = match schedule_selector(home, selector, host).await {
+        Ok(schedule) => return Ok(schedule),
+        Err(error) => error,
+    };
+
+    let directory = PathBuf::from(home).join("logs/schedules");
+    let prefix = format!("{selector}-");
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(live_error),
+        Err(error) => return Err(format!("Could not list schedule history: {error}.")),
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let Some(filename) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+
+        if let Some(id) = filename
+            .strip_prefix(&prefix)
+            .and_then(|suffix| suffix.strip_suffix(".jsonl"))
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            return Ok((id, selector.to_owned()));
+        }
+    }
+
+    Err(live_error)
+}
+
+fn read_schedule_history(
+    home: &str,
+    id: u64,
+    page: usize,
+) -> Result<(Vec<Value>, usize, PathBuf), String> {
+    let directory = PathBuf::from(home).join("logs/schedules");
+    let suffix = format!("-{id}.jsonl");
+    let path = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&suffix))
+            })
+            .unwrap_or_else(|| directory.join(format!("{id}.jsonl"))),
+
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            directory.join(format!("{id}.jsonl"))
+        }
+
+        Err(error) => return Err(format!("Could not list schedule history: {error}.")),
+    };
+
+    let retained_limit = page
+        .checked_mul(SCHEDULE_HISTORY_PAGE_SIZE)
+        .ok_or_else(|| "Schedule history page is too large.".to_owned())?;
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), 0, path));
+        }
+
+        Err(error) => return Err(format!("Could not open schedule history: {error}.")),
+    };
+
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    let mut records = std::collections::VecDeque::new();
+    let mut line_number = 0;
+    let mut total = 0_usize;
+
+    loop {
+        line.clear();
+
+        let read = (&mut reader)
+            .take(64 * 1024 + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("Could not read schedule history: {error}."))?;
+
+        if read == 0 {
+            break;
+        }
+
+        line_number += 1;
+
+        if read > 64 * 1024 {
+            return Err(format!("Schedule history line {line_number} exceeds the 64 KiB limit."));
+        }
+
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+
+        let text = std::str::from_utf8(&line).map_err(|error| {
+            format!("Schedule history line {line_number} is not UTF-8: {error}.")
+        })?;
+        let record: Value = serde_json::from_str(text).map_err(|error| {
+            format!("Schedule history line {line_number} is invalid JSON: {error}.")
+        })?;
+
+        if !record.is_object() {
+            return Err(format!("Schedule history line {line_number} is not a JSON object."));
+        }
+
+        total += 1;
+
+        if records.len() == retained_limit {
+            records.pop_front();
+        }
+
+        records.push_back(record);
+    }
+
+    let skip = (page - 1).saturating_mul(SCHEDULE_HISTORY_PAGE_SIZE);
+    let count = total.saturating_sub(skip).min(SCHEDULE_HISTORY_PAGE_SIZE);
+    let start = records.len().saturating_sub(skip.saturating_add(count));
+    let page_records = records.into_iter().skip(start).take(count).collect();
+
+    Ok((page_records, total, path))
+}
+
+fn format_schedule_history(
+    records: &[Value],
+    total: usize,
+    id: u64,
+    name: &str,
+    page: usize,
+    path: &std::path::Path,
+) -> String {
+    let pages = total.div_ceil(SCHEDULE_HISTORY_PAGE_SIZE).max(1);
+    let start = if total == 0 { 0 } else { (page - 1) * SCHEDULE_HISTORY_PAGE_SIZE + 1 };
+
+    let end = (start + records.len()).saturating_sub(1).min(total);
+    let name = records
+        .last()
+        .and_then(|record| record["schedule"]["name"].as_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(name);
+    let mut output =
+        format!("Schedule history: {name} | {start}–{end} of {total} | page {page}/{pages}:\n");
+
+    if records.is_empty() {
+        output.push_str("No execution history has been recorded.\n");
+    } else {
+        output.push('\n');
+        let displayed = records.iter().rev().collect::<Vec<_>>();
+
+        for (index, record) in displayed.iter().enumerate() {
+            let run = &record["run"];
+            let run_id =
+                run["id"].as_u64().map_or_else(|| "Run".to_owned(), |id| format!("Run {id}"));
+            let outcome = run["status"]
+                .as_str()
+                .or_else(|| record["status"].as_str())
+                .map(schedule_outcome_label)
+                .unwrap_or("outcome unknown");
+            let mut details = Vec::new();
+
+            if let Some(timestamp) = record["timestamp"].as_str() {
+                let recorded = timestamp
+                    .parse::<jiff::Timestamp>()
+                    .ok()
+                    .and_then(|timestamp| u64::try_from(timestamp.as_second()).ok())
+                    .map(crabbot_date::format_datetime)
+                    .unwrap_or_else(|| schedule_history_text(timestamp));
+                details.push(format!("Recorded: {recorded}"));
+            }
+
+            let timezone = record["schedule"]["timezone"].as_str().unwrap_or("UTC");
+
+            for (field, label) in [
+                ("scheduled_for", "Scheduled for"),
+                ("next_run_at", "Next run"),
+                ("retry_at", "Retry at"),
+            ] {
+                if let Some(timestamp) = run[field].as_u64() {
+                    details.push(format!(
+                        "{label}: {}",
+                        crabbot_date::format_datetime_in_timezone(timestamp, timezone)
+                    ));
+                }
+            }
+
+            if let Some(attempt) = run["attempt"].as_u64() {
+                details.push(format!(
+                    "Attempt: {attempt} (retries configured: {})",
+                    run["retry_limit"].as_u64().unwrap_or_default()
+                ));
+            }
+
+            if run["manual"] == true {
+                details.push("Trigger: manual run".into());
+            } else if run["retry"] == true {
+                details.push("Trigger: manual retry".into());
+            }
+
+            if let Some(policy) = run["missed_policy"].as_str() {
+                details.push(format!("Missed-run policy: {}", schedule_history_text(policy)));
+            }
+
+            if let Some(provider) = record["agent"]["provider"].as_str() {
+                let model = record["agent"]["model"].as_str().map(schedule_history_text);
+                details.push(format!(
+                    "Agent: {}{}",
+                    schedule_history_text(provider),
+                    model.map_or_else(String::new, |model| format!(" ({model})"))
+                ));
+            }
+
+            if let Some(workspace) = record["agent"]["workspace"].as_str() {
+                details.push(format!("Workspace: {}", schedule_history_text(workspace)));
+            }
+
+            let result = schedule_history_text(record["result"].as_str().unwrap_or_default());
+            details.push(if result.is_empty() {
+                "Result: (no result text)".into()
+            } else {
+                format!("Result: {result}")
+            });
+
+            output.push_str(&format_tree_entry(
+                &format!("{run_id} | {outcome}"),
+                &details,
+                index + 1 == displayed.len(),
+            ));
+
+            if index + 1 < displayed.len() {
+                output.push_str("\n\n");
+            }
+        }
+    }
+
+    output.push_str(&format!(
+        "\nRaw JSONL: {}\nUse `crab schedule history {id} --raw` to print the raw log.\n> ",
+        schedule_history_text(&path.display().to_string())
+    ));
+    output
+}
+
+fn schedule_outcome_label(outcome: &str) -> &'static str {
+    match outcome {
+        "completed" => "completed successfully",
+        "retrying" => "failed; retry queued",
+        "continuing" => "failed; next occurrence remains scheduled",
+        "cancelled" => "cancelled",
+        "skipped" => "skipped",
+        _ => "failed; task paused",
+    }
+}
+
+fn schedule_history_text(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                character.is_whitespace().then_some(' ')
+            } else if character == '—' {
+                Some('-')
+            } else {
+                Some(character)
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn schedule_help() -> &'static str {
+    r#"Schedule autonomous agent work.
+
+Commands:
+  /schedule help                          Show this help
+  /schedule list [PAGE]                   List schedules and latest outcomes
+  /schedule history ID|NAME [PAGE]        Show schedule run history
+  /schedule add TIMING [options] TEXT      Add a one-time or recurring task
+  /schedule run ID|NAME                    Run a task now
+  /schedule retry ID|NAME                  Retry a paused task
+  /schedule pause ID|NAME                  Pause a task
+  /schedule resume ID|NAME                 Resume a paused task
+  /schedule remove ID|NAME                 Cancel future runs
+
+Timing:
+  --after DURATION                        Run after a delay, such as 5m or "1 month"
+  --at DATE-TIME                          Run at "YYYY-MM-DD HH:MM" locally or RFC 3339
+  --every DURATION                        Repeat at a fixed interval
+  --cron 'FIELDS' --timezone AREA/CITY    Repeat on a cron schedule
+
+Options:
+  --timezone AREA/CITY                    Timezone for local --at and cron
+  --name NAME                             Selectable name; no spaces
+  --missed skip|coalesce|replay            Handle runs missed while offline
+  --retries 0..5                           Retry reported failures with backoff
+  --on-failure pause|continue              Recurring task policy (default: pause)
+
+Notes:
+  Durations accept s, m, h, d, w, mo, and y units, or written units. Months are
+  30 days and years are 365 days. Quote --at values containing spaces. Local
+  --at uses --timezone, the configured scheduler timezone, or the machine's timezone.
+  Fixed intervals start after one interval unless --after or --at sets the first
+  run. Replay runs at most five missed occurrences.
+  You can also describe a task
+  in natural language. Tasks capture the current provider, model, workspace,
+  tools, and shell settings. Schedule names contain no spaces and can replace IDs
+  in commands. Requests activate immediately without a separate approval step.
+  Uncertain side effects pause for review.
+> "#
+}
+
+fn parse_schedule_add(input: &str, home: &str) -> Result<(Value, String), String> {
+    let mut tokens = schedule_tokens(input)?;
+
+    if tokens.is_empty() {
+        return Err(
+            "Usage: /schedule add --after DURATION INSTRUCTION. Run /schedule help for details."
+                .into(),
+        );
+    }
+
+    if !tokens[0].starts_with("--") && !tokens.iter().any(|token| token.starts_with("--")) {
+        let delay = parse_schedule_seconds(&tokens[0], "--after")?;
+
+        if tokens.len() < 2 {
+            return Err(
+                "Schedule delay must be between 5 seconds and 1 year, with an instruction.".into(),
+            );
+        }
+
+        tokens.splice(0..1, ["--after".into(), delay.to_string()]);
+    }
+
+    let mut after = None;
+    let mut every = None;
+    let mut at_input = None;
+    let mut cron = None;
+    let mut timezone = None;
+    let mut missed = None;
+    let mut retries = None;
+    let mut on_failure = None;
+    let mut schedule_name = None;
+    let mut instruction_words = Vec::new();
+    let mut index = 0;
+
+    while index < tokens.len() {
+        let name = tokens[index].as_str();
+        index += 1;
+
+        if name == "--" {
+            instruction_words.extend_from_slice(&tokens[index..]);
+            break;
+        }
+
+        if !name.starts_with("--") {
+            instruction_words.push(name.to_owned());
+            continue;
+        }
+
+        let value = tokens.get(index).ok_or_else(|| format!("{name} requires a value."))?.clone();
+        index += 1;
+
+        match name {
+            "--after" => after = Some(parse_schedule_seconds(&value, name)?),
+            "--every" => every = Some(parse_schedule_seconds(&value, name)?),
+
+            "--at" => {
+                at_input = Some(value);
+            }
+
+            "--cron" => cron = Some(value),
+            "--timezone" => timezone = Some(value),
+
+            "--missed" if matches!(value.as_str(), "skip" | "coalesce" | "replay") => {
+                missed = Some(value)
+            }
+
+            "--missed" => return Err("--missed must be skip, coalesce, or replay.".into()),
+
+            "--retries" => {
+                let count = value
+                    .parse::<u8>()
+                    .map_err(|_| "--retries must be a number from 0 to 5.".to_owned())?;
+
+                if count > 5 {
+                    return Err("--retries must be a number from 0 to 5.".into());
+                }
+
+                retries = Some(count);
+            }
+
+            "--on-failure" if matches!(value.as_str(), "pause" | "continue") => {
+                on_failure = Some(value)
+            }
+
+            "--on-failure" => return Err("--on-failure must be pause or continue.".into()),
+            "--name" => schedule_name = Some(value),
+            _ => return Err(format!("Unknown schedule option {name}. Run /schedule help.")),
+        }
+    }
+
+    let instruction = instruction_words.join(" ").trim().to_owned();
+
+    if instruction.is_empty() {
+        return Err("A schedule instruction is required.".into());
+    }
+
+    if every.is_some() && cron.is_some() {
+        return Err("Choose either --every or --cron for a recurring schedule.".into());
+    }
+
+    let selected_times = [
+        after.is_some() || (every.is_some() && at_input.is_none()),
+        at_input.is_some(),
+        cron.is_some(),
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count();
+
+    if selected_times != 1 {
+        return Err(
+            "Choose one schedule time: --after, --at, or --cron; --every controls repetition."
+                .into(),
+        );
+    }
+
+    if on_failure.as_deref() == Some("continue") && every.is_none() && cron.is_none() {
+        return Err("--on-failure continue requires a recurring schedule.".into());
+    }
+
+    let configured_timezone =
+        std::fs::read_to_string(std::path::Path::new(home).join("config.toml"))
+            .ok()
+            .and_then(|source| toml::from_str::<toml::Value>(&source).ok())
+            .and_then(|config| {
+                config.get("scheduler")?.get("timezone")?.as_str().map(str::to_owned)
+            });
+
+    let timezone = timezone.or(configured_timezone);
+
+    let at = at_input
+        .as_deref()
+        .map(|value| crabbot_date::parse_datetime(value, timezone.as_deref()))
+        .transpose()?;
+
+    if at.is_some_and(|seconds| seconds < schedule_now().saturating_add(5)) {
+        return Err("--at must be at least five seconds in the future.".into());
+    }
+
+    if cron.is_some() && timezone.is_none() {
+        return Err("Cron schedules need --timezone or scheduler.timezone in config.toml.".into());
+    }
+
+    let delay = after.or_else(|| every.filter(|_| at.is_none()));
+    let mut params = serde_json::json!({
+        "delay": delay.unwrap_or_default(),
+        "zone": timezone.unwrap_or_else(|| "UTC".into())
+    });
+
+    if let Some(every) = every {
+        params["repeat"] = Value::from(every);
+    }
+
+    if let Some(at) = at {
+        params["at"] = Value::from(at);
+    }
+
+    if let Some(cron) = cron {
+        params["cron"] = Value::String(cron);
+    }
+
+    if let Some(missed) = missed {
+        params["missed"] = Value::String(missed);
+    }
+
+    if let Some(retries) = retries {
+        params["retries"] = Value::from(retries);
+    }
+
+    if let Some(on_failure) = on_failure {
+        params["on_failure"] = Value::String(on_failure);
+    }
+
+    if let Some(name) = schedule_name {
+        if name.chars().count() > 80 || !valid_schedule_name(name.trim()) {
+            return Err("Schedule names must start with a letter or number and contain only letters, numbers, hyphens, underscores, or dots (up to 80 characters).".into());
+        }
+
+        params["name"] = Value::String(name.trim().to_owned());
+    }
+
+    Ok((params, instruction))
+}
+
+fn valid_schedule_name(name: &str) -> bool {
+    let mut characters = name.chars();
+
+    characters.next().is_some_and(|character| character.is_ascii_alphanumeric())
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
+fn parse_schedule_seconds(value: &str, option: &str) -> Result<u64, String> {
+    let seconds = match value.parse::<u64>() {
+        Ok(seconds) => seconds,
+        Err(_) => crabbot_date::parse_duration(value)
+            .map_err(|_| format!("{option} needs a duration such as 5m or \"1 month\"."))?,
+    };
+
+    if !(5..=MAX_SCHEDULE_DELAY_SECONDS).contains(&seconds) {
+        return Err(format!(
+            "{option} must be between 5 and {MAX_SCHEDULE_DELAY_SECONDS} seconds."
+        ));
+    }
+
+    Ok(seconds)
+}
+
+fn schedule_tokens(input: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut started = false;
+
+    let mut characters = input.chars().peekable();
+
+    while let Some(character) = characters.next() {
+        if escaped {
+            token.push(character);
+            escaped = false;
+            started = true;
+            continue;
+        }
+
+        if character == '\\' {
+            escaped = true;
+            started = true;
+            continue;
+        }
+
+        if let Some(active_quote) = quote {
+            if character == active_quote
+                && characters.peek().is_none_or(|next| next.is_whitespace())
+            {
+                quote = None;
+            } else {
+                token.push(character);
+            }
+
+            started = true;
+            continue;
+        }
+
+        match character {
+            '\'' | '"' if token.is_empty() => {
+                quote = Some(character);
+                started = true;
+            }
+
+            character if character.is_whitespace() => {
+                if started {
+                    tokens.push(std::mem::take(&mut token));
+                    started = false;
+                }
+            }
+
+            _ => {
+                token.push(character);
+                started = true;
+            }
+        }
+    }
+
+    if escaped {
+        token.push('\\');
+    }
+
+    if quote.is_some() {
+        return Err("Schedule arguments have an unclosed quote.".into());
+    }
+
+    if started {
+        tokens.push(token);
+    }
+
+    Ok(tokens)
+}
+
+fn schedule_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn configured_tui_tools(home: &str) -> bool {
+    has_capability(home, "tool")
+        && std::fs::read_to_string(std::path::Path::new(home).join("config.toml"))
+            .ok()
+            .and_then(|text| toml::from_str::<Value>(&text).ok())
+            .and_then(|config| config["clients"]["tui"]["tools"].as_bool())
+            .unwrap_or(false)
+}
+
+fn configured_tui_shell(home: &str) -> bool {
+    std::fs::read_to_string(std::path::Path::new(home).join("config.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<Value>(&text).ok())
+        .and_then(|config| {
+            config["clients"]["tui"]["shell"].as_bool().or_else(|| config["shell"].as_bool())
+        })
+        .unwrap_or(false)
 }
 
 async fn memory_command<C, F>(home: String, session: String, command: &str, host: C) -> String
@@ -2206,49 +3051,25 @@ where
     }
 
     let local_scope = format!("tui:{session}");
-    let result = if command == "list" {
-        let global = capability(
-            home.clone(),
-            "memory",
-            "list",
-            serde_json::json!({"scope": "global"}),
-            host,
-        )
-        .await;
 
-        match global {
-            Ok(global) => {
-                let local = capability(
-                    home.clone(),
-                    "memory",
-                    "list",
-                    serde_json::json!({"scope": local_scope}),
-                    host,
-                )
-                .await;
+    let result = if command == "list" || command.starts_with("list ") {
+        match parse_memory_list(command) {
+            Ok((page, record_type)) => {
+                let mut params = serde_json::json!({
+                    "page": page,
+                    "scopes": ["global", local_scope, format!("provider:tui:{session}")]
+                });
 
-                match local {
-                    Ok(local) => {
-                        let legacy_scope = format!("provider:tui:{session}");
-                        let legacy = capability(
-                            home,
-                            "memory",
-                            "list",
-                            serde_json::json!({"scope": legacy_scope}),
-                            host,
-                        )
-                        .await;
-
-                        legacy.map(|legacy| format_memories(&global, &local, &legacy))
-                    }
-
-                    Err(error) => Err(error),
+                if let Some(record_type) = record_type {
+                    params["type"] = Value::String(record_type.into());
                 }
+
+                capability(home, "memory", "list", params, host)
+                    .await
+                    .map(|value| format_memories(&value))
             }
 
-            Err(error) => {
-                return format!("Memory action failed: {}.\n> ", sentence(error.to_string()));
-            }
+            Err(()) => Ok("Usage: /memory list [page] [--type global|session].\n> ".into()),
         }
     } else if let Some(value) = command.strip_prefix("remember ") {
         match value.split_once('=') {
@@ -2272,52 +3093,94 @@ where
         }
     } else if let Some(key) = command.strip_prefix("forget ") {
         if key.trim().is_empty() {
-            Ok("Usage: /memory forget KEY or /memory forget global KEY. Run /memory help for details.\n> ".into())
+            Ok("Usage: /memory forget [global|session] KEY. Run /memory help for details.\n> "
+                .into())
         } else {
-            let (scope, key) = key
+            let (requested_scope, key) = key
                 .trim()
                 .strip_prefix("global ")
-                .map_or((local_scope.as_str(), key.trim()), |key| ("global", key.trim()));
+                .map(|key| (Some("global"), key.trim()))
+                .or_else(|| {
+                    key.trim().strip_prefix("session ").map(|key| (Some("session"), key.trim()))
+                })
+                .unwrap_or((None, key.trim()));
 
             async {
-                let forgotten = capability(
-                    home.clone(),
-                    "memory",
-                    "forget",
-                    serde_json::json!({"key": key, "scope": scope}),
-                    host,
-                )
-                .await;
+                let legacy_scope = format!("provider:tui:{session}");
+                let target_scopes = match requested_scope {
+                    Some("global") => vec!["global".to_owned()],
+                    Some("session") => vec![local_scope.clone(), legacy_scope.clone()],
 
-                if scope != "global" {
-                    let legacy_scope = format!("provider:tui:{session}");
-                    let legacy = capability(
-                        home,
+                    _ => {
+                        let mut found_session = false;
+                        let mut found_global = false;
+
+                        for scope in [
+                            local_scope.clone(),
+                            legacy_scope.clone(),
+                            "global".to_owned(),
+                        ] {
+                            let recalled = capability(
+                                home.clone(),
+                                "memory",
+                                "recall",
+                                serde_json::json!({"key": key, "scope": scope}),
+                                host,
+                            )
+                            .await?;
+
+                            if !recalled["item"].is_null() {
+                                if scope == "global" {
+                                    found_global = true;
+                                } else {
+                                    found_session = true;
+                                }
+                            }
+                        }
+
+                        match (found_session, found_global) {
+                            (true, true) => {
+                                return Err(crabbot_core::Error::Denied(
+                                    "This key exists in global and session memory. Choose `/memory forget global KEY` or `/memory forget session KEY`.".into(),
+                                ));
+                            }
+
+                            (true, false) => vec![local_scope.clone(), legacy_scope.clone()],
+                            (false, true) => vec!["global".into()],
+                            (false, false) => return Ok(serde_json::json!({"deleted": false})),
+                        }
+                    }
+                };
+
+                let resolved_scope =
+                    if target_scopes.iter().any(|scope| scope == "global") && target_scopes.len() == 1 {
+                        "global"
+                    } else {
+                        "session"
+                    };
+
+                let mut deleted = false;
+
+                for scope in target_scopes {
+                    let forgotten = capability(
+                        home.clone(),
                         "memory",
                         "forget",
-                        serde_json::json!({"key": key, "scope": legacy_scope}),
+                        serde_json::json!({"key": key, "scope": scope}),
                         host,
                     )
-                    .await;
-
-                    if forgotten.as_ref().is_ok_and(|value| value["deleted"] == true)
-                        || legacy.as_ref().is_ok_and(|value| value["deleted"] == true)
-                    {
-                        return Ok(serde_json::json!({"deleted": true}));
-                    }
-
-                    match (forgotten, legacy) {
-                        (Err(error), _) | (_, Err(error)) => Err(error),
-                        (Ok(_), Ok(_)) => Ok(serde_json::json!({"deleted": false})),
-                    }
-                } else {
-                    forgotten
+                    .await?;
+                    deleted |= forgotten["deleted"] == true;
                 }
+
+                Ok(serde_json::json!({"deleted": deleted, "scope": resolved_scope}))
             }
             .await
             .map(|value| {
-                if value["deleted"] == true {
-                    "Memory removed.\n> ".into()
+                if value["deleted"] == true && value["scope"] == "global" {
+                    "Global memory removed.\n> ".into()
+                } else if value["deleted"] == true {
+                    "Session memory removed.\n> ".into()
                 } else {
                     "Memory was not found.\n> ".into()
                 }
@@ -2333,83 +3196,196 @@ where
 }
 
 fn memory_help() -> &'static str {
-    "Memory commands:\n  /memory list                 List global and this session's memories\n  /memory remember KEY=VALUE   Save a memory for this session\n  /memory forget KEY           Remove a memory from this session\n  /memory forget global KEY    Remove a global memory\n  /memory help                 Show this help\n\nSelecting /memory in the command picker shows this help.\n> "
+    r#"Manage memories for this session.
+
+Commands:
+  /memory help                               Show this help
+  /memory list [PAGE] [options]              List memories
+  /memory remember KEY=VALUE                 Save a memory for this session
+  /memory forget KEY                         Remove a unique matching memory
+  /memory forget global KEY                  Remove a global memory
+  /memory forget session KEY                 Remove a session memory
+
+Options:
+  --type global|session                      Filter the list by memory type
+
+Notes:
+  List rows show their type. If a key exists in both scopes, specify global or
+  session when forgetting it. Selecting /memory in the command picker shows
+  this help.
+> "#
 }
 
-fn format_timers(value: &Value) -> String {
+fn parse_memory_list(command: &str) -> Result<(usize, Option<&'static str>), ()> {
+    let mut parts = command.split_whitespace();
+
+    if parts.next() != Some("list") {
+        return Err(());
+    }
+
+    let mut page = 1;
+    let mut page_seen = false;
+    let mut record_type = None;
+
+    while let Some(part) = parts.next() {
+        if part == "--type" {
+            if record_type.is_some() {
+                return Err(());
+            }
+
+            record_type = match parts.next() {
+                Some("global") => Some("global"),
+                Some("session") => Some("session"),
+                _ => return Err(()),
+            };
+        } else if !page_seen {
+            page = part.parse::<usize>().ok().filter(|page| *page > 0).ok_or(())?;
+            page_seen = true;
+        } else {
+            return Err(());
+        }
+    }
+
+    Ok((page, record_type))
+}
+
+fn format_schedules(value: &Value) -> String {
     let Some(items) = value["items"].as_array() else {
-        return "Timers: none.\n> ".into();
+        return "There are no schedules to list.\n> ".into();
     };
 
+    if items.is_empty() {
+        return "There are no schedules to list.\n> ".into();
+    }
+
+    let total = value["total"].as_u64().unwrap_or(items.len() as u64);
+    let page = value["page"].as_u64().unwrap_or(1);
+    let pages = value["pages"].as_u64().unwrap_or(1);
+    let from = value["from"].as_u64().unwrap_or(1);
+    let to = value["to"].as_u64().unwrap_or(items.len() as u64);
     let items = items
         .iter()
-        .take(100)
-        .filter_map(|item| {
+        .enumerate()
+        .filter_map(|(index, item)| {
             let id = item["id"].as_u64()?;
-            let due = item["due"].as_u64()?;
-            let text = item["text"].as_str().unwrap_or_default();
-            Some(format!("{id} (due {due}): {}", short(text)))
+            let status = item["status"].as_str().unwrap_or("pending");
+            let mut details = Vec::new();
+
+            if let Some(due) = item["due"].as_u64() {
+                details.push(format!(
+                    "Next run: {}",
+                    crabbot_date::format_datetime_in_timezone(
+                        due,
+                        item["zone"].as_str().unwrap_or("UTC"),
+                    )
+                ));
+            } else {
+                details.push("No upcoming run".into());
+            }
+
+            if let Some(cron) = item["cron"].as_str() {
+                details.push(format!(
+                    "Repeats on cron {cron} in {}",
+                    item["zone"].as_str().unwrap_or("UTC")
+                ));
+            } else if let Some(repeat) = item["repeat"].as_u64().filter(|repeat| *repeat > 0) {
+                details.push(format!("Repeats every {}", crabbot_date::format_duration(repeat)));
+            }
+
+            let retries = item["retries"].as_u64().unwrap_or_default();
+
+            if retries > 0 {
+                let used =
+                    item["attempts"].as_u64().unwrap_or_default().saturating_sub(1).min(retries);
+                details.push(format!("Automatic retries: {used} of {retries} used"));
+            } else {
+                details.push("Automatic retries are off".into());
+            }
+
+            if item["on_failure"] == "continue" {
+                details.push("Continues after failed occurrences".into());
+            }
+
+            if let Some(retry_at) = item["retry_at"].as_u64() {
+                details.push(format!(
+                    "Next retry: {}",
+                    crabbot_date::format_datetime_in_timezone(
+                        retry_at,
+                        item["zone"].as_str().unwrap_or("UTC"),
+                    )
+                ));
+            }
+
+            if item["run_requested"] == true {
+                details.push("A manual run is queued".into());
+            }
+
+            if let Some(outcome) = item["last_outcome"].as_str() {
+                let label = match outcome {
+                    "completed" => "completed successfully",
+                    "retrying" => "failed; retry queued",
+                    "continuing" => "failed; next occurrence remains scheduled",
+                    "cancelled" => "cancelled",
+                    "skipped" => "skipped",
+                    _ => "failed; task paused",
+                };
+
+                details.push(format!(
+                    "Last result: {label}. Details: crab schedule history {}",
+                    item["name"].as_str().unwrap_or("Scheduled task")
+                ));
+            }
+
+            Some(format_tree_entry(
+                &format!("{id} | {} | {status}", item["name"].as_str().unwrap_or("Scheduled task")),
+                &details,
+                index + 1 == items.len(),
+            ))
         })
         .collect::<Vec<_>>();
 
-    if items.is_empty() {
-        "Timers: none.\n> ".into()
-    } else {
-        format!("Timers: {}.\n> ", items.join("; "))
-    }
+    format!(
+        "Schedules ({from}–{to} of {total}, page {page} of {pages})\n{}\n> ",
+        items.join("\n\n")
+    )
 }
 
-fn format_memories(global: &Value, session: &Value, legacy: &Value) -> String {
-    let format_items = |value: &Value| {
-        value["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .take(100)
-            .filter_map(|item| {
-                let key = item["key"].as_str()?;
-                let value = item["value"].as_str().unwrap_or_default();
-                Some(format!("    {} = {}", short(key), short(value)))
-            })
-            .collect::<Vec<_>>()
+fn format_memories(value: &Value) -> String {
+    let Some(items) = value["items"].as_array() else {
+        return "Memory list returned an invalid response.\n> ".into();
     };
 
-    let global = format_items(global);
-    let mut session_items =
-        session["items"].as_array().into_iter().flatten().cloned().collect::<Vec<_>>();
-    let current_keys = session_items
-        .iter()
-        .filter_map(|item| item["key"].as_str().map(str::to_owned))
-        .collect::<std::collections::BTreeSet<_>>();
+    let total = value["total"].as_u64().unwrap_or(items.len() as u64) as usize;
 
-    session_items.extend(
-        legacy["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|item| item["key"].as_str().is_none_or(|key| !current_keys.contains(key)))
-            .cloned(),
-    );
+    if total == 0 || items.is_empty() {
+        let page = value["page"].as_u64().unwrap_or(1);
+        let pages = value["pages"].as_u64().unwrap_or(1);
 
-    let session = format_items(&serde_json::json!({"items": session_items}));
-
-    if global.is_empty() && session.is_empty() {
-        return "Memories: none.\n> ".into();
+        return format!("Memories | 0–0 of 0 | page {page}/{pages}:\nNo memories found.\n> ");
     }
 
-    let format_section = |name: &str, items: &[String]| {
-        if items.is_empty() {
-            format!("  {name}: none")
-        } else {
-            format!("  {name}:\n{}", items.join("\n"))
-        }
-    };
+    let page = value["page"].as_u64().unwrap_or(1) as usize;
+    let pages =
+        value["pages"].as_u64().unwrap_or(total.div_ceil(PLUGIN_LIST_PAGE_SIZE) as u64) as usize;
 
-    format!(
-        "Memories:\n{}\n{}\n> ",
-        format_section("Global", &global),
-        format_section("This session", &session)
-    )
+    let start = (page - 1) * PLUGIN_LIST_PAGE_SIZE;
+    let end = (start + items.len()).min(total);
+    let mut output = format!("Memories | {}–{} of {total} | page {page}/{pages}:", start + 1, end);
+
+    for (index, item) in items.iter().enumerate() {
+        let key = short(item["key"].as_str().unwrap_or("unknown"));
+        let record_type = item["type"].as_str().unwrap_or("session");
+        let value = short(item["value"].as_str().unwrap_or_default());
+        let metadata = [format!("type: {record_type}"), value];
+
+        output.push_str(&format!(
+            "\n\n{}",
+            format_tree_entry(&key, &metadata, index + 1 == items.len())
+        ));
+    }
+
+    output.push_str("\n> ");
+    output
 }
 
 fn short(value: &str) -> String {
@@ -2423,7 +3399,7 @@ fn short(value: &str) -> String {
     short
 }
 
-fn timer_id() -> u64 {
+fn schedule_id() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos().min(u64::MAX as u128) as u64)
@@ -2509,6 +3485,7 @@ async fn control_with_stream(
     let token = tokio::fs::read_to_string(std::path::Path::new(home).join("ipc.token"))
         .await
         .map_err(unavailable_before_delivery)?;
+
     let port = tokio::fs::read_to_string(std::path::Path::new(home).join("ipc.port"))
         .await
         .map_err(unavailable_before_delivery)?
@@ -2727,6 +3704,7 @@ fn format_status(value: &Value) -> String {
 
 fn format_approval(value: &Value) -> String {
     let mode = value["approval"].as_str().unwrap_or("off");
+
     format!("Approvals: {mode}.\n> ")
 }
 
@@ -3164,17 +4142,30 @@ mod tests {
             async move {
                 assert_eq!(method, "capability.call");
                 assert_eq!(params["service"], "memory");
-                assert_eq!(params["method"], "forget");
+                let action = params["method"].as_str().unwrap();
+                let scope = params["params"]["scope"].as_str().unwrap();
 
-                if params["params"]["scope"] == "tui:default" {
-                    assert_eq!(params["params"]["key"], "duplicate");
+                assert_eq!(params["params"]["key"], "duplicate");
+
+                match action {
+                    "recall" => Ok(serde_json::json!({
+                        "item": if scope == "tui:default" || scope == "provider:tui:default" {
+                            serde_json::json!({"key": "duplicate", "scope": scope})
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    })),
+
+                    "forget" => {
+                        if scope == "provider:tui:default" {
+                            legacy_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+
+                        Ok(serde_json::json!({"deleted": true}))
+                    }
+
+                    _ => panic!("unexpected memory method {action}"),
                 }
-
-                if params["params"]["scope"] == "provider:tui:default" {
-                    legacy_called.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-
-                Ok(serde_json::json!({"deleted": true}))
             }
         };
 
@@ -3186,8 +4177,91 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response, "Memory removed.\n> ");
+        assert_eq!(response, "Session memory removed.\n> ");
         assert!(legacy_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn forgets_a_unique_global_memory_by_its_listed_key() {
+        let global_deleted = std::sync::atomic::AtomicBool::new(false);
+        let host = |_: String, method: String, params: serde_json::Value| {
+            let global_deleted = &global_deleted;
+
+            async move {
+                assert_eq!(method, "capability.call");
+                assert_eq!(params["service"], "memory");
+                let action = params["method"].as_str().unwrap();
+                let scope = params["params"]["scope"].as_str().unwrap();
+
+                assert_eq!(params["params"]["key"], "foo");
+
+                match action {
+                    "recall" => Ok(serde_json::json!({
+                        "item": if scope == "global" {
+                            serde_json::json!({"key": "foo", "scope": "global"})
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    })),
+
+                    "forget" => {
+                        assert_eq!(scope, "global");
+                        global_deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(serde_json::json!({"deleted": true}))
+                    }
+
+                    _ => panic!("unexpected memory method {action}"),
+                }
+            }
+        };
+
+        let response =
+            super::memory_command("/tmp/crabbot".into(), "default".into(), "forget foo", host)
+                .await;
+
+        assert_eq!(response, "Global memory removed.\n> ");
+        assert!(global_deleted.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn asks_for_scope_when_a_memory_key_is_ambiguous() {
+        let deleted = std::sync::atomic::AtomicBool::new(false);
+        let host = |_: String, method: String, params: serde_json::Value| {
+            let deleted = &deleted;
+
+            async move {
+                assert_eq!(method, "capability.call");
+                assert_eq!(params["service"], "memory");
+                let action = params["method"].as_str().unwrap();
+                let scope = params["params"]["scope"].as_str().unwrap();
+
+                assert_eq!(params["params"]["key"], "foo");
+
+                match action {
+                    "recall" => Ok(serde_json::json!({
+                        "item": if scope == "global" || scope == "tui:default" {
+                            serde_json::json!({"key": "foo", "scope": scope})
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    })),
+
+                    "forget" => {
+                        deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(serde_json::json!({"deleted": true}))
+                    }
+
+                    _ => panic!("unexpected memory method {action}"),
+                }
+            }
+        };
+
+        let response =
+            super::memory_command("/tmp/crabbot".into(), "default".into(), "forget foo", host)
+                .await;
+
+        assert!(response.contains("exists in global and session memory"));
+        assert!(!deleted.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -3507,11 +4581,12 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("crabbot-tui-capability-{}", std::process::id()));
 
-        let plugin = root.join("plugins/timer");
-        let binary = crabbot_core::plugin::binary_name("timer");
+        let plugin = root.join("plugins/scheduler");
+        let binary = crabbot_core::plugin::binary_name("scheduler");
 
         std::fs::create_dir_all(plugin.join("bin")).unwrap();
-        std::fs::write(plugin.join("crabbot-plugin.toml"), "capabilities = ['timer']\n").unwrap();
+        std::fs::write(plugin.join("crabbot-plugin.toml"), "capabilities = ['scheduler']\n")
+            .unwrap();
         std::fs::write(plugin.join("bin").join(binary), "test").unwrap();
 
         let memory = root.join("plugins/memory");
@@ -3522,7 +4597,7 @@ mod tests {
 
         std::fs::write(memory.join("bin").join(memory_binary), "test").unwrap();
 
-        assert!(super::has_capability(root.to_str().unwrap(), "timer"));
+        assert!(super::has_capability(root.to_str().unwrap(), "scheduler"));
         assert!(super::has_capability(root.to_str().unwrap(), "memory"));
 
         let help = super::command_help(root.to_str().unwrap(), true, true);
@@ -3880,29 +4955,421 @@ mod tests {
     }
 
     #[test]
-    fn formats_timer_and_memory_records() {
+    fn formats_schedule_and_memory_records() {
         assert_eq!(
-            super::format_timers(&json!({"items": [{"id": 7, "due": 42, "text": "call back"}]})),
-            "Timers: 7 (due 42): call back.\n> "
+            super::format_schedules(&json!({"items": []})),
+            "There are no schedules to list.\n> "
         );
 
         assert_eq!(
-            super::format_memories(
-                &json!({"items": [{"key": "close-up", "value": "banana"}]}),
-                &json!({"items": [{"key": "drink", "value": "tea"}]}),
-                &json!({"items": [{"key": "legacy", "value": "saved before upgrade"}]}),
-            ),
-            "Memories:\n  Global:\n    close-up = banana\n  This session:\n    drink = tea\n    legacy = saved before upgrade\n> "
+            super::format_schedules(&json!({"items": [{"id": 7, "due": 42, "text": "call back"}]})),
+            "Schedules (1–1 of 1, page 1 of 1)\n└─ 7 | Scheduled task | pending\n   ├─ Next run: 1970-01-01 00:00:42 UTC\n   └─ Automatic retries are off\n> "
+        );
+
+        let local = super::format_schedules(&json!({
+            "items": [{
+                "id": 8,
+                "name": "rome-report",
+                "due": 1_700_000_000,
+                "cron": "0 9 * * *",
+                "zone": "Europe/Rome",
+                "status": "active"
+            }]
+        }));
+
+        assert!(local.contains(
+            "Next run: 2023-11-14 23:13:20 +01:00 (Europe/Rome; 2023-11-14 22:13:20 UTC)"
+        ));
+
+        assert_eq!(
+            super::format_memories(&json!({
+                "items": [
+                    {"key": "close-up", "value": "banana", "type": "global"},
+                    {"key": "drink", "value": "tea", "type": "session"},
+                    {"key": "legacy", "value": "saved before upgrade", "type": "session"}
+                ],
+                "total": 3,
+                "page": 1,
+                "pages": 1
+            })),
+            "Memories | 1–3 of 3 | page 1/1:\n\n├─ close-up\n│  ├─ type: global\n│  └─ banana\n\n├─ drink\n│  ├─ type: session\n│  └─ tea\n\n└─ legacy\n   ├─ type: session\n   └─ saved before upgrade\n> "
         );
 
         assert_eq!(
-            super::format_memories(
-                &json!({"items": []}),
-                &json!({"items": []}),
-                &json!({"items": []}),
-            ),
-            "Memories: none.\n> "
+            super::format_memories(&json!({"items": [], "total": 0, "page": 1, "pages": 1})),
+            "Memories | 0–0 of 0 | page 1/1:\nNo memories found.\n> "
         );
+    }
+
+    #[test]
+    fn tui_schedule_history_paginates_five_runs() {
+        let root = std::env::temp_dir()
+            .join(format!("crabbot-tui-schedule-history-{}", std::process::id()));
+        let directory = root.join("logs/schedules");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("morning-check-42.jsonl");
+        let records = (1..=12)
+            .map(|run_id| {
+                json!({
+                    "timestamp": "2026-10-19T14:00:00Z",
+                    "schedule": {"id": 42, "name": "morning-check", "timezone": "UTC"},
+                    "run": {"id": run_id, "status": "completed", "scheduled_for": 1_800_000_000},
+                    "agent": {"provider": "codex", "model": "gpt-6-luna"},
+                    "result": format!("run-{run_id}")
+                })
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(
+            &path,
+            records.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"),
+        )
+        .unwrap();
+
+        let (page, total, found_path) =
+            super::read_schedule_history(root.to_str().unwrap(), 42, 2).unwrap();
+        let output =
+            super::format_schedule_history(&page, total, 42, "morning-check", 2, &found_path);
+
+        assert_eq!(page.len(), 5);
+        assert_eq!(total, 12);
+        assert!(output.contains("Schedule history: morning-check | 6–10 of 12 | page 2/3:"));
+        assert!(
+            output.find("Run 7 | completed successfully").unwrap()
+                < output.find("Run 3 | completed successfully").unwrap()
+        );
+
+        assert!(output.contains("Raw JSONL: "));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tui_schedule_add_shows_name_access_and_frequency() {
+        let host = |_: String, _: String, _: serde_json::Value| async move {
+            Ok(json!({
+                "id": 77,
+                "name": "morning-check",
+                "status": "active",
+                "due": 1_800_000_000_u64,
+                "repeat": 300,
+                "zone": "UTC",
+                "context": {"tools": false, "shell": false}
+            }))
+        };
+
+        let output = super::schedule_command(
+            "/tmp/crabbot".into(),
+            "add --every 5m --name morning-check Review the report",
+            "default".into(),
+            "codex".into(),
+            "gpt-6-luna".into(),
+            Some("/work/reports".into()),
+            host,
+        )
+        .await;
+
+        assert!(output.starts_with("Schedule morning-check ("));
+        assert!(output.contains(") is active.\n\nInstruction: Review the report"));
+        assert!(output.contains("\nTools: disabled\nShell: disabled\n"));
+        assert!(output.contains("Frequency: every 5 minutes"));
+        assert!(output.contains("\n\nCheck it with /schedule list;"));
+    }
+
+    #[tokio::test]
+    async fn schedule_selectors_resolve_names_across_pages() {
+        let host = |_: String, _: String, params: serde_json::Value| async move {
+            let page = params["params"]["page"].as_u64().unwrap();
+            let value = if page == 1 {
+                json!({"items": [{"id": 10, "name": "first-task"}], "pages": 2})
+            } else {
+                json!({"items": [{"id": 11, "name": "mighty-raccoon"}], "pages": 2})
+            };
+
+            Ok(value)
+        };
+
+        assert_eq!(
+            super::schedule_selector_id("/home/crabbot", "mighty-raccoon", host).await,
+            Ok(11)
+        );
+
+        assert_eq!(super::schedule_selector_id("/home/crabbot", "10", host).await, Ok(10));
+        assert!(super::schedule_selector_id("/home/crabbot", "missing", host).await.is_err());
+    }
+
+    #[test]
+    fn schedule_list_shows_repeat_interval_and_last_outcome() {
+        let output = super::format_schedules(&json!({
+            "items": [{
+                "id": 8,
+                "name": "send-report",
+                "due": 1_700_000_000,
+                "repeat": 300,
+                "status": "paused",
+                "text": "send report",
+                "last_outcome": "failed",
+                "last_result": "PAUSED: The channel is not available."
+            }]
+        }));
+
+        assert!(output.contains("Repeats every 5 minutes"));
+        assert!(output.contains("Last result: failed; task paused."));
+        assert!(output.contains("crab schedule history send-report"));
+        assert!(!output.contains("The channel is not available"));
+    }
+
+    #[test]
+    fn schedule_list_shows_continue_after_retries_policy() {
+        let output = super::format_schedules(&json!({
+            "items": [{
+                "id": 10,
+                "due": 1_700_000_000,
+                "repeat": 300,
+                "status": "active",
+                "on_failure": "continue",
+                "text": "check the backup"
+            }]
+        }));
+
+        assert!(output.contains("Continues after failed occurrences"));
+    }
+
+    #[test]
+    fn parses_memory_list_pages_and_type_filters() {
+        assert_eq!(super::parse_memory_list("list"), Ok((1, None)));
+        assert_eq!(super::parse_memory_list("list 3"), Ok((3, None)));
+        assert_eq!(super::parse_memory_list("list --type global"), Ok((1, Some("global"))));
+        assert_eq!(super::parse_memory_list("list 2 --type session"), Ok((2, Some("session"))));
+        assert_eq!(super::parse_memory_list("list --type global 2"), Ok((2, Some("global"))));
+        assert!(super::parse_memory_list("list 0").is_err());
+        assert!(super::parse_memory_list("list --type invalid").is_err());
+        assert!(super::parse_memory_list("list 2 3").is_err());
+        assert!(super::parse_memory_list("list --type global --type session").is_err());
+    }
+
+    #[tokio::test]
+    async fn lists_memories_with_page_and_type_filter() {
+        let host = |_: String, method: String, params: serde_json::Value| async move {
+            assert_eq!(method, "capability.call");
+            assert_eq!(params["service"], "memory");
+            assert_eq!(params["method"], "list");
+            assert_eq!(params["params"]["page"], 2);
+            assert_eq!(params["params"]["type"], "session");
+            assert_eq!(
+                params["params"]["scopes"],
+                json!(["global", "tui:default", "provider:tui:default"])
+            );
+
+            Ok(json!({
+                "items": [{"key": "note", "value": "session detail", "type": "session"}],
+                "total": 6,
+                "page": 2,
+                "pages": 2
+            }))
+        };
+
+        let response = super::memory_command(
+            "/tmp/crabbot".into(),
+            "default".into(),
+            "list 2 --type session",
+            host,
+        )
+        .await;
+
+        assert!(response.contains("Memories | 6–6 of 6 | page 2/2:"));
+        assert!(response.contains("└─ note\n   ├─ type: session\n   └─ session detail"));
+    }
+
+    #[test]
+    fn schedule_help_uses_enterable_arguments() {
+        let help = super::schedule_help();
+
+        assert!(help.contains("/schedule add TIMING [options] TEXT"));
+        assert!(help.contains("--after DURATION"));
+        assert!(help.contains("--at DATE-TIME"));
+        assert!(help.contains("--every DURATION"));
+        assert!(help.contains("--name NAME"));
+        assert!(help.contains("--cron 'FIELDS'"));
+        assert!(help.contains("--timezone AREA/CITY"));
+        assert!(help.contains("/schedule run ID|NAME"));
+        assert!(help.contains("/schedule retry ID|NAME"));
+        assert!(help.contains("--missed skip|coalesce|replay"));
+        assert!(help.contains("--retries 0..5"));
+        assert!(help.contains("--on-failure pause|continue"));
+        assert!(!help.contains('<'));
+
+        let memory_help = super::memory_help();
+
+        assert!(memory_help.contains("/memory list [PAGE] [options]"));
+        assert!(memory_help.contains("--type global|session"));
+        assert!(memory_help.contains("Notes:"));
+        assert!(!memory_help.contains('<'));
+    }
+
+    #[test]
+    fn tui_schedule_add_accepts_cli_timing_and_retry_options() {
+        let (params, instruction) = super::parse_schedule_add(
+            "--every 300 --at 2030-10-20T09:00:00+02:00 --missed replay --retries 2 --on-failure continue 'Check user's backup folder'",
+            "/missing-crabbot-home",
+        )
+        .unwrap();
+        let expected_at = u64::try_from(
+            "2030-10-20T09:00:00+02:00".parse::<jiff::Timestamp>().unwrap().as_second(),
+        )
+        .unwrap();
+
+        assert_eq!(instruction, "Check user's backup folder");
+        assert_eq!(params["repeat"], 300);
+        assert_eq!(params["at"], expected_at);
+        assert_eq!(params["missed"], "replay");
+        assert_eq!(params["retries"], 2);
+        assert_eq!(params["on_failure"], "continue");
+    }
+
+    #[test]
+    fn tui_schedule_add_accepts_human_durations_and_options_after_instruction() {
+        let (params, instruction) = super::parse_schedule_add(
+            "run a backup --after '1m30s' --every 1mo --name Backup",
+            "/missing-crabbot-home",
+        )
+        .unwrap();
+
+        assert_eq!(instruction, "run a backup");
+        assert_eq!(params["delay"], 90);
+        assert_eq!(params["repeat"], 2_592_000);
+        assert_eq!(params["name"], "Backup");
+
+        let (params, _) = super::parse_schedule_add(
+            "--after '1 month' do the monthly backup",
+            "/missing-crabbot-home",
+        )
+        .unwrap();
+
+        assert_eq!(params["delay"], 2_592_000);
+
+        let (params, _) = super::parse_schedule_add(
+            "--at '2030-10-20 09:00' --timezone UTC Run the report",
+            "/missing-crabbot-home",
+        )
+        .unwrap();
+
+        assert_eq!(
+            params["at"],
+            "2030-10-20T09:00:00Z".parse::<jiff::Timestamp>().unwrap().as_second() as u64
+        );
+
+        assert!(
+            super::parse_schedule_add("--after 5m --name 'Backup job' Send report", "/tmp")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tui_schedule_add_parses_quoted_cron_and_validates_options() {
+        let (params, instruction) = super::parse_schedule_add(
+            "--cron '0 9 * * 1-5' --timezone Europe/Rome --retries 1 Send the weekday report",
+            "/missing-crabbot-home",
+        )
+        .unwrap();
+
+        assert_eq!(params["cron"], "0 9 * * 1-5");
+        assert_eq!(params["zone"], "Europe/Rome");
+        assert_eq!(instruction, "Send the weekday report");
+        assert!(
+            super::parse_schedule_add("--every 300 --cron '* * * * *' --timezone UTC Run", "/tmp")
+                .unwrap_err()
+                .contains("either --every or --cron")
+        );
+
+        assert!(super::parse_schedule_add("--at yesterday Run", "/tmp").is_err());
+        assert!(super::parse_schedule_add("30 --retries 8 Run", "/tmp").is_err());
+    }
+
+    #[tokio::test]
+    async fn manual_schedule_controls_use_scheduler_ipc_methods() {
+        let host = |_: String, _: String, params: serde_json::Value| async move {
+            if params["method"] == "list" {
+                Ok(json!({
+                    "items": [
+                        {"id": 7, "name": "morning-check"},
+                        {"id": 8, "name": "evening-check"},
+                        {"id": 9, "name": "night-check"}
+                    ],
+                    "pages": 1
+                }))
+            } else {
+                Ok(json!({"id": params["params"]["id"], "status": "active"}))
+            }
+        };
+
+        let run = super::schedule_command(
+            "/tmp/crabbot".into(),
+            "run 7",
+            "default".into(),
+            "codex".into(),
+            "gpt-6-luna".into(),
+            None,
+            host,
+        )
+        .await;
+        let retry = super::schedule_command(
+            "/tmp/crabbot".into(),
+            "retry 8",
+            "default".into(),
+            "codex".into(),
+            "gpt-6-luna".into(),
+            None,
+            host,
+        )
+        .await;
+        let remove_host = |_: String, _: String, params: serde_json::Value| async move {
+            if params["method"] == "list" {
+                Ok(json!({
+                    "items": [{"id": 9, "name": "night-check"}],
+                    "pages": 1
+                }))
+            } else {
+                Ok(json!({"deleted": false, "cancel_requested": true}))
+            }
+        };
+
+        let remove = super::schedule_command(
+            "/tmp/crabbot".into(),
+            "remove 9",
+            "default".into(),
+            "codex".into(),
+            "gpt-6-luna".into(),
+            None,
+            remove_host,
+        )
+        .await;
+
+        assert!(run.contains("Schedule morning-check (7) queued to run now."), "{run}");
+        assert!(retry.contains("Schedule evening-check (8) retry queued."));
+        assert!(remove.contains("Cancellation requested for schedule night-check (9)."));
+        assert!(remove.contains("side effect may already have happened"));
+    }
+
+    #[test]
+    fn scheduled_tui_tasks_capture_the_configured_shell_setting() {
+        let root =
+            std::env::temp_dir().join(format!("crabbot-tui-schedule-shell-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.toml");
+
+        std::fs::write(&config, "[clients.tui]\nshell = true\n").unwrap();
+
+        assert!(super::configured_tui_shell(root.to_str().unwrap()));
+
+        std::fs::write(&config, "shell = true\n[clients.tui]\nshell = false\n").unwrap();
+
+        assert!(!super::configured_tui_shell(root.to_str().unwrap()));
+
+        std::fs::write(&config, "shell = true\n").unwrap();
+
+        assert!(super::configured_tui_shell(root.to_str().unwrap()));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -4020,32 +5487,47 @@ mod tests {
             })),
 
             "capability.call" => match (params["service"].as_str(), params["method"].as_str()) {
-                (Some("timer"), Some("list")) => Ok(json!({
-                    "items": [{"id": 7, "due": 42, "text": "call back"}]
+                (Some("scheduler"), Some("list")) => Ok(json!({
+                    "items": [{"id": 7, "name": "morning-check", "due": 42, "text": "call back"}]
                 })),
 
-                (Some("timer"), Some("add")) => Ok(json!({"id": params["params"]["id"]})),
-                (Some("timer"), Some("remove")) => Ok(json!({"deleted": true})),
-
-                (Some("memory"), Some("list")) if params["params"]["scope"] == "global" => {
-                    Ok(json!({"items": [{"key": "close-up", "value": "banana at the end"}]}))
-                }
-
-                (Some("memory"), Some("list"))
-                    if params["params"]["scope"] == "provider:tui:default" =>
-                {
-                    Ok(json!({"items": [{"key": "old-note", "value": "saved before upgrade"}]}))
-                }
-
-                (Some("memory"), Some("list")) if params["params"]["scope"] == "tui:default" => {
-                    Ok(json!({"items": [{"key": "drink", "value": "tea"}]}))
-                }
+                (Some("scheduler"), Some("add")) => Ok(json!({"id": params["params"]["id"]})),
+                (Some("scheduler"), Some("remove")) => Ok(json!({"deleted": true})),
 
                 (Some("memory"), Some("list")) => {
-                    Ok(json!({"items": [{"key": "drink", "value": "tea"}]}))
+                    assert_eq!(
+                        params["params"]["scopes"],
+                        json!(["global", "tui:default", "provider:tui:default"])
+                    );
+
+                    Ok(json!({
+                        "items": [
+                            {"key": "close-up", "value": "banana at the end", "type": "global"},
+                            {"key": "drink", "value": "tea", "type": "session"},
+                            {"key": "old-note", "value": "saved before upgrade", "type": "session"}
+                        ],
+                        "total": 3,
+                        "page": params["params"]["page"],
+                        "pages": 1
+                    }))
                 }
 
                 (Some("memory"), Some("remember")) => Ok(json!({"ok": true})),
+                (Some("memory"), Some("recall"))
+                    if params["params"]["key"] == "drink"
+                        && params["params"]["scope"] == "tui:default" =>
+                {
+                    Ok(json!({"item": {"key": "drink", "scope": "tui:default"}}))
+                }
+
+                (Some("memory"), Some("recall"))
+                    if params["params"]["key"] == "old-note"
+                        && params["params"]["scope"] == "provider:tui:default" =>
+                {
+                    Ok(json!({"item": {"key": "old-note", "scope": "provider:tui:default"}}))
+                }
+
+                (Some("memory"), Some("recall")) => Ok(json!({"item": null})),
                 (Some("memory"), Some("forget"))
                     if params["params"]["key"] == "old-note"
                         && params["params"]["scope"] == "tui:default" =>
@@ -4385,7 +5867,7 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
         fs::write(
             &input_path,
             format!(
-                "/help\n/status\n/approval\n/approvals\n/approve 0123456789abcdef01234567\n/deny 0123456789abcdef01234567\n/session list\n/session help\n/deliveries\n/retry bad id\n/drop bad id\n/plugin\n/workspace\n/workspace {}\n/workspace reset\n/timer list\n/timer add 30 break\n/timer remove 7\n/memory\n/memory help\n/memory list\n/memory remember drink=tea\n/memory forget drink\n/memory forget old-note\n/model \n/model test\n/session bad!\n/new two\n/session create test-one\n/session one\n/session rename renamed\n/session archive two\n/session unarchive two\n/session unarchive missing\n/session delete two -y\n/session delete renamed -y\n/session archive renamed\n/compact\n/clear\n\nhello\n/quit\n",
+                "/help\n/status\n/approval\n/approvals\n/approve 0123456789abcdef01234567\n/deny 0123456789abcdef01234567\n/session list\n/session help\n/deliveries\n/retry bad id\n/drop bad id\n/plugin\n/workspace\n/workspace {}\n/workspace reset\n/schedule list\n/schedule add 30 break\n/schedule remove 7\n/memory\n/memory help\n/memory list\n/memory remember drink=tea\n/memory forget drink\n/memory forget old-note\n/model \n/model test\n/session bad!\n/new two\n/session create test-one\n/session one\n/session rename renamed\n/session archive two\n/session unarchive two\n/session unarchive missing\n/session delete two -y\n/session delete renamed -y\n/session archive renamed\n/compact\n/clear\n\nhello\n/quit\n",
                 root.display()
             ),
         )
@@ -4442,15 +5924,21 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
         assert!(text.contains("Kept active session renamed"));
         assert!(text.contains("Kept active session renamed"));
         assert!(text.contains(&format!("Workspace changed to: {}", root.display())));
-        assert!(text.contains("Timers: 7 (due 42): call back."));
-        assert!(text.contains("was scheduled."));
-        assert!(text.contains("Timer 7 was removed."));
-        assert!(text.contains("Global:\n    close-up = banana at the end"));
-        assert!(text.contains("This session:\n    drink = tea"));
-        assert!(text.contains("old-note = saved before upgrade"));
-        assert!(text.matches("Memory commands:").count() >= 2);
+        assert!(
+            text.contains(
+                "Schedules (1–1 of 1, page 1 of 1)\n└─ 7 | morning-check | pending\n   ├─ Next run: 1970-01-01 00:00:42 UTC\n   └─ Automatic retries are off"
+            )
+        );
+
+        assert!(text.contains("is active."));
+        assert!(text.contains("Schedule morning-check (7) was removed."));
+        assert!(text.contains("Memories | 1–3 of 3 | page 1/1:"));
+        assert!(text.contains("├─ close-up\n│  ├─ type: global\n│  └─ banana at the end"));
+        assert!(text.contains("├─ drink\n│  ├─ type: session\n│  └─ tea"));
+        assert!(text.contains("old-note"));
+        assert!(text.matches("Manage memories for this session.").count() >= 2);
         assert!(text.contains("Memory saved for this session."));
-        assert!(text.matches("Memory removed.").count() >= 2);
+        assert!(text.matches("Session memory removed.").count() >= 2);
 
         let one_shot = super::run_once(
             root.display().to_string(),

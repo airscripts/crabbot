@@ -34,6 +34,16 @@ that complete run still misses a threshold. Do not infer a gate failure from an
 isolated package rerun or a restricted run, and do not lower thresholds to work
 around skipped integration tests.
 
+Before adding coverage tests in response to a local shortfall, check that the
+environment permits a loopback bind:
+
+```sh
+python3 -c 'import socket; socket.create_server(("127.0.0.1", 0))'
+```
+
+If this fails with `PermissionError` or `Operation not permitted`, rerun the
+coverage profile with local socket access before changing tests or thresholds.
+
 ## Formatting
 
 Rust formatting has two checks: `cargo fmt` handles syntax formatting, while

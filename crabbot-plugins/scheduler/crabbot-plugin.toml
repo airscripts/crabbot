@@ -1,0 +1,8 @@
+id = "scheduler"
+version = "0.1.0"
+capabilities = ["scheduler"]
+permissions = ["scheduler"]
+
+[protocol]
+major = 0
+minor = 1

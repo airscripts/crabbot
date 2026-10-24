@@ -48,7 +48,7 @@ Brand positioning:
   MCP, speech, or TUI implementation. Core-only startup still supports
   configuration, diagnostics, plugin management, and version reporting.
 - Official plugins are codex, claude, gemini, ollama, openrouter, telegram,
-  discord, whatsapp, signal, slack, sqlite, memory, timer, tools, mcp, whisper,
+  discord, whatsapp, signal, slack, sqlite, memory, scheduler, tools, mcp, whisper,
   tui, and pi.
 - Every plugin uses versioned JSON-RPC 2.0 over strict LF-delimited stdio. stdout is
   protocol-only and stderr is for redacted logs. Require handshake, protocol
@@ -84,7 +84,7 @@ Brand positioning:
   plugin can run; other optional commands are registered by plugins such as
   `code`, `codex`, `memory`, and `tui`. Human output is default; JSON and noninteractive
   confirmation are explicit.
-- TUI supports chat, sessions, model/workspace switching, approvals, timers,
+- TUI supports chat, sessions, model/workspace switching, approvals, schedules,
   memory, plugin health, and streamed activity. Session transcripts retain
   displayed TUI command exchanges alongside model turns.
 - Sessions support new, resume, fork, cancel, and model switching. One turn
@@ -111,7 +111,8 @@ Brand positioning:
   explicit user request; autonomous learning retains stable, useful facts
   without secrets or sensitive inferences. Its private `memory/` home is
   created only after the plugin is installed and first used.
-- Scheduling supports one-shot reminders and cron prompts with IANA zones.
+- Scheduling supports approved one-time and recurring agent tasks, including
+  cron expressions with IANA timezones.
   Missed tasks default to skip-and-notify, with configurable once recovery.
 - Tools provide root-confined files, search, patches, Git status/diff/
   worktrees, and optional shell. Shell is disabled by default and each
@@ -167,7 +168,7 @@ Brand positioning:
 - Cross-platform tests cover IPC, services, TUI snapshots, installers,
   archives, and plugin discovery.
 - Acceptance flows cover a Telegram DM with text/image/voice/tools/memory/
-  timer, a Discord thread with authorization and a worktree, provider
+  scheduler, a Discord thread with authorization and a worktree, provider
   switching without history loss, core-only diagnostics, and update rollback.
   The deterministic evidence matrix is maintained in
   [Acceptance](acceptance.md).

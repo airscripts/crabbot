@@ -23,7 +23,7 @@ pub enum Capability {
     Channel,
     Store,
     Memory,
-    Timer,
+    Scheduler,
     Tool,
     Mcp,
     Speech,
@@ -296,9 +296,13 @@ mod tests {
 
     #[test]
     fn protocol_requires_matching_major_and_supported_minor() {
+        assert!(Protocol::CURRENT.compatible(Protocol { major: 0, minor: 1 }));
+
         assert!(Protocol::CURRENT.compatible(Protocol { major: 0, minor: 0 }));
+
         assert!(!Protocol::CURRENT.compatible(Protocol { major: 1, minor: 0 }));
-        assert!(!Protocol { major: 0, minor: 0 }.compatible(Protocol::CURRENT));
+
+        assert!(!Protocol::CURRENT.compatible(Protocol { major: 0, minor: 2 }));
     }
 
     #[test]

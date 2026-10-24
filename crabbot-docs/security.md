@@ -32,10 +32,17 @@ tool capabilities or replace host authorization. Channel
 allowlists can be narrowed by owner, admin, member, topic, and thread IDs. Tool
 schemas are exposed only when daemon approvals are enabled and the sender is
 trusted by the channel policy; private messages are not trusted implicitly.
+Messaging-channel turns cannot use the global schedule-list tool, which could
+expose task instructions from another channel or local CLI session. Local CLI
+and TUI turns can list schedules.
 With `approval = "prompt"`, mutating calls use signed, single-use callbacks
 that expire after five minutes and are bound to their channel route, session,
-tool, and arguments. `approval = "auto"` intentionally skips that interactive
-confirmation and should be limited to explicitly trusted channel policies.
+tool, and arguments. Explicitly requested schedule proposals activate without
+an interactive approval step; creating the schedule is the user's delegation.
+The scheduled turn remains limited to the provider, tools, workspace, shell
+setting, and message destination captured at creation. Other mutating calls
+under `approval = "auto"` skip interactive confirmation, so that mode should
+be limited to explicitly trusted channel policies.
 Group turns use an isolated Git worktree by default when the configured root is
 a repository; this can be disabled per channel with an explicit
 `worktree = false` setting.
@@ -68,7 +75,7 @@ bodies reserve protocol-frame headroom, plugin metadata and persisted values
 are bounded before storage, and SQLite enforces its database cap using the
 configured file's actual page size.
 
-State, memory, timer, credential, plugin lock metadata, and gateway cursor files use a shared
+State, memory, scheduler, credential, plugin lock metadata, and gateway cursor files use a shared
 crash-safe transaction writer. Unix files are mode 0600; Windows files use an
 owner-only protected DACL. Startup recovery completes interrupted replacements
 before a file is read. Channel sends are at-most-once: an ambiguous transport

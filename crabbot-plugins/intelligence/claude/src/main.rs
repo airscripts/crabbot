@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use crabbot_core::{
-    plugin::{Emitter, serve_events},
+    plugin::{Emitter, serve_events_concurrent},
     types::{
         Capability, Content, Event, Hello, ModelReply, ModelRequest, Protocol, Request, Response,
     },
@@ -28,7 +28,7 @@ async fn plugin_main() -> crabbot_core::Result<()> {
             crabbot_core::Error::Denied(format!("Anthropic client failed: {error}."))
         })?;
 
-    serve_events(
+    serve_events_concurrent(
         Hello {
             protocol: Protocol { major: 0, minor: 1 },
             id: "claude".into(),

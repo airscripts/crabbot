@@ -30,6 +30,7 @@ const FRAME: usize = jsonl::MAX;
 const NOTES: usize = 256;
 const OUTPUT: usize = 32;
 const EVENTS: usize = 256;
+const CONCURRENT_HANDLERS: usize = 4;
 
 pub fn binary_name(id: &str) -> String {
     format!("crabbot-plugin-{id}{}", std::env::consts::EXE_SUFFIX)
@@ -136,6 +137,16 @@ where
     serve_io_events(hello, BufReader::new(stdin), stdout, &mut handle).await
 }
 
+pub async fn serve_events_concurrent<F, Fut>(hello: Hello, handle: F) -> Result<()>
+where
+    F: Fn(Request, Emitter) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Option<Response>>> + Send + 'static,
+{
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+    serve_io_events_concurrent(hello, BufReader::new(stdin), stdout, handle).await
+}
+
 pub async fn serve_io_events<R, W, F, Fut>(
     hello: Hello,
     input: R,
@@ -151,6 +162,7 @@ where
     let (sender, mut receiver) = mpsc::channel::<Value>(OUTPUT);
     let (incoming, mut requests) = mpsc::channel::<Incoming>(OUTPUT);
     let replies = Arc::new(Mutex::new(BTreeMap::new()));
+    let calls = Arc::new(AtomicU64::new(1));
     let reader = tokio::spawn(read_input(input, incoming, Arc::clone(&replies)));
 
     let writer = tokio::spawn(async move {
@@ -211,7 +223,7 @@ where
                     let emitter = Emitter {
                         output: sender.clone(),
                         events: Arc::new(AtomicUsize::new(0)),
-                        calls: Arc::new(AtomicU64::new(1)),
+                        calls: Arc::clone(&calls),
                         replies: Arc::clone(&replies),
                     };
 
@@ -238,6 +250,175 @@ where
                             }
                         }
                     }
+                }
+            }
+        }
+
+        Ok(())
+    }
+    .await;
+
+    reader.abort();
+    drop(sender);
+
+    let written = writer
+        .await
+        .map_err(|error| Error::Protocol(format!("plugin output task failed: {error}")))?;
+
+    result?;
+    written
+}
+
+pub async fn serve_io_events_concurrent<R, W, F, Fut>(
+    hello: Hello,
+    input: R,
+    output: W,
+    handle: F,
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    F: Fn(Request, Emitter) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Option<Response>>> + Send + 'static,
+{
+    let (sender, mut receiver) = mpsc::channel::<Value>(OUTPUT);
+    let (incoming, mut requests) = mpsc::channel::<Incoming>(OUTPUT);
+    let replies = Arc::new(Mutex::new(BTreeMap::new()));
+    let calls = Arc::new(AtomicU64::new(1));
+    let reader = tokio::spawn(read_input(input, incoming, Arc::clone(&replies)));
+
+    let writer = tokio::spawn(async move {
+        let mut output = output;
+
+        while let Some(value) = receiver.recv().await {
+            jsonl::write(&mut output, &value).await?;
+        }
+
+        Ok::<(), Error>(())
+    });
+
+    let handle = Arc::new(handle);
+    let mut workers = tokio::task::JoinSet::new();
+    let result = async {
+        loop {
+            tokio::select! {
+                request = requests.recv(), if workers.len() < CONCURRENT_HANDLERS => {
+                    let Some(request) = request else {
+                        break;
+                    };
+
+                    let request = match request {
+                        Incoming::Request(request) => request,
+                        Incoming::Error(error) => return Err(error),
+                    };
+
+                    let id = request.id();
+
+                    if !request.valid() {
+                        if let Some(id) = id {
+                            write_output(&sender, Response::fail(id, -32600, "invalid request"))
+                                .await?;
+                        }
+
+                        continue;
+                    }
+
+                    let method = match &request {
+                        Request::Call { method, .. } | Request::Note { method, .. } => method.as_str(),
+                    };
+
+                    match method {
+                        "hello" => {
+                            if let Some(id) = id {
+                                write_output(
+                                    &sender,
+                                    Response::ok(id, serde_json::to_value(&hello)?),
+                                )
+                                .await?;
+                            }
+                        }
+
+                        "ping" => {
+                            if let Some(id) = id {
+                                write_output(&sender, Response::ok(id, json!({"ok": true})))
+                                    .await?;
+                            }
+                        }
+
+                        "shutdown" => {
+                            if let Some(id) = id {
+                                write_output(&sender, Response::ok(id, json!({"ok": true})))
+                                    .await?;
+                            }
+
+                            break;
+                        }
+
+                        _ => {
+                            let handle = Arc::clone(&handle);
+                            let sender = sender.clone();
+                            let emitter = Emitter {
+                                output: sender.clone(),
+                                events: Arc::new(AtomicUsize::new(0)),
+                                calls: Arc::clone(&calls),
+                                replies: Arc::clone(&replies),
+                            };
+
+                            workers.spawn(async move {
+                                match handle(request, emitter).await {
+                                    Ok(Some(response)) => write_output(&sender, response).await,
+
+                                    Ok(None) => {
+                                        if let Some(id) = id {
+                                            write_output(
+                                                &sender,
+                                                Response::fail(id, -32601, "method not found"),
+                                            )
+                                            .await?;
+                                        }
+
+                                        Ok(())
+                                    }
+
+                                    Err(error) => {
+                                        if let Some(id) = id {
+                                            write_output(
+                                                &sender,
+                                                Response::fail(id, -32000, error.to_string()),
+                                            )
+                                            .await?;
+                                        }
+
+                                        Ok(())
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+
+                result = workers.join_next(), if !workers.is_empty() => {
+                    match result {
+                        Some(Ok(Ok(()))) => {}
+                        Some(Ok(Err(error))) => return Err(error),
+
+                        Some(Err(error)) => {
+                            return Err(Error::Protocol(format!("plugin request task failed: {error}")));
+                        }
+
+                        None => {}
+                    }
+                }
+            }
+        }
+
+        while let Some(result) = workers.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(error),
+
+                Err(error) => {
+                    return Err(Error::Protocol(format!("plugin request task failed: {error}")));
                 }
             }
         }
@@ -828,7 +1009,10 @@ fn kill_group(group: Pid, signal: Signal) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Emitter, Process, binary_name, serve_io, serve_io_events};
+    use super::{
+        Emitter, Process, binary_name, serve_io, serve_io_events, serve_io_events_concurrent,
+    };
+
     #[cfg(unix)]
     use super::{external_group, getpgrp};
 
@@ -1143,6 +1327,111 @@ fn main() {
         input.read_line(&mut line).await.unwrap();
         let shutdown: Response = serde_json::from_str(&line).unwrap();
         assert_eq!(shutdown.id, 2);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_handlers_return_responses_by_request_id() {
+        let (client, server) = duplex(16 * 1024);
+        let (mut client_read, mut client_write) = split(client);
+        let (server_read, server_write) = split(server);
+        let handle = |request: Request, _emitter: Emitter| async move {
+            let Request::Call { id, .. } = request else {
+                return Ok(None);
+            };
+
+            if id == 1 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            Ok(Some(Response::ok(id, json!({"done": true}))))
+        };
+
+        let task = tokio::spawn(async move {
+            serve_io_events_concurrent(hello(), BufReader::new(server_read), server_write, handle)
+                .await
+        });
+
+        jsonl::write(&mut client_write, &Request::call(1, "generate", json!({}))).await.unwrap();
+        jsonl::write(&mut client_write, &Request::call(2, "generate", json!({}))).await.unwrap();
+
+        let mut input = BufReader::new(&mut client_read);
+        let mut line = String::new();
+        input.read_line(&mut line).await.unwrap();
+        let first: Response = serde_json::from_str(&line).unwrap();
+        line.clear();
+        input.read_line(&mut line).await.unwrap();
+        let second: Response = serde_json::from_str(&line).unwrap();
+
+        assert_eq!((first.id, second.id), (2, 1));
+
+        jsonl::write(&mut client_write, &Request::call(3, "shutdown", json!({}))).await.unwrap();
+        line.clear();
+        input.read_line(&mut line).await.unwrap();
+        let shutdown: Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(shutdown.id, 3);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_handlers_use_distinct_ids_for_host_calls() {
+        let (client, server) = duplex(16 * 1024);
+        let (mut client_read, mut client_write) = split(client);
+        let (server_read, server_write) = split(server);
+        let handle = |request: Request, emitter: Emitter| async move {
+            let Request::Call { id, .. } = request else {
+                return Ok(None);
+            };
+
+            let response = emitter.call("host/tool", json!({"request": id})).await?;
+            Ok(Some(Response::ok(id, response.result.unwrap())))
+        };
+
+        let task = tokio::spawn(async move {
+            serve_io_events_concurrent(hello(), BufReader::new(server_read), server_write, handle)
+                .await
+        });
+
+        jsonl::write(&mut client_write, &Request::call(1, "generate", json!({}))).await.unwrap();
+        jsonl::write(&mut client_write, &Request::call(2, "generate", json!({}))).await.unwrap();
+
+        let mut input = BufReader::new(&mut client_read);
+        let mut line = String::new();
+        input.read_line(&mut line).await.unwrap();
+        let first: Request = serde_json::from_str(&line).unwrap();
+        line.clear();
+        input.read_line(&mut line).await.unwrap();
+        let second: Request = serde_json::from_str(&line).unwrap();
+
+        let Request::Call { id: first_id, params: first_params, .. } = first else {
+            panic!("plugin server call must be a JSON-RPC request");
+        };
+
+        let Request::Call { id: second_id, params: second_params, .. } = second else {
+            panic!("plugin server call must be a JSON-RPC request");
+        };
+
+        assert_ne!(first_id, second_id);
+
+        jsonl::write(&mut client_write, &Response::ok(second_id, second_params)).await.unwrap();
+        jsonl::write(&mut client_write, &Response::ok(first_id, first_params)).await.unwrap();
+
+        let mut responses = std::collections::BTreeMap::new();
+
+        for _ in 0..2 {
+            line.clear();
+            input.read_line(&mut line).await.unwrap();
+            let response: Response = serde_json::from_str(&line).unwrap();
+            responses.insert(response.id, response.result.unwrap());
+        }
+
+        assert_eq!(responses[&1]["request"], 1);
+        assert_eq!(responses[&2]["request"], 2);
+
+        jsonl::write(&mut client_write, &Request::call(3, "shutdown", json!({}))).await.unwrap();
+        line.clear();
+        input.read_line(&mut line).await.unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&line).unwrap().id, 3);
         task.await.unwrap().unwrap();
     }
 

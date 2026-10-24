@@ -29,7 +29,7 @@ fi
 
 plugin=${1:-core}
 case "$plugin" in
-    core|codex|claude|gemini|ollama|openrouter|telegram|discord|whatsapp|signal|slack|sqlite|memory|timer|tools|mcp|whisper|tui|pi) ;;
+    core|codex|claude|gemini|ollama|openrouter|telegram|discord|whatsapp|signal|slack|sqlite|memory|scheduler|tools|mcp|whisper|tui|pi) ;;
     *) die "Unknown plugin '$plugin'." ;;
 esac
 

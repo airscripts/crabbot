@@ -28,6 +28,9 @@ every permission and external endpoint so installation and updates can show
 the operator what changes. Command names must be unique across installed plugins
 and cannot shadow native commands. Capability, permission, and secret lists are
 validated for known, unique values before a plugin can be installed or started.
+Protocol minor versions are backward-compatible: this host accepts plugins
+declaring 0.0 or 0.1. The current protocol is 0.1, and all bundled plugins
+declare 0.1.
 
 `plugins.lock` records the canonical source, revision marker, SHA-256 of the
 manifest and executable, protocol, version, capabilities, permissions, and
@@ -173,8 +176,9 @@ After `install` commits the plugin and lock entry, the CLI asks a
 running daemon to start it through authenticated local IPC. The plugin becomes
 available without restarting the daemon or reinstalling the core. When no
 daemon is running, it is discovered at the next daemon start. A selected model
-or channel plugin is loaded only when its required credentials are ready; an
-activation error leaves the verified plugin installed and reports the reason.
+plugin loads when installed and reports missing authentication when a request
+needs it. Channel plugins load only when their required credentials are ready;
+an activation error leaves the verified plugin installed and reports the reason.
 `plugin uninstall` unloads an active process before deleting its files. `plugin
 update` unloads active plugin processes before replacing their files, then
 starts those plugins again through IPC. Inactive plugins remain inactive, and
@@ -222,12 +226,24 @@ stored under `records/`. Global memories apply across conversations, while
 provider and TUI memories stay within their conversation. The model receives
 only a bounded summary of global and current-conversation memories.
 
-The timer plugin persists one-shot and repeating tasks atomically. It validates
-five-field cron expressions and resolves IANA timezones through the system
-timezone database on Unix and the platform bundle where a system database is
-unavailable. Cron entries therefore calculate calendar and daylight-saving
-transitions. Its `due` operation claims ready work exactly once for one-shot
-tasks.
+The scheduler plugin persists pending tasks and active schedules atomically
+under `CRABBOT_HOME/data/schedules/`. Explicit schedule requests become active
+immediately; agent scheduling tool calls are authorized before activation.
+The daemon executes active tasks as
+isolated agent turns using their captured provider, model, and workspace, then
+reports results to the originating conversation and records append-only JSONL
+history under `CRABBOT_HOME/logs/schedules/<schedule-name>-<id>.jsonl`. Each
+record includes a schema version, RFC 3339 timestamp, schedule/run identifiers,
+status, attempt/retry details, scheduled/next-run times, captured
+provider/model/workspace, and redacted result text bounded to 4,000 characters.
+The outcome history has no fixed record-count limit and can be inspected
+directly. Tasks support one-time delays and
+exact RFC 3339 run times, plus five-field cron expressions in IANA timezones,
+including daylight-saving transitions. Active tasks can be run immediately;
+failed tasks can opt into up to five retries with exponential backoff or be
+retried manually after pausing. Interrupted runs pause for review because an
+action may already have happened. Missed recurring runs default to `skip`;
+schedules can choose `coalesce` or bounded `replay`.
 
 The Whisper plugin is an optional local adapter. It invokes an explicitly
 configured executable against a root-confined path and returns text, keeping

@@ -1,6 +1,10 @@
 [advisories]
 yanked = "deny"
 
+# Keep rejecting unmaintained direct dependencies.
+# Allow transitive ones when no safe upgrade is available.
+unmaintained = "workspace"
+
 [licenses]
 confidence-threshold = 0.8
 allow = [

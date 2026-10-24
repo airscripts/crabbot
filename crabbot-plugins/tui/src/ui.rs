@@ -616,6 +616,10 @@ where
                         app.push_system_output(&text);
                     }
 
+                    Some(crate::EngineEvent::RequestFailed(text)) => {
+                        app.push_request_failure(&text);
+                    }
+
                     Some(crate::EngineEvent::SystemNotice(text)) => {
                         app.push_system(&text);
                     }
@@ -732,6 +736,8 @@ where
                 }
 
                 crate::EngineEvent::SystemText(text) => app.push_system_output(&text),
+
+                crate::EngineEvent::RequestFailed(text) => app.push_request_failure(&text),
 
                 crate::EngineEvent::AssistantFinished => {
                     app.finish_streamed_interactions();
@@ -915,11 +921,28 @@ fn format_role_label(label: &str, timestamp: Option<&str>) -> String {
 }
 
 fn message_timestamp(id: &str) -> Option<String> {
-    let (timestamp, digits) = id.split('-').find_map(|part| {
-        (part.len() >= 13 && part.bytes().all(|byte| byte.is_ascii_digit()))
-            .then(|| part.parse::<u128>().ok().map(|timestamp| (timestamp, part.len())))
-            .flatten()
-    })?;
+    let parts = id.split('-').collect::<Vec<_>>();
+    let timestamp = match parts.as_slice() {
+        ["tui", "user", timestamp, ..]
+        | ["tui", "assistant", timestamp, ..]
+        | ["schedule", "user", timestamp, ..]
+        | ["schedule", "assistant", timestamp, ..] => *timestamp,
+        ["tui", "system", "command", timestamp, ..]
+        | ["tui", "system", "assistant", timestamp, ..]
+        | ["tui", "interaction", "user", timestamp, ..]
+        | ["tui", "interaction", "assistant", timestamp, ..] => *timestamp,
+        ["tui", "system", "interaction", "assistant", timestamp, ..]
+        | ["schedule", "notice", "at", timestamp, ..] => *timestamp,
+        _ => return None,
+    };
+
+    let digits = timestamp.len();
+
+    if digits < 13 || !timestamp.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    let timestamp = timestamp.parse::<u128>().ok()?;
 
     let seconds = match digits {
         19.. => timestamp / 1_000_000_000,
@@ -1081,8 +1104,8 @@ fn command_options(home: &str, has_model: bool) -> Vec<(&'static str, &'static s
         ]);
     }
 
-    if crate::has_capability(home, "timer") {
-        commands.push(("/timer <list|add|remove>", "Manage timers."));
+    if crate::has_capability(home, "scheduler") {
+        commands.push(("/schedule <list|add|remove>", "Manage schedules."));
     }
 
     if crate::has_capability(home, "memory") {
@@ -3251,6 +3274,17 @@ impl App {
         self.show_output(value);
     }
 
+    fn push_request_failure(&mut self, value: &str) {
+        if let Some(interaction) = self.pending_interactions.back_mut() {
+            interaction.system = true;
+        }
+
+        self.reply_pending = true;
+        self.push_system_output(value);
+        let completed = self.finish_interactions();
+        self.completed_interactions.extend(completed);
+    }
+
     fn push_system_label(&mut self) {
         let label = format_role_label("System", Some(&current_timestamp()));
         self.push_label(&label);
@@ -3426,6 +3460,31 @@ mod tests {
         assert!(app.pending_interactions.is_empty());
         assert!(app.completed_interactions.is_empty());
         assert!(!app.reply_pending);
+    }
+
+    #[test]
+    fn failed_model_request_keeps_prompt_and_persists_system_error() {
+        let mut app = App {
+            name: "Crabbot".into(),
+            generation_active: true,
+            reply_pending: true,
+            ..App::default()
+        };
+
+        app.begin_interaction("ping");
+        app.push_user("ping");
+        app.push_request_failure("Request failed: Codex supplied too many tools.");
+        app.finish_generation(false);
+
+        let saved = app.take_persistable_interactions();
+
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].input, "ping");
+        assert_eq!(saved[0].output, "Request failed: Codex supplied too many tools.");
+        assert!(saved[0].system);
+        assert!(app.transcript.contains("ping"));
+        assert!(app.transcript.contains("System |"));
+        assert!(!app.transcript.contains("Crabbot |"));
     }
 
     #[test]
@@ -3689,9 +3748,12 @@ mod tests {
         let home =
             std::env::temp_dir().join(format!("crabbot-tui-commands-{}", std::process::id()));
 
-        for (id, capability) in
-            [("tools", "tool"), ("channel", "channel"), ("timer", "timer"), ("memory", "memory")]
-        {
+        for (id, capability) in [
+            ("tools", "tool"),
+            ("channel", "channel"),
+            ("scheduler", "scheduler"),
+            ("memory", "memory"),
+        ] {
             let plugin = home.join("plugins").join(id);
             let binary = crabbot_core::plugin::binary_name(id);
 
@@ -3715,7 +3777,7 @@ mod tests {
             "/deliveries",
             "/retry <id>",
             "/drop <id>",
-            "/timer <list|add|remove>",
+            "/schedule <list|add|remove>",
             "/memory <list|remember|forget>",
         ] {
             assert!(names.contains(&command), "missing command: {command}");
@@ -4009,9 +4071,46 @@ mod tests {
     fn saved_message_timestamps_support_milliseconds_and_nanoseconds() {
         let milliseconds = super::message_timestamp("tui-user-1700000000000-1");
         let nanoseconds = super::message_timestamp("tui-assistant-1700000000000000000-1");
+        let scheduled = super::message_timestamp("schedule-notice-at-1700000000000-7-9");
+        let scheduled_turn = super::message_timestamp("schedule-assistant-1700000000000000000");
+        let system_command = super::message_timestamp("tui-system-command-1700000000000000000-1");
+        let interaction =
+            super::message_timestamp("tui-system-interaction-assistant-1700000000000-1");
 
         assert_eq!(nanoseconds, milliseconds);
+        assert_eq!(scheduled, milliseconds);
+        assert_eq!(scheduled_turn, milliseconds);
+        assert_eq!(system_command, milliseconds);
+        assert_eq!(interaction, milliseconds);
+        assert!(milliseconds.as_deref().unwrap().starts_with("2023-"));
         assert!(nanoseconds.is_some());
+        assert_eq!(super::message_timestamp("schedule-notice-1792380000000000000-9"), None);
+        assert_eq!(super::message_timestamp("schedule-policy-1792380000000000000"), None);
+        assert_eq!(super::message_timestamp("tui-compact-1792380000000000000"), None);
+    }
+
+    #[test]
+    fn scheduled_result_timestamp_uses_the_recorded_date_on_hover() {
+        let timestamp = super::message_timestamp("schedule-notice-at-1700000000000-7-9").unwrap();
+        let transcript =
+            format!("Crabbot | {timestamp}\nScheduled task completed (schedule 7):\nFinished.");
+        let row_text =
+            |row: &Line<'_>| row.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+
+        let hidden = super::wrap_transcript_layout(&transcript, "Crabbot", 80, None)
+            .0
+            .iter()
+            .map(row_text)
+            .collect::<String>();
+        let hovered = super::wrap_transcript_layout(&transcript, "Crabbot", 80, Some(0))
+            .0
+            .iter()
+            .map(row_text)
+            .collect::<String>();
+
+        assert!(timestamp.starts_with("2023-"));
+        assert!(!hidden.contains(&timestamp));
+        assert!(hovered.contains(&format!("Crabbot, {timestamp}")));
     }
 
     #[test]

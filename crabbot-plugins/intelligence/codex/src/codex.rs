@@ -14,8 +14,9 @@ use tokio::{
 };
 
 const BODY: usize = jsonl::MAX / 2;
-const TOOLS: usize = 16;
+const TOOL_CALLS: usize = 16;
 const STREAM_EVENTS: usize = 200;
+
 // App-server startup and control requests may take up to one minute.
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 const TURN_TIMEOUT: Duration = Duration::from_secs(115);
@@ -372,10 +373,6 @@ fn tool_guidance(tools: &[ToolSpec]) -> String {
 }
 
 fn dynamic_tools(tools: &[ToolSpec]) -> crabbot_core::Result<Vec<Value>> {
-    if tools.len() > TOOLS {
-        return Err(denied("Crabbot supplied too many tools to Codex."));
-    }
-
     let mut names = std::collections::BTreeSet::new();
 
     tools
@@ -766,7 +763,7 @@ impl Server {
             } else if value.get("id").is_some() {
                 calls = calls.saturating_add(1);
 
-                if calls > TOOLS {
+                if calls > TOOL_CALLS {
                     return Err(denied("Codex exceeded the tool-call limit."));
                 }
 
@@ -1168,6 +1165,22 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn accepts_more_than_sixteen_dynamic_tools() {
+        let tools = (0..20)
+            .map(|index| ToolSpec {
+                name: format!("tool_{index}"),
+                description: None,
+                schema: json!({"type": "object"}),
+            })
+            .collect::<Vec<_>>();
+
+        let value = dynamic_tools(&tools).unwrap();
+
+        assert_eq!(value.len(), 20);
+        assert_eq!(value[19]["name"], "tool_19");
     }
 
     #[test]

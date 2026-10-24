@@ -22,6 +22,7 @@ const FRAME_HEADROOM: usize = 64 * 1024;
 const INDEX_LIMIT: usize = 32;
 const GLOBAL_INDEX_RESERVE: usize = INDEX_LIMIT / 2;
 const CONFLICT_LIMIT: usize = 32;
+const LIST_PAGE_SIZE: usize = 5;
 
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -284,17 +285,7 @@ fn call_inner_at(
             json!({"ok": true, "scope": scope, "mode": mode})
         }
 
-        "list" => {
-            let scope = params["scope"].as_str();
-            json!({
-                "items": state
-                    .items
-                    .iter()
-                    .filter(|(_, entry)| scope.is_none_or(|value| value == entry.scope))
-                    .map(|(_, entry)| json!({"key": entry.key, "value": entry.value, "scope": entry.scope, "created": entry.created, "updated": entry.updated}))
-                    .collect::<Vec<_>>()
-            })
-        }
+        "list" => list_memories(&state, &params)?,
 
         "index" => {
             let scope = params["scope"].as_str();
@@ -490,6 +481,135 @@ fn call_inner_at(
     Ok(Some(response))
 }
 
+fn list_memories(
+    state: &State,
+    params: &serde_json::Value,
+) -> crabbot_core::Result<serde_json::Value> {
+    let record_type = params
+        .get("type")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                crabbot_core::Error::Denied("Memory type must be global or session.".into())
+            })
+        })
+        .transpose()?;
+
+    if record_type.is_some_and(|value| !matches!(value, "global" | "session")) {
+        return Err(crabbot_core::Error::Denied("Memory type must be global or session.".into()));
+    }
+
+    let scope = params
+        .get("scope")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| crabbot_core::Error::Denied("Memory scope must be text.".into()))
+        })
+        .transpose()?;
+
+    let scopes = params
+        .get("scopes")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value.as_array().ok_or_else(|| {
+                crabbot_core::Error::Denied("Memory scopes must be a list of text values.".into())
+            })
+        })
+        .transpose()?;
+
+    if scope.is_some() && scopes.is_some() {
+        return Err(crabbot_core::Error::Denied(
+            "Use scope or scopes when listing memories, not both.".into(),
+        ));
+    }
+
+    if let Some(scopes) = scopes
+        && (scopes.is_empty() || scopes.len() > 8 || scopes.iter().any(|scope| !scope.is_string()))
+    {
+        return Err(crabbot_core::Error::Denied(
+            "Memory scopes must contain between one and eight text values.".into(),
+        ));
+    }
+
+    let page = params
+        .get("page")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|page| usize::try_from(page).ok())
+                .filter(|page| *page > 0)
+                .ok_or_else(|| {
+                    crabbot_core::Error::Denied("Memory page must be a positive number.".into())
+                })
+        })
+        .transpose()?
+        .unwrap_or(1);
+
+    if page == 0 {
+        return Err(crabbot_core::Error::Denied("Page numbers start at 1.".into()));
+    }
+
+    let mut entries = state
+        .items
+        .values()
+        .filter(|entry| {
+            scope.is_none_or(|scope| entry.scope == scope)
+                && scopes.is_none_or(|scopes| {
+                    scopes.iter().any(|scope| scope.as_str() == Some(&entry.scope))
+                })
+                && record_type.is_none_or(|kind| {
+                    if kind == "global" { entry.scope == "global" } else { entry.scope != "global" }
+                })
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(scopes) = scopes {
+        entries.sort_by_key(|entry| {
+            scopes
+                .iter()
+                .position(|scope| scope.as_str() == Some(&entry.scope))
+                .unwrap_or(usize::MAX)
+        });
+
+        let mut session_keys = BTreeSet::new();
+        entries.retain(|entry| entry.scope == "global" || session_keys.insert(entry.key.clone()));
+    }
+
+    entries.sort_by(|left, right| {
+        right.updated.cmp(&left.updated).then_with(|| left.key.cmp(&right.key))
+    });
+
+    let total = entries.len();
+    let pages = total.div_ceil(LIST_PAGE_SIZE).max(1);
+
+    if page > pages {
+        return Err(crabbot_core::Error::Denied(format!(
+            "Page {page} is out of range. Choose a page from 1 to {pages} for memories."
+        )));
+    }
+
+    let start = (page - 1) * LIST_PAGE_SIZE;
+    let end = (start + LIST_PAGE_SIZE).min(total);
+    let items = entries[start..end]
+        .iter()
+        .map(|entry| {
+            json!({
+                "key": entry.key,
+                "value": summary(&entry.value),
+                "scope": entry.scope,
+                "type": if entry.scope == "global" { "global" } else { "session" },
+                "created": entry.created,
+                "updated": entry.updated,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({"items": items, "total": total, "page": page, "pages": pages}))
+}
+
 fn load() -> Arc<Mutex<State>> {
     load_at(path().as_deref())
 }
@@ -600,12 +720,13 @@ fn summary(value: &str) -> String {
     let mut summary = value.split_whitespace().collect::<Vec<_>>().join(" ");
 
     if summary.len() > 240 {
-        summary.truncate(240);
+        let mut boundary = 240;
 
-        while !summary.is_char_boundary(summary.len()) {
-            summary.pop();
+        while !summary.is_char_boundary(boundary) {
+            boundary -= 1;
         }
 
+        summary.truncate(boundary);
         summary.push('…');
     }
 
@@ -636,16 +757,28 @@ fn command_at(
     };
 
     let json_output = params["json"] == true;
-    let mut scope = "global".to_owned();
+    let mut scope = None;
+    let mut record_type = None;
     let mut values = Vec::new();
     let mut index = 1;
 
     while index < args.len() {
         if args[index] == "--scope" {
-            scope = args
-                .get(index + 1)
-                .ok_or_else(|| crabbot_core::Error::Denied("--scope requires an ID.".into()))?
-                .clone();
+            scope = Some(
+                args.get(index + 1)
+                    .ok_or_else(|| crabbot_core::Error::Denied("--scope requires an ID.".into()))?
+                    .clone(),
+            );
+
+            index += 2;
+        } else if args[index] == "--type" {
+            record_type = Some(
+                args.get(index + 1)
+                    .ok_or_else(|| {
+                        crabbot_core::Error::Denied("--type requires global or session.".into())
+                    })?
+                    .clone(),
+            );
 
             index += 2;
         } else if args[index].starts_with('-') {
@@ -659,12 +792,22 @@ fn command_at(
         }
     }
 
+    if record_type.as_deref().is_some_and(|value| !matches!(value, "global" | "session")) {
+        return Err(crabbot_core::Error::Denied("Memory type must be global or session.".into()));
+    }
+
+    if record_type.is_some() && command != "list" {
+        return Err(crabbot_core::Error::Denied(
+            "--type is available only with memory list.".into(),
+        ));
+    }
+
     if command == "converge" {
         let state = items
             .lock()
             .map_err(|_| crabbot_core::Error::Denied("Memory lock is poisoned.".into()))?;
 
-        let result = detect_conflicts(&state, &scope);
+        let result = detect_conflicts(&state, scope.as_deref().unwrap_or("global"));
         let result = if json_output { result } else { json!(command_text(command, &result)) };
 
         let response = Response::ok(id, result);
@@ -700,7 +843,37 @@ fn command_at(
             )));
         }
 
-        "list" => ("list", json!({"scope": scope})),
+        "list" => {
+            let page = match values.as_slice() {
+                [] => 1,
+
+                [value] => {
+                    value.parse::<usize>().ok().filter(|page| *page > 0).ok_or_else(|| {
+                        crabbot_core::Error::Denied(
+                            "Memory list page must be a positive number.".into(),
+                        )
+                    })?
+                }
+
+                _ => {
+                    return Err(crabbot_core::Error::Denied(
+                        "Usage: memory list [page] [--type global|session] [--scope ID].".into(),
+                    ));
+                }
+            };
+
+            let mut params = json!({"page": page});
+
+            if let Some(scope) = &scope {
+                params["scope"] = json!(scope);
+            }
+
+            if let Some(record_type) = &record_type {
+                params["type"] = json!(record_type);
+            }
+
+            ("list", params)
+        }
 
         "search" => {
             if values.is_empty() {
@@ -709,7 +882,10 @@ fn command_at(
                 ));
             }
 
-            ("search", json!({"query": values.join(" "), "scope": scope}))
+            (
+                "search",
+                json!({"query": values.join(" "), "scope": scope.as_deref().unwrap_or("global")}),
+            )
         }
 
         "show" => {
@@ -717,7 +893,7 @@ fn command_at(
                 crabbot_core::Error::Denied("Usage: memory show <key> [--scope ID].".into())
             })?;
 
-            ("recall", json!({"key": key, "scope": scope}))
+            ("recall", json!({"key": key, "scope": scope.as_deref().unwrap_or("global")}))
         }
 
         "remember" | "edit" => {
@@ -729,7 +905,7 @@ fn command_at(
 
             (
                 "remember",
-                json!({"key": values[0], "value": values[1..].join(" "), "scope": scope, "approved": true}),
+                json!({"key": values[0], "value": values[1..].join(" "), "scope": scope.as_deref().unwrap_or("global"), "approved": true}),
             )
         }
 
@@ -738,7 +914,7 @@ fn command_at(
                 crabbot_core::Error::Denied("Usage: memory forget <key> [--scope ID].".into())
             })?;
 
-            ("forget", json!({"key": key, "scope": scope}))
+            ("forget", json!({"key": key, "scope": scope.as_deref().unwrap_or("global")}))
         }
 
         "audit" => ("audit", json!({"key": values.first()})),
@@ -769,25 +945,36 @@ fn command_at(
 }
 
 fn memory_help() -> &'static str {
-    r#"Usage: crab memory <command> [arguments...]
+    r#"Manage scoped agent memories.
+
+Usage: crab memory <command> [arguments...]
 
 Commands:
-  status                         Show learning mode and memory count
-  search <text> [--scope ID]     Search saved memories
-  list [--scope ID]              List saved memories
-  show <key> [--scope ID]        Show one memory
-  remember <key> <text>          Save a memory
-  edit <key> <text>              Replace a memory
-  forget <key>                   Delete a memory
-  audit [key]                    Show memory change history
-  converge [--scope ID]         Review likely conflicting memories
-  learning <guided|autonomous>   Set the learning mode
-  help                           Show this help
+  status                       Show learning mode and memory count
+  search <text> [OPTIONS]      Search saved memories
+  list [PAGE] [OPTIONS]        List saved memories
+  show <KEY> [OPTIONS]         Show one memory
+  remember <KEY> <TEXT> [OPTIONS]
+                               Save a memory
+  edit <KEY> <TEXT> [OPTIONS]  Replace a memory
+  forget <KEY> [OPTIONS]       Delete a memory
+  audit [KEY]                  Show memory change history
+  converge [OPTIONS]           Review likely conflicting memories
+  learning <MODE>              Set the learning mode: guided or autonomous
+  help                         Show this help
 
-Commands use the global scope by default. Use --scope ID to select a different scope.
-Converge uses text matching, not a model. It reports candidates but makes no changes.
-Each result includes a command to remove the older memory if you choose.
-Guided learning saves only when you explicitly ask Crabbot to remember something."#
+Options:
+  --scope <ID>                 Select scope for supported commands
+  --type <TYPE>                Filter list by global or session
+  -h, --help                   Print this help
+
+Notes:
+  Use --scope with search, list, show, remember, edit, forget, or converge.
+  Scope defaults to global for scoped commands. List shows both global and
+  session memories unless filtered with --type. Converge uses text matching,
+  reports candidates without changing memories, and suggests a forget command
+  for the older record. Guided learning saves only when you explicitly ask
+  Crabbot to remember something."#
 }
 
 fn detect_conflicts(state: &State, scope: &str) -> serde_json::Value {
@@ -873,6 +1060,7 @@ fn memories_conflict(
     }
 
     let shared_words = left_words.intersection(right_words).count();
+
     let polarity_differs = left_negated != right_negated;
     polarity_differs && shared_words >= 2
 }
@@ -929,7 +1117,9 @@ fn shell_word(value: &str) -> String {
 
 fn command_text(command: &str, result: &serde_json::Value) -> String {
     match command {
-        "list" | "search" => {
+        "list" => memory_list_text(result),
+
+        "search" => {
             let items = result["items"]
                 .as_array()
                 .into_iter()
@@ -1017,6 +1207,43 @@ fn command_text(command: &str, result: &serde_json::Value) -> String {
 
         _ => result.to_string(),
     }
+}
+
+fn memory_list_text(result: &serde_json::Value) -> String {
+    let Some(items) = result["items"].as_array() else {
+        return "Memory list returned an invalid response.".into();
+    };
+
+    let total = result["total"].as_u64().unwrap_or(items.len() as u64) as usize;
+
+    if total == 0 || items.is_empty() {
+        let page = result["page"].as_u64().unwrap_or(1);
+        let pages = result["pages"].as_u64().unwrap_or(1);
+
+        return format!("Memories (0–0 of 0, page {page} of {pages})\nNo memories found.");
+    }
+
+    let page = result["page"].as_u64().unwrap_or(1) as usize;
+    let pages = result["pages"].as_u64().unwrap_or(total.div_ceil(LIST_PAGE_SIZE) as u64) as usize;
+    let start = (page - 1) * LIST_PAGE_SIZE;
+    let end = (start + items.len()).min(total);
+    let mut output = format!("Memories ({}–{} of {total}, page {page} of {pages})", start + 1, end);
+
+    for (index, item) in items.iter().enumerate() {
+        let key = item["key"].as_str().unwrap_or("unknown");
+        let record_type = item["type"].as_str().unwrap_or("session");
+        let value = item["value"].as_str().unwrap_or_default();
+        let root = if index + 1 == items.len() { "└─" } else { "├─" };
+
+        let branch = if index + 1 == items.len() { "   └─" } else { "│  └─" };
+
+        let separator = if index == 0 { "\n" } else { "\n\n" };
+
+        output
+            .push_str(&format!("{separator}{root} {key} | type: {record_type}\n{branch} {value}",));
+    }
+
+    output
 }
 
 fn quarantine(path: &Path) {
@@ -1189,6 +1416,149 @@ mod tests {
             call(&items, Request::call(4, "forget", json!({"key": "name"}))).unwrap().unwrap();
 
         assert_eq!(forget.result.unwrap()["deleted"], true);
+    }
+
+    #[test]
+    fn memory_list_truncates_values_at_a_utf8_boundary() {
+        let items = items();
+        let value = format!("{}é", "a".repeat(239));
+
+        items.lock().unwrap().items.insert(
+            storage("global", "long"),
+            Entry {
+                key: "long".into(),
+                value,
+                scope: "global".into(),
+                created: 0,
+                updated: 1,
+                record: String::new(),
+            },
+        );
+
+        let list =
+            call(&items, Request::call(1, "list", json!({}))).unwrap().unwrap().result.unwrap();
+
+        assert_eq!(list["items"][0]["value"], format!("{}…", "a".repeat(239)));
+    }
+
+    #[test]
+    fn memory_list_filters_by_type_and_pages_records() {
+        let items = items();
+
+        {
+            let mut state = items.lock().unwrap();
+
+            for index in 0..7 {
+                let (scope, key) = if index % 2 == 0 {
+                    ("global", format!("global-{index}"))
+                } else {
+                    ("tui:one", format!("session-{index}"))
+                };
+
+                state.items.insert(
+                    storage(scope, &key),
+                    Entry {
+                        key,
+                        value: format!("value-{index}"),
+                        scope: scope.into(),
+                        created: index,
+                        updated: index,
+                        record: String::new(),
+                    },
+                );
+            }
+        }
+
+        let first = call(&items, Request::call(1, "list", json!({"page": 1})))
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+
+        assert_eq!(first["total"], 7);
+        assert_eq!(first["page"], 1);
+        assert_eq!(first["pages"], 2);
+        assert_eq!(first["items"].as_array().unwrap().len(), 5);
+        assert_eq!(first["items"][0]["type"], "global");
+
+        let second = call(&items, Request::call(2, "list", json!({"page": 2})))
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+
+        assert_eq!(second["items"].as_array().unwrap().len(), 2);
+
+        let global = call(&items, Request::call(3, "list", json!({"type": "global"})))
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+
+        assert_eq!(global["total"], 4);
+        assert!(global["items"].as_array().unwrap().iter().all(|item| item["type"] == "global"));
+
+        let session = call(&items, Request::call(4, "list", json!({"type": "session"})))
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+
+        assert_eq!(session["total"], 3);
+        assert!(session["items"].as_array().unwrap().iter().all(|item| item["type"] == "session"));
+    }
+
+    #[test]
+    fn memory_list_scope_union_keeps_global_and_prefers_current_session_record() {
+        let items = items();
+
+        {
+            let mut state = items.lock().unwrap();
+
+            for (scope, value, updated) in [
+                ("global", "global value", 1),
+                ("tui:one", "current value", 2),
+                ("provider:tui:one", "legacy value", 3),
+            ] {
+                state.items.insert(
+                    storage(scope, "same-key"),
+                    Entry {
+                        key: "same-key".into(),
+                        value: value.into(),
+                        scope: scope.into(),
+                        created: updated,
+                        updated,
+                        record: String::new(),
+                    },
+                );
+            }
+        }
+
+        let response = call(
+            &items,
+            Request::call(1, "list", json!({"scopes": ["global", "tui:one", "provider:tui:one"]})),
+        )
+        .unwrap()
+        .unwrap()
+        .result
+        .unwrap();
+
+        assert_eq!(response["total"], 2);
+        assert!(
+            response["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "global" && item["value"] == "global value")
+        );
+
+        assert!(
+            response["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "session" && item["value"] == "current value")
+        );
     }
 
     #[test]
@@ -1436,12 +1806,14 @@ mod tests {
 
         assert!(!old_path.exists());
         let current_path = root.join(record_ref("global", "favorite"));
+
         assert!(std::fs::read_to_string(&current_path).unwrap().contains("new value"));
 
         call_at(&state, Request::call(2, "forget", json!({"key": "favorite"})), Some(&index))
             .unwrap();
 
         assert!(!current_path.exists());
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1592,16 +1964,32 @@ mod tests {
 
         assert_eq!(no_matches.result.unwrap(), "No memories found.");
 
-        let machine =
-            command_at(&state, 3, &json!({"args": ["list"], "json": true}), None).unwrap().unwrap();
+        let human = command_at(&state, 3, &json!({"args": ["list"]}), None).unwrap().unwrap();
+        let human = human.result.unwrap();
 
-        assert_eq!(machine.result.unwrap()["items"][0]["value"], "Ada");
+        assert!(human.as_str().unwrap().contains("Memories (1–1 of 1, page 1 of 1)"));
+        assert!(human.as_str().unwrap().contains("└─ name | type: global"));
+        assert!(human.as_str().unwrap().contains("└─ Ada"));
 
-        let help = command_at(&state, 4, &json!({"args": ["help"]}), None).unwrap().unwrap();
+        let machine = command_at(
+            &state,
+            4,
+            &json!({"args": ["list", "--type", "session"], "json": true}),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(machine.result.unwrap()["items"].as_array().unwrap().len(), 0);
+
+        let help = command_at(&state, 5, &json!({"args": ["help"]}), None).unwrap().unwrap();
 
         assert!(help.result.unwrap().as_str().unwrap().contains("search <text>"));
-        assert!(super::memory_help().contains("converge [--scope ID]"));
-        assert!(super::memory_help().contains("text matching, not a model"));
+        assert!(super::memory_help().contains("converge [OPTIONS]"));
+        assert!(super::memory_help().contains("list [PAGE] [OPTIONS]"));
+        assert!(super::memory_help().contains("--scope <ID>"));
+        assert!(super::memory_help().contains("--type <TYPE>"));
+        assert!(super::memory_help().contains("uses text matching"));
     }
 
     #[test]
