@@ -18892,7 +18892,9 @@ done
 
     #[test]
     fn cli_schedule_workspace_is_canonical_current_directory() {
-        assert_eq!(super::current_schedule_workspace().unwrap(), std::env::current_dir().unwrap());
+        let current_directory = std::env::current_dir().unwrap().canonicalize().unwrap();
+
+        assert_eq!(super::current_schedule_workspace().unwrap(), current_directory);
     }
 
     #[test]
