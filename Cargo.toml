@@ -22,7 +22,7 @@ members = [
     "crabbot-plugins/messaging/telegram",
     "crabbot-plugins/messaging/whatsapp",
     "crabbot-plugins/sqlite",
-    "crabbot-plugins/timer",
+    "crabbot-plugins/scheduler",
     "crabbot-plugins/tools",
     "crabbot-plugins/tui",
     "crabbot-plugins/whisper",

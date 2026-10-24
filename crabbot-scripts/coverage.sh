@@ -23,7 +23,7 @@ packages=(
     crabbot-plugin-telegram
     crabbot-plugin-whatsapp
     crabbot-plugin-sqlite
-    crabbot-plugin-timer
+    crabbot-plugin-scheduler
     crabbot-plugin-tools
     crabbot-plugin-tui
     crabbot-plugin-whisper

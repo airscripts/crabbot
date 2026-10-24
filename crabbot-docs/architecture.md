@@ -67,7 +67,7 @@ management still work. A model plugin handles `generate` with a normalized
 session ownership, approvals, timeouts, and durable state; model events cannot
 grant their own approval. Plugins never call one another directly. Plugins may
 register bounded CLI commands through JSON-RPC. Store,
-memory, timer, MCP, speech, and client plugins
+memory, scheduler, MCP, speech, and client plugins
 are explicit extension seams; only model, channel, and tool routing is enabled
 in the initial daemon flow.
 

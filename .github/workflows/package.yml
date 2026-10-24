@@ -99,7 +99,7 @@ jobs:
           cargo build --workspace --release --locked --target "$env:CRABBOT_TARGET"
           $version = $env:CRABBOT_VERSION
           $target = $env:CRABBOT_TARGET
-          $plugins = @("core", "codex", "claude", "gemini", "ollama", "openrouter", "telegram", "discord", "whatsapp", "signal", "slack", "sqlite", "memory", "timer", "tools", "mcp", "whisper", "tui", "pi")
+          $plugins = @("core", "codex", "claude", "gemini", "ollama", "openrouter", "telegram", "discord", "whatsapp", "signal", "slack", "sqlite", "memory", "scheduler", "tools", "mcp", "whisper", "tui", "pi")
 
           foreach ($plugin in $plugins) {
             $name = if ($plugin -eq "core") { "crabbot" } else { "crabbot-plugin-$plugin" }

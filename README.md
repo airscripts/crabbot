@@ -242,7 +242,7 @@ archive.
 | `slack` | Messaging | Slack Web API and Socket Mode credentials |
 | `sqlite` | Store | Local durable state |
 | `memory` | Memory | In-process memory seam |
-| `timer` | Timer | In-process reminders seam |
+| `scheduler` | Scheduler | Approved recurring and one-time agent tasks |
 | `tools` | Tool | Confined files, patches, Git worktrees, and approved shell |
 | `mcp` | MCP | Protocol seam for tools and resources |
 | `whisper` | Speech | Protocol seam for local transcription |

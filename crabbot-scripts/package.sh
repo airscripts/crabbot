@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-plugins=(core codex claude gemini ollama openrouter telegram discord whatsapp signal slack sqlite memory timer tools mcp whisper tui pi)
+plugins=(core codex claude gemini ollama openrouter telegram discord whatsapp signal slack sqlite memory scheduler tools mcp whisper tui pi)
 
 usage() {
     printf '%s\n' 'Usage: crabbot-scripts/package.sh VERSION TARGET'

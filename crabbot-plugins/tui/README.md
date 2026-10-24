@@ -25,7 +25,7 @@ In an interactive terminal, use `/help`, `/status`, `/approval`, `/approvals`, `
 `/deny <id>`, `/session help`, `/session list`, `/deliveries`, `/retry <id>`,
 `/drop <id>`, `/model <name>`, `/new <id>`,
 `/plugin [page]`, `/history <list|clear|help>`, `/workspace [path|reset]`,
-`/timer <list|add|remove>`, `/memory
+`/schedule <help|list|add|approve|run|retry|pause|resume|remove>`, `/memory
 <list|remember|forget>`, `/compact`, `/clear`, and `/quit`. Plain lines are sent through
 the configured model plugin. Sessions, selected models, and completed turns
 are persisted through authenticated daemon IPC. `/session switch <id>` resumes
@@ -56,10 +56,21 @@ copy transcript text; the mouse wheel remains available for scrolling.
 `/approvals` lists pending mutating-tool requests. `/approve <id>` and
 `/deny <id>` resolve a request through authenticated daemon IPC; the request
 ID expires with the pending approval.
-`/timer add <seconds> <text>` schedules a reminder, while `/timer list` and
-`/timer remove <id>` manage it through authenticated daemon IPC. `/memory
-remember <key>=<value>`, `/memory list`, and `/memory forget <key>` manage
-memories scoped to the selected session; explicitly entering `remember`
+`/schedule add` accepts the same timing and retry options as the CLI, including
+`--after`, `--at`, `--every`, `--cron`, `--timezone`, `--missed`, `--retries`,
+and `--on-failure`; the legacy `/schedule add <seconds> <instruction>` form
+also works. Schedules activate immediately. Check one with `/schedule list
+[page]` (including the latest outcome), and use `/schedule
+run|retry|pause|resume|remove <id-or-name>` to control it through authenticated
+daemon IPC. Schedule names contain no spaces. Agent-proposed tasks activate
+without a separate approval and can opt into up to five automatic retries with
+backoff; retries can repeat side effects.
+Scheduled tasks run as isolated agent turns with their captured provider,
+model, and workspace. `/memory remember <key>=<value>` saves a session memory,
+and `/memory list [page] [--type global|session]` shows up to five global and
+session records in a paginated tree. Each row includes its `type:`. `/memory forget <key>`
+removes a unique matching record; use `/memory forget global <key>` or
+`/memory forget session <key>` to choose a scope explicitly. Entering `remember`
 authorizes a suggest-mode write.
 
 `/status`, `/session list [page]`, and `/plugin [page]` use authenticated daemon

@@ -22,6 +22,9 @@ secrets or sensitive inferences. Return to the safer default with
 Use `crab memory help` or `crab memory --help` for command syntax. The
 registered `crab memory` command supports `status`, `search`, `list`,
 `show`, `remember`, `edit`, `forget`, `audit`, `converge`, and `learning`. The
+`list [page] [--type global|session] [--scope ID]` command displays up to five
+records in a paginated tree; each row identifies its `type: global` or
+`type: session`. `--type` filters the listed records. The
 `converge` command reports likely contradictions within a scope and gives
 precedence to the newer saved preference without deleting either record. It
 uses text matching, not a model, and makes no changes. Each conflict includes a

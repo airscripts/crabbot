@@ -264,20 +264,31 @@ impl LogFile {
             let label = if verbosity == Verbosity::Debug { "debug" } else { "verbose" };
 
             let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-            let path = directory.join(format!(
-                "{}-{label}-{stamp}-{}.{}",
-                date_stamp(),
-                std::process::id(),
-                extension
-            ));
+            let debug_directory = directory.join("debug");
 
-            private_log_file(path.clone()).ok().map(|_| path)
+            if create_private_dir(&debug_directory).is_ok() {
+                let path = debug_directory.join(command_log_filename(
+                    &date_stamp(),
+                    label,
+                    stamp,
+                    std::process::id(),
+                    extension,
+                ));
+
+                private_log_file(path.clone()).ok().map(|_| path)
+            } else {
+                None
+            }
         } else {
             None
         };
 
         Some(Self { directory, extension, command_path })
     }
+}
+
+fn command_log_filename(date: &str, label: &str, stamp: u128, pid: u32, extension: &str) -> String {
+    format!("{date}-{label}-{stamp}-{pid}.{extension}")
 }
 
 impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogFile {
@@ -596,6 +607,11 @@ mod tests {
     fn log_file_dates_sort_lexically_and_use_utc() {
         assert_eq!(date_stamp_at(0), "1970-01-01");
         assert_eq!(date_stamp_at(1_709_251_200), "2024-03-01");
+
+        assert_eq!(
+            super::command_log_filename("2024-03-01", "debug", 123, 456, "log"),
+            "2024-03-01-debug-123-456.log"
+        );
     }
 
     #[test]

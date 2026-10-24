@@ -6,6 +6,8 @@ directory defaults to the platform application-data directory; set
 Plugin-owned persistent data is kept separately under
 `CRABBOT_HOME/data/plugins/<plugin-id>/`; agent workspaces remain the place for
 agent instructions, prompts, and other working files.
+Scheduled tasks are stored under `CRABBOT_HOME/data/schedules/`, and their
+execution history is stored under `CRABBOT_HOME/logs/schedules/`.
 
 Read or change settings without opening the TOML file with `crab config get`
 and `crab config set KEY=VALUE`. For example, enable TUI workspace tools with
@@ -41,19 +43,34 @@ member = ["9"]
 topic = ["12"]
 thread = ["topic-12"]
 tools = false
+shell = false
 worktree = true
 
 [channels.discord]
 allow = ["123456789012345678"]
 mention = "@crabbot"
 tools = true
+shell = false
 worktree = true
 
 [clients.tui]
 tools = true
 shell = false
 theme = true
+
+[scheduler]
+timezone = "Europe/Rome"
+missed = "skip"
 ```
+
+The scheduler timezone is the default for cron expressions; ask for a timezone
+when it is not configured. `missed` controls what happens to tasks that became
+due while the daemon was offline: `skip` (the default) skips overdue
+occurrences, and `coalesce` runs once for the missed period. A task may opt
+into bounded `replay` when it is created. Explicitly requested schedules become
+active immediately after any configured approval step. A task interrupted
+while it is running pauses for review because its action may already have
+happened.
 
 Set `[clients.tui] theme = false` to disable TUI colors and use the terminal's
 default foreground color. This can improve contrast in terminals with unusual
@@ -99,6 +116,8 @@ separate locations under `CRABBOT_HOME`:
 | --- | --- |
 | `data/` | Durable runtime state, including session records, client and delivery state, and plugin-owned data or settings. This is storage, not telemetry collection. |
 | `logs/` | Daily application diagnostics, including plugin stderr, in sortable UTC-dated `YYYY-MM-DD.log` or `.jsonl` files. |
+| `logs/debug/` | Raw per-command log captures created by `--verbose` and `--debug`. |
+| `logs/schedules/` | Append-only per-schedule JSONL outcome logs named `<schedule-name>-<id>.jsonl`. |
 | `workspace/` | The default agent working area for project files and context instructions. `CRAB.md` and `CLAW.md` are loaded into turns; file tools are confined to the active workspace. |
 | `plugins/<plugin-id>/` | Installed plugin files and their `crabbot-plugin.toml` manifests. A manifest declares capabilities; plugin code supplies them through the plugin protocol. |
 
@@ -154,7 +173,7 @@ All Crabbot configuration variables use the `CRABBOT_` prefix:
 | `CRABBOT_MODEL_PLUGIN` | Default intelligence plugin ID |
 | `CRABBOT_MODEL` | Default model identifier |
 | `CRABBOT_MEMORY` | Override the optional memory plugin's JSON index path; Markdown records live under a sibling `records/` directory |
-| `CRABBOT_TIMER` | Timer plugin persistence path |
+| `CRABBOT_TIMER` | Legacy timer state path, imported into the scheduler on upgrade |
 | `CRABBOT_DB` | SQLite plugin database path |
 | `CRABBOT_MEDIA` | Private media cache directory |
 | `CRABBOT_WHISPER` | Default speech plugin ID |
@@ -209,7 +228,12 @@ unless the sender also satisfies the channel policy and daemon approval mode.
 Group messages require an `allow` entry. `owner`, `admin`, and `member` match
 sender IDs; `topic` and `thread` match platform metadata; `mention` requires
 the configured marker in message text. A message must satisfy every configured
-filter. Set `tools = true` only for channels whose senders are trusted.
+policy filter. Set `tools = true` only for channels whose senders are trusted.
+Set `shell = true` as well to allow authorized turns to run shell commands on
+the daemon's machine; it defaults to `false` and has no effect unless tools are
+enabled and the sender is authorized. Use `approval = "prompt"` or
+`approval = "auto"` to enable channel tools. Scheduled tasks capture these
+effective permissions when created and use them for their later runs.
 
 `worktree = true` creates an isolated Git worktree for a group session. Set it
 to `false` only when the channel is explicitly allowed to operate in the

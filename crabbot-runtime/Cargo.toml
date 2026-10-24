@@ -15,8 +15,10 @@ clap_complete.workspace = true
 crabbot-process = { path = "../crabbot-libs/process" }
 crabbot-log.workspace = true
 crabbot-core = { path = "../crabbot-core" }
+crabbot-date.workspace = true
 crabbot-file = { path = "../crabbot-libs/file" }
 getrandom.workspace = true
+jiff.workspace = true
 keyring.workspace = true
 ring.workspace = true
 serde.workspace = true

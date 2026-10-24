@@ -63,12 +63,12 @@ async fn call(
 }
 
 fn credential() -> crabbot_core::Result<String> {
-    for name in ["CRABBOT_TELEGRAM_TOKEN"] {
-        if let Ok(value) = std::env::var(name)
-            && !value.trim().is_empty()
-        {
-            return Ok(value);
-        }
+    let name = "CRABBOT_TELEGRAM_TOKEN";
+
+    if let Ok(value) = std::env::var(name)
+        && !value.trim().is_empty()
+    {
+        return Ok(value);
     }
 
     if let Some(value) = keyring("telegram") {
