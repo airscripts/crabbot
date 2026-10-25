@@ -577,8 +577,9 @@ mod tests {
         let workspace = std::env::temp_dir().join("work").join("project");
         let file = workspace.join("src").join("main.rs");
         let secret = workspace.parent().unwrap().join("secret.txt");
+        let relative = PathBuf::from("src").join("main.rs").to_string_lossy().into_owned();
 
-        assert_eq!(workspace_relative(file.to_str().unwrap(), &workspace).unwrap(), "src/main.rs");
+        assert_eq!(workspace_relative(file.to_str().unwrap(), &workspace).unwrap(), relative);
 
         assert!(workspace_relative(secret.to_str().unwrap(), &workspace).is_err());
         assert!(workspace_relative("src/main.rs", &workspace).is_err());
