@@ -515,13 +515,17 @@ async fn write_message(writer: &mut ChildStdin, message: Value) -> krabb_core::R
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::run_command;
     use super::{
         RunRequest, command_args_from, command_args_from_optional, filesystem_request, hello,
-        rejection, run_command, safe_id, select_lines, stream_update, workspace_relative,
+        rejection, safe_id, select_lines, stream_update, workspace_relative,
     };
 
     use krabb_core::plugin::Emitter;
     use serde_json::json;
+
+    #[cfg(unix)]
     use std::{fs, os::unix::fs::PermissionsExt, time::SystemTime};
 
     #[test]
