@@ -81,42 +81,41 @@ jobs:
         name: Build Unix Archives
 
         env:
-          CRABBOT_VERSION: ${{ inputs.version }}
-          CRABBOT_TARGET: ${{ matrix.target }}
+          KRABB_VERSION: ${{ inputs.version }}
+          KRABB_TARGET: ${{ matrix.target }}
 
-        run: bash crabbot-scripts/package.sh "$CRABBOT_VERSION" "$CRABBOT_TARGET"
+        run: bash krabb-scripts/package.sh "$KRABB_VERSION" "$KRABB_TARGET"
 
       - if: matrix.archive == 'zip'
         name: Build Windows Archives
         shell: pwsh
 
         env:
-          CRABBOT_VERSION: ${{ inputs.version }}
-          CRABBOT_TARGET: ${{ matrix.target }}
+          KRABB_VERSION: ${{ inputs.version }}
+          KRABB_TARGET: ${{ matrix.target }}
 
         run: |
           $ErrorActionPreference = "Stop"
-          cargo build --workspace --release --locked --target "$env:CRABBOT_TARGET"
-          $version = $env:CRABBOT_VERSION
-          $target = $env:CRABBOT_TARGET
-          $plugins = @("core", "codex", "claude", "gemini", "ollama", "openrouter", "telegram", "discord", "whatsapp", "signal", "slack", "sqlite", "memory", "scheduler", "tools", "mcp", "whisper", "tui", "pi")
+          cargo build --workspace --release --locked --target "$env:KRABB_TARGET"
+          $version = $env:KRABB_VERSION
+          $target = $env:KRABB_TARGET
+          $plugins = @("core", "acp", "a2a", "ag-ui", "codex", "anthropic", "openai", "gemini", "ollama", "openrouter", "telegram", "discord", "whatsapp", "signal", "slack", "sqlite", "memory", "scheduler", "tools", "mcp", "whisper", "tui")
 
           foreach ($plugin in $plugins) {
-            $name = if ($plugin -eq "core") { "crabbot" } else { "crabbot-plugin-$plugin" }
+            $name = if ($plugin -eq "core") { "krabb" } else { "krabb-plugin-$plugin" }
 
-            $package = "crabbot-$plugin-v$version-$target"
+            $package = "krabb-$plugin-v$version-$target"
             New-Item -ItemType Directory -Force -Path $package | Out-Null
             New-Item -ItemType Directory -Force -Path "$package/bin" | Out-Null
             Copy-Item "target/$target/release/$name.exe" "$package/bin/$name.exe"
 
             if ($plugin -eq "core") {
-              Copy-Item "target/$target/release/crab.exe" "$package/bin/"
-              Copy-Item "target/$target/release/crabbot-daemon.exe" "$package/bin/"
+              Copy-Item "target/$target/release/krabb-daemon.exe" "$package/bin/"
             }
 
             Copy-Item LICENSE, NOTICE "$package/"
             if ($plugin -ne "core") {
-              $manifest = Get-ChildItem "crabbot-plugins" -Recurse -Filter "crabbot-plugin.toml" |
+              $manifest = Get-ChildItem "krabb-plugins" -Recurse -Filter "krabb-plugin.toml" |
                 Where-Object { $_.Directory.Name -eq $plugin } | Select-Object -First 1
 
               if (-not $manifest) { throw "Plugin manifest is missing: $plugin." }
@@ -133,43 +132,43 @@ jobs:
         shell: bash
 
         env:
-          CRABBOT_VERSION: ${{ inputs.version }}
-          CRABBOT_TARGET: ${{ matrix.target }}
+          KRABB_VERSION: ${{ inputs.version }}
+          KRABB_TARGET: ${{ matrix.target }}
 
         run: |
           set -euo pipefail
-          archives=(crabbot-*-v${CRABBOT_VERSION}-${CRABBOT_TARGET}.tar.gz)
+          archives=(krabb-*-v${KRABB_VERSION}-${KRABB_TARGET}.tar.gz)
           [[ ${#archives[@]} -eq 19 ]]
           stage=$(mktemp -d)
 
           for archive in "${archives[@]}"; do
-            crabbot-scripts/check.sh "$archive"
+            krabb-scripts/check.sh "$archive"
             name=${archive%.tar.gz}
             tar -xzf "$archive" -C "$stage"
             package="$stage/$name"
             [[ -f "$package/LICENSE" && -f "$package/NOTICE" ]]
             [[ -d "$package/bin" ]]
 
-            if [[ "$name" == crabbot-core-* ]]; then
-              [[ -x "$package/bin/crabbot" && -x "$package/bin/crab" && -x "$package/bin/crabbot-daemon" ]]
-              "$package/bin/crabbot" version
-              "$package/bin/crab" version
+            if [[ "$name" == krabb-core-* ]]; then
+              [[ -x "$package/bin/krabb" && -x "$package/bin/krabb" && -x "$package/bin/krabb-daemon" ]]
+              "$package/bin/krabb" version
+              "$package/bin/krabb" version
               smoke="$stage/service-smoke"
               mkdir -p "$smoke/home" "$smoke/config"
 
-              HOME="$smoke/home" XDG_CONFIG_HOME="$smoke/config" CRABBOT_HOME="$smoke/home/crabbot" \
-                "$package/bin/crabbot" service install
+              HOME="$smoke/home" XDG_CONFIG_HOME="$smoke/config" KRABB_HOME="$smoke/home/krabb" \
+                "$package/bin/krabb" service install
 
-              HOME="$smoke/home" XDG_CONFIG_HOME="$smoke/config" CRABBOT_HOME="$smoke/home/crabbot" \
-                "$package/bin/crabbot" service status
+              HOME="$smoke/home" XDG_CONFIG_HOME="$smoke/config" KRABB_HOME="$smoke/home/krabb" \
+                "$package/bin/krabb" service status
 
-              test -f "$smoke/config/systemd/user/crabbot.service"
-              rm -f "$smoke/config/systemd/user/crabbot.service"
+              test -f "$smoke/config/systemd/user/krabb.service"
+              rm -f "$smoke/config/systemd/user/krabb.service"
             else
-              [[ -f "$package/crabbot-plugin.toml" ]]
-              plugin=${name#crabbot-}
+              [[ -f "$package/krabb-plugin.toml" ]]
+              plugin=${name#krabb-}
               plugin=${plugin%-v*}
-              binary="crabbot-plugin-$plugin"
+              binary="krabb-plugin-$plugin"
               [[ -x "$package/bin/$binary" ]]
             fi
           done
@@ -179,38 +178,38 @@ jobs:
         shell: bash
 
         env:
-          CRABBOT_VERSION: ${{ inputs.version }}
-          CRABBOT_TARGET: ${{ matrix.target }}
+          KRABB_VERSION: ${{ inputs.version }}
+          KRABB_TARGET: ${{ matrix.target }}
 
         run: |
           set -euo pipefail
 
           if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum crabbot-*-v${CRABBOT_VERSION}-${CRABBOT_TARGET}.tar.gz > SHA256SUMS
+            sha256sum krabb-*-v${KRABB_VERSION}-${KRABB_TARGET}.tar.gz > SHA256SUMS
           else
-            shasum -a 256 crabbot-*-v${CRABBOT_VERSION}-${CRABBOT_TARGET}.tar.gz > SHA256SUMS
+            shasum -a 256 krabb-*-v${KRABB_VERSION}-${KRABB_TARGET}.tar.gz > SHA256SUMS
           fi
 
-          prefix="$RUNNER_TEMP/crabbot-prefix"
+          prefix="$RUNNER_TEMP/krabb-prefix"
 
-          CRABBOT_VERSION="$CRABBOT_VERSION" \
-            CRABBOT_RELEASE_BASE="file://$PWD" \
-            CRABBOT_PREFIX="$prefix" \
+          KRABB_VERSION="$KRABB_VERSION" \
+            KRABB_RELEASE_BASE="file://$PWD" \
+            KRABB_PREFIX="$prefix" \
             sh install.sh
-          "$prefix/bin/crabbot" version
-          "$prefix/bin/crab" version
+          "$prefix/bin/krabb" version
+          "$prefix/bin/krabb" version
 
       - if: matrix.archive == 'zip'
         name: Validate Windows Archives
         shell: pwsh
 
         env:
-          CRABBOT_VERSION: ${{ inputs.version }}
-          CRABBOT_TARGET: ${{ matrix.target }}
+          KRABB_VERSION: ${{ inputs.version }}
+          KRABB_TARGET: ${{ matrix.target }}
 
         run: |
           $ErrorActionPreference = "Stop"
-          $archives = @(Get-ChildItem "crabbot-*-v$env:CRABBOT_VERSION-$env:CRABBOT_TARGET.zip")
+          $archives = @(Get-ChildItem "krabb-*-v$env:KRABB_VERSION-$env:KRABB_TARGET.zip")
           if ($archives.Count -ne 19) { throw "Expected 19 plugin and core archives, found $($archives.Count)." }
 
           foreach ($archive in $archives) {
@@ -224,18 +223,18 @@ jobs:
 
             if (!(Test-Path "$package/bin")) { throw "Archive is missing binaries: $($archive.Name)." }
 
-            if ($archive.BaseName -like "crabbot-core-*") {
-              if (!(Test-Path "$package/bin/crabbot.exe") -or !(Test-Path "$package/bin/crab.exe") -or !(Test-Path "$package/bin/crabbot-daemon.exe")) {
+            if ($archive.BaseName -like "krabb-core-*") {
+              if (!(Test-Path "$package/bin/krabb.exe") -or !(Test-Path "$package/bin/krabb.exe") -or !(Test-Path "$package/bin/krabb-daemon.exe")) {
                 throw "Core archive is missing an executable."
               }
-              & "$package/bin/crabbot.exe" version
+              & "$package/bin/krabb.exe" version
               if ($LASTEXITCODE -ne 0) { throw "Packaged CLI failed to start." }
-              & "$package/bin/crab.exe" version
+              & "$package/bin/krabb.exe" version
               if ($LASTEXITCODE -ne 0) { throw "Packaged CLI alias failed to start." }
             } else {
-              if (!(Test-Path "$package/crabbot-plugin.toml")) { throw "Plugin manifest is missing." }
-              $plugin = $archive.BaseName -replace "^crabbot-", "" -replace "-v.*$", ""
-              $binary = "crabbot-plugin-$plugin.exe"
+              if (!(Test-Path "$package/krabb-plugin.toml")) { throw "Plugin manifest is missing." }
+              $plugin = $archive.BaseName -replace "^krabb-", "" -replace "-v.*$", ""
+              $binary = "krabb-plugin-$plugin.exe"
               if (!(Test-Path "$package/bin/$binary")) { throw "Plugin executable is missing." }
             }
           }
@@ -245,30 +244,30 @@ jobs:
         shell: pwsh
 
         env:
-          CRABBOT_VERSION: ${{ inputs.version }}
-          CRABBOT_TARGET: ${{ matrix.target }}
+          KRABB_VERSION: ${{ inputs.version }}
+          KRABB_TARGET: ${{ matrix.target }}
 
         run: |
           $ErrorActionPreference = "Stop"
 
-          $lines = Get-ChildItem "crabbot-*-v$env:CRABBOT_VERSION-$env:CRABBOT_TARGET.zip" |
+          $lines = Get-ChildItem "krabb-*-v$env:KRABB_VERSION-$env:KRABB_TARGET.zip" |
             ForEach-Object { "$( (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() )  $($_.Name)" }
 
           $lines | Set-Content -Encoding ascii SHA256SUMS
-          $env:CRABBOT_RELEASE_BASE = ([Uri]((Get-Location).Path)).AbsoluteUri.TrimEnd('/')
-          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "crabbot-local"
+          $env:KRABB_RELEASE_BASE = ([Uri]((Get-Location).Path)).AbsoluteUri.TrimEnd('/')
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "krabb-local"
           New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
           & "$env:GITHUB_WORKSPACE/install.ps1"
           if ($LASTEXITCODE -ne 0) { throw "Packaged installer failed." }
-          & "$env:LOCALAPPDATA/Crabbot/bin/crabbot.exe" version
+          & "$env:LOCALAPPDATA/Krabb/bin/krabb.exe" version
           if ($LASTEXITCODE -ne 0) { throw "Installed CLI failed to start." }
-          & "$env:LOCALAPPDATA/Crabbot/bin/crab.exe" version
+          & "$env:LOCALAPPDATA/Krabb/bin/krabb.exe" version
           if ($LASTEXITCODE -ne 0) { throw "Installed CLI alias failed to start." }
 
       - name: Upload Archives
         uses: actions/upload-artifact@v7
 
         with:
-          name: crabbot-v${{ inputs.version }}-${{ matrix.target }}
-          path: crabbot-*-v${{ inputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+          name: krabb-v${{ inputs.version }}-${{ matrix.target }}
+          path: krabb-*-v${{ inputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
           if-no-files-found: error

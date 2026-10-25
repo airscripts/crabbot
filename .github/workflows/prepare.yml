@@ -38,11 +38,11 @@ jobs:
         name: Validate Release Metadata
 
         env:
-          CRABBOT_RELEASE_TAG: ${{ github.ref_name }}
+          KRABB_RELEASE_TAG: ${{ github.ref_name }}
 
         run: |
           set -euo pipefail
-          tag="$CRABBOT_RELEASE_TAG"
+          tag="$KRABB_RELEASE_TAG"
           tag="${tag#refs/tags/}"
 
           [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
@@ -71,6 +71,6 @@ jobs:
         uses: actions/upload-artifact@v7
 
         with:
-          name: crabbot-release-notes-${{ steps.release.outputs.version }}
+          name: krabb-release-notes-${{ steps.release.outputs.version }}
           path: release-notes.md
           if-no-files-found: error

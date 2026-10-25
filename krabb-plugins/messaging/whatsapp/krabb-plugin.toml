@@ -1,0 +1,9 @@
+id = "whatsapp"
+version = "0.1.0"
+capabilities = ["channel"]
+permissions = ["network", "filesystem"]
+secrets = ["KRABB_WHATSAPP_TOKEN", "KRABB_WHATSAPP_APP_SECRET", "KRABB_WHATSAPP_VERIFY"]
+
+[protocol]
+major = 0
+minor = 1

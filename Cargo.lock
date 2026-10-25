@@ -512,338 +512,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crabbot"
-version = "0.1.0"
-dependencies = [
- "crabbot-runtime",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-core"
-version = "0.1.0"
-dependencies = [
- "rustix",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-daemon"
-version = "0.1.0"
-dependencies = [
- "crabbot-runtime",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "crabbot-date"
-version = "0.1.0"
-dependencies = [
- "jiff",
-]
-
-[[package]]
-name = "crabbot-file"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "crabbot-log"
-version = "0.1.0"
-dependencies = [
- "crabbot-date",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "crabbot-plugin-claude"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-file",
- "crabbot-log",
- "futures-util",
- "keyring",
- "reqwest",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-plugin-codex"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-file",
- "crabbot-log",
- "futures-util",
- "keyring",
- "reqwest",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-plugin-discord"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-file",
- "crabbot-log",
- "futures-util",
- "keyring",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
-]
-
-[[package]]
-name = "crabbot-plugin-gemini"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-log",
- "reqwest",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-plugin-mcp"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-log",
- "futures-util",
- "reqwest",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-plugin-memory"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-file",
- "crabbot-log",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "crabbot-plugin-ollama"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-file",
- "crabbot-log",
- "futures-util",
- "keyring",
- "reqwest",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-plugin-openrouter"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-log",
- "futures-util",
- "reqwest",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-plugin-pi"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-log",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-plugin-scheduler"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-file",
- "crabbot-log",
- "getrandom 0.4.3",
- "jiff",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-plugin-signal"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "crabbot-core",
- "crabbot-file",
- "crabbot-log",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-plugin-slack"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-file",
- "crabbot-log",
- "futures-util",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
-]
-
-[[package]]
-name = "crabbot-plugin-sqlite"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-log",
- "rusqlite",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-plugin-telegram"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-file",
- "crabbot-log",
- "futures-util",
- "keyring",
- "reqwest",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-plugin-tools"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-log",
- "reqwest",
- "rustix",
- "serde_json",
- "tokio",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "crabbot-plugin-tui"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-date",
- "crabbot-file",
- "crabbot-log",
- "crossterm",
- "getrandom 0.4.3",
- "jiff",
- "ratatui",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
-name = "crabbot-plugin-whatsapp"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-file",
- "crabbot-log",
- "futures-util",
- "reqwest",
- "ring",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-plugin-whisper"
-version = "0.1.0"
-dependencies = [
- "crabbot-core",
- "crabbot-log",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "crabbot-process"
-version = "0.1.0"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "crabbot-runtime"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "clap",
- "clap_complete",
- "crabbot-core",
- "crabbot-date",
- "crabbot-file",
- "crabbot-log",
- "crabbot-process",
- "getrandom 0.4.3",
- "jiff",
- "keyring",
- "ring",
- "rustix",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tokio",
- "toml",
- "toml_edit",
- "tracing",
-]
-
-[[package]]
 name = "crossbeam-utils"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1681,6 +1349,375 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb1e621458ca9c51aa110bd0339d4751a056b9576bf1253aee1aa560dda0fc9d"
 dependencies = [
  "log",
+]
+
+[[package]]
+name = "krabb"
+version = "0.1.0"
+dependencies = [
+ "krabb-runtime",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-core"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-daemon"
+version = "0.1.0"
+dependencies = [
+ "krabb-runtime",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "krabb-date"
+version = "0.1.0"
+dependencies = [
+ "jiff",
+]
+
+[[package]]
+name = "krabb-file"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "krabb-log"
+version = "0.1.0"
+dependencies = [
+ "krabb-date",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "krabb-plugin-a2a"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "krabb-core",
+ "krabb-log",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-acp"
+version = "0.1.0"
+dependencies = [
+ "krabb-core",
+ "krabb-log",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-ag-ui"
+version = "0.1.0"
+dependencies = [
+ "krabb-core",
+ "krabb-log",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "krabb-plugin-anthropic"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "keyring",
+ "krabb-core",
+ "krabb-file",
+ "krabb-log",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-codex"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "keyring",
+ "krabb-core",
+ "krabb-file",
+ "krabb-log",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-discord"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "keyring",
+ "krabb-core",
+ "krabb-file",
+ "krabb-log",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
+name = "krabb-plugin-gemini"
+version = "0.1.0"
+dependencies = [
+ "krabb-core",
+ "krabb-log",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-mcp"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "krabb-core",
+ "krabb-log",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-memory"
+version = "0.1.0"
+dependencies = [
+ "krabb-core",
+ "krabb-file",
+ "krabb-log",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "krabb-plugin-ollama"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "keyring",
+ "krabb-core",
+ "krabb-file",
+ "krabb-log",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-openai"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "keyring",
+ "krabb-core",
+ "krabb-file",
+ "krabb-log",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-openrouter"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "krabb-core",
+ "krabb-log",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-scheduler"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "jiff",
+ "krabb-core",
+ "krabb-file",
+ "krabb-log",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-signal"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "krabb-core",
+ "krabb-file",
+ "krabb-log",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-slack"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "krabb-core",
+ "krabb-file",
+ "krabb-log",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
+name = "krabb-plugin-sqlite"
+version = "0.1.0"
+dependencies = [
+ "krabb-core",
+ "krabb-log",
+ "rusqlite",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-telegram"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "keyring",
+ "krabb-core",
+ "krabb-file",
+ "krabb-log",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-tools"
+version = "0.1.0"
+dependencies = [
+ "krabb-core",
+ "krabb-log",
+ "reqwest",
+ "rustix",
+ "serde_json",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "krabb-plugin-tui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "getrandom 0.4.3",
+ "jiff",
+ "krabb-core",
+ "krabb-date",
+ "krabb-file",
+ "krabb-log",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "krabb-plugin-whatsapp"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "krabb-core",
+ "krabb-file",
+ "krabb-log",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-whisper"
+version = "0.1.0"
+dependencies = [
+ "krabb-core",
+ "krabb-log",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-process"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "krabb-runtime"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "clap",
+ "clap_complete",
+ "getrandom 0.4.3",
+ "jiff",
+ "keyring",
+ "krabb-core",
+ "krabb-date",
+ "krabb-file",
+ "krabb-log",
+ "krabb-process",
+ "ring",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "tracing",
 ]
 
 [[package]]

@@ -2,16 +2,17 @@
 
 ## Mission And Repository Map
 
-Crabbot is a small, self-hosted Rust agent with an experimental process-plugin
+Krabb is a small, self-hosted Rust agent with an experimental process-plugin
 protocol.
 
-- `crabbot-core` owns normalized types, the turn loop, policy, and protocol.
-- `crabbot-runtime` owns host orchestration, daemon state, IPC, and plugin
-  lifecycle; `crabbot` and `crabbot-daemon` are thin entrypoints.
-- `crabbot-libs/file` owns shared crash-safe filesystem primitives.
-- `crabbot-plugins` owns optional model, channel, store, memory, timer, tool,
-  MCP, speech, and client processes.
-- `crabbot-docs/`, `crabbot-scripts/`, `.github/`, and release files own user guidance,
+- `krabb-core` owns normalized types, the turn loop, policy, and protocol.
+- `krabb-runtime` owns host orchestration, daemon state, IPC, and plugin
+  lifecycle; `krabb` and `krabb-daemon` are thin entrypoints.
+- `krabb-libs/file` owns shared crash-safe filesystem primitives.
+- `krabb-plugins` owns process integrations. `krabb-plugins/intelligence/` and `krabb-plugins/messaging/`
+  group providers and channels; manifests declare capabilities. A2A, ACP,
+  AG-UI, MCP, memory, stores, tools, scheduler, speech, and TUI are plugins.
+- `krabb-docs/`, `krabb-scripts/`, `.github/`, and release files own user guidance,
   automation, and project support.
 
 ## Non-Negotiables
@@ -37,16 +38,16 @@ protocol.
 ```bash
 lefthook install
 make verify
-crabbot init
-crabbot doctor
+krabb init
+krabb doctor
 ```
 
 ## Change Routing
 
-Put shared contracts in `crabbot-core`, host orchestration in
-`crabbot-runtime`, thin entrypoint behavior in `crabbot` or `crabbot-daemon`,
-filesystem primitives in `crabbot-libs/file`, and provider/channel/capability
-behavior in its plugin. Update `crabbot-docs/`, tests, and `CHANGELOG.md` with
+Put shared contracts in `krabb-core`, host orchestration in
+`krabb-runtime`, thin entrypoint behavior in `krabb` or `krabb-daemon`,
+filesystem primitives in `krabb-libs/file`, and provider/channel/capability
+behavior in its plugin. Update `krabb-docs/`, tests, and `CHANGELOG.md` with
 public behavior changes.
 
 ## Implementation Conventions

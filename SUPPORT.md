@@ -1,7 +1,7 @@
 # Support
 
-Run `crabbot help` or `crabbot doctor` first. For a reproducible bug, include
-the Crabbot version, operating system, command, expected behavior, actual
+Run `krabb help` or `krabb doctor` first. For a reproducible bug, include
+the Krabb version, operating system, command, expected behavior, actual
 behavior, and redacted output. Never include tokens or private conversation
 content.
 

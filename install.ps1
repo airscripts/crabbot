@@ -2,9 +2,9 @@ $ErrorActionPreference = "Stop"
 
 function Show-Usage {
     Write-Output "Usage: install.ps1 [PLUGIN]"
-    Write-Output "Install Crabbot core or one official plugin from a release."
-    Write-Output "Environment: CRABBOT_VERSION, CRABBOT_RELEASE_BASE,"
-    Write-Output "             CRABBOT_HOME, CRABBOT_BIN."
+    Write-Output "Install Krabb core or one official plugin from a release."
+    Write-Output "Environment: KRABB_VERSION, KRABB_RELEASE_BASE,"
+    Write-Output "             KRABB_HOME, KRABB_BIN."
 }
 
 function Stop-Install([string] $Message) {
@@ -26,7 +26,7 @@ if ($args.Count -gt 1) {
 }
 
 $plugin = if ($args.Count -eq 1) { $args[0] } else { "core" }
-$valid = @("core", "codex", "claude", "gemini", "ollama", "openrouter", "telegram", "discord", "whatsapp", "signal", "slack", "sqlite", "memory", "scheduler", "tools", "mcp", "whisper", "tui", "pi")
+$valid = @("core", "acp", "a2a", "ag-ui", "codex", "anthropic", "openai", "gemini", "ollama", "openrouter", "telegram", "discord", "whatsapp", "signal", "slack", "sqlite", "memory", "scheduler", "tools", "mcp", "whisper", "tui")
 if ($valid -notcontains $plugin) { Stop-Install "Unknown plugin '$plugin'." }
 
 $arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
@@ -35,25 +35,25 @@ $arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitect
     default { Stop-Install "Unsupported architecture." }
 }
 
-if ($env:CRABBOT_VERSION) {
-    $version = $env:CRABBOT_VERSION
+if ($env:KRABB_VERSION) {
+    $version = $env:KRABB_VERSION
 } else {
-    $version = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 https://raw.githubusercontent.com/airscripts/crabbot/main/VERSION).Content.Trim()
+    $version = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 https://raw.githubusercontent.com/krabblab/krabb/main/VERSION).Content.Trim()
 }
 if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$') {
     Stop-Install "Version '$version' is not valid."
 }
 
-$name = if ($plugin -eq "core") { "crabbot" } else { "crabbot-plugin-$plugin" }
-$archive = "crabbot-$plugin-v$version-x86_64-pc-windows-msvc.zip"
-if ($arch -eq "aarch64") { $archive = "crabbot-$plugin-v$version-aarch64-pc-windows-msvc.zip" }
-$base = if ($env:CRABBOT_RELEASE_BASE) {
-    $env:CRABBOT_RELEASE_BASE.TrimEnd('/')
+$name = if ($plugin -eq "core") { "krabb" } else { "krabb-plugin-$plugin" }
+$archive = "krabb-$plugin-v$version-x86_64-pc-windows-msvc.zip"
+if ($arch -eq "aarch64") { $archive = "krabb-$plugin-v$version-aarch64-pc-windows-msvc.zip" }
+$base = if ($env:KRABB_RELEASE_BASE) {
+    $env:KRABB_RELEASE_BASE.TrimEnd('/')
 } else {
-    "https://github.com/airscripts/crabbot/releases/download/v$version"
+    "https://github.com/krabblab/krabb/releases/download/v$version"
 }
 if ($base -notmatch '^(https://|file://)') {
-    Stop-Install "CRABBOT_RELEASE_BASE must use https:// or file://."
+    Stop-Install "KRABB_RELEASE_BASE must use https:// or file://."
 }
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $tmp | Out-Null
@@ -84,45 +84,45 @@ try {
         Expand-Archive $archivePath -DestinationPath $tmp
         $file = Get-ChildItem $tmp -Recurse -File -Filter "$name.exe" | Select-Object -First 1
         if (-not $file) { Stop-Install "The archive does not contain '$name.exe'." }
-        $alias = Get-ChildItem $tmp -Recurse -File -Filter "crab.exe" | Select-Object -First 1
-        if (-not $alias) { Stop-Install "The archive does not contain 'crab.exe'." }
-        $daemon = Get-ChildItem $tmp -Recurse -File -Filter "crabbot-daemon.exe" | Select-Object -First 1
-        if (-not $daemon) { Stop-Install "The archive does not contain 'crabbot-daemon.exe'." }
-        $dest = Join-Path $env:LOCALAPPDATA "Crabbot/bin"
+        $alias = Get-ChildItem $tmp -Recurse -File -Filter "krabb.exe" | Select-Object -First 1
+        if (-not $alias) { Stop-Install "The archive does not contain 'krabb.exe'." }
+        $daemon = Get-ChildItem $tmp -Recurse -File -Filter "krabb-daemon.exe" | Select-Object -First 1
+        if (-not $daemon) { Stop-Install "The archive does not contain 'krabb-daemon.exe'." }
+        $dest = Join-Path $env:LOCALAPPDATA "Krabb/bin"
         New-Item -ItemType Directory -Force -Path $dest | Out-Null
         $temporary = Join-Path $dest ".$name.exe.tmp"
         Copy-Item $file.FullName $temporary
         Move-Item -Force $temporary (Join-Path $dest "$name.exe")
-        $aliasTemporary = Join-Path $dest ".crab.exe.tmp"
+        $aliasTemporary = Join-Path $dest ".krabb.exe.tmp"
         Copy-Item $alias.FullName $aliasTemporary
-        Move-Item -Force $aliasTemporary (Join-Path $dest "crab.exe")
-        $daemonTemporary = Join-Path $dest ".crabbot-daemon.exe.tmp"
+        Move-Item -Force $aliasTemporary (Join-Path $dest "krabb.exe")
+        $daemonTemporary = Join-Path $dest ".krabb-daemon.exe.tmp"
         Copy-Item $daemon.FullName $daemonTemporary
-        Move-Item -Force $daemonTemporary (Join-Path $dest "crabbot-daemon.exe")
-        Write-Install "Installed $name, crab, and crabbot-daemon in $dest."
+        Move-Item -Force $daemonTemporary (Join-Path $dest "krabb-daemon.exe")
+        Write-Install "Installed $name, krabb, and krabb-daemon in $dest."
     } else {
-        if ($env:CRABBOT_HOME) {
-            $config = $env:CRABBOT_HOME
+        if ($env:KRABB_HOME) {
+            $config = $env:KRABB_HOME
         } elseif ($env:XDG_CONFIG_HOME) {
-            $config = Join-Path $env:XDG_CONFIG_HOME "crabbot"
+            $config = Join-Path $env:XDG_CONFIG_HOME "krabb"
         } else {
-            $config = Join-Path $env:USERPROFILE ".config/crabbot"
+            $config = Join-Path $env:USERPROFILE ".config/krabb"
         }
         New-Item -ItemType Directory -Force -Path (Join-Path $config "plugins") | Out-Null
-        $crabbot = if ($env:CRABBOT_BIN) {
-            $env:CRABBOT_BIN
+        $krabb = if ($env:KRABB_BIN) {
+            $env:KRABB_BIN
         } else {
-            Join-Path $env:LOCALAPPDATA "Crabbot/bin/crabbot.exe"
+            Join-Path $env:LOCALAPPDATA "Krabb/bin/krabb.exe"
         }
-        if (-not (Test-Path -LiteralPath $crabbot -PathType Leaf)) {
-            $command = Get-Command crabbot.exe -ErrorAction SilentlyContinue
-            if ($command) { $crabbot = $command.Source }
+        if (-not (Test-Path -LiteralPath $krabb -PathType Leaf)) {
+            $command = Get-Command krabb.exe -ErrorAction SilentlyContinue
+            if ($command) { $krabb = $command.Source }
         }
-        if (-not (Test-Path -LiteralPath $crabbot -PathType Leaf)) {
-            Stop-Install "Install the Crabbot core before installing an official plugin."
+        if (-not (Test-Path -LiteralPath $krabb -PathType Leaf)) {
+            Stop-Install "Install the Krabb core before installing an official plugin."
         }
-        & $crabbot plugin install $plugin "$archiveUri#sha256=$expected" --yes
-        if ($LASTEXITCODE -ne 0) { Stop-Install "The Crabbot plugin installation failed." }
+        & $krabb plugin install $plugin "$archiveUri#sha256=$expected" --yes
+        if ($LASTEXITCODE -ne 0) { Stop-Install "The Krabb plugin installation failed." }
         Write-Install "Installed plugin $plugin."
     }
 } finally {

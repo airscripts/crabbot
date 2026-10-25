@@ -4,19 +4,20 @@
 
 - Agentskill Version: `2.1.0`.
 - Evidence Schema Version: `4`.
-- Repository Revision: `03c79ff484255bb0b14ac00111d65f9239e88300`.
+- Repository Revision: `546ccdf8aa89ef4964b702439cd0dd8893477789`.
 - Configuration: default signature enabled.
 - Maintainer-Confirmed Decisions: capability-free core; process plugins over JSONL; Apache-2.0; one-word naming where clear; Lefthook pre-commit gates; Gitfleet-style releases; the implementation ledger is authoritative.
 - Unresolved Uncertainty: vendor OAuth terms and the final native service implementation remain platform-specific implementation work.
 
 ## Boundaries And Ownership
 
-`crabbot-core` owns normalized types, JSON-RPC framing, policy, and the bounded
-turn loop. `crabbot-runtime` owns host orchestration, daemon state, authenticated
-IPC, and plugin lifecycle, while `crabbot` and `crabbot-daemon` are thin
-entrypoints. `crabbot-libs/file` owns shared filesystem primitives. Every
-directory under `crabbot-plugins` is an executable capability boundary.
-`crabbot-docs` is the user-facing source of truth; `crabbot-scripts` contains
+`krabb-core` owns normalized types, JSON-RPC framing, policy, and the bounded
+turn loop. `krabb-runtime` owns host orchestration, daemon state, authenticated
+IPC, and plugin lifecycle, while `krabb` and `krabb-daemon` are thin
+entrypoints. `krabb-libs/file` owns shared filesystem primitives. Plugin
+crate directories under `krabb-plugins` are process boundaries; `krabb-plugins/intelligence/`
+and `krabb-plugins/messaging/` only group plugins. Manifests declare capabilities.
+`krabb-docs` is the user-facing source of truth; `krabb-scripts` contains
 release, metrics, verification, and review helpers.
 
 ## Development Workflow
@@ -36,12 +37,12 @@ and checksums.
 
 Child scopes inherit this document additively:
 
-- `crabbot-core/` — kernel, policy, types, and protocol.
-- `crabbot-runtime/` — host orchestration, daemon state, IPC, and plugin lifecycle.
-- `crabbot-libs/file/` — shared private and crash-safe filesystem primitives.
-- `crabbot-plugins/` — independently released capability processes.
-- `crabbot/` — thin host CLI entrypoint.
-- `crabbot-daemon/` — thin daemon entrypoint.
+- `krabb-core/` — kernel, policy, types, and protocol.
+- `krabb-runtime/` — host orchestration, daemon state, IPC, and plugin lifecycle.
+- `krabb-libs/file/` — shared private and crash-safe filesystem primitives.
+- `krabb-plugins/` — independently released capability processes.
+- `krabb/` — thin host CLI entrypoint.
+- `krabb-daemon/` — thin daemon entrypoint.
 
 ## Naming
 

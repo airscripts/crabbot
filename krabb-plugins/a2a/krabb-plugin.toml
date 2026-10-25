@@ -1,0 +1,14 @@
+id = "a2a"
+version = "0.1.0"
+capabilities = ["agent"]
+permissions = ["network"]
+secrets = ["KRABB_A2A_TOKEN"]
+
+[[commands]]
+name = "a2a"
+description = "Discover and collaborate with a remote A2A agent."
+interactive = false
+
+[protocol]
+major = 0
+minor = 1

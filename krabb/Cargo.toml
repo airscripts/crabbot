@@ -1,0 +1,17 @@
+[package]
+name = "krabb"
+description = "A self-hostable, open-source agent operating system for building, running, and orchestrating native and external AI agents."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "krabb"
+path = "src/main.rs"
+
+[dependencies]
+krabb-runtime = { path = "../krabb-runtime" }
+tokio.workspace = true

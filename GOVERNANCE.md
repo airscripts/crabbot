@@ -1,6 +1,6 @@
 # Governance
 
-Crabbot is maintained in the open by Airscripts and its contributors.
+Krabb is maintained in the open by Krabblab and its contributors.
 Technical decisions are proposed through issues or pull requests, discussed
 in public, and recorded in the plan or architecture documentation when they
 change a public contract.

@@ -88,12 +88,12 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          ./target/${{ matrix.target }}/release/crabbot version
-          ./target/${{ matrix.target }}/release/crab version
+          ./target/${{ matrix.target }}/release/krabb version
+          ./target/${{ matrix.target }}/release/krabb version
 
       - name: Verify Native CLI on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          .\target\${{ matrix.target }}\release\crabbot.exe version
-          .\target\${{ matrix.target }}\release\crab.exe version
+          .\target\${{ matrix.target }}\release\krabb.exe version
+          .\target\${{ matrix.target }}\release\krabb.exe version

@@ -1,0 +1,86 @@
+# Krabfile Specification
+
+`Krabfile` is the versioned, portable description used by `krabb export`,
+`krabb validate`, and `krabb import`. The current format is version `0.1`.
+The version is required at the top of the document so future formats can be
+validated without guessing which rules apply.
+
+## Schema
+
+```toml
+version = "0.1"
+
+[config]
+update = "prompt"          # off, check, prompt, or auto
+approval = "off"            # off, prompt, or auto
+
+[config.clients.tui]
+tools = false
+shell = false
+
+[config.channels.telegram]
+allow = ["-1001234567890"]
+mention = "@krabb"
+owner = "42"
+admin = ["7"]
+member = ["9"]
+topic = ["12"]
+thread = ["topic-12"]
+worktree = true
+tools = false
+
+[[plugins]]
+id = "telegram"
+source = "krabb-plugins/messaging/telegram"
+revision = "local"
+version = "0.1.0"
+capabilities = ["channel"]
+```
+
+The root keys are:
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `version` | string | Krabfile format version. Version `0.1` is currently supported. |
+| `config` | table | The configuration that will become `config.toml`. |
+| `plugins` | array of tables | Plugin sources and locked metadata to import. |
+
+Each `plugins` entry contains:
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `id` | string | Lowercase plugin identifier using letters, digits, and hyphens. |
+| `source` | string | Local path, Git URL, or archive source. It must not be empty. |
+| `revision` | string | Source revision; use `local` or an empty value for the local/default revision. |
+| `version` | string | Expected plugin version from its manifest. |
+| `capabilities` | array of strings | Expected normalized capability names from the manifest. |
+
+The `config` table uses the same keys as `config.toml`, including
+`clients.tui.shell`. Legacy top-level `shell` remains readable and applies only
+to the TUI. Update and approval modes are documented in the
+[configuration guide](configuration.md). Each channel policy supports `allow`,
+`mention`, `owner`, `admin`, `member`, `topic`, `thread`, `worktree`, and
+`tools`.
+
+Unknown keys are invalid. Plugin IDs must be unique, and the first invalid
+root, configuration, or plugin entry is reported so it can be corrected before
+the next check.
+
+## Validation And Import
+
+Use the read-only validator before importing a file:
+
+```sh
+krabb validate
+krabb validate --path ./Krabfile --json
+```
+
+The default path is `./Krabfile`. Validation checks TOML syntax, the schema,
+the supported format version, configuration modes, plugin identifiers, empty
+sources, and duplicate plugin IDs. A valid file prints its path and plugin
+count; an invalid file reports the first error with a line and column when the
+parser provides one.
+
+Import validates first, then resolves plugin sources and verifies their
+metadata. It prompts before changing state; use `--yes` to skip the prompt and
+`--force` to replace existing configuration.

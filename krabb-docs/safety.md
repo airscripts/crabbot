@@ -1,0 +1,49 @@
+# Safety
+
+Krabb is designed for least privilege and bounded failure. Safe defaults keep
+shell execution off, keep tools disabled for channels, and require explicit
+workspace configuration.
+
+## Trust Boundaries
+
+The daemon trusts the local operator and treats model output, channel senders,
+plugin archives, and workspace files as untrusted. Plugins run as separate
+processes and cannot call one another directly. Review every plugin manifest
+before installation.
+
+## Tools
+
+File operations stay below the active session workspace after canonicalization,
+or below `KRABB_ROOT` when a session has not selected a workspace. Symlinked
+instructions, traversal, dangling write links, and worktree paths outside the
+active workspace are rejected. Shell tools in TUI turns require
+`clients.tui.shell = true` and approval. Typed `!` commands need the setting and
+count as explicit user actions. Output and execution time are bounded.
+
+### Optional Container Sandbox
+
+When shell tools are enabled, a Docker or Podman sandbox can keep approved
+commands away from the host filesystem and network. Set
+`KRABB_SANDBOX_RUNTIME` to `docker` or `podman` and
+`KRABB_SANDBOX_IMAGE` to an image already available locally. Krabb mounts
+only the active workspace writable, uses a read-only container root, drops
+Linux capabilities, disables networking, and applies bounded resource limits.
+Runtime errors never fall back to host execution. This reduces the impact of
+routine command mistakes; it is not a complete security boundary, so the
+container engine, image, kernel, and host still need to be trusted and
+maintained. See the [configuration](configuration.md) and
+[security](security.md) guides for setup and threat-model details.
+
+## Recovery
+
+Accepted events, leases, transcripts, and outbox entries are durable. A crash
+can retry only a lease proven safe; a mutating phase is never replayed. A
+canceled turn is discarded. Ambiguous deliveries are not retried automatically;
+an explicit delivery retry does not rerun model or tool work.
+
+## Limits
+
+Protocol frames, model context, session history, queues, archive extraction,
+search work, plugin metadata, provider bodies, and persisted values are bounded.
+When a limit is reached, Krabb reports an error or dead-letters the item
+instead of silently expanding resource use.

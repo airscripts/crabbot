@@ -1,0 +1,18 @@
+[package]
+name = "krabb-log"
+description = "Shared structured logging for Krabb processes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+krabb-date.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
