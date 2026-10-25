@@ -1,6 +1,6 @@
 cff-version: 1.2.0
-message: If you use Crabbot in your work, please cite it using this metadata.
-title: Crabbot
+message: If you use Krabb in your work, please cite it using this metadata.
+title: Krabb
 authors:
   - family-names: Sardone
     given-names: Francesco
@@ -10,4 +10,4 @@ keywords:
   - rust
 version: 0.1.0
 license: Apache-2.0
-repository-code: https://github.com/airscripts/crabbot
+repository-code: https://github.com/krabblab/krabb

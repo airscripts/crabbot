@@ -1,0 +1,14 @@
+id = "codex"
+version = "0.1.0"
+capabilities = ["model", "vision"]
+permissions = ["network"]
+secrets = ["KRABB_CODEX_KEY"]
+
+[[commands]]
+name = "codex"
+description = "Manage Codex sign-in and list available models."
+interactive = false
+
+[protocol]
+major = 0
+minor = 1

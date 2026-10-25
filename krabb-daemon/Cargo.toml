@@ -1,0 +1,18 @@
+[package]
+name = "krabb-daemon"
+description = "The Krabb background daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "krabb-daemon"
+path = "src/main.rs"
+
+[dependencies]
+krabb-runtime = { path = "../krabb-runtime" }
+tracing.workspace = true
+tokio.workspace = true

@@ -57,7 +57,7 @@ jobs:
       - name: Check Rust Formatting
         run: |
           cargo fmt --all --check
-          bash crabbot-scripts/spacing.sh --check
+          bash krabb-scripts/spacing.sh --check
 
       - name: Run Clippy
         run: CARGO_BUILD_JOBS=4 cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -66,10 +66,10 @@ jobs:
         run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
 
       - name: Check Shell Scripts
-        run: bash -n crabbot-scripts/*.sh install.sh
+        run: bash -n krabb-scripts/*.sh install.sh
 
       - name: Report Metrics
-        run: bash crabbot-scripts/metrics.sh
+        run: bash krabb-scripts/metrics.sh
 
   crate:
     name: Crate (${{ matrix.name }})
@@ -87,73 +87,83 @@ jobs:
       matrix:
         include:
           - name: Core
-            package: crabbot-core
+            package: krabb-core
 
           - name: File
-            package: crabbot-file
+            package: krabb-file
 
           - name: Runtime
-            package: crabbot-runtime
+            package: krabb-runtime
 
           - name: CLI
-            package: crabbot
+            package: krabb
 
           - name: Daemon
-            package: crabbot-daemon
+            package: krabb-daemon
 
-          - name: Claude Plugin
-            package: crabbot-plugin-claude
+          - name: Anthropic Plugin
+            package: krabb-plugin-anthropic
 
           - name: Codex Plugin
-            package: crabbot-plugin-codex
+            package: krabb-plugin-codex
+
+          - name: OpenAI Plugin
+            package: krabb-plugin-openai
+
+          - name: ACP Plugin
+            package: krabb-plugin-acp
+
+          - name: A2A Plugin
+            package: krabb-plugin-a2a
+
+          - name: AG-UI Plugin
+            package: krabb-plugin-ag-ui
 
           - name: Gemini Plugin
-            package: crabbot-plugin-gemini
+            package: krabb-plugin-gemini
 
           - name: Ollama Plugin
-            package: crabbot-plugin-ollama
+            package: krabb-plugin-ollama
 
           - name: OpenRouter Plugin
-            package: crabbot-plugin-openrouter
+            package: krabb-plugin-openrouter
 
           - name: Telegram Plugin
-            package: crabbot-plugin-telegram
+            package: krabb-plugin-telegram
 
           - name: Discord Plugin
-            package: crabbot-plugin-discord
+            package: krabb-plugin-discord
 
           - name: WhatsApp Plugin
-            package: crabbot-plugin-whatsapp
+            package: krabb-plugin-whatsapp
 
           - name: Signal Plugin
-            package: crabbot-plugin-signal
+            package: krabb-plugin-signal
 
           - name: Slack Plugin
-            package: crabbot-plugin-slack
+            package: krabb-plugin-slack
 
-          - name: Pi Agent
-            package: crabbot-plugin-pi
 
           - name: Tools Plugin
-            package: crabbot-plugin-tools
+            package: krabb-plugin-tools
 
           - name: Memory Plugin
-            package: crabbot-plugin-memory
+            package: krabb-plugin-memory
 
           - name: Scheduler Plugin
-            package: crabbot-plugin-scheduler
+            package: krabb-plugin-scheduler
 
           - name: SQLite Plugin
-            package: crabbot-plugin-sqlite
+            package: krabb-plugin-sqlite
 
           - name: Whisper Plugin
-            package: crabbot-plugin-whisper
+            package: krabb-plugin-whisper
 
           - name: MCP Plugin
-            package: crabbot-plugin-mcp
+            package: krabb-plugin-mcp
 
           - name: TUI Plugin
-            package: crabbot-plugin-tui
+            package: krabb-plugin-tui
 
     steps:
       - name: Checkout

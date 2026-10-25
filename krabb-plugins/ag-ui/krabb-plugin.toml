@@ -1,0 +1,13 @@
+id = "ag-ui"
+version = "0.1.0"
+capabilities = ["agent"]
+permissions = ["network"]
+
+[[commands]]
+name = "ag-ui"
+description = "Serve the AG-UI run endpoint for local agent clients."
+interactive = false
+
+[protocol]
+major = 0
+minor = 1

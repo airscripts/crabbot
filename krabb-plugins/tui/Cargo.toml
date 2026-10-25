@@ -1,0 +1,23 @@
+[package]
+name = "krabb-plugin-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+krabb-date.workspace = true
+krabb-log.workspace = true
+crossterm.workspace = true
+krabb-core = { path = "../../krabb-core" }
+krabb-file = { path = "../../krabb-libs/file" }
+getrandom.workspace = true
+jiff.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+unicode-width = "0.2.2"
+unicode-segmentation = "1.13.3"

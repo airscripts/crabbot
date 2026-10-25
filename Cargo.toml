@@ -1,31 +1,34 @@
 [workspace]
 members = [
-    "crabbot-core",
-    "crabbot-libs/date",
-    "crabbot-libs/logging",
-    "crabbot-libs/file",
-    "crabbot-libs/process",
-    "crabbot-runtime",
-    "crabbot",
-    "crabbot-daemon",
-    "crabbot-plugins/intelligence/claude",
-    "crabbot-plugins/intelligence/codex",
-    "crabbot-plugins/intelligence/gemini",
-    "crabbot-plugins/intelligence/ollama",
-    "crabbot-plugins/intelligence/openrouter",
-    "crabbot-plugins/agents/pi",
-    "crabbot-plugins/mcp",
-    "crabbot-plugins/memory",
-    "crabbot-plugins/messaging/discord",
-    "crabbot-plugins/messaging/signal",
-    "crabbot-plugins/messaging/slack",
-    "crabbot-plugins/messaging/telegram",
-    "crabbot-plugins/messaging/whatsapp",
-    "crabbot-plugins/sqlite",
-    "crabbot-plugins/scheduler",
-    "crabbot-plugins/tools",
-    "crabbot-plugins/tui",
-    "crabbot-plugins/whisper",
+    "krabb-core",
+    "krabb-libs/date",
+    "krabb-libs/logging",
+    "krabb-libs/file",
+    "krabb-libs/process",
+    "krabb-runtime",
+    "krabb",
+    "krabb-daemon",
+    "krabb-plugins/intelligence/anthropic",
+    "krabb-plugins/intelligence/codex",
+    "krabb-plugins/intelligence/gemini",
+    "krabb-plugins/intelligence/ollama",
+    "krabb-plugins/intelligence/openrouter",
+    "krabb-plugins/intelligence/openai",
+    "krabb-plugins/acp",
+    "krabb-plugins/a2a",
+    "krabb-plugins/ag-ui",
+    "krabb-plugins/mcp",
+    "krabb-plugins/memory",
+    "krabb-plugins/messaging/discord",
+    "krabb-plugins/messaging/signal",
+    "krabb-plugins/messaging/slack",
+    "krabb-plugins/messaging/telegram",
+    "krabb-plugins/messaging/whatsapp",
+    "krabb-plugins/sqlite",
+    "krabb-plugins/scheduler",
+    "krabb-plugins/tools",
+    "krabb-plugins/tui",
+    "krabb-plugins/whisper",
 ]
 resolver = "3"
 
@@ -35,15 +38,15 @@ edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
 authors = ["Francesco Sardone"]
-repository = "https://github.com/airscripts/crabbot"
-homepage = "https://github.com/airscripts/crabbot"
+repository = "https://github.com/krabblab/krabb"
+homepage = "https://github.com/krabblab/krabb"
 readme = "README.md"
 publish = false
 
 [workspace.dependencies]
 base64 = "0.23"
-crabbot-date = { path = "crabbot-libs/date" }
-crabbot-log = { path = "crabbot-libs/logging" }
+krabb-date = { path = "krabb-libs/date" }
+krabb-log = { path = "krabb-libs/logging" }
 crossterm = "0.29"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"

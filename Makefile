@@ -9,9 +9,9 @@ all: build
 	$(MAKE) install
 
 help:
-	@printf '%s\n' 'Crabbot development targets:'
+	@printf '%s\n' 'Krabb development targets:'
 	@printf '%s\n' '  all       Build the workspace, then install the CLI and daemon (default)'
-	@printf '%s\n' '  install   Install the crabbot, crab, and crabbot-daemon binaries only'
+	@printf '%s\n' '  install   Install the krabb and krabb-daemon binaries only'
 	@printf '%s\n' '  hooks     Install Lefthook git hooks'
 	@printf '%s\n' '  fmt       Check Rust formatting and spacing'
 	@printf '%s\n' '  spacing   Apply Rust block spacing'
@@ -27,18 +27,18 @@ help:
 	@printf '%s\n' '  verify    Run the complete local quality workflow'
 
 install:
-	$(CARGO) install --path crabbot --locked --force
-	$(CARGO) install --path crabbot-daemon --locked --force
+	$(CARGO) install --path krabb --locked --force
+	$(CARGO) install --path krabb-daemon --locked --force
 
 hooks:
 	lefthook install
 
 fmt:
 	$(CARGO) fmt --all --check
-	bash crabbot-scripts/spacing.sh --check
+	bash krabb-scripts/spacing.sh --check
 
 spacing:
-	bash crabbot-scripts/spacing.sh
+	bash krabb-scripts/spacing.sh
 
 clippy:
 	CARGO_BUILD_JOBS=$(JOBS) $(CARGO) clippy --workspace --all-targets --locked -- -D warnings
@@ -50,7 +50,7 @@ test:
 	CARGO_BUILD_JOBS=$(JOBS) $(CARGO) test --workspace --no-fail-fast --locked
 
 coverage:
-	bash crabbot-scripts/coverage.sh "$(COVERAGE_PROFILE)"
+	bash krabb-scripts/coverage.sh "$(COVERAGE_PROFILE)"
 
 build:
 	CARGO_BUILD_JOBS=$(JOBS) $(CARGO) build --workspace --locked
@@ -59,12 +59,12 @@ release:
 	CARGO_BUILD_JOBS=$(JOBS) $(CARGO) build --workspace --release --locked
 
 metrics:
-	bash crabbot-scripts/metrics.sh
+	bash krabb-scripts/metrics.sh
 
 ci:
-	bash crabbot-ci/ci.sh
+	bash krabb-ci/ci.sh
 
 revloop:
-	bash crabbot-scripts/revloop.sh $(subst $(comma), ,$(REVLOOP_ARGS))
+	bash krabb-scripts/revloop.sh $(subst $(comma), ,$(REVLOOP_ARGS))
 
 verify: fmt clippy check test coverage build metrics

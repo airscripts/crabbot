@@ -1,14 +1,14 @@
 # Contributing
 
-Thanks for helping make Crabbot useful, safe, and easy to extend. Discuss
+Thanks for helping make Krabb useful, safe, and easy to extend. Discuss
 substantial changes through an issue before opening a pull request. Use
 [SECURITY.md](SECURITY.md) for private vulnerability reports.
 
 ## Local Setup
 
 ```sh
-git clone https://github.com/airscripts/crabbot.git
-cd crabbot
+git clone https://github.com/krabblab/krabb.git
+cd krabb
 rustup toolchain install 1.89.0
 lefthook install
 cargo build --workspace --locked
@@ -47,7 +47,7 @@ coverage profile with local socket access before changing tests or thresholds.
 ## Formatting
 
 Rust formatting has two checks: `cargo fmt` handles syntax formatting, while
-`crabbot-scripts/spacing.sh` keeps blank lines between adjacent Rust blocks and
+`krabb-scripts/spacing.sh` keeps blank lines between adjacent Rust blocks and
 multiline statements. Run the complete formatting check with:
 
 ```sh
@@ -89,7 +89,7 @@ cross-architecture jobs still run only on their GitHub-hosted runners.
 
 Use `make ci` when adding or changing GitHub Actions workflows, or when the
 workflow itself needs debugging: it runs the local preflight and then executes
-the important Actions flow through `crabbot-ci/ci.sh` and `act`. For ordinary
+the important Actions flow through `krabb-ci/ci.sh` and `act`. For ordinary
 Rust or plugin changes, the local commands are sufficient:
 
 ```sh
@@ -126,7 +126,7 @@ supports Bash, Fish, PowerShell, and Zsh through `clap_complete`.
 ## Commit Messages
 
 Use lowercase Conventional Commits. When a scope applies, use the
-corresponding monorepo module without the `crabbot-` prefix. The CLI is the
+corresponding monorepo module without the `krabb-` prefix. The CLI is the
 exception and uses `cli`; plugin scopes use the plugin ID. Do not use `repo` as
 a scope. For genuinely cross-cutting or repository-wide changes, omit the
 scope entirely.

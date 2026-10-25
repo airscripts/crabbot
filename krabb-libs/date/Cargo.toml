@@ -1,0 +1,12 @@
+[package]
+name = "krabb-date"
+description = "Shared date and time formatting for Krabb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+jiff.workspace = true

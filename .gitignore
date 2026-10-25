@@ -1,8 +1,8 @@
 target/
 .revloop/
-crabbot-ci/.cache/
-crabbot-ci/.artifacts/
-crabbot-ci/.target/
+krabb-ci/.cache/
+krabb-ci/.artifacts/
+krabb-ci/.target/
 metadata/
 *.db
 *.db-shm

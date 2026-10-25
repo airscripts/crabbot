@@ -29,14 +29,14 @@ jobs:
         uses: actions/download-artifact@v8
 
         with:
-          name: crabbot-release-notes-${{ inputs.version }}
+          name: krabb-release-notes-${{ inputs.version }}
           path: notes
 
       - name: Download Archives
         uses: actions/download-artifact@v8
 
         with:
-          pattern: crabbot-v${{ inputs.version }}-*
+          pattern: krabb-v${{ inputs.version }}-*
           path: dist
           merge-multiple: true
 
@@ -45,7 +45,7 @@ jobs:
 
         with:
           tag_name: ${{ inputs.tag }}
-          name: Crabbot ${{ inputs.tag }}
+          name: Krabb ${{ inputs.tag }}
           body_path: notes/release-notes.md
           prerelease: ${{ inputs.prerelease }}
           files: |

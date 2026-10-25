@@ -2,7 +2,7 @@
 
 ## v0.2 | Reliability
 
-Strengthen Crabbot’s engineering foundation while keeping the core small and
+Strengthen Krabb’s engineering foundation while keeping the core small and
 the public behavior stable.
 
 - Resolve all known high and medium reliability findings.
@@ -33,16 +33,16 @@ clearer for adopters and contributors.
 ## v0.4 | Plugin Ecosystem
 
 Standardize how official and community plugins are published, discovered, and
-installed, with plugin releases independent from Crabbot kernel releases.
+installed, with plugin releases independent from Krabb kernel releases.
 
-- Add the `crabbot-plugins/template` Hello Crabworld Rust starter.
+- Add the `krabb-plugins/template` Hello Krabb Rust starter.
 - Use one plugin manifest and release format for official and community plugins.
 - Keep the official catalog metadata in this monorepo and review community
   submissions through pull requests.
 - Give each plugin its own version and release trigger; plugin releases must not
-  publish a Crabbot kernel release or appear as kernel GitHub Releases.
+  publish a Krabb kernel release or appear as kernel GitHub Releases.
 - Publish platform artifacts with immutable versions and verifiable digests.
-- Declare supported Crabbot versions in each plugin manifest and reject
+- Declare supported Krabb versions in each plugin manifest and reject
   incompatible installs or updates.
 - Resolve catalog IDs to pinned sources and artifacts; record the selected
   plugin version and digest in `plugins.lock` for reproducible installs.
@@ -55,7 +55,7 @@ installed, with plugin releases independent from Crabbot kernel releases.
 
 ## v0.5 | Deployments
 
-Make Crabbot straightforward to operate in containerized environments without
+Make Krabb straightforward to operate in containerized environments without
 coupling users to one container engine or bundling optional plugins into the
 core image.
 
@@ -64,7 +64,7 @@ core image.
   and documented entrypoints.
 - Implement and document container configuration through environment variables
   and mounted secret files, including precedence and validation.
-- Support persistent volumes for `CRABBOT_HOME` and `CRABBOT_ROOT`, health
+- Support persistent volumes for `KRABB_HOME` and `KRABB_ROOT`, health
   checks, graceful shutdown, and restart behavior.
 - Keep plugins independently installable and hot-loadable, with explicit IPC,
   network, and volume boundaries in the container deployment guide.
@@ -78,7 +78,7 @@ process and machine boundaries, without weakening workspace or capability
 isolation.
 
 - Keep the existing single-agent home layout and behavior as the default.
-- Add an explicit `crabbot init --multiagent` mode that puts every agent,
+- Add an explicit `krabb init --multiagent` mode that puts every agent,
   including the first, under `agents/<id>` with its own configuration, state,
   workspace, and plugin installations; do not create a special root agent in
   this mode. Plugin configuration, enablement, and updates are scoped to their
@@ -112,7 +112,7 @@ isolation.
 
 ## v0.7 | Small-Footprint Runtime
 
-Reduce Crabbot's idle and peak resource use for constrained hosts while
+Reduce Krabb's idle and peak resource use for constrained hosts while
 preserving the full feature set and clear behavior under load.
 
 - Establish and document minimum supported resource targets instead of
