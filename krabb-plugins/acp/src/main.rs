@@ -574,14 +574,13 @@ mod tests {
 
     #[test]
     fn confines_absolute_filesystem_paths_to_the_selected_workspace() {
-        let workspace = PathBuf::from("/work/project");
+        let workspace = std::env::temp_dir().join("work").join("project");
+        let file = workspace.join("src").join("main.rs");
+        let secret = workspace.parent().unwrap().join("secret.txt");
 
-        assert_eq!(
-            workspace_relative("/work/project/src/main.rs", &workspace).unwrap(),
-            "src/main.rs"
-        );
+        assert_eq!(workspace_relative(file.to_str().unwrap(), &workspace).unwrap(), "src/main.rs");
 
-        assert!(workspace_relative("/work/secret.txt", &workspace).is_err());
+        assert!(workspace_relative(secret.to_str().unwrap(), &workspace).is_err());
         assert!(workspace_relative("src/main.rs", &workspace).is_err());
     }
 
@@ -602,7 +601,9 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_acp_filesystem_requests_before_host_calls() {
-        let workspace = PathBuf::from("/work/project");
+        let workspace = std::env::temp_dir().join("work").join("project");
+        let outside = workspace.parent().unwrap().join("outside").join("file");
+        let inside = workspace.join("file");
         let (_sender, _receiver) = tokio::sync::mpsc::channel(1);
         let emitter = Emitter::new(_sender);
 
@@ -615,7 +616,7 @@ mod tests {
         assert!(
             filesystem_request(
                 "fs/read_text_file",
-                &json!({"path":"/outside/file"}),
+                &json!({"path":outside.to_str().unwrap()}),
                 &workspace,
                 &emitter
             )
@@ -626,7 +627,7 @@ mod tests {
         assert!(
             filesystem_request(
                 "fs/write_text_file",
-                &json!({"path":"/work/project/file"}),
+                &json!({"path":inside.to_str().unwrap()}),
                 &workspace,
                 &emitter
             )

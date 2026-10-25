@@ -20,8 +20,8 @@ permissions:
   contents: read
 
 jobs:
-  agent:
-    name: Agent (${{ matrix.name }})
+  krabb:
+    name: Krabb (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
 

@@ -1387,6 +1387,23 @@ fn main() {
             }
         }
 
+        "stream_server_request" => {
+            while let Some(Ok(line)) = lines.next() {
+                if line.contains("\"method\":\"hello\"") {
+                    send(r#"{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"test","version":"0.1.0","capabilities":[]}}"#);
+                } else if line.contains("\"method\":\"command\"") {
+                    send(r#"{"jsonrpc":"2.0","id":7,"method":"host/model_stream","params":{}}"#);
+
+                    let _ = lines.next();
+                    let _ = lines.next();
+                    send(r#"{"jsonrpc":"2.0","id":2,"result":{"done":true}}"#);
+                } else if line.contains("\"method\":\"shutdown\"") {
+                    send(r#"{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}"#);
+                    break;
+                }
+            }
+        }
+
         _ => {
             for line in lines.map_while(Result::ok) {
                 if line.contains("\"method\":\"hello\"") {
