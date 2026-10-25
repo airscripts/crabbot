@@ -160,7 +160,7 @@ jobs:
           exit 0
 
   sandbox:
-    name: Tools Plugin Sandbox
+    name: Sandbox
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
