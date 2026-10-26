@@ -447,7 +447,7 @@ async fn close(state: &mut BrowserState, owner: &str, params: &Value) -> krabb_c
     let session_id =
         params["session_id"].as_str().ok_or_else(|| denied("session_id is required."))?;
 
-    if !state.sessions.get(session_id).is_some_and(|session| session.owner == owner) {
+    if state.sessions.get(session_id).is_none_or(|session| session.owner != owner) {
         return Err(denied("Browser session is unavailable to this Krabb session."));
     }
 
