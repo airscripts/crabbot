@@ -29,6 +29,21 @@ Set `KRABB_PLAYWRIGHT_BROWSERS_PATH` when Chromium is installed outside
 Playwright's default cache directory. The plugin passes only this configured
 path to its worker; it does not accept browser paths from model tool calls.
 
+On Windows, use PowerShell to install the separate package and browser build:
+
+```powershell
+$PlaywrightHome = Join-Path $env:LOCALAPPDATA 'Krabb\playwright'
+npm install --prefix $PlaywrightHome playwright@1.64.1
+node (Join-Path $PlaywrightHome 'node_modules/playwright/cli.js') install chromium
+$env:KRABB_PLAYWRIGHT_MODULE = Join-Path $PlaywrightHome 'node_modules/playwright/index.js'
+$env:KRABB_PLAYWRIGHT_BROWSERS_PATH = Join-Path $PlaywrightHome 'browsers'
+```
+
+Keep the Node.js, Playwright package, and Chromium binary versions matched. The
+browser worker preserves the Windows system, user profile, and temporary-path
+variables needed to start Chromium while keeping unrelated host variables out
+of the browser process.
+
 ## Tools
 
 `browser_open` starts an isolated browser context. The returned opaque
@@ -68,7 +83,7 @@ Observation still requires an owned browser session. For example, `browser_open`
 without `KRABB_PLAYWRIGHT_MODULE` or `KRABB_BROWSER_EGRESS_PROXY` returns an
 error instead of starting an unrestricted browser.
 
-## Permissions and limits
+## Permissions And Limits
 
 Browser tools are available only where Krabb tool access is enabled. Navigation
 and interaction use Krabb's existing approval policy. Screenshots are

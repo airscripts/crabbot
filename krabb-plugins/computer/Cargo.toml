@@ -18,3 +18,8 @@ krabb-log.workspace = true
 rustix.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+enigo = "0.6.1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+xcap = "0.9.8"

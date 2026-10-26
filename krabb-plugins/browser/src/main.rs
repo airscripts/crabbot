@@ -124,7 +124,17 @@ impl Worker {
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
 
-        for key in ["HOME", "USERPROFILE", "TMPDIR", "TMP", "TEMP"] {
+        for key in [
+            "HOME",
+            "USERPROFILE",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "SystemRoot",
+            "WINDIR",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
             }

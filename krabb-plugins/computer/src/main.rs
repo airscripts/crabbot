@@ -1,12 +1,16 @@
 #![forbid(unsafe_code)]
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
-use std::{collections::BTreeMap, fs, path::PathBuf, process::Stdio, sync::Arc, time::Duration};
+#[cfg(target_os = "linux")]
+use std::{collections::BTreeMap, process::Stdio};
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
+#[cfg(target_os = "linux")]
 use base64::Engine;
+#[cfg(target_os = "linux")]
+use krabb_core::jsonl;
 use krabb_core::{
-    jsonl,
     plugin::serve_events_concurrent,
     types::{Capability, Hello, Protocol, Request, Response, ToolSpec},
 };
@@ -14,22 +18,31 @@ use krabb_core::{
 #[cfg(unix)]
 use rustix::process::{Pid, Signal, kill_process_group};
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod native;
+
 use serde_json::{Value, json};
+#[cfg(target_os = "linux")]
+use tokio::process::Command;
+use tokio::sync::Mutex;
+#[cfg(target_os = "linux")]
 use tokio::{
-    process::{Child, Command},
-    sync::Mutex,
+    process::Child,
     time::{sleep, timeout},
 };
 
+#[cfg(target_os = "linux")]
 const ACTION_TIME: Duration = Duration::from_secs(10);
+#[cfg(target_os = "linux")]
 const START_TIME: Duration = Duration::from_secs(5);
 const SESSION_IDLE: Duration = Duration::from_secs(600);
 const SESSION_REAPER: Duration = Duration::from_secs(30);
 const IMAGE_LIMIT: usize = 4 * 1024 * 1024;
 const COORDINATE_LIMIT: i64 = 4095;
+#[cfg(target_os = "linux")]
 const SCREEN: &str = "1280x720x24";
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 static TEST_COMMAND_DIRECTORY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
 #[tokio::main]
@@ -77,8 +90,10 @@ struct ComputerState {
     session_id: Option<String>,
     last_used: Option<std::time::Instant>,
     display: Option<String>,
+    #[cfg(target_os = "linux")]
     server: Option<Child>,
     server_group: Option<u32>,
+    #[cfg(target_os = "linux")]
     application: Option<Child>,
     application_group: Option<u32>,
     auth_dir: Option<PathBuf>,
@@ -128,78 +143,27 @@ async fn handle(
         "computer_displays" => {
             let display = owned_display(&state, owner, arguments)?;
             let authority = owned_authority(&state, owner, arguments)?;
-            let output = run("xdotool", &["getdisplaygeometry"], display, &authority).await?;
-            let dimensions = output
-                .split_whitespace()
-                .filter_map(|part| part.parse::<u32>().ok())
-                .collect::<Vec<_>>();
-
-            if dimensions.len() != 2 {
-                return Err(denied("Could not read isolated display dimensions."));
-            }
-
-            json!({"display": display, "width": dimensions[0], "height": dimensions[1]})
+            display_info(display, &authority).await?
         }
 
         "computer_windows" => {
             let display = owned_display(&state, owner, arguments)?;
             let authority = owned_authority(&state, owner, arguments)?;
-            let output =
-                run("xdotool", &["search", "--onlyvisible", "--name", "."], display, &authority)
-                    .await
-                    .unwrap_or_default();
-            let ids = output
-                .lines()
-                .filter(|id| {
-                    !id.is_empty() && id.len() <= 32 && id.bytes().all(|byte| byte.is_ascii_digit())
-                })
-                .take(65)
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
-            let truncated = ids.len() > 64;
-            let mut windows = Vec::new();
-
-            for id in ids.iter().take(64) {
-                let Ok(title) = run("xdotool", &["getwindowname", id], display, &authority).await
-                else {
-                    continue;
-                };
-
-                let Ok(geometry) =
-                    run("xdotool", &["getwindowgeometry", "--shell", id], display, &authority)
-                        .await
-                else {
-                    continue;
-                };
-
-                if let Some(bounds) = window_bounds(&geometry) {
-                    windows.push(json!({
-                        "title": title.trim().chars().take(512).collect::<String>(),
-                        "x": bounds.0,
-                        "y": bounds.1,
-                        "width": bounds.2,
-                        "height": bounds.3
-                    }));
-                }
-            }
-
-            json!({"windows": windows, "truncated": truncated})
+            list_windows(display, &authority).await?
         }
 
         "computer_screenshot" => {
             let display = owned_display(&state, owner, arguments)?;
             let authority = owned_authority(&state, owner, arguments)?;
-            screenshot(display, &authority, arguments["format"].as_str().unwrap_or("png")).await?
+            capture_screen(display, &authority, arguments["format"].as_str().unwrap_or("png"))
+                .await?
         }
 
         "computer_move" => {
             let display = owned_display(&state, owner, arguments)?;
             let authority = owned_authority(&state, owner, arguments)?;
             let (x, y) = coordinates(arguments)?;
-            let mut release = InputRelease::new(display, authority.clone());
-            run("xdotool", &["mousemove", &x.to_string(), &y.to_string()], display, &authority)
-                .await?;
-            release.disarm();
+            move_pointer(display, &authority, x, y).await?;
             json!({"moved": true})
         }
 
@@ -207,14 +171,9 @@ async fn handle(
             let display = owned_display(&state, owner, arguments)?;
             let authority = owned_authority(&state, owner, arguments)?;
             let (x, y) = coordinates(arguments)?;
-            let button = mouse_button(arguments["button"].as_str().unwrap_or("left"))?;
-            let mut release = InputRelease::new(display, authority.clone());
-            run("xdotool", &["mousemove", &x.to_string(), &y.to_string()], display, &authority)
+            let button = arguments["button"].as_str().unwrap_or("left");
+            click_pointer(display, &authority, x, y, button, method == "computer_double_click")
                 .await?;
-            let count = if method == "computer_double_click" { "2" } else { "1" };
-
-            run("xdotool", &["click", "--repeat", count, button], display, &authority).await?;
-            release.disarm();
             json!({"clicked": true})
         }
 
@@ -223,25 +182,8 @@ async fn handle(
             let authority = owned_authority(&state, owner, arguments)?;
             let (x, y) = coordinates(arguments)?;
             let (to_x, to_y) = coordinates_at(arguments, "to_x", "to_y")?;
-            let button = mouse_button(arguments["button"].as_str().unwrap_or("left"))?;
-            let mut release = InputRelease::new(display, authority.clone());
-            run("xdotool", &["mousemove", &x.to_string(), &y.to_string()], display, &authority)
-                .await?;
-            run("xdotool", &["mousedown", button], display, &authority).await?;
-            let drag = run(
-                "xdotool",
-                &["mousemove", "--sync", &to_x.to_string(), &to_y.to_string(), "mouseup", button],
-                display,
-                &authority,
-            )
-            .await;
-
-            if drag.is_err() {
-                let _ = run("xdotool", &["mouseup", button], display, &authority).await;
-            }
-
-            drag?;
-            release.disarm();
+            let button = arguments["button"].as_str().unwrap_or("left");
+            drag_pointer(display, &authority, x, y, to_x, to_y, button).await?;
             json!({"dragged": true})
         }
 
@@ -250,24 +192,7 @@ async fn handle(
             let authority = owned_authority(&state, owner, arguments)?;
             let (x, y) = coordinates(arguments)?;
             let amount = bounded_integer(arguments, "amount", -20, 20)?;
-            let button = if amount < 0 { "4" } else { "5" };
-
-            let mut release = InputRelease::new(display, authority.clone());
-
-            run("xdotool", &["mousemove", &x.to_string(), &y.to_string()], display, &authority)
-                .await?;
-
-            if amount != 0 {
-                run(
-                    "xdotool",
-                    &["click", "--repeat", &amount.unsigned_abs().to_string(), button],
-                    display,
-                    &authority,
-                )
-                .await?;
-            }
-
-            release.disarm();
+            scroll_pointer(display, &authority, x, y, amount).await?;
             json!({"scrolled": true})
         }
 
@@ -277,10 +202,8 @@ async fn handle(
             let key = arguments["key"]
                 .as_str()
                 .filter(|key| valid_key(key))
-                .ok_or_else(|| denied("key must use supported X11 key names."))?;
-            let mut release = InputRelease::new(display, authority.clone());
-            run("xdotool", &["key", "--clearmodifiers", key], display, &authority).await?;
-            release.disarm();
+                .ok_or_else(|| denied("key must use a supported key name or combination."))?;
+            press_key(display, &authority, key).await?;
             json!({"pressed": true})
         }
 
@@ -291,15 +214,7 @@ async fn handle(
                 .as_str()
                 .filter(|text| !text.is_empty() && text.len() <= 4096)
                 .ok_or_else(|| denied("text must contain 1 to 4096 bytes."))?;
-            let mut release = InputRelease::new(display, authority.clone());
-            run(
-                "xdotool",
-                &["type", "--clearmodifiers", "--delay", "0", text],
-                display,
-                &authority,
-            )
-            .await?;
-            release.disarm();
+            type_text(display, &authority, text).await?;
             json!({"typed": true})
         }
 
@@ -310,14 +225,68 @@ async fn handle(
 }
 
 async fn open(state: &mut ComputerState, owner: &str) -> krabb_core::Result<Value> {
-    let mode = std::env::var("KRABB_COMPUTER_MODE").unwrap_or_default();
-    let display = std::env::var("KRABB_COMPUTER_DISPLAY").unwrap_or_default();
-    let xvfb = std::env::var("KRABB_XVFB").unwrap_or_else(|_| "Xvfb".into());
     let startup = startup_config()?;
 
-    open_with_config(state, owner, &mode, &display, &xvfb, startup).await
+    #[cfg(target_os = "linux")]
+    {
+        let mode = std::env::var("KRABB_COMPUTER_MODE").unwrap_or_default();
+        let display = std::env::var("KRABB_COMPUTER_DISPLAY").unwrap_or_default();
+        let xvfb = std::env::var("KRABB_XVFB").unwrap_or_else(|_| "Xvfb".into());
+
+        open_with_config(state, owner, &mode, &display, &xvfb, startup).await
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        if startup.is_some() {
+            return Err(denied(
+                "KRABB_COMPUTER_STARTUP is supported only by the isolated Linux backend.",
+            ));
+        }
+
+        open_native(state, owner)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (state, owner, startup);
+        Err(denied("The computer plugin does not support this operating system."))
+    }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn open_native(state: &mut ComputerState, owner: &str) -> krabb_core::Result<Value> {
+    let mode = std::env::var("KRABB_COMPUTER_MODE").unwrap_or_default();
+
+    let host_control = std::env::var("KRABB_COMPUTER_ALLOW_HOST_CONTROL").unwrap_or_default();
+
+    if mode != "interactive" || host_control != "1" {
+        return Err(denied(
+            "Interactive desktop control requires KRABB_COMPUTER_MODE=interactive and KRABB_COMPUTER_ALLOW_HOST_CONTROL=1.",
+        ));
+    }
+
+    if state.owner.is_some() {
+        return Err(denied("The interactive desktop is already owned by another session."));
+    }
+
+    let dimensions = native::display_info()?;
+    let session_id = session_id()?;
+    let display = format!("{}x{}", dimensions["width"], dimensions["height"]);
+    state.owner = Some(owner.into());
+    state.session_id = Some(session_id.clone());
+    state.last_used = Some(std::time::Instant::now());
+    state.display = Some(display.clone());
+
+    Ok(json!({
+        "opened": true,
+        "session_id": session_id,
+        "display": display,
+        "mode": "interactive"
+    }))
+}
+
+#[cfg(target_os = "linux")]
 async fn open_with_config(
     state: &mut ComputerState,
     owner: &str,
@@ -326,10 +295,6 @@ async fn open_with_config(
     xvfb: &str,
     startup: Option<(std::ffi::OsString, Vec<std::ffi::OsString>)>,
 ) -> krabb_core::Result<Value> {
-    if !cfg!(target_os = "linux") {
-        return Err(denied("The computer plugin currently supports Linux X11 only."));
-    }
-
     if mode != "isolated" || !valid_display(display) {
         return Err(denied(
             "Computer access requires KRABB_COMPUTER_MODE=isolated and a dedicated X11 display above :0.",
@@ -341,6 +306,7 @@ async fn open_with_config(
     }
 
     let session_id = session_id()?;
+
     let auth_dir = auth_directory()?;
     let authority = auth_dir.join("Xauthority");
     let mut cookie = [0_u8; 16];
@@ -485,10 +451,12 @@ async fn close(
         return Err(denied("Computer session is unavailable to this Krabb session."));
     }
 
+    #[cfg(target_os = "linux")]
     if let Some(application) = state.application.take() {
         stop_owned_process(application, state.application_group.take()).await;
     }
 
+    #[cfg(target_os = "linux")]
     if let Some(server) = state.server.take() {
         stop_owned_process(server, state.server_group.take()).await;
     }
@@ -521,14 +489,16 @@ fn owned_display<'a>(
 }
 
 async fn expire_session(state: &mut ComputerState) -> krabb_core::Result<()> {
-    if !state.last_used.is_some_and(|last_used| last_used.elapsed() >= SESSION_IDLE) {
+    if state.last_used.is_none_or(|last_used| last_used.elapsed() < SESSION_IDLE) {
         return Ok(());
     }
 
+    #[cfg(target_os = "linux")]
     if let Some(application) = state.application.take() {
         stop_owned_process(application, state.application_group.take()).await;
     }
 
+    #[cfg(target_os = "linux")]
     if let Some(server) = state.server.take() {
         stop_owned_process(server, state.server_group.take()).await;
     }
@@ -555,14 +525,337 @@ fn owned_authority(
         return Err(denied("Computer session is unavailable to this Krabb session."));
     }
 
-    state
-        .auth_dir
-        .as_ref()
-        .map(|directory| directory.join("Xauthority"))
-        .ok_or_else(|| denied("Computer session has no X11 authorization."))
+    #[cfg(target_os = "linux")]
+    {
+        state
+            .auth_dir
+            .as_ref()
+            .map(|directory| directory.join("Xauthority"))
+            .ok_or_else(|| denied("Computer session has no X11 authorization."))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = state;
+        Ok(PathBuf::new())
+    }
 }
 
-async fn screenshot(
+async fn display_info(display: &str, authority: &std::path::Path) -> krabb_core::Result<Value> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = run("xdotool", &["getdisplaygeometry"], display, authority).await?;
+        let dimensions = output
+            .split_whitespace()
+            .filter_map(|part| part.parse::<u32>().ok())
+            .collect::<Vec<_>>();
+
+        if dimensions.len() != 2 {
+            return Err(denied("Could not read isolated display dimensions."));
+        }
+
+        Ok(json!({"display": display, "width": dimensions[0], "height": dimensions[1]}))
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let _ = (display, authority);
+        native::display_info()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (display, authority);
+        Err(denied("The computer plugin does not support this operating system."))
+    }
+}
+
+async fn list_windows(display: &str, authority: &std::path::Path) -> krabb_core::Result<Value> {
+    #[cfg(target_os = "linux")]
+    {
+        let output =
+            run("xdotool", &["search", "--onlyvisible", "--name", "."], display, authority)
+                .await
+                .unwrap_or_default();
+        let ids = output
+            .lines()
+            .filter(|id| {
+                !id.is_empty() && id.len() <= 32 && id.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            .take(65)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let truncated = ids.len() > 64;
+        let mut windows = Vec::new();
+
+        for id in ids.iter().take(64) {
+            let Ok(title) = run("xdotool", &["getwindowname", id], display, authority).await else {
+                continue;
+            };
+
+            let Ok(geometry) =
+                run("xdotool", &["getwindowgeometry", "--shell", id], display, authority).await
+            else {
+                continue;
+            };
+
+            if let Some(bounds) = window_bounds(&geometry) {
+                windows.push(json!({
+                    "title": title.trim().chars().take(512).collect::<String>(),
+                    "x": bounds.0,
+                    "y": bounds.1,
+                    "width": bounds.2,
+                    "height": bounds.3
+                }));
+            }
+        }
+
+        Ok(json!({"windows": windows, "truncated": truncated}))
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let _ = (display, authority);
+        native::list_windows()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (display, authority);
+        Err(denied("The computer plugin does not support this operating system."))
+    }
+}
+
+async fn capture_screen(
+    display: &str,
+    authority: &std::path::Path,
+    format: &str,
+) -> krabb_core::Result<Value> {
+    #[cfg(target_os = "linux")]
+    {
+        return linux_screenshot(display, authority, format).await;
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let _ = (display, authority);
+        native::capture_screen(format)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (display, authority, format);
+        Err(denied("The computer plugin does not support this operating system."))
+    }
+}
+
+async fn move_pointer(
+    display: &str,
+    authority: &std::path::Path,
+    x: i64,
+    y: i64,
+) -> krabb_core::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut release = InputRelease::new(display, authority.to_path_buf());
+        run("xdotool", &["mousemove", &x.to_string(), &y.to_string()], display, authority).await?;
+        release.disarm();
+
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let _ = (display, authority);
+        native::move_pointer(x, y)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (display, authority, x, y);
+        Err(denied("The computer plugin does not support this operating system."))
+    }
+}
+
+async fn click_pointer(
+    display: &str,
+    authority: &std::path::Path,
+    x: i64,
+    y: i64,
+    button: &str,
+    double: bool,
+) -> krabb_core::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let button = mouse_button(button)?;
+        let mut release = InputRelease::new(display, authority.to_path_buf());
+        run("xdotool", &["mousemove", &x.to_string(), &y.to_string()], display, authority).await?;
+        let count = if double { "2" } else { "1" };
+
+        run("xdotool", &["click", "--repeat", count, button], display, authority).await?;
+        release.disarm();
+
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let _ = (display, authority);
+        native::click_pointer(x, y, button, double)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (display, authority, x, y, button, double);
+        Err(denied("The computer plugin does not support this operating system."))
+    }
+}
+
+async fn drag_pointer(
+    display: &str,
+    authority: &std::path::Path,
+    x: i64,
+    y: i64,
+    to_x: i64,
+    to_y: i64,
+    button: &str,
+) -> krabb_core::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let button = mouse_button(button)?;
+        let mut release = InputRelease::new(display, authority.to_path_buf());
+        run("xdotool", &["mousemove", &x.to_string(), &y.to_string()], display, authority).await?;
+        run("xdotool", &["mousedown", button], display, authority).await?;
+        let drag = run(
+            "xdotool",
+            &["mousemove", "--sync", &to_x.to_string(), &to_y.to_string(), "mouseup", button],
+            display,
+            authority,
+        )
+        .await;
+
+        if drag.is_err() {
+            let _ = run("xdotool", &["mouseup", button], display, authority).await;
+        }
+
+        drag?;
+        release.disarm();
+
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let _ = (display, authority);
+        native::drag_pointer(x, y, to_x, to_y, button)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (display, authority, x, y, to_x, to_y, button);
+        Err(denied("The computer plugin does not support this operating system."))
+    }
+}
+
+async fn scroll_pointer(
+    display: &str,
+    authority: &std::path::Path,
+    x: i64,
+    y: i64,
+    amount: i64,
+) -> krabb_core::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut release = InputRelease::new(display, authority.to_path_buf());
+        run("xdotool", &["mousemove", &x.to_string(), &y.to_string()], display, authority).await?;
+
+        if amount != 0 {
+            let button = if amount < 0 { "4" } else { "5" };
+
+            run(
+                "xdotool",
+                &["click", "--repeat", &amount.unsigned_abs().to_string(), button],
+                display,
+                authority,
+            )
+            .await?;
+        }
+
+        release.disarm();
+
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let _ = (display, authority);
+        native::scroll_pointer(x, y, amount)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (display, authority, x, y, amount);
+        Err(denied("The computer plugin does not support this operating system."))
+    }
+}
+
+async fn press_key(
+    display: &str,
+    authority: &std::path::Path,
+    key: &str,
+) -> krabb_core::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut release = InputRelease::new(display, authority.to_path_buf());
+        run("xdotool", &["key", "--clearmodifiers", key], display, authority).await?;
+        release.disarm();
+
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let _ = (display, authority);
+        native::press_key(key)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (display, authority, key);
+        Err(denied("The computer plugin does not support this operating system."))
+    }
+}
+
+async fn type_text(
+    display: &str,
+    authority: &std::path::Path,
+    text: &str,
+) -> krabb_core::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut release = InputRelease::new(display, authority.to_path_buf());
+        run("xdotool", &["type", "--clearmodifiers", "--delay", "0", text], display, authority)
+            .await?;
+        release.disarm();
+
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let _ = (display, authority);
+        native::type_text(text)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (display, authority, text);
+        Err(denied("The computer plugin does not support this operating system."))
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn linux_screenshot(
     display: &str,
     authority: &std::path::Path,
     format: &str,
@@ -619,6 +912,7 @@ async fn screenshot(
     }))
 }
 
+#[cfg(target_os = "linux")]
 async fn run(
     program: &str,
     arguments: &[&str],
@@ -628,6 +922,7 @@ async fn run(
     run_with_authority(program, arguments, display, authority).await
 }
 
+#[cfg(target_os = "linux")]
 async fn run_with_authority(
     program: &str,
     arguments: &[&str],
@@ -660,12 +955,14 @@ async fn run_with_authority(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+#[cfg(target_os = "linux")]
 struct InputRelease {
     display: String,
     authority: PathBuf,
     armed: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl InputRelease {
     fn new(display: &str, authority: PathBuf) -> Self {
         Self { display: display.into(), authority, armed: true }
@@ -676,6 +973,7 @@ impl InputRelease {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for InputRelease {
     fn drop(&mut self) {
         if !self.armed {
@@ -703,6 +1001,7 @@ impl Drop for InputRelease {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn desktop_application(
     program: std::ffi::OsString,
     arguments: Vec<std::ffi::OsString>,
@@ -728,6 +1027,7 @@ fn desktop_application(
     command
 }
 
+#[cfg(target_os = "linux")]
 fn isolate_process(command: &mut Command) {
     #[cfg(unix)]
     command.process_group(0);
@@ -746,6 +1046,7 @@ fn kill_owned_group(process_id: Option<u32>) {
     let _ = process_id;
 }
 
+#[cfg(target_os = "linux")]
 async fn stop_owned_process(mut child: Child, process_id: Option<u32>) {
     #[cfg(unix)]
     if let Some(id) = process_id.and_then(|id| i32::try_from(id).ok()).and_then(Pid::from_raw) {
@@ -792,6 +1093,7 @@ fn startup_config() -> krabb_core::Result<Option<(std::ffi::OsString, Vec<std::f
     Ok(Some((program, arguments.into_iter().map(Into::into).collect())))
 }
 
+#[cfg(target_os = "linux")]
 fn command(program: &str) -> Command {
     #[cfg(test)]
     if let Some(directory) = TEST_COMMAND_DIRECTORY.get() {
@@ -801,6 +1103,7 @@ fn command(program: &str) -> Command {
     Command::new(program)
 }
 
+#[cfg(target_os = "linux")]
 fn desktop_command(program: &str, display: &str, authority: &std::path::Path) -> Command {
     let mut command = command(program);
 
@@ -813,6 +1116,7 @@ fn desktop_command(program: &str, display: &str, authority: &std::path::Path) ->
     command
 }
 
+#[cfg(target_os = "linux")]
 fn auth_directory() -> krabb_core::Result<PathBuf> {
     let mut random = [0_u8; 16];
     getrandom::fill(&mut random)
@@ -836,6 +1140,7 @@ fn auth_directory() -> krabb_core::Result<PathBuf> {
     Ok(directory)
 }
 
+#[cfg(target_os = "linux")]
 fn valid_display(display: &str) -> bool {
     let Some(number) = display.strip_prefix(':').and_then(|rest| rest.split('.').next()) else {
         return false;
@@ -870,6 +1175,7 @@ fn bounded_integer(
         .ok_or_else(|| denied(format!("{name} must be between {minimum} and {maximum}.")))
 }
 
+#[cfg(target_os = "linux")]
 fn window_bounds(output: &str) -> Option<(i32, i32, u32, u32)> {
     let mut values = BTreeMap::new();
 
@@ -897,6 +1203,7 @@ fn window_bounds(output: &str) -> Option<(i32, i32, u32, u32)> {
     Some((x, y, width as u32, height as u32))
 }
 
+#[cfg(target_os = "linux")]
 fn mouse_button(button: &str) -> krabb_core::Result<&'static str> {
     match button {
         "left" => Ok("1"),
@@ -936,17 +1243,17 @@ fn tool_specs() -> Vec<ToolSpec> {
     [
         (
             "computer_open",
-            "Claim the configured isolated X11 display.",
+            "Claim the configured computer display for this session.",
             object_schema(json!({}), &[]),
         ),
         (
             "computer_close",
-            "Release the owned isolated display session.",
+            "Release the owned computer display session.",
             object_schema(json!({"session_id":{"type":"string"}}), &["session_id"]),
         ),
         (
             "computer_displays",
-            "Read dimensions of the owned isolated display.",
+            "Read dimensions of the owned computer display.",
             object_schema(json!({"session_id":{"type":"string"}}), &["session_id"]),
         ),
         (
@@ -956,7 +1263,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         ),
         (
             "computer_screenshot",
-            "Capture the owned isolated display as an image.",
+            "Capture the owned computer display as an image.",
             object_schema(
                 json!({"session_id":{"type":"string"},"format":{"type":"string","enum":["png","jpeg"]}}),
                 &["session_id"],
@@ -1019,7 +1326,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         ),
         (
             "computer_keypress",
-            "Press a bounded X11 key name or combination.",
+            "Press a supported key name or key combination.",
             object_schema(
                 json!({"session_id":{"type":"string"},"key":{"type":"string","minLength":1,"maxLength":64}}),
                 &["session_id", "key"],

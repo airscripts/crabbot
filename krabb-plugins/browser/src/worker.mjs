@@ -137,7 +137,10 @@ async function launch() {
       timeout: 30000,
       proxy,
       env: Object.fromEntries(
-        ['PATH', 'HOME', 'USERPROFILE', 'TMPDIR', 'TMP', 'TEMP']
+        [
+          'PATH', 'HOME', 'USERPROFILE', 'TMPDIR', 'TMP', 'TEMP',
+          'SystemRoot', 'WINDIR', 'APPDATA', 'LOCALAPPDATA',
+        ]
           .filter((key) => process.env[key])
           .map((key) => [key, process.env[key]]),
       ),
