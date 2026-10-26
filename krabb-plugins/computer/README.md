@@ -85,6 +85,8 @@ KRABB_COMPUTER_PLUGIN="$PWD/target/debug/krabb-plugin-computer" \
 The integration test launches a disposable authenticated Xvfb display and a
 small local Tk application. It checks window discovery, PNG screenshot bytes,
 pointer input, text entry, and cleanup without controlling the host desktop.
+This integration has been run successfully on Linux with the documented
+dependencies installed.
 
 If startup fails, check that `KRABB_COMPUTER_MODE=isolated`, the display number
 is dedicated and greater than `:0`, and Xvfb, `xauth`, `xdotool`, and

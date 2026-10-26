@@ -115,8 +115,10 @@ above. It starts a local mock HTTP proxy, serves a fixture page through it,
 checks context storage isolation, snapshots, viewport, full-page, and element
 PNG/JPEG screenshot bytes, dynamic waits, form interaction, scrolling, fresh
 and stale coordinate clicks, and tab lifecycle, delivery of untrusted page
-text, and redirect and popup attempts to reach loopback without contacting the
-destination server:
+text, and redirect and popup attempts to reach loopback. The mock egress proxy
+and private destination use separate local endpoints, and the harness fails
+if either case reaches the private destination server. This integration passed
+locally on Linux with Playwright 1.64.1 and its matching Chromium build:
 
 ```sh
 cargo build --locked -p krabb-plugin-browser

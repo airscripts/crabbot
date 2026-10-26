@@ -48,20 +48,21 @@
 | 1. Architecture investigation | Complete | Source inspection and browser backend decision recorded above. |
 | 2. Generic tool registry | Complete | `tools/list`, ownership routing, duplicate rejection, schema checks, and trusted session/turn context are implemented. |
 | 3. Multimodal tool results | Complete | Bounded image content reaches vision-capable providers and is omitted from persisted transcripts; screenshot tools are hidden from providers without vision support. |
-| 4. Browser foundation | In progress | Rust plugin, Playwright worker, session ownership, tool schemas, exact-host filtering, required proxy, and worker process-group cancellation are present. Live Playwright tests and externally enforced egress remain. |
-| 5. Browser interaction | In progress | Navigation, tabs, snapshots, viewport/full-page/element screenshots, semantic actions, coordinate freshness, bounded waits, and mutating-tool approval are present; live interaction and timeout recovery need validation. |
-| 6. Computer foundation | In progress | The plugin starts an authenticated, fixed-size Xvfb server on Linux and can launch one fixed operator-configured application. It does not touch the ambient desktop. |
-| 7. Computer interaction | In progress | Bounded pointer, click, drag, scroll, key, text, and screenshot calls use `xdotool`; cancellation schedules release of mouse buttons and common modifiers. Real desktop integration remains unverified. |
-| 8. Security hardening | In progress | Tool schemas, trusted owner routing, image limits, existing approval policy, private X authority, and cancellation paths exist. OS network/process/filesystem isolation remains deployment policy; browser proxy and remote-channel integration need validation. |
-| 9. End-to-end integration | In progress | A fake provider verifies that a tool screenshot reaches a later vision request as image data. Local Playwright and Xvfb interaction harnesses now run in dedicated CI jobs; those jobs have not run from this worktree. |
+| 4. Browser foundation | In progress | Rust plugin, Playwright worker, session ownership, tool schemas, exact-host filtering, required proxy, and worker process-group cancellation are present. The local Playwright integration passes; externally enforced egress remains deployment policy. |
+| 5. Browser interaction | In progress | Navigation, tabs, snapshots, viewport/full-page/element screenshots, semantic actions, coordinate freshness, bounded waits, and mutating-tool approval pass the local Playwright integration. Timeout recovery still needs validation. |
+| 6. Computer foundation | Complete | Local Xvfb integration verifies the authenticated fixed-size display, configured application startup, and cleanup. The plugin does not touch the ambient desktop. |
+| 7. Computer interaction | Complete | Local Xvfb integration verifies window discovery, screenshots, clicks, text entry, and cleanup; unit tests cover bounded input actions and cancellation release. |
+| 8. Security hardening | In progress | Tool schemas, trusted owner routing, image limits, existing approval policy, private X authority, and cancellation paths exist. OS network/process/filesystem isolation remains deployment policy. |
+| 9. End-to-end integration | Complete | The fake-provider screenshot test and local Playwright and Xvfb integration harnesses pass. GitHub reported no CI status checks or PR-triggered workflow runs for the checkpoint commit. |
 | 10. Documentation and distribution | Complete | Plugin READMEs, user docs, Cargo workspace, package scripts, coverage lists, and CI package matrices include both plugins. Runtime dependencies remain external and explicit. |
 
 ## Validation
 
-- The latest `make verify` passed on Linux, including formatting, the Rust
-  spacing check, workspace Clippy with warnings denied, workspace check,
-  workspace tests, package coverage gates, build, and source metrics. All
-  changed packages cleared their configured coverage gates.
+- The latest `make verify` passed on Linux outside the restricted sandbox,
+  including formatting, the Rust spacing check, workspace Clippy with warnings
+  denied, workspace check, workspace tests, package coverage gates, build, and
+  source metrics. All changed packages cleared their configured coverage gates;
+  runtime line coverage was 82.02% against the 80% threshold.
 - The macOS scheduler failure in the supplied CI log was traced to its fake
   scheduler not answering `reports`, adding the runtime RPC timeout to the
   recovery wait. The fixture now returns an empty report page, and the test
@@ -81,27 +82,28 @@
 - A scan of runtime asynchronous test waits found the shutdown fixture's
   fixed-delay race described above. Other waits were kept where they represent
   cancellation or protocol deadlines rather than readiness polling.
-- `node --check` passed for the browser worker and local browser integration
-  harness. Live Playwright behavior remains unverified because Playwright is
-  not installed and system Chromium cannot start in this environment. The
-  fixture covers storage isolation, dynamic controls, viewport/full-page/
-  element PNG/JPEG captures, coordinate freshness, and redirect and popup
-  attempts to reach loopback.
-- Computer unit tests passed. A new local integration harness launches a
-  disposable Tk application under the plugin-owned Xvfb session and checks
-  screenshots, window discovery, clicks, typing, and cleanup. This environment
-  lacks Xvfb, `xdotool`, ImageMagick `import`, and tkinter, so it could not run
-  here.
-- Dedicated browser and computer integration jobs were added to `verify.yml`.
-  They must pass on CI before those end-to-end acceptance requirements are
-  considered verified.
+- `node --check` passed for the browser worker and integration harness. The live
+  integration passed with Playwright 1.64.1 and Chromium 156.0.8078.4. The
+  redirect failure came from the harness using the same loopback endpoint for
+  its mock egress proxy and supposed private destination. Those now use
+  separate endpoints, and distinct redirect and popup assertions count actual
+  hits on the private destination server; both observed zero requests.
+- The computer integration passed on Linux with the documented dependencies.
+  It exposed a missing display positional argument in the Xvfb launch command;
+  adding the configured display made the authenticated Xvfb session ready and
+  the screenshot, window discovery, click, typing, and cleanup checks pass.
+- Dedicated browser and computer integration jobs are present in
+  `.github/workflows/verify.yml`. The GitHub connector returned no status checks
+  or PR-triggered workflow runs for `e661b49`, so CI has not confirmed these
+  jobs or the macOS scheduler fix.
 - Browser's eight tests and computer's eight tests pass locally. The protocol
   cancellation test and all 277 runtime tests passed in the latest `make verify`
   run. Windows GNU `cargo check` passes for both plugins.
 - A final process check found no leftover Cargo, plugin, Node, or Xvfb test
   processes.
-- The macOS fix still needs CI confirmation. If it repeats, replace the longer
-  readiness deadline with deterministic synchronization.
+- The `Starting` and `Stopping` service states are constructed on Linux and
+  Windows. Their `dead_code` allowance now applies only to targets that support
+  neither implementation; macOS service status maps to `Active` or `Inactive`.
 - Cancellation is a JSON-RPC notification keyed to the active request ID. The
   core server test confirms it aborts only the matching handler and continues
   serving requests. Browser cancellation kills the worker process group;

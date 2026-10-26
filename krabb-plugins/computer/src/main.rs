@@ -402,6 +402,7 @@ async fn open_with_config(
         .env("DISPLAY", display)
         .env("XAUTHORITY", &authority)
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .arg(display)
         .args(["-screen", "0", SCREEN, "-nolisten", "tcp", "-auth"])
         .arg(&authority)
         .stdin(Stdio::null())

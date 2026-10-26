@@ -14,3 +14,7 @@ Semantic Versioning.
   observations and explicit runtime dependencies.
 - Support viewport, full-page, and element browser screenshots with explicit
   coordinate-space metadata.
+
+### Fixed
+
+- Start the computer plugin's Xvfb server on its configured display.

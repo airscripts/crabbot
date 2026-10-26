@@ -13162,9 +13162,9 @@ fn service_at_with_status(
 enum ServiceState {
     Active,
     Inactive,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     Starting,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     Stopping,
     Failed,
     NotInstalled,
