@@ -14,6 +14,8 @@ same host bridge and persistence paths used by a running daemon.
 | Telegram Tools And Approvals | `runs_a_tool_turn_before_replying`, `prompts_for_signed_approval_before_mutating_tools`, `denied_prompt_never_dispatches_a_mutating_tool` |
 | Discord Media And Uploads | Discord normalization and media confinement tests, including text files, images, and voice-message audio |
 | Memory And Schedules | `memory_can_remember_list_and_forget`, scheduler lifecycle, retry, recovery, and execution tests |
+| Browser Automation | Browser ownership, worker timeout, and routing tests; Playwright fixture covers contexts, actions, viewport/full-page/element screenshots, coordinate freshness, and blocked loopback redirects/popups |
+| Isolated Computer Tools | Unit tests cover display ownership and bounded input; Xvfb integration exercises screenshots, windows, clicks, typing, and cleanup |
 | Discord Routing And Authorization | Discord `classifies_gateway_events`, `normalizes_gateway_messages`, and `prepares_approval_controls_and_normalizes_interactions` |
 | Isolated Worktrees | `isolates_group_workspaces` |
 | Provider And Model Switching | `manages_local_sessions_and_plugins`, `runs_session_commands_without_daemon` |
@@ -32,3 +34,7 @@ Docker image.
 Live Telegram, Discord, provider, and service-manager credentials are not
 required for acceptance. Operators should perform one credentialed smoke run
 before publishing a release, using the checklist in [Release](release.md).
+Linux CI runs the browser and computer integration harnesses with Playwright,
+Chromium, Xvfb, and a disposable local application. Other operating systems run
+the backend-independent unit tests and compile checks; they do not claim native
+desktop integration support.

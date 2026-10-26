@@ -16,7 +16,7 @@ use std::{
 use krabb_core::{
     plugin::serve_with,
     policy::{Policy, Shell},
-    types::{Capability, Hello, Protocol, Request, Response},
+    types::{Capability, Hello, Protocol, Request, Response, ToolSpec},
 };
 
 #[cfg(unix)]
@@ -109,6 +109,8 @@ async fn call_with_sandbox(
     };
 
     let result = match method.as_str() {
+        "tools/list" => serde_json::json!({"tools": tool_specs(policy.shell != Shell::Off)}),
+
         "read" => {
             let workspace = workspace(params["workspace"].as_str())?;
             let path = confined(
@@ -278,6 +280,58 @@ async fn call_with_sandbox(
     };
 
     response(id, result)
+}
+
+fn tool_specs(shell_enabled: bool) -> Vec<ToolSpec> {
+    let mut definitions = vec![
+        ("read", "Read a text file.", &["path"][..]),
+        (
+            "write",
+            "Write a text file with approval. Paths must remain inside the active workspace; use workspace-relative paths.",
+            &["path", "text"][..],
+        ),
+        ("list", "List workspace entries.", &["path"][..]),
+        ("search", "Search workspace text.", &["path", "text"][..]),
+        ("fetch", "Fetch bounded text from a public HTTPS URL.", &["url"][..]),
+        ("patch", "Apply an approved Git patch.", &["text"][..]),
+        ("git", "Inspect or manage approved Git worktrees.", &["args"][..]),
+    ];
+
+    if shell_enabled {
+        definitions.push((
+            "shell",
+            "Run an approved local shell command; it may inspect available paths beyond the workspace.",
+            &["command"][..],
+        ));
+    }
+
+    definitions
+        .into_iter()
+        .map(|(name, description, required)| {
+            let properties = required
+                .iter()
+                .map(|key| {
+                    let value = match *key {
+                        "args" => serde_json::json!({"type": "array", "items": {"type": "string"}}),
+                        _ => serde_json::json!({"type": "string"}),
+                    };
+
+                    ((*key).to_owned(), value)
+                })
+                .collect::<serde_json::Map<_, _>>();
+
+            ToolSpec {
+                name: name.into(),
+                description: Some(description.into()),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": false,
+                }),
+            }
+        })
+        .collect()
 }
 
 fn response(id: u64, result: serde_json::Value) -> krabb_core::Result<Option<Response>> {
@@ -1623,7 +1677,7 @@ fn read_text(file: std::fs::File) -> std::io::Result<String> {
 mod tests {
     use super::{
         ENTRY_LIMIT, Policy, Sandbox, Shell, apply, call, confined, denied, fetch_url_parse, file,
-        git, list_confined, patch_paths, public_ip, search, shell, shell_with,
+        git, list_confined, patch_paths, public_ip, search, shell, shell_with, tool_specs,
     };
 
     use krabb_core::types::{Request, Response};
@@ -1661,6 +1715,28 @@ mod tests {
             Sandbox::parse(Some("docker"), Some("local/tool:latest")).unwrap(),
             Some(Sandbox { runtime: "docker".into(), image: "local/tool:latest".into() })
         );
+    }
+
+    #[tokio::test]
+    async fn advertises_tool_schemas_for_enabled_operations() {
+        let root = test_root("tools-list");
+        fs::create_dir_all(&root).unwrap();
+        let response =
+            call(&policy(&root), Request::call(1, "tools/list", json!({}))).await.unwrap().unwrap();
+
+        let definitions = &response.result.unwrap()["tools"];
+
+        assert!(definitions.as_array().unwrap().iter().any(|tool| tool["name"] == "read"));
+        assert!(definitions.as_array().unwrap().iter().any(|tool| tool["name"] == "fetch"));
+        assert!(!definitions.as_array().unwrap().iter().any(|tool| tool["name"] == "shell"));
+        assert!(tool_specs(true).iter().any(|tool| tool.name == "shell"));
+        assert_eq!(
+            definitions.as_array().unwrap().iter().find(|tool| tool["name"] == "write").unwrap()["schema"]
+                ["required"],
+            json!(["path", "text"])
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

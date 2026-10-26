@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-plugins=(core acp a2a ag-ui codex anthropic openai gemini ollama openrouter telegram discord whatsapp signal slack sqlite memory scheduler tools mcp whisper tui)
+plugins=(core acp a2a ag-ui codex anthropic openai gemini ollama openrouter telegram discord whatsapp signal slack sqlite memory scheduler tools mcp whisper tui browser computer)
 
 usage() {
     printf '%s\n' 'Usage: krabb-scripts/package.sh VERSION TARGET'

@@ -14,9 +14,11 @@ memory, scheduling, speech recognition, MCP, and the TUI are independently
 installed process plugins.
 
 The supported experience includes Telegram, Discord, Codex, Anthropic and
-OpenAI APIs, Ollama Local/Cloud, ACP, A2A, AG-UI, a full terminal UI, local coding tools,
-persistent memory, scheduled tasks, MCP integrations, and local Whisper
-transcription.
+OpenAI APIs, Ollama Local/Cloud, ACP, A2A, AG-UI, a full terminal UI, local
+coding tools, persistent memory, scheduled tasks, MCP integrations, and local
+Whisper transcription. Experimental browser automation and isolated Linux X11
+computer tools are available as optional plugins with separate system
+dependencies.
 
 Follow Krabblab's workspace architecture, CI/CD conventions, documentation
 organization, release automation, and Agentskill orchestration. Use Apache-2.0,
@@ -46,8 +48,8 @@ Brand positioning:
   MCP, speech, or TUI implementation. Core-only startup still supports
   configuration, diagnostics, plugin management, and version reporting.
 - Official plugins include intelligence providers, messaging channels, tools,
-  memory and storage, and optional agent interoperability through ACP, A2A,
-  and AG-UI.
+  memory and storage, browser and isolated desktop controls, and optional agent
+  interoperability through ACP, A2A, and AG-UI.
 - Every plugin uses versioned JSON-RPC 2.0 over strict LF-delimited stdio. stdout is
   protocol-only and stderr is for redacted logs. Require handshake, protocol
   range negotiation, capability advertisement, health, shutdown, correlated
@@ -101,6 +103,14 @@ Brand positioning:
 - Accept text, images, safe text/code files, and voice. Gate media by model
   support and limits. Delete raw voice after transcription and expire other
   cached attachments after 24 hours unless pinned.
+- Browser observations can reach vision-capable models as temporary image
+  inputs. The Playwright plugin requires separately installed Node.js,
+  Playwright, and Chromium; network interception does not replace OS egress
+  controls.
+- The computer plugin starts an authenticated Xvfb session on Linux and can
+  launch one operator-configured application. Wayland and host-desktop control
+  are not supported; process, filesystem, and network isolation remain the
+  operator's responsibility.
 - Whisper downloads local models separately and is CPU-first.
 - SQLite supplies WAL persistence, migrations, leases, deduplication, and
   durable outbox support.

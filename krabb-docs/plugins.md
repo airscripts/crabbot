@@ -93,6 +93,62 @@ implements only the operations it declares. Media-capable channels may expose
 `media` to resolve a normalized external reference into a bounded private file.
 Do not add a direct dependency from one plugin to another.
 
+### Tool discovery and results
+
+A plugin advertising the `tool` capability can expose its model-callable tools
+through `tools/list`. Return an object with a `tools` array; every entry uses
+the normalized `ToolSpec` fields `name`, optional `description`, and JSON
+Schema `schema`. Keep names unique across all active tool plugins. The runtime
+rejects duplicate names rather than routing a call to an arbitrary provider.
+The legacy `tools` plugin keeps its built-in schemas as a fallback for older
+installed binaries that do not implement `tools/list`.
+
+Tool methods may return the legacy `{ "text": "..." }` result or normalized
+multimodal content:
+
+```json
+{
+  "content": [
+    { "kind": "text", "text": "Screenshot captured." },
+    {
+      "kind": "image",
+      "uri": "data:image/png;base64,...",
+      "alt": "Browser viewport"
+    }
+  ],
+  "metadata": { "width": 1280, "height": 720 }
+}
+```
+
+For non-`tools` providers, invocation parameters use a trusted envelope:
+`{ "arguments": <model arguments>, "host": { "session": "...", "turn": "..." } }`.
+The runtime supplies the host values after validating the model arguments. A
+plugin must use them for ownership and turn-scoped observations; it must never
+accept model-supplied values as a substitute.
+
+The runtime validates inline PNG/JPEG image data and enforces its image and
+protocol limits before adding it to the next model request. The selected model
+must advertise vision support. Temporary tool images remain available during
+the current turn and are replaced with text in persisted transcripts.
+
+The `browser` plugin requires Node.js, Playwright 1.64.1, and a separately
+installed Chromium build. Install those dependencies explicitly; browser turns
+never download executable packages. Its URL allowlist and request filters are
+defense in depth and do not replace an operating-system egress boundary. See
+[`krabb-plugins/browser/README.md`](../krabb-plugins/browser/README.md).
+
+The `computer` plugin supports isolated X11 on Linux. Set
+`KRABB_COMPUTER_MODE=isolated` and `KRABB_COMPUTER_DISPLAY=:N` (`N` greater
+than zero). The plugin starts Xvfb with a private Xauthority cookie and can
+start one operator-configured application. Its opaque session ID is required
+for every later action; sessions expire after ten idle minutes. It provides
+bounded visible-window summaries and PNG or JPEG screenshots. The plugin
+requires Xvfb, `xauth`, `xdotool`, and ImageMagick `import`; it does not support
+host desktop control. A virtual display does not itself confine processes,
+files, or network access.
+See
+[`krabb-plugins/computer/README.md`](../krabb-plugins/computer/README.md).
+
 ## Create A Custom Plugin
 
 Custom plugins are supported today. A plugin source directory needs a manifest

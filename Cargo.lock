@@ -1454,6 +1454,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "krabb-plugin-browser"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "krabb-core",
+ "krabb-log",
+ "rustix",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "krabb-plugin-codex"
 version = "0.1.0"
 dependencies = [
@@ -1463,6 +1475,19 @@ dependencies = [
  "krabb-file",
  "krabb-log",
  "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "krabb-plugin-computer"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "krabb-core",
+ "krabb-log",
+ "rustix",
  "serde_json",
  "tokio",
 ]

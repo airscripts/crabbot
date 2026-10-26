@@ -7,6 +7,10 @@ the public behavior stable.
 
 - Resolve all known high and medium reliability findings.
 - Improve recovery, cancellation, queue handling, persistence, and plugin updates.
+- Stabilize and verify the macOS scheduler-restart recovery test
+  `scheduler_recovers_again_after_the_plugin_process_restarts_in_place`; keep
+  its restart window generous enough for coverage-instrumented runners and add
+  deterministic readiness synchronization if the longer deadline still flakes.
 - Reconcile TUI session changes saved to the local fallback during daemon outages
   with the daemon's session catalog on reconnect; make replay safe and preserve
   history when both stores have changed.

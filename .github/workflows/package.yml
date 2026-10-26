@@ -99,7 +99,7 @@ jobs:
           cargo build --workspace --release --locked --target "$env:KRABB_TARGET"
           $version = $env:KRABB_VERSION
           $target = $env:KRABB_TARGET
-          $plugins = @("core", "acp", "a2a", "ag-ui", "codex", "anthropic", "openai", "gemini", "ollama", "openrouter", "telegram", "discord", "whatsapp", "signal", "slack", "sqlite", "memory", "scheduler", "tools", "mcp", "whisper", "tui")
+          $plugins = @("core", "acp", "a2a", "ag-ui", "codex", "anthropic", "openai", "gemini", "ollama", "openrouter", "telegram", "discord", "whatsapp", "signal", "slack", "sqlite", "memory", "scheduler", "tools", "mcp", "whisper", "tui", "browser", "computer")
 
           foreach ($plugin in $plugins) {
             $name = if ($plugin -eq "core") { "krabb" } else { "krabb-plugin-$plugin" }
@@ -138,7 +138,7 @@ jobs:
         run: |
           set -euo pipefail
           archives=(krabb-*-v${KRABB_VERSION}-${KRABB_TARGET}.tar.gz)
-          [[ ${#archives[@]} -eq 19 ]]
+          [[ ${#archives[@]} -eq 24 ]]
           stage=$(mktemp -d)
 
           for archive in "${archives[@]}"; do

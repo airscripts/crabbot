@@ -147,6 +147,12 @@ jobs:
           - name: Tools Plugin
             package: krabb-plugin-tools
 
+          - name: Browser Plugin
+            package: krabb-plugin-browser
+
+          - name: Computer Plugin
+            package: krabb-plugin-computer
+
           - name: Memory Plugin
             package: krabb-plugin-memory
 
@@ -181,6 +187,63 @@ jobs:
 
       - name: Test ${{ matrix.name }}
         run: cargo test --locked -p "${{ matrix.package }}"
+
+  browser_integration:
+    name: Browser Integration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        if: inputs.local != 'true'
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.89
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Playwright and Chromium
+        run: |
+          npm install --prefix "$RUNNER_TEMP/krabb-playwright" playwright@1.64.1
+          "$RUNNER_TEMP/krabb-playwright/node_modules/.bin/playwright" install --with-deps chromium
+
+      - name: Build Browser Plugin
+        run: cargo build --locked -p krabb-plugin-browser
+
+      - name: Run Browser Integration
+        run: node krabb-plugins/browser/tests/integration.mjs
+        env:
+          KRABB_BROWSER_PLUGIN: ${{ github.workspace }}/target/debug/krabb-plugin-browser
+          KRABB_PLAYWRIGHT_MODULE: ${{ runner.temp }}/krabb-playwright/node_modules/playwright/index.js
+
+  computer_integration:
+    name: Computer Integration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        if: inputs.local != 'true'
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.89
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Isolated Desktop Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y xvfb xauth xdotool imagemagick python3-tk
+
+      - name: Build Computer Plugin
+        run: cargo build --locked -p krabb-plugin-computer
+
+      - name: Run Computer Integration
+        run: python3 krabb-plugins/computer/tests/integration.py
+        env:
+          KRABB_COMPUTER_PLUGIN: ${{ github.workspace }}/target/debug/krabb-plugin-computer
 
   msrv:
     name: Minimum Rust Version

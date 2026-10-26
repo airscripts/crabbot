@@ -346,10 +346,11 @@ where
 
     let handle = Arc::new(handle);
     let mut workers = tokio::task::JoinSet::new();
+    let mut active = BTreeMap::<u64, tokio::task::AbortHandle>::new();
     let result = async {
         loop {
             tokio::select! {
-                request = requests.recv(), if workers.len() < CONCURRENT_HANDLERS => {
+                request = requests.recv() => {
                     let Some(request) = request else {
                         break;
                     };
@@ -370,9 +371,45 @@ where
                         continue;
                     }
 
+                    if let Request::Note { method, params, .. } = &request
+                        && method == "cancel"
+                    {
+                        if let Some(handle) = params["id"].as_u64().and_then(|id| active.get(&id)) {
+                            handle.abort();
+                        }
+
+                        continue;
+                    }
+
                     let method = match &request {
                         Request::Call { method, .. } | Request::Note { method, .. } => method.as_str(),
                     };
+
+                    if workers.len() >= CONCURRENT_HANDLERS
+                        && !matches!(method, "hello" | "ping" | "shutdown")
+                    {
+                        if let Some(id) = id {
+                            write_output(
+                                &sender,
+                                Response::fail(id, -32000, "plugin is at its concurrent request limit"),
+                            )
+                            .await?;
+                        }
+
+                        continue;
+                    }
+
+                    if id.is_some_and(|id| active.contains_key(&id)) {
+                        if let Some(id) = id {
+                            write_output(
+                                &sender,
+                                Response::fail(id, -32600, "request ID is already active"),
+                            )
+                            .await?;
+                        }
+
+                        continue;
+                    }
 
                     match method {
                         "hello" => {
@@ -412,7 +449,7 @@ where
                                 streams: Arc::clone(&streams),
                             };
 
-                            workers.spawn(async move {
+                            let worker = workers.spawn(async move {
                                 match handle(request, emitter).await {
                                     Ok(Some(response)) => write_output(&sender, response).await,
 
@@ -441,6 +478,11 @@ where
                                     }
                                 }
                             });
+
+                            if let Some(id) = id {
+                                active.retain(|_, handle| !handle.is_finished());
+                                active.insert(id, worker);
+                            }
                         }
                     }
                 }
@@ -451,11 +493,18 @@ where
                         Some(Ok(Err(error))) => return Err(error),
 
                         Some(Err(error)) => {
+                            if error.is_cancelled() {
+                                active.retain(|_, handle| !handle.is_finished());
+                                continue;
+                            }
+
                             return Err(Error::Protocol(format!("plugin request task failed: {error}")));
                         }
 
                         None => {}
                     }
+
+                    active.retain(|_, handle| !handle.is_finished());
                 }
             }
         }
@@ -466,6 +515,10 @@ where
                 Ok(Err(error)) => return Err(error),
 
                 Err(error) => {
+                    if error.is_cancelled() {
+                        continue;
+                    }
+
                     return Err(Error::Protocol(format!("plugin request task failed: {error}")));
                 }
             }
@@ -840,6 +893,14 @@ impl Process {
 
     pub async fn call(&mut self, request: Request) -> Result<Response> {
         self.call_stream(request, |_| {}).await
+    }
+
+    pub async fn notify(&mut self, request: Request) -> Result<()> {
+        if !request.valid() || request.id().is_some() {
+            return Err(Error::Protocol("notifications must be valid JSON-RPC notes".into()));
+        }
+
+        jsonl::write(&mut self.output, &request).await
     }
 
     pub async fn call_stream<F>(&mut self, request: Request, mut note: F) -> Result<Response>
@@ -1579,6 +1640,49 @@ fn main() {
         input.read_line(&mut line).await.unwrap();
         let shutdown: Response = serde_json::from_str(&line).unwrap();
         assert_eq!(shutdown.id, 3);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts_a_request_without_stopping_the_plugin() {
+        let (client, server) = duplex(16 * 1024);
+        let (mut client_read, mut client_write) = split(client);
+        let (server_read, server_write) = split(server);
+        let handle = |request: Request, _emitter: Emitter| async move {
+            let Request::Call { id, .. } = request else {
+                return Ok(None);
+            };
+
+            if id == 1 {
+                std::future::pending::<()>().await;
+            }
+
+            Ok(Some(Response::ok(id, json!({"done": true}))))
+        };
+
+        let task = tokio::spawn(async move {
+            serve_io_events_concurrent(hello(), BufReader::new(server_read), server_write, handle)
+                .await
+        });
+
+        jsonl::write(&mut client_write, &Request::call(1, "run", json!({}))).await.unwrap();
+        jsonl::write(
+            &mut client_write,
+            &Request::Note {
+                jsonrpc: "2.0".into(),
+                method: "cancel".into(),
+                params: json!({"id": 1}),
+            },
+        )
+        .await
+        .unwrap();
+        jsonl::write(&mut client_write, &Request::call(2, "shutdown", json!({}))).await.unwrap();
+
+        let mut input = BufReader::new(&mut client_read);
+        let mut line = String::new();
+        timeout(Duration::from_secs(1), input.read_line(&mut line)).await.unwrap().unwrap();
+        let shutdown: Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(shutdown.id, 2);
         task.await.unwrap().unwrap();
     }
 
