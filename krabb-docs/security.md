@@ -74,11 +74,12 @@ The browser plugin requires a configured HTTP(S) egress proxy and checks an
 exact host allowlist and resolved addresses for each request. Configure that
 proxy to repeat the host and address checks at connect time; DNS validation in
 the browser plugin alone cannot prevent rebinding. Apply an OS/container egress
-policy as a second boundary. The computer
-plugin starts an authenticated Xvfb server for an explicitly configured display
-above `:0`; operators remain responsible for process, filesystem, and network
-sandboxing around Krabb and any desktop applications. The plugin does not
-provide host desktop control.
+policy as a second boundary. On Linux, the computer plugin starts an
+authenticated Xvfb server for an explicitly configured display above `:0`. On
+macOS and Windows, interactive desktop control requires explicit opt-in and
+operating-system permissions, and it affects the signed-in user's desktop.
+Operators remain responsible for process, filesystem, and network sandboxing
+around Krabb and any desktop applications.
 Plugin restarts terminate their process trees so canceled shell descendants do
 not continue after the host has stopped a turn. Provider and channel response
 bodies reserve protocol-frame headroom, plugin metadata and persisted values

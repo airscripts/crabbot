@@ -16,9 +16,10 @@ installed process plugins.
 The supported experience includes Telegram, Discord, Codex, Anthropic and
 OpenAI APIs, Ollama Local/Cloud, ACP, A2A, AG-UI, a full terminal UI, local
 coding tools, persistent memory, scheduled tasks, MCP integrations, and local
-Whisper transcription. Experimental browser automation and isolated Linux X11
-computer tools are available as optional plugins with separate system
-dependencies.
+Whisper transcription. Experimental browser automation and computer control are
+available as optional plugins with separate system dependencies. Computer
+control uses isolated Xvfb on Linux and explicitly enabled interactive desktop
+access on macOS and Windows.
 
 Follow Krabblab's workspace architecture, CI/CD conventions, documentation
 organization, release automation, and Agentskill orchestration. Use Apache-2.0,
@@ -107,9 +108,10 @@ Brand positioning:
   inputs. The Playwright plugin requires separately installed Node.js,
   Playwright, and Chromium; network interception does not replace OS egress
   controls.
-- The computer plugin starts an authenticated Xvfb session on Linux and can
-  launch one operator-configured application. Wayland and host-desktop control
-  are not supported; process, filesystem, and network isolation remain the
+- The computer plugin starts an authenticated Xvfb session on Linux. On macOS
+  and Windows it can control the signed-in desktop only when the operator sets
+  interactive mode and explicitly enables host control. Native desktop access
+  is not isolated; process, filesystem, and network isolation remain the
   operator's responsibility.
 - Whisper downloads local models separately and is CPU-first.
 - SQLite supplies WAL persistence, migrations, leases, deduplication, and
@@ -176,7 +178,7 @@ Brand positioning:
   scheduler, a Discord thread with authorization and a worktree, provider
   switching without history loss, core-only diagnostics, and update rollback.
   The deterministic evidence matrix is maintained in
-  [Acceptance](acceptance.md).
+  [Compatibility And Deployment Checks](../COMPATIBILITY.md).
 
 Browser automation, video, text-to-speech, Telegram webhooks,
 email/calendar/smart-home integrations, hosted multi-tenancy, Claude Code

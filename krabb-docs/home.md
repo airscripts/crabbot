@@ -22,7 +22,8 @@ these guides when operating or extending an installation:
 13. [Release](release.md) — packaging, checksums, and publication gates.
 14. [License](license.md) — Apache-2.0 rationale and contribution terms.
 15. [Product](product.md) — capabilities, boundaries, and engineering principles.
-16. [Acceptance](acceptance.md) — deterministic product and release flows.
+16. [Compatibility And Deployment Checks](../COMPATIBILITY.md) — platform
+    support, automated coverage, and manual deployment checks.
 
 ## Request Flow
 

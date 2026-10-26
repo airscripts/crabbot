@@ -93,7 +93,7 @@ implements only the operations it declares. Media-capable channels may expose
 `media` to resolve a normalized external reference into a bounded private file.
 Do not add a direct dependency from one plugin to another.
 
-### Tool discovery and results
+### Tool Discovery And Results
 
 A plugin advertising the `tool` capability can expose its model-callable tools
 through `tools/list`. Return an object with a `tools` array; every entry uses
@@ -137,15 +137,17 @@ never download executable packages. Its URL allowlist and request filters are
 defense in depth and do not replace an operating-system egress boundary. See
 [`krabb-plugins/browser/README.md`](../krabb-plugins/browser/README.md).
 
-The `computer` plugin supports isolated X11 on Linux. Set
+The `computer` plugin supports an isolated X11 session on Linux. Set
 `KRABB_COMPUTER_MODE=isolated` and `KRABB_COMPUTER_DISPLAY=:N` (`N` greater
 than zero). The plugin starts Xvfb with a private Xauthority cookie and can
-start one operator-configured application. Its opaque session ID is required
-for every later action; sessions expire after ten idle minutes. It provides
-bounded visible-window summaries and PNG or JPEG screenshots. The plugin
-requires Xvfb, `xauth`, `xdotool`, and ImageMagick `import`; it does not support
-host desktop control. A virtual display does not itself confine processes,
-files, or network access.
+start one operator-configured application. It also supports interactive desktop
+control on macOS and Windows when both `KRABB_COMPUTER_MODE=interactive` and
+`KRABB_COMPUTER_ALLOW_HOST_CONTROL=1` are set. Interactive mode controls the
+signed-in desktop and requires the OS privacy permissions for input and screen
+capture; it does not provide an isolated desktop. Its opaque session ID is
+required for every later action, and sessions expire after ten idle minutes.
+Linux requires Xvfb, `xauth`, `xdotool`, and ImageMagick `import`. A virtual
+display does not itself confine processes, files, or network access.
 See
 [`krabb-plugins/computer/README.md`](../krabb-plugins/computer/README.md).
 
@@ -309,7 +311,7 @@ The Whisper plugin is an optional local adapter. It invokes an explicitly
 configured executable against a root-confined path and returns text, keeping
 native model dependencies outside the workspace core.
 
-## Agent interoperability
+## Agent Interoperability
 
 ACP starts a configured local agent, creates or resumes its protocol sessions,
 and forwards text, progress, and tool status updates. Its filesystem callbacks

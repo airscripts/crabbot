@@ -72,7 +72,7 @@ policy have been reviewed.
 
 Use `krabb plugin list` and `krabb doctor` to inspect installed providers.
 
-## Agent interoperability
+## Agent Interoperability
 
 The `acp` plugin starts a configured local executable that implements ACP. The
 `a2a` plugin discovers and calls a remote A2A agent. The `ag-ui` plugin serves
