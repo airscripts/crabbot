@@ -1,4 +1,4 @@
-# AG-UI plugin
+# AG-UI Plugin
 
 The AG-UI plugin serves a local HTTP endpoint that accepts AG-UI run input and
 streams events as chunked server-sent events. It calls the configured Krabb

@@ -269,7 +269,18 @@ fn parse_options(args: &[String]) -> krabb_core::Result<TuiOptions> {
 }
 
 async fn run(args: &[String]) -> krabb_core::Result<Option<String>> {
-    let options = parse_options(args)?;
+    let mut options = parse_options(args)?;
+
+    if let Some(prompt) = options.once.take() {
+        return run_one_shot(options, prompt).await.map(Some);
+    }
+
+    run_interactive(options).await?;
+
+    Ok(None)
+}
+
+async fn run_one_shot(options: TuiOptions, prompt: String) -> krabb_core::Result<String> {
     let model_override = options.model.clone();
     let plugin = options
         .plugin
@@ -285,47 +296,60 @@ async fn run(args: &[String]) -> krabb_core::Result<Option<String>> {
 
     require_daemon(&home).await?;
 
-    if let Some(prompt) = options.once {
-        let temporary_session = options.session.is_none();
-        let session = match options.session {
-            Some(session) => selected_session_id(Some(session)),
-            None => one_shot_session_id()?,
-        };
+    let temporary_session = options.session.is_none();
+    let session = match options.session {
+        Some(session) => selected_session_id(Some(session)),
+        None => one_shot_session_id()?,
+    };
 
-        let result = run_once(
-            home.clone(),
-            plugin,
-            model,
-            model_override,
-            session.clone(),
-            prompt,
-            daemon_control,
+    let result = run_once(
+        home.clone(),
+        plugin,
+        model,
+        model_override,
+        session.clone(),
+        prompt,
+        daemon_control,
+    )
+    .await;
+
+    if temporary_session {
+        let cleanup = daemon_control(
+            home,
+            "session.delete".into(),
+            serde_json::json!({"id": session, "deep": true}),
         )
         .await;
 
-        if temporary_session {
-            let cleanup = daemon_control(
-                home,
-                "session.delete".into(),
-                serde_json::json!({"id": session, "deep": true}),
-            )
-            .await;
-
-            if result.is_ok() {
-                cleanup?;
-            }
+        if result.is_ok() {
+            cleanup?;
         }
-
-        return result.map(Some);
     }
+
+    result
+}
+
+async fn run_interactive(options: TuiOptions) -> krabb_core::Result<()> {
+    let model_override = options.model.clone();
+    let plugin = options
+        .plugin
+        .or_else(|| std::env::var("KRABB_MODEL_PLUGIN").ok())
+        .unwrap_or_else(|| "codex".into());
+
+    let model = options
+        .model
+        .or_else(|| std::env::var("KRABB_MODEL").ok())
+        .unwrap_or_else(|| DEFAULT_MODEL.into());
+
+    let home = std::env::var("KRABB_HOME").unwrap_or_else(|_| ".config/krabb".into());
+
+    require_daemon(&home).await?;
 
     let session = resolve_session_id(&home, options.session, daemon_control).await?;
 
     let input = terminal("r")?;
     let output = terminal("w")?;
-    run_at(input, output, home, plugin, model, model_override, session).await?;
-
-    Ok(None)
+    run_at(input, output, home, plugin, model, model_override, session).await
 }
 
 fn selected_session_id(session: Option<String>) -> String {

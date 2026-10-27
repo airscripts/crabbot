@@ -609,7 +609,7 @@ async fn rejects_an_oversized_response_before_parsing() {
         );
 
         stream.write_all(header.as_bytes()).await.unwrap();
-        stream.write_all(&body).await.unwrap();
+        let _ = stream.write_all(&body).await;
     });
 
     let request = ModelRequest {

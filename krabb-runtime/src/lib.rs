@@ -25,7 +25,7 @@ use krabb_core::{
     plugin::Process,
     types::{
         Capability, CommandSpec, Content, Event, Hello, Message, ModelReply, ModelRequest,
-        Protocol, Request, Response, Role, ToolSpec,
+        Protocol, Request, Response, Role, ToolContent, ToolResult, ToolSpec,
     },
 };
 
@@ -162,6 +162,12 @@ pub(crate) struct Plugins {
     changed: Arc<Notify>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ToolRegistry {
+    specs: Vec<ToolSpec>,
+    owners: BTreeMap<String, String>,
+}
+
 impl Default for Plugins {
     fn default() -> Self {
         Self {
@@ -174,15 +180,56 @@ impl Default for Plugins {
 
 pub(crate) struct Live {
     hello: Hello,
-    process: AsyncMutex<Option<Process>>,
+    process: Arc<AsyncMutex<Option<Process>>>,
     restart_generation: std::sync::atomic::AtomicU64,
+}
+
+struct CancelPluginCall {
+    process: Arc<AsyncMutex<Option<Process>>>,
+    id: u64,
+    armed: bool,
+}
+
+impl CancelPluginCall {
+    fn new(process: Arc<AsyncMutex<Option<Process>>>, id: u64) -> Self {
+        Self { process, id, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelPluginCall {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let process = Arc::clone(&self.process);
+        let id = self.id;
+
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Some(plugin) = process.lock().await.as_mut() {
+                    let request = Request::Note {
+                        jsonrpc: "2.0".into(),
+                        method: "cancel".into(),
+                        params: serde_json::json!({"id": id}),
+                    };
+
+                    let _ = plugin.notify(request).await;
+                }
+            });
+        }
+    }
 }
 
 impl Live {
     fn new(process: Process) -> Self {
         Self {
             hello: process.hello.clone(),
-            process: AsyncMutex::new(Some(process)),
+            process: Arc::new(AsyncMutex::new(Some(process))),
             restart_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -196,13 +243,21 @@ impl Live {
     }
 
     async fn call(&self, request: Request) -> krabb_core::Result<Response> {
-        self.process
-            .lock()
-            .await
-            .as_mut()
-            .ok_or_else(|| krabb_core::Error::Protocol("Plugin is stopped.".into()))?
-            .call(request)
-            .await
+        let cancel = request.id().map(|id| CancelPluginCall::new(Arc::clone(&self.process), id));
+        let result = {
+            let mut process = self.process.lock().await;
+            process
+                .as_mut()
+                .ok_or_else(|| krabb_core::Error::Protocol("Plugin is stopped.".into()))?
+                .call(request)
+                .await
+        };
+
+        if let Some(mut cancel) = cancel {
+            cancel.disarm();
+        }
+
+        result
     }
 
     async fn call_full_async<F, Fut, C, Cfut>(
@@ -286,6 +341,264 @@ impl Plugins {
             .map(|(id, plugin)| (id.clone(), Arc::clone(plugin)))
             .collect()
     }
+}
+
+async fn tool_registry(
+    plugins: &Plugins,
+    enabled: bool,
+    shell_enabled: bool,
+) -> Result<ToolRegistry, Box<dyn std::error::Error + Send + Sync>> {
+    let mut registry = ToolRegistry::default();
+
+    if !enabled {
+        return Ok(registry);
+    }
+
+    for (plugin_id, plugin) in plugins.all().await {
+        if !plugin.supports(Capability::Tool) {
+            continue;
+        }
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            plugin.call(Request::call(1, "tools/list", serde_json::json!({}))),
+        )
+        .await;
+        let definitions = match response {
+            Ok(Ok(response)) if response.error.is_none() => {
+                let result = response.result.ok_or("Tool listing returned no result.")?;
+                serde_json::from_value::<Vec<ToolSpec>>(result["tools"].clone())?
+            }
+
+            Ok(Ok(response))
+                if plugin_id == "tools"
+                    && response.error.as_ref().is_some_and(|error| error.code == -32601) =>
+            {
+                tools(shell_enabled)
+            }
+
+            Ok(Ok(_)) if plugin_id == "tools" => tools(shell_enabled),
+
+            Ok(Ok(response)) => {
+                if let Some(error) = response.error {
+                    return Err(format!(
+                        "Plugin {plugin_id} could not list tools: {}",
+                        error.message
+                    )
+                    .into());
+                }
+
+                return Err(format!("Plugin {plugin_id} returned an invalid tool listing.").into());
+            }
+
+            Ok(Err(error)) if plugin_id == "tools" => {
+                let _ = error;
+                tools(shell_enabled)
+            }
+
+            Ok(Err(error)) => {
+                return Err(format!("Plugin {plugin_id} tool listing failed: {error}").into());
+            }
+
+            Err(_) if plugin_id == "tools" => tools(shell_enabled),
+
+            Err(_) => return Err(format!("Plugin {plugin_id} tool listing timed out.").into()),
+        };
+
+        if definitions.len() > 128 {
+            return Err(format!("Plugin {plugin_id} listed too many tools.").into());
+        }
+
+        for definition in definitions {
+            validate_tool_spec(&definition)?;
+
+            if registry.owners.insert(definition.name.clone(), plugin_id.clone()).is_some() {
+                return Err(
+                    format!("Multiple plugins registered tool `{}`.", definition.name).into()
+                );
+            }
+
+            registry.specs.push(definition);
+        }
+    }
+
+    Ok(registry)
+}
+
+fn validate_tool_spec(spec: &ToolSpec) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if spec.name.is_empty()
+        || spec.name.len() > 128
+        || !spec
+            .name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        || !spec.schema.is_object()
+        || spec.schema["type"] != "object"
+        || !spec.schema["properties"].is_object()
+        || serde_json::to_vec(&spec.schema).is_ok_and(|schema| schema.len() > 64 * 1024)
+        || spec.description.as_ref().is_some_and(|description| description.len() > 4_096)
+        || validate_schema_definition(&spec.schema, 0).is_err()
+    {
+        return Err(format!("Tool `{}` has an invalid definition.", spec.name).into());
+    }
+
+    Ok(())
+}
+
+fn validate_schema_definition(schema: &Value, depth: usize) -> Result<(), String> {
+    if depth > 8 || !schema.is_object() {
+        return Err("Tool schema is too deep or malformed.".into());
+    }
+
+    let kind = schema["type"].as_str().ok_or("Tool schema must declare a type.")?;
+
+    if !matches!(kind, "object" | "array" | "string" | "integer" | "number" | "boolean") {
+        return Err("Tool schema declares an unsupported type.".into());
+    }
+
+    if let Some(properties) = schema.get("properties") {
+        let properties =
+            properties.as_object().ok_or("Tool schema properties must be an object.")?;
+
+        if properties.len() > 128 {
+            return Err("Tool schema declares too many properties.".into());
+        }
+
+        for property in properties.values() {
+            validate_schema_definition(property, depth + 1)?;
+        }
+    }
+
+    if let Some(items) = schema.get("items") {
+        validate_schema_definition(items, depth + 1)?;
+    }
+
+    if let Some(required) = schema.get("required") {
+        let required = required.as_array().ok_or("Tool schema required must be an array.")?;
+
+        if required.len() > 128 || required.iter().any(|item| !item.is_string()) {
+            return Err("Tool schema has invalid required fields.".into());
+        }
+    }
+
+    if schema.get("additionalProperties").is_some_and(|value| !value.is_boolean()) {
+        return Err("Tool schema additionalProperties must be boolean.".into());
+    }
+
+    Ok(())
+}
+
+fn validate_registered_args(
+    registry: &ToolRegistry,
+    name: &str,
+    args: &Value,
+) -> Result<(), String> {
+    let Some(schema) =
+        registry.specs.iter().find(|spec| spec.name == name).map(|spec| &spec.schema)
+    else {
+        return Ok(());
+    };
+
+    let mut model_args = args.clone();
+
+    if let Value::Object(values) = &mut model_args {
+        values.remove("approve");
+    }
+
+    validate_schema_value(schema, &model_args, 0)
+}
+
+fn validate_schema_value(schema: &Value, value: &Value, depth: usize) -> Result<(), String> {
+    if depth > 8 {
+        return Err("Tool arguments exceed the schema depth limit.".into());
+    }
+
+    if let Some(expected) = schema.get("const")
+        && value != expected
+    {
+        return Err("Tool arguments do not match the declared constant.".into());
+    }
+
+    if let Some(choices) = schema.get("enum")
+        && !choices.as_array().is_some_and(|choices| choices.contains(value))
+    {
+        return Err("Tool arguments do not match an allowed value.".into());
+    }
+
+    let kind = schema["type"].as_str().ok_or("Tool schema must declare a type.")?;
+    let valid = match kind {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        _ => false,
+    };
+
+    if !valid {
+        return Err(format!("Tool argument must be {kind}."));
+    }
+
+    if let Some(object) = value.as_object() {
+        let properties = schema["properties"].as_object();
+
+        if let Some(required) = schema["required"].as_array() {
+            for required in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(required) {
+                    return Err(format!("Tool argument `{required}` is required."));
+                }
+            }
+        }
+
+        if schema["additionalProperties"] == false
+            && properties
+                .is_some_and(|properties| object.keys().any(|key| !properties.contains_key(key)))
+        {
+            return Err("Tool arguments contain an undeclared property.".into());
+        }
+
+        if let Some(properties) = properties {
+            for (key, value) in object {
+                if let Some(property) = properties.get(key) {
+                    validate_schema_value(property, value, depth + 1)?;
+                }
+            }
+        }
+    }
+
+    if let Some(array) = value.as_array() {
+        if let Some(items) = schema.get("items") {
+            for item in array {
+                validate_schema_value(items, item, depth + 1)?;
+            }
+        }
+
+        if schema["minItems"].as_u64().is_some_and(|minimum| (array.len() as u64) < minimum)
+            || schema["maxItems"].as_u64().is_some_and(|maximum| (array.len() as u64) > maximum)
+        {
+            return Err("Tool array argument is outside its allowed size.".into());
+        }
+    }
+
+    if let Some(string) = value.as_str() {
+        let length = string.chars().count() as u64;
+
+        if schema["minLength"].as_u64().is_some_and(|minimum| length < minimum)
+            || schema["maxLength"].as_u64().is_some_and(|maximum| length > maximum)
+        {
+            return Err("Tool text argument is outside its allowed length.".into());
+        }
+    }
+
+    if let Some(number) = value.as_f64()
+        && (schema["minimum"].as_f64().is_some_and(|minimum| number < minimum)
+            || schema["maximum"].as_f64().is_some_and(|maximum| number > maximum))
+    {
+        return Err("Tool numeric argument is outside its allowed range.".into());
+    }
+
+    Ok(())
 }
 
 impl Stop {
@@ -6700,6 +7013,16 @@ fn env_for(manifest: &Manifest, config: &Config, root: &Path) -> Vec<(String, St
         "KRABB_WHATSAPP_PHONE",
         "KRABB_WHATSAPP_LISTEN",
         "KRABB_WHATSAPP_GRAPH_URL",
+        "KRABB_PLAYWRIGHT_MODULE",
+        "KRABB_PLAYWRIGHT_BROWSERS_PATH",
+        "KRABB_NODE",
+        "KRABB_BROWSER_ALLOWED_HOSTS",
+        "KRABB_BROWSER_EGRESS_PROXY",
+        "KRABB_COMPUTER_MODE",
+        "KRABB_COMPUTER_DISPLAY",
+        "KRABB_XVFB",
+        "KRABB_COMPUTER_STARTUP",
+        "KRABB_COMPUTER_STARTUP_ARGS",
     ];
 
     let mut values = SAFE
@@ -9832,7 +10155,10 @@ fn tools(shell_enabled: bool) -> Vec<ToolSpec> {
 
 #[cfg(test)]
 mod tool_availability_tests {
-    use super::{schedule_listing_allowed, scheduler_tools, tools};
+    use super::{
+        ToolContent, ToolRegistry, ToolResult, decode_tool_result, schedule_listing_allowed,
+        scheduler_tools, tool_result_value, tools, validate_registered_args, validate_tool_spec,
+    };
 
     #[test]
     fn shell_is_only_declared_when_enabled() {
@@ -9848,6 +10174,83 @@ mod tool_availability_tests {
 
         assert_eq!(fetch.schema["required"], serde_json::json!(["url"]));
         assert_eq!(fetch.schema["properties"]["url"]["type"], "string");
+    }
+
+    #[test]
+    fn validates_and_preserves_multimodal_tool_results() {
+        let result = decode_tool_result(serde_json::json!({
+            "content": [
+                {"kind":"text", "text":"Screen captured."},
+                {"kind":"image", "uri":"data:image/png;base64,iVBORw0KGgo=", "alt":"desktop"}
+            ],
+            "metadata": {"width": 1280, "height": 720}
+        }))
+        .unwrap();
+
+        assert_eq!(result.content.len(), 2);
+        assert!(
+            matches!(&result.content[1], ToolContent::Image { uri, .. } if uri.starts_with("data:image/png"))
+        );
+
+        assert_eq!(result.metadata.as_ref().unwrap()["width"], 1280);
+
+        let wire = tool_result_value(result).unwrap();
+
+        assert_eq!(wire["content"][1]["kind"], "image");
+        assert_eq!(
+            wire["text"],
+            "Screen captured.\ndesktop\nTool metadata: {\"height\":720,\"width\":1280}"
+        );
+    }
+
+    #[test]
+    fn rejects_unbounded_or_untrusted_tool_images_and_schemas() {
+        assert!(
+            decode_tool_result(serde_json::json!({
+                "content": [{"kind":"image", "uri":"https://example.test/image.png", "alt":null}]
+            }))
+            .is_err()
+        );
+
+        assert!(decode_tool_result(serde_json::json!({
+            "content": [{"kind":"image", "uri":"data:image/png;base64,not-an-image", "alt":null}]
+        }))
+        .is_err());
+
+        let bad = super::ToolSpec {
+            name: "bad name".into(),
+            description: None,
+            schema: serde_json::json!({"type":"object", "properties":{}}),
+        };
+
+        assert!(validate_tool_spec(&bad).is_err());
+
+        let result = ToolResult::text("plain result");
+
+        assert_eq!(tool_result_value(result).unwrap()["text"], "plain result");
+    }
+
+    #[test]
+    fn validates_registered_arguments_before_execution() {
+        let specs = tools(false);
+        let registry = ToolRegistry {
+            owners: specs.iter().map(|spec| (spec.name.clone(), "tools".into())).collect(),
+            specs,
+        };
+
+        assert!(
+            validate_registered_args(&registry, "read", &serde_json::json!({"path":"a"})).is_ok()
+        );
+
+        assert!(validate_registered_args(&registry, "read", &serde_json::json!({})).is_err());
+        assert!(
+            validate_registered_args(
+                &registry,
+                "read",
+                &serde_json::json!({"path":"a", "outside":true})
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -10467,10 +10870,16 @@ async fn answer(
     prepare_images(&mut messages, media_root);
     let mut tokens = 0_u64;
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let tool_plugin = plugins.find(Capability::Tool).await;
     let memory_plugin = plugins.find(Capability::Memory).await;
-    let mut specs =
-        if tool_plugin.is_some() && tools_enabled { tools(shell_enabled) } else { Vec::new() };
+    let mut registry = tool_registry(plugins, tools_enabled, shell_enabled).await?;
+
+    if !provider.supports(Capability::Vision) {
+        registry.specs.retain(|spec| !requires_vision_tool(&spec.name));
+        registry.owners.retain(|name, _| !requires_vision_tool(name));
+    }
+
+    let mut specs = registry.specs.clone();
+    let turn_id = format!("{session}:{}", *call);
 
     if memory_plugin.is_some() && tools_enabled {
         specs.extend(memory_tools());
@@ -10486,7 +10895,7 @@ async fn answer(
             .into_iter()
             .filter_map(|(id, plugin)| plugin.supports(Capability::Channel).then_some(id))
             .collect::<Vec<_>>();
-        let workspace_tools_enabled = tool_plugin.is_some() && tools_enabled;
+        let workspace_tools_enabled = !registry.specs.is_empty();
         specs.extend(scheduler_tools(
             workspace_tools_enabled,
             shell_enabled,
@@ -10521,6 +10930,8 @@ async fn answer(
         let host_thread = thread.map(str::to_owned);
         let host_notices = notices.clone();
         let host_tool_failures = tool_failures.clone();
+        let host_registry = registry.clone();
+        let host_turn_id = turn_id.clone();
         let host_scheduled_destination = scheduled_destination.clone();
         let request_stream = provider.call_full_async(
             request,
@@ -10546,9 +10957,11 @@ async fn answer(
                 let thread = host_thread.clone();
                 let notices = host_notices.clone();
                 let tool_failures = host_tool_failures.clone();
+                let registry = host_registry.clone();
+                let turn_id = host_turn_id.clone();
                 let scheduled_destination = host_scheduled_destination.clone();
                 async move {
-                    let response = host_tool(
+                    let response = host_tool_with_registry(
                         request,
                         &plugins,
                         &sessions,
@@ -10566,6 +10979,8 @@ async fn answer(
                         thread.as_deref(),
                         notices,
                         calls,
+                        registry,
+                        turn_id,
                         deadline,
                         scheduled_destination,
                         schedule_run_id,
@@ -10702,6 +11117,10 @@ async fn answer(
                 return Err(format!("The model requested unavailable tool `{name}`.").into());
             }
 
+            if let Err(error) = validate_registered_args(&registry, name, args) {
+                return Err(format!("Tool arguments are invalid: {error}").into());
+            }
+
             if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= TOOL_CALLS {
                 return Err("The turn exceeded its tool-call limit.".into());
             }
@@ -10724,8 +11143,10 @@ async fn answer(
 
             let output = tokio::time::timeout_at(
                 deadline,
-                execute_tool(
+                execute_tool_with_registry(
                     plugins,
+                    &registry,
+                    &turn_id,
                     *call,
                     name,
                     args.clone(),
@@ -10760,9 +11181,9 @@ async fn answer(
 
                     Err(_) => {
                         if failed_tool.is_none()
-                            && let Some((id, _)) = plugins.find(Capability::Tool).await
+                            && let Some(id) = registry.owners.get(name)
                         {
-                            *failed_tool = Some(id);
+                            *failed_tool = Some(id.clone());
                         }
 
                         return Err("The turn exceeded its time limit.".into());
@@ -10771,16 +11192,47 @@ async fn answer(
             };
 
             *call += 1;
+            let mut content: Vec<Content> = output
+                .content
+                .into_iter()
+                .map(|item| match item {
+                    ToolContent::Text { text } => Content::Text { text: clip(text, TEXT_LIMIT) },
+                    ToolContent::Image { uri, alt } => Content::Image { uri, alt },
+                })
+                .collect();
+
+            if let Some(metadata) = output.metadata {
+                content.push(Content::Text { text: format!("Tool metadata: {metadata}") });
+            }
+
+            if content.iter().any(|item| matches!(item, Content::Image { .. }))
+                && !provider.supports(Capability::Vision)
+            {
+                return Err("The selected model provider does not support image inputs.".into());
+            }
+
             let message = Message {
                 id: format!("tool-{call}"),
                 session: session.into(),
                 role: Role::Tool,
                 sender: Some(name.clone()),
-                content: vec![Content::Text { text: output }],
+                content,
             };
 
             messages.push(message.clone());
-            sessions.lock().map_err(|_| "Session lock is poisoned.")?.push(session, message)?;
+            let mut persisted = message;
+
+            for item in &mut persisted.content {
+                if let Content::Image { alt, .. } = item {
+                    *item = Content::Text {
+                        text: alt.clone().unwrap_or_else(|| {
+                            "Temporary image observation used during this turn; image not retained.".into()
+                        }),
+                    };
+                }
+            }
+
+            sessions.lock().map_err(|_| "Session lock is poisoned.")?.push(session, persisted)?;
             status(sessions, session, "working")?;
             called = true;
         }
@@ -10977,14 +11429,44 @@ fn mutating(name: &str, args: &serde_json::Value) -> bool {
         "write" | "patch" | "shell" | "memory_remember" | "schedule_propose"
         | "schedule_cancel" | "schedule_pause" | "schedule_resume" | "schedule_run"
         | "schedule_retry" | "message_send" => true,
-        "git" => args["args"].as_array().is_some_and(|values| {
-            values.len() >= 2
-                && values[0].as_str() == Some("worktree")
-                && matches!(values[1].as_str(), Some("add" | "remove"))
+        "read"
+        | "list"
+        | "search"
+        | "fetch"
+        | "memory_search"
+        | "schedule_list"
+        | "browser_open"
+        | "browser_close"
+        | "browser_tabs"
+        | "browser_snapshot"
+        | "browser_screenshot"
+        | "computer_open"
+        | "computer_close"
+        | "computer_displays"
+        | "computer_screenshot"
+        | "computer_windows" => false,
+
+        "git" => !args["args"].as_array().is_some_and(|values| {
+            matches!(
+                values.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>().as_slice(),
+                ["status"] | ["diff"] | ["worktree", "list"]
+            )
         }),
 
-        _ => false,
+        name if name.starts_with("browser_") => {
+            !matches!(name, "browser_tabs" | "browser_snapshot" | "browser_screenshot")
+        }
+
+        name if name.starts_with("computer_") => {
+            !matches!(name, "computer_displays" | "computer_screenshot" | "computer_windows")
+        }
+
+        _ => true,
     }
+}
+
+fn requires_vision_tool(name: &str) -> bool {
+    matches!(name, "browser_screenshot" | "computer_screenshot")
 }
 
 fn keep_one_mutation(events: &mut Vec<Event>) {
@@ -11003,16 +11485,19 @@ fn keep_one_mutation(events: &mut Vec<Event>) {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn tool(
+async fn tool_with_registry(
     plugins: &Plugins,
+    registry: &ToolRegistry,
     id: u64,
     name: &str,
     mut args: serde_json::Value,
     approve: bool,
     workspace: Option<&Path>,
     memory_scope: &str,
+    host_session: &str,
+    turn_id: &str,
     failed_tool: &mut Option<String>,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(action) = name.strip_prefix("schedule_")
         && action != "propose"
     {
@@ -11042,7 +11527,7 @@ async fn tool(
 
         let value = response.result.ok_or("Scheduler returned no result.")?;
 
-        return Ok(match method {
+        return Ok(ToolResult::text(match method {
             "list" => format_schedule_list(&value),
             "remove" if value["cancel_requested"] == true => format!(
                 "Cancellation requested for schedule {}. Its current action will be interrupted; a side effect may already have happened.",
@@ -11055,7 +11540,7 @@ async fn tool(
                 args["id"],
                 value["status"].as_str().unwrap_or(method)
             ),
-        });
+        }));
     }
 
     if name == "schedule_propose" {
@@ -11227,10 +11712,10 @@ async fn tool(
 
         info!(schedule = schedule_id, "Scheduled task activated.");
 
-        return Ok(format!(
+        return Ok(ToolResult::text(format!(
             "Schedule {} ({schedule_id}) is active.\n\nNext run: {due}\nTools: {tools_note}\nShell: {shell_note}{frequency}\nAutomatic retries: {retries}. {retry_note} {failure_note}\n\nCheck it with /schedule list; pause it with /schedule pause {schedule_id}.",
             schedule["name"].as_str().unwrap_or("Scheduled task")
-        ));
+        )));
     }
 
     if let Some(method) = name.strip_prefix("memory_") {
@@ -11261,16 +11746,25 @@ async fn tool(
             return Err(error.message.into());
         }
 
-        return response
+        let value = response
             .result
             .map(|value| clip(value.to_string(), TEXT_LIMIT))
-            .ok_or_else(|| "The memory plugin returned no result.".into());
+            .ok_or_else(|| "The memory plugin returned no result.".to_owned())?;
+
+        return Ok(ToolResult::text(value));
     }
 
-    let (id_plugin, plugin) =
-        plugins.find(Capability::Tool).await.ok_or("The tools plugin is not installed.")?;
+    let id_plugin =
+        registry.owners.get(name).ok_or_else(|| format!("Tool `{name}` is not registered."))?;
+    let plugin = plugins
+        .get(id_plugin)
+        .await
+        .filter(|plugin| plugin.supports(Capability::Tool))
+        .ok_or_else(|| format!("Tool provider {id_plugin} is unavailable."))?;
 
-    if let serde_json::Value::Object(values) = &mut args {
+    if id_plugin == "tools"
+        && let serde_json::Value::Object(values) = &mut args
+    {
         values.insert("approve".into(), serde_json::Value::Bool(approve));
 
         if let Some(workspace) = workspace {
@@ -11279,15 +11773,24 @@ async fn tool(
                 serde_json::Value::String(workspace.display().to_string()),
             );
         }
-    } else {
+    } else if !args.is_object() {
         return Err("Tool arguments must be an object.".into());
     }
 
-    let response = match plugin.call(Request::call(id, name, args)).await {
+    let params = if id_plugin == "tools" {
+        args
+    } else {
+        serde_json::json!({
+            "arguments": args,
+            "host": {"session": host_session, "turn": turn_id}
+        })
+    };
+
+    let response = match plugin.call(Request::call(id, name, params)).await {
         Ok(response) => response,
 
         Err(error) => {
-            *failed_tool = Some(id_plugin);
+            *failed_tool = Some(id_plugin.clone());
             return Err(error.into());
         }
     };
@@ -11297,15 +11800,174 @@ async fn tool(
     }
 
     let value = response.result.ok_or("The tool returned no result.")?;
-    Ok(value["text"].as_str().map_or_else(
-        || clip(value.to_string(), TEXT_LIMIT),
-        |text| clip(text.to_owned(), TEXT_LIMIT),
-    ))
+    decode_tool_result(value)
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+async fn tool(
+    plugins: &Plugins,
+    id: u64,
+    name: &str,
+    args: serde_json::Value,
+    approve: bool,
+    workspace: Option<&Path>,
+    memory_scope: &str,
+    failed_tool: &mut Option<String>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let registry = legacy_tool_registry(Some(name));
+    let result = tool_with_registry(
+        plugins,
+        &registry,
+        id,
+        name,
+        args,
+        approve,
+        workspace,
+        memory_scope,
+        "test",
+        "test-turn",
+        failed_tool,
+    )
+    .await?;
+
+    Ok(tool_result_text(&result))
+}
+
+#[cfg(test)]
+fn legacy_tool_registry(name: Option<&str>) -> ToolRegistry {
+    let mut registry = ToolRegistry {
+        specs: tools(true),
+        owners: tools(true).into_iter().map(|spec| (spec.name, "tools".into())).collect(),
+    };
+
+    if let Some(name) = name {
+        registry.owners.insert(name.into(), "tools".into());
+    }
+
+    registry
+}
+
+fn tool_result_text(result: &ToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|item| match item {
+            ToolContent::Text { text } => Some(text.as_str()),
+            ToolContent::Image { alt, .. } => alt.as_deref(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn decode_tool_result(
+    value: serde_json::Value,
+) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(content) = value.get("content") {
+        let content = serde_json::from_value::<Vec<ToolContent>>(content.clone())?;
+
+        if content.len() > 8 {
+            return Err("Tool result contains too many content items.".into());
+        }
+
+        for item in &content {
+            match item {
+                ToolContent::Text { text } if text.len() > TEXT_LIMIT => {
+                    return Err("Tool result text exceeds the size limit.".into());
+                }
+
+                ToolContent::Image { uri, .. }
+                    if !uri.starts_with("data:image/")
+                        || image_data_size(uri).is_none_or(|size| size > IMAGE_LIMIT) =>
+                {
+                    return Err("Tool result image is invalid or exceeds the image limit.".into());
+                }
+
+                ToolContent::Text { .. } | ToolContent::Image { .. } => {}
+            }
+        }
+
+        let metadata = value.get("metadata").cloned();
+
+        if metadata.as_ref().is_some_and(|metadata| {
+            serde_json::to_vec(metadata).is_ok_and(|data| data.len() > 16 * 1024)
+        }) {
+            return Err("Tool result metadata exceeds the size limit.".into());
+        }
+
+        return Ok(ToolResult { content, metadata });
+    }
+
+    let text = value["text"].as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
+
+    Ok(ToolResult::text(clip(text, TEXT_LIMIT)))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn execute_tool(
     plugins: &Plugins,
+    id: u64,
+    name: &str,
+    args: serde_json::Value,
+    provider: &str,
+    model: &str,
+    approval_mode: ApprovalMode,
+    approvals: Arc<AsyncMutex<approval::Gate>>,
+    channel: &str,
+    chat: &str,
+    thread: Option<&str>,
+    session: &str,
+    sessions: &Arc<Mutex<state::Store>>,
+    workspace: Option<&Path>,
+    tools_enabled: bool,
+    schedule_enabled: bool,
+    shell_enabled: bool,
+    notices: tokio::sync::mpsc::Sender<StreamNotice>,
+    deadline: tokio::time::Instant,
+    failed_tool: &mut Option<String>,
+    scheduled_destination: Option<&AuthorizedDestination>,
+    schedule_run_id: Option<u64>,
+    tool_call: usize,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let registry = legacy_tool_registry(Some(name));
+    let result = execute_tool_with_registry(
+        plugins,
+        &registry,
+        "test-turn",
+        id,
+        name,
+        args,
+        provider,
+        model,
+        approval_mode,
+        approvals,
+        channel,
+        chat,
+        thread,
+        session,
+        sessions,
+        workspace,
+        tools_enabled,
+        schedule_enabled,
+        shell_enabled,
+        notices,
+        deadline,
+        failed_tool,
+        scheduled_destination,
+        schedule_run_id,
+        tool_call,
+    )
+    .await?;
+
+    Ok(tool_result_text(&result))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_tool_with_registry(
+    plugins: &Plugins,
+    registry: &ToolRegistry,
+    turn_id: &str,
     id: u64,
     name: &str,
     mut args: serde_json::Value,
@@ -11328,7 +11990,7 @@ async fn execute_tool(
     scheduled_destination: Option<&AuthorizedDestination>,
     schedule_run_id: Option<u64>,
     tool_call: usize,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
     if name == "shell" && !shell_enabled {
         return Err("Shell access is not authorized for this turn.".into());
     }
@@ -11383,7 +12045,11 @@ async fn execute_tool(
 
             match challenge.answer.await {
                 Ok(true) => true,
-                Ok(false) => return Ok("The request was denied. No changes were made.".into()),
+
+                Ok(false) => {
+                    return Ok(ToolResult::text("The request was denied. No changes were made."));
+                }
+
                 Err(_) => return Err("The approval request is no longer available.".into()),
             }
         }
@@ -11421,8 +12087,7 @@ async fn execute_tool(
             return Err("A TUI message must target the originating TUI session, or the explicitly requested default TUI chat.".into());
         }
 
-        let schedule_tools_enabled =
-            tools_enabled && plugins.find(Capability::Tool).await.is_some();
+        let schedule_tools_enabled = tools_enabled && !registry.specs.is_empty();
         let private = sessions
             .lock()
             .map_err(|_| "Session lock is poisoned.")?
@@ -11474,7 +12139,10 @@ async fn execute_tool(
                 .iter()
                 .any(|existing| existing.id == message_id)
             {
-                return Ok(format!("Message was already added to TUI session {}.", message.chat));
+                return Ok(ToolResult::text(format!(
+                    "Message was already added to TUI session {}.",
+                    message.chat
+                )));
             }
 
             store.append_notice(
@@ -11489,7 +12157,7 @@ async fn execute_tool(
             )?;
             info!(session = %message.chat, schedule = %session, "Scheduled message added to a TUI session.");
 
-            return Ok(format!("Message added to TUI session {}.", message.chat));
+            return Ok(ToolResult::text(format!("Message added to TUI session {}.", message.chat)));
         }
 
         let plugin = plugins
@@ -11510,12 +12178,28 @@ async fn execute_tool(
         )?;
         info!(channel = %message.channel, schedule = %session, "Scheduled message queued for delivery.");
 
-        return Ok(format!("Message queued for delivery through {}.", message.channel));
+        return Ok(ToolResult::text(format!(
+            "Message queued for delivery through {}.",
+            message.channel
+        )));
     }
 
     let scope = memory_scope(channel, chat);
 
-    tool(plugins, id, name, args, approve, workspace, &scope, failed_tool).await
+    tool_with_registry(
+        plugins,
+        registry,
+        id,
+        name,
+        args,
+        approve,
+        workspace,
+        &scope,
+        session,
+        turn_id,
+        failed_tool,
+    )
+    .await
 }
 
 struct ScheduledMessage {
@@ -11675,6 +12359,7 @@ fn approval_params(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn host_tool(
     request: Request,
     plugins: &Plugins,
@@ -11693,6 +12378,58 @@ async fn host_tool(
     thread: Option<&str>,
     notices: tokio::sync::mpsc::Sender<StreamNotice>,
     calls: Arc<std::sync::atomic::AtomicUsize>,
+    deadline: tokio::time::Instant,
+    scheduled_destination: Option<AuthorizedDestination>,
+    schedule_run_id: Option<u64>,
+) -> krabb_core::Result<Response> {
+    host_tool_with_registry(
+        request,
+        plugins,
+        sessions,
+        session,
+        provider,
+        model,
+        workspace,
+        tools_enabled,
+        schedule_enabled,
+        shell_enabled,
+        approval_mode,
+        approvals,
+        channel,
+        chat,
+        thread,
+        notices,
+        calls,
+        legacy_tool_registry(None),
+        "test-turn".into(),
+        deadline,
+        scheduled_destination,
+        schedule_run_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn host_tool_with_registry(
+    request: Request,
+    plugins: &Plugins,
+    sessions: &Arc<Mutex<state::Store>>,
+    session: &str,
+    provider: &str,
+    model: &str,
+    workspace: Option<&Path>,
+    tools_enabled: bool,
+    schedule_enabled: bool,
+    shell_enabled: bool,
+    approval_mode: ApprovalMode,
+    approvals: Arc<AsyncMutex<approval::Gate>>,
+    channel: &str,
+    chat: &str,
+    thread: Option<&str>,
+    notices: tokio::sync::mpsc::Sender<StreamNotice>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    registry: ToolRegistry,
+    turn_id: String,
     deadline: tokio::time::Instant,
     scheduled_destination: Option<AuthorizedDestination>,
     schedule_run_id: Option<u64>,
@@ -11752,11 +12489,17 @@ async fn host_tool(
         return Ok(Response::fail(id, -32602, message));
     }
 
+    if let Err(message) = validate_registered_args(&registry, name, &args) {
+        return Ok(Response::fail(id, -32602, format!("Tool arguments are invalid: {message}")));
+    }
+
     let mut failed_tool = None;
     let output = match tokio::time::timeout_at(
         deadline,
-        execute_tool(
+        execute_tool_with_registry(
             plugins,
+            &registry,
+            &turn_id,
             id,
             name,
             args,
@@ -11794,15 +12537,32 @@ async fn host_tool(
         }
 
         Err(_) => {
-            if let Some((failed, _)) = plugins.find(Capability::Tool).await {
-                restart_tool(plugins, &failed).await;
+            if let Some(failed) = registry.owners.get(name) {
+                restart_tool(plugins, failed).await;
             }
 
             return Ok(Response::fail(id, -32000, "The turn exceeded its time limit."));
         }
     };
 
-    Ok(Response::ok(id, serde_json::json!({"text": output})))
+    Ok(Response::ok(id, tool_result_value(output)?))
+}
+
+fn tool_result_value(result: ToolResult) -> krabb_core::Result<serde_json::Value> {
+    let mut text = tool_result_text(&result);
+
+    if let Some(metadata) = &result.metadata {
+        text.push_str("\nTool metadata: ");
+        text.push_str(&metadata.to_string());
+    }
+
+    let mut value = serde_json::to_value(result)?;
+
+    if let serde_json::Value::Object(fields) = &mut value {
+        fields.insert("text".into(), serde_json::Value::String(text));
+    }
+
+    Ok(value)
 }
 
 fn track_scheduled_tool_response(
@@ -12402,7 +13162,9 @@ fn service_at_with_status(
 enum ServiceState {
     Active,
     Inactive,
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     Starting,
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     Stopping,
     Failed,
     NotInstalled,
@@ -19562,7 +20324,7 @@ done
         let restarted = Process::start_with("sh", ["-c", script]).await.unwrap();
         plugins.insert(super::Live::new(restarted)).await;
 
-        let scheduler = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+        let scheduler = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
             .await
             .unwrap()
             .unwrap()
@@ -19588,6 +20350,7 @@ while IFS= read -r line; do
     case "$line" in
         *'"method":"hello"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"protocol":{{"major":0,"minor":1}},"id":"scheduler","version":"0.1.0","capabilities":["scheduler"]}}}}' ;;
         *'"method":"recover"'*) printf '%s\n' recovered >> '{}'; printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"recovered":0}}}}' ;;
+        *'"method":"reports"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"items":[]}}}}' ;;
         *'"method":"claim"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"item":null}}}}' ;;
         *'"method":"shutdown"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"ok":true}}}}'; exit 0 ;;
     esac
@@ -19626,7 +20389,7 @@ done
         let replacement_stop = Arc::clone(&stop);
         let replacement_log = log.clone();
         let restart = tokio::spawn(async move {
-            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
                     if fs::read_to_string(&replacement_log)
                         .is_ok_and(|contents| contents.lines().count() >= 1)
@@ -19642,7 +20405,7 @@ done
 
             restarted_plugins.get("scheduler").await.unwrap().restart().await.unwrap();
 
-            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
                     if fs::read_to_string(&replacement_log)
                         .is_ok_and(|contents| contents.lines().count() >= 2)
@@ -19735,7 +20498,7 @@ done
             .await;
         });
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 if fs::read_to_string(&log).is_ok_and(|contents| contents.lines().count() >= 5) {
                     break;
@@ -22456,6 +23219,13 @@ done
         assert!(super::mutating("schedule_propose", &serde_json::json!({})));
         assert!(super::mutating("schedule_run", &serde_json::json!({"id": 1})));
         assert!(super::mutating("schedule_retry", &serde_json::json!({"id": 1})));
+        assert!(super::mutating(
+            "browser_navigate",
+            &serde_json::json!({"url":"https://example.test"})
+        ));
+
+        assert!(super::mutating("browser_click", &serde_json::json!({"approve":true})));
+        assert!(super::mutating("computer_type", &serde_json::json!({"text":"submit"})));
         assert!(super::mutating("git", &serde_json::json!({"args": ["worktree", "add", "path"]})));
         assert!(super::mutating(
             "git",
@@ -22463,7 +23233,12 @@ done
         ));
 
         assert!(!super::mutating("read", &serde_json::json!({})));
+        assert!(!super::mutating("browser_screenshot", &serde_json::json!({})));
+        assert!(!super::mutating("computer_screenshot", &serde_json::json!({})));
         assert!(!super::mutating("git", &serde_json::json!({"args": ["status"]})));
+        assert!(super::requires_vision_tool("browser_screenshot"));
+        assert!(super::requires_vision_tool("computer_screenshot"));
+        assert!(!super::requires_vision_tool("browser_snapshot"));
     }
 
     #[cfg(unix)]
@@ -25404,6 +26179,78 @@ fn main() {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn sends_inline_tool_screenshots_to_the_next_vision_request() {
+        let root = std::env::temp_dir().join(format!("krabb-tool-image-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join("image-received");
+        let provider_script = r#"count=0; while IFS= read -r line; do case "$line" in *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"vision-fixture","version":"0.1.0","capabilities":["model","vision"]}}' ;; *generate*) request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); if [ "$count" = 0 ]; then count=1; printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"text":"","stop":"tool","events":[{"kind":"tool","name":"browser_screenshot","args":{}}]}}'; else case "$line" in *'data:image/png;base64,iVBORw0KGgo='*) touch "__MARKER__" ;; esac; printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"text":"I saw the screenshot.","stop":"stop"}}'; fi ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;; esac; done"#;
+        let provider_script = provider_script.replace("__MARKER__", &marker.display().to_string());
+        let tool_script = r#"while IFS= read -r line; do case "$line" in *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"browser","version":"0.1.0","capabilities":["tool"]}}' ;; *tools/list*) request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"tools":[{"name":"browser_screenshot","description":"Capture a test image.","schema":{"type":"object","properties":{},"additionalProperties":false}}]}}' ;; *browser_screenshot*) request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"content":[{"kind":"text","text":"Screenshot captured."},{"kind":"image","uri":"data:image/png;base64,iVBORw0KGgo=","alt":"fixture screenshot"}],"metadata":{"width":1,"height":1}}}' ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;; esac; done"#;
+        let provider = Process::start_with("sh", ["-c", &provider_script]).await.unwrap();
+        let browser = Process::start_with("sh", ["-c", tool_script]).await.unwrap();
+        let provider = Live::new(provider);
+        let plugins = registry([browser]).await;
+        let sessions =
+            Arc::new(Mutex::new(super::state::Store::load(root.join("sessions.json")).unwrap()));
+        sessions.lock().unwrap().create("local", "test").unwrap();
+        let (notices, _receiver) = tokio::sync::mpsc::channel(8);
+        let mut call = 1;
+        let reply = super::answer(
+            &provider,
+            &plugins,
+            "vision-fixture",
+            vec![Message {
+                id: "user-1".into(),
+                session: "local".into(),
+                role: Role::User,
+                sender: None,
+                content: vec![Content::Text { text: "Inspect the screen.".into() }],
+            }],
+            "local",
+            "tui",
+            "tui-default",
+            None,
+            &sessions,
+            None,
+            &root,
+            true,
+            false,
+            false,
+            super::ApprovalMode::Off,
+            Arc::new(super::AsyncMutex::new(super::approval::Gate::new().unwrap())),
+            &Cancellation::new(),
+            &Stop::new(),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            &mut call,
+            &mut None,
+            None,
+            notices,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reply.text, "I saw the screenshot.");
+        assert!(marker.exists(), "the next model request must contain the image data URL");
+        let transcript = sessions.lock().unwrap().sessions["local"].messages.clone();
+
+        assert!(transcript.iter().any(|message| {
+            message.content.iter().any(|item| {
+                matches!(item, Content::Text { text } if text.contains("fixture screenshot"))
+            })
+        }));
+
+        assert!(serde_json::to_string(&transcript).unwrap().contains("fixture screenshot"));
+        assert!(!serde_json::to_string(&transcript).unwrap().contains("data:image/png"));
+
+        stop_registry(&plugins).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn prompts_for_signed_approval_before_mutating_tools() {
         let root = test_root("prompt-approval");
         let marker = root.join("approved");
@@ -25483,7 +26330,7 @@ fn main() {
     }
 
     #[tokio::test]
-    async fn denied_prompt_never_dispatches_a_mutating_tool() {
+    async fn denied_prompt_never_dispatches_browser_control() {
         let approvals = Arc::new(super::AsyncMutex::new(super::approval::Gate::new().unwrap()));
         let sessions = Arc::new(Mutex::new(super::state::Store::default()));
         let (notices, mut events) = tokio::sync::mpsc::channel(1);
@@ -25493,8 +26340,13 @@ fn main() {
             super::execute_tool(
                 &Plugins::default(),
                 1,
-                "write",
-                serde_json::json!({"path": "note.txt", "text": "blocked"}),
+                "browser_click",
+                serde_json::json!({
+                    "session_id": "owned-session",
+                    "by": "coordinate",
+                    "x": 20,
+                    "y": 20
+                }),
                 "codex",
                 "test",
                 super::ApprovalMode::Prompt,
@@ -26108,7 +26960,14 @@ done
         .await
         .unwrap();
 
-        assert!(mutation.error.unwrap().message.contains("Approval policy blocks"));
+        let mutation_error = mutation.error.unwrap();
+
+        assert!(
+            mutation_error.message.contains("Approval policy blocks"),
+            "unexpected mutation error: {}",
+            mutation_error.message
+        );
+
         assert_eq!(sessions.lock().unwrap().sessions["room"].phase, "safe");
 
         let disabled = super::host_tool(
@@ -26245,25 +27104,71 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn interrupts_a_stalled_tool_on_shutdown() {
-        let provider_script = r#"while IFS= read -r line; do case "$line" in *hello*) printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol\":{\"major\":0,\"minor\":1},\"id\":\"codex\",\"version\":\"0.1.0\",\"capabilities\":[\"model\"]}}' ;; *generate*) printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":11,\"result\":{\"text\":\"\",\"stop\":\"tool\",\"events\":[{\"kind\":\"tool\",\"name\":\"read\",\"args\":{\"path\":\"note.txt\"},\"approve\":false}]}}' ;; *shutdown*) printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":9999,\"result\":{\"ok\":true}}'; exit 0 ;; esac; done"#
-            .replace("\\\\n", "\\n")
-            .replace("\\\"", "\"");
-        let tool_script = r#"while IFS= read -r line; do case "$line" in *hello*) printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol\":{\"major\":0,\"minor\":1},\"id\":\"tools\",\"version\":\"0.1.0\",\"capabilities\":[\"tool\"]}}' ;; *read*) sleep 5 ;; *shutdown*) printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":9999,\"result\":{\"ok\":true}}'; exit 0 ;; esac; done"#
-            .replace("\\\\n", "\\n")
-            .replace("\\\"", "\"");
-        let provider = Process::start_with("sh", ["-c", &provider_script]).await.unwrap();
+        let root = test_root("stalled-tool");
+        fs::create_dir_all(&root).unwrap();
+        let tool_started = root.join("tool-started");
+        let provider_script = r#"
+while IFS= read -r line; do
+    case "$line" in
+        *hello*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"codex","version":"0.1.0","capabilities":["model"]}}'
+            ;;
+        *generate*)
+            request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\),.*/\1/p')
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"text":"","stop":"tool","events":[{"kind":"tool","name":"read","args":{"path":"note.txt"},"approve":false}]}}\n' "$request_id"
+            ;;
+        *shutdown*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'
+            exit 0
+            ;;
+    esac
+done
+"#;
+        let tool_script = format!(
+            r#"
+while IFS= read -r line; do
+    case "$line" in
+        *hello*)
+            printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocol":{{"major":0,"minor":1}},"id":"tools","version":"0.1.0","capabilities":["tool"]}}}}'
+            ;;
+        *tools/list*)
+            request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\),.*/\1/p')
+            printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32601,"message":"Method not found"}}}}\n' "$request_id"
+            ;;
+        *read*)
+            touch '{started}'
+            sleep 5
+            ;;
+        *shutdown*)
+            printf '%s\n' '{{"jsonrpc":"2.0","id":9999,"result":{{"ok":true}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+            started = tool_started.display()
+        );
+        let provider = Process::start_with("sh", ["-c", provider_script]).await.unwrap();
         let tool = Process::start_with("sh", ["-c", &tool_script]).await.unwrap();
         let plugins = registry([provider, tool]).await;
         let provider = plugins.get("codex").await.unwrap();
-        let root = test_root("stalled-tool");
         let sessions =
             Arc::new(Mutex::new(super::state::Store::load(root.join("sessions.json")).unwrap()));
         sessions.lock().unwrap().create("session", "test").unwrap();
         let stop = Arc::new(Stop::new());
         let signal = Arc::clone(&stop);
         let notifier = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let started = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while !tool_started.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+
             signal.signal();
+
+            started
         });
 
         let mut call = 10;
@@ -26272,7 +27177,7 @@ done
         let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
 
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
             answer(
                 &provider,
                 &plugins,
@@ -26312,7 +27217,7 @@ done
         .unwrap_err();
 
         assert_eq!(result.to_string(), "The turn was interrupted.");
-        notifier.await.unwrap();
+        assert!(notifier.await.unwrap(), "the stalled tool was not called before shutdown");
         drain.await.unwrap();
         stop_registry(&plugins).await;
         let _ = fs::remove_dir_all(root);

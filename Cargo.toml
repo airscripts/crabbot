@@ -27,6 +27,8 @@ members = [
     "krabb-plugins/sqlite",
     "krabb-plugins/scheduler",
     "krabb-plugins/tools",
+    "krabb-plugins/browser",
+    "krabb-plugins/computer",
     "krabb-plugins/tui",
     "krabb-plugins/whisper",
 ]

@@ -28,6 +28,8 @@ packages=(
     krabb-plugin-sqlite
     krabb-plugin-scheduler
     krabb-plugin-tools
+    krabb-plugin-browser
+    krabb-plugin-computer
     krabb-plugin-tui
     krabb-plugin-whisper
 )

@@ -151,6 +151,26 @@ pub struct ToolSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ToolResult {
+    pub content: Vec<ToolContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+impl ToolResult {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self { content: vec![ToolContent::Text { text: text.into() }], metadata: None }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolContent {
+    Text { text: String },
+    Image { uri: String, alt: Option<String> },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
     Text {
@@ -428,6 +448,26 @@ mod tests {
         .unwrap();
 
         assert!(matches!(legacy, Event::Tool { name, .. } if name == "read"));
+    }
+
+    #[test]
+    fn tool_results_preserve_text_images_and_metadata() {
+        let result = ToolResult {
+            content: vec![
+                ToolContent::Text { text: "Captured.".into() },
+                ToolContent::Image {
+                    uri: "data:image/png;base64,aW1hZ2U=".into(),
+                    alt: Some("desktop".into()),
+                },
+            ],
+            metadata: Some(serde_json::json!({"width": 10, "height": 20})),
+        };
+
+        let value = serde_json::to_value(&result).unwrap();
+
+        assert_eq!(value["content"][0]["kind"], "text");
+        assert_eq!(value["content"][1]["kind"], "image");
+        assert_eq!(serde_json::from_value::<ToolResult>(value).unwrap(), result);
     }
 
     #[test]

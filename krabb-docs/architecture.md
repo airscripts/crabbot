@@ -67,12 +67,12 @@ management still work. A model plugin handles `generate` with a normalized
 session ownership, approvals, timeouts, and durable state; model events cannot
 grant their own approval. Plugins never call one another directly. Plugins may
 register bounded CLI commands through JSON-RPC. Store,
-memory, scheduler, MCP, speech, and client plugins
+memory, scheduler, MCP, speech, browser, isolated desktop, and client plugins
 are explicit extension seams; only model, channel, and tool routing is enabled
 in the initial daemon flow.
 
 The runtime keeps a live registry of verified plugin processes. `plugin install`
-and `plugin install` request authenticated IPC activation after committing the
+and `plugin link` request authenticated IPC activation after committing the
 plugin; `plugin uninstall` unloads it before deleting its files. The bridge wakes
 when a configured channel or model is added, so a daemon need not restart to
 discover it. Selected model plugins load when installed; their own request
@@ -107,6 +107,12 @@ into general Krabb requests.
    multi-part response edits its first chunk and sends the remaining chunks.
    A transport failure is never retried automatically because the provider
    may have accepted the message.
+
+Tool definitions are collected from every active `tool` plugin through
+`tools/list` and routed by their unique names. Tool results can contain
+validated text and inline images. The runtime keeps those images in the active
+turn so a vision-capable provider receives them as image inputs, then stores
+only text for temporary tool screenshots in the session transcript.
 
 Cancellation is terminal for the active turn. A restart can requeue only a
 lease marked replay-safe; a lease that reached a mutating tool is recorded as

@@ -178,6 +178,17 @@ All Krabb configuration variables use the `KRABB_` prefix:
 | `KRABB_MEDIA` | Private media cache directory |
 | `KRABB_WHISPER` | Default speech plugin ID |
 | `KRABB_WHISPER_COMMAND` | Local Whisper-compatible executable |
+| `KRABB_PLAYWRIGHT_MODULE` | Explicit Playwright package entry point for the browser plugin |
+| `KRABB_PLAYWRIGHT_BROWSERS_PATH` | Optional Chromium cache directory when it differs from Playwright's default |
+| `KRABB_NODE` | Optional Node.js executable path for the browser worker |
+| `KRABB_BROWSER_ALLOWED_HOSTS` | Comma-separated exact host allowlist for browser requests |
+| `KRABB_BROWSER_EGRESS_PROXY` | Required controlled HTTP proxy for browser network access |
+| `KRABB_COMPUTER_MODE` | `isolated` for Linux Xvfb, or `interactive` for native macOS and Windows desktop control |
+| `KRABB_COMPUTER_ALLOW_HOST_CONTROL` | Must be `1` to enable interactive macOS or Windows desktop control |
+| `KRABB_COMPUTER_DISPLAY` | Dedicated Xvfb display number, above `:0`, for Linux computer control |
+| `KRABB_XVFB` | Optional path to the Xvfb executable; defaults to `Xvfb` on `PATH` |
+| `KRABB_COMPUTER_STARTUP` | Optional absolute path to one fixed application started in the Linux isolated display |
+| `KRABB_COMPUTER_STARTUP_ARGS` | Optional JSON array of fixed arguments for that Linux application |
 | `KRABB_CODEX_KEY` | Optional Codex compatible API key |
 | `KRABB_CODEX_BASE_URL` | Optional Codex compatible API base |
 | `KRABB_OPENAI_KEY` | OpenAI API key |
