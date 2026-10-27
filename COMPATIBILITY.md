@@ -60,6 +60,7 @@ exercise native OS desktop behavior.
 | --- | --- | --- |
 | `make verify` (2026-10-26) | Passed | Linux x86_64 formatting, Clippy, workspace checks/tests, coverage, build, and metrics |
 | `make verify` (2026-10-27) | Passed | Linux x86_64 formatting, spacing, Clippy, workspace checks/tests, coverage, build, and metrics |
+| Plugin Package Completeness Audit (2026-10-27) | Passed | All 23 plugins have a manifest, README, Rust binary source, and at least four tests; no `todo!`, `unimplemented!`, or `FIXME`. One Gemini 2 compatibility cleanup TODO remains documented in source |
 | Plugin Protocol Smoke (2026-10-27) | Passed | All 23 built plugins matched manifest identity/capabilities, answered `ping`, and shut down cleanly using temporary state and no provider credentials |
 | Local Capability Smoke (2026-10-27) | Passed | Memory remember/list/forget, SQLite put/get/delete, pending scheduler add/list, and confined tools list/read against temporary state |
 | Local Daemon Capability Smoke (2026-10-27) | Passed | In an isolated home, six local capability plugins plus Codex loaded with healthy daemon status; Memory status/remember/list/forget and Scheduler list/add/pause/list passed. No provider request was sent; the temporary schedule was left paused |
