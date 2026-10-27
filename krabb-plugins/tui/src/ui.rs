@@ -433,6 +433,7 @@ where
             session: Some(session_tx),
             engine: Some(engine_event_tx),
             streaming_host: Some(crate::daemon_streaming_control),
+            stop_after_generation: false,
         },
         interrupt_rx,
     ));

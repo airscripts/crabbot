@@ -173,6 +173,7 @@ struct EngineEvents {
     session: Option<mpsc::UnboundedSender<ui::SessionView>>,
     engine: Option<mpsc::UnboundedSender<EngineEvent>>,
     streaming_host: Option<StreamingHost>,
+    stop_after_generation: bool,
 }
 
 struct SessionReservation {
@@ -473,27 +474,34 @@ where
         engine_output,
         EngineConfig { home, plugin, model, model_override, session },
         host,
-        EngineEvents { engine: Some(engine_events), ..EngineEvents::default() },
+        EngineEvents {
+            engine: Some(engine_events),
+            stop_after_generation: true,
+            ..EngineEvents::default()
+        },
         interrupt_rx,
     ));
 
     input.write_all(serde_json::to_string(&prompt)?.as_bytes()).await?;
-    input.write_all(b"\n/quit\n").await?;
-    drop(input);
+    input.write_all(b"\n").await?;
 
     engine.await.map_err(|error| krabb_core::Error::Denied(error.to_string()))??;
 
     let mut reply = String::new();
+    let mut failed = false;
 
     while let Ok(event) = event_rx.try_recv() {
         match event {
-            EngineEvent::AssistantText(text)
-            | EngineEvent::SystemText(text)
-            | EngineEvent::RequestFailed(text)
-            | EngineEvent::SystemNotice(text) => reply.push_str(&text),
+            EngineEvent::AssistantText(text) => reply.push_str(&text),
+
+            EngineEvent::RequestFailed(_) | EngineEvent::SystemNotice(_) => failed = true,
 
             _ => {}
         }
+    }
+
+    if failed {
+        return Err(krabb_core::Error::Denied("The one-shot request did not complete.".into()));
     }
 
     Ok(reply)
@@ -514,7 +522,12 @@ where
     F: Future<Output = krabb_core::Result<Value>> + Send + 'static,
 {
     let EngineConfig { home, plugin, mut model, model_override, mut session } = config;
-    let EngineEvents { session: session_events, engine: engine_events, streaming_host } = events;
+    let EngineEvents {
+        session: session_events,
+        engine: engine_events,
+        streaming_host,
+        stop_after_generation,
+    } = events;
     let input = BufReader::new(input);
     let initial_session = ensure_session(&home, &session, &model, host).await?;
     let last_session_path = data::plugin_file(&home, "tui", "last-session.json");
@@ -573,6 +586,10 @@ where
         }
 
         output.flush().await?;
+
+        if stop_after_generation {
+            return Ok(());
+        }
     }
 
     let mut sequence = 0_u64;
@@ -1166,11 +1183,20 @@ where
             }
 
             if model == "unset" && terminal_command.is_none() {
-                output
-                    .write_all(b"No model is selected. Use /model list, then /model set <id>.\n> ")
-                    .await?;
+                let message = "No model is selected. Use /model list, then /model set <id>.";
+
+                if let Some(events) = &engine_events {
+                    let _ = events.send(EngineEvent::SystemNotice(message.into()));
+                } else {
+                    output.write_all(format!("{message}\n> ").as_bytes()).await?;
+                }
 
                 output.flush().await?;
+
+                if stop_after_generation {
+                    break;
+                }
+
                 continue;
             }
 
@@ -1256,6 +1282,11 @@ where
                 }
 
                 output.flush().await?;
+
+                if stop_after_generation {
+                    break;
+                }
+
                 continue;
             }
 
@@ -1395,6 +1426,11 @@ where
 
             output.write_all(b"> ").await?;
             output.flush().await?;
+
+            if stop_after_generation {
+                break;
+            }
+
             continue;
 
         }
@@ -5676,6 +5712,33 @@ mod tests {
         }
     }
 
+    async fn delayed_control(
+        home: String,
+        method: String,
+        params: serde_json::Value,
+    ) -> krabb_core::Result<serde_json::Value> {
+        if method == "session.answer" {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            return Ok(json!({"text": "Delayed reply"}));
+        }
+
+        mock_control(home, method, params).await
+    }
+
+    async fn session_id_error_control(
+        home: String,
+        method: String,
+        params: serde_json::Value,
+    ) -> krabb_core::Result<serde_json::Value> {
+        if method == "session.answer" {
+            let id = params["id"].as_str().unwrap_or_default();
+
+            return Err(krabb_core::Error::Denied(format!("Request for session {id} failed.")));
+        }
+
+        mock_control(home, method, params).await
+    }
+
     async fn mock_deep_delete(
         _home: String,
         method: String,
@@ -6031,6 +6094,56 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
         assert_eq!(one_shot, "Reply");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn one_shot_waits_for_a_delayed_model_response() {
+        let root =
+            std::env::temp_dir().join(format!("krabb-tui-one-shot-delay-{}", std::process::id()));
+
+        let reply = super::run_once(
+            root.display().to_string(),
+            "codex".into(),
+            "base".into(),
+            None,
+            "once-delayed".into(),
+            "hello once".into(),
+            delayed_control,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reply, "Delayed reply");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn one_shot_does_not_print_session_ids_from_diagnostic_events() {
+        let root =
+            std::env::temp_dir().join(format!("krabb-tui-one-shot-error-{}", std::process::id()));
+        let session = "tui-once-sensitive-session-id";
+
+        let error = super::run_once(
+            root.display().to_string(),
+            "codex".into(),
+            "base".into(),
+            None,
+            session.into(),
+            "hello once".into(),
+            session_id_error_control,
+        )
+        .await
+        .unwrap_err();
+
+        let krabb_core::Error::Denied(message) = error else {
+            panic!("one-shot diagnostics should be reported with a generic message");
+        };
+
+        assert_eq!(message, "The one-shot request did not complete.");
+        assert!(!message.contains(session));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

@@ -18,6 +18,8 @@ Semantic Versioning.
 
 ### Fixed
 
+- Keep one-shot TUI diagnostics out of CLI output so temporary session IDs are
+  not written to standard output or error.
 - Start the computer plugin's Xvfb server on its configured display.
 - Simplify the computer session idle check to satisfy current Clippy.
 - Preserve required Windows runtime variables when launching the browser worker
