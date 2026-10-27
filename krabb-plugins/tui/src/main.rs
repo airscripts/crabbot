@@ -304,7 +304,7 @@ async fn run_one_shot(options: TuiOptions, prompt: String) -> krabb_core::Result
     let temporary_session = options.session.is_none();
     let session = match options.session {
         Some(session) => selected_session_id(Some(session)),
-        None => one_shot_session_id()?,
+        None => temporary_run_namespace()?,
     };
 
     let result = run_once(
@@ -361,7 +361,7 @@ fn selected_session_id(session: Option<String>) -> String {
     tui_session_id(&session.unwrap_or_else(|| DEFAULT_SESSION_ID.into()))
 }
 
-fn one_shot_session_id() -> krabb_core::Result<String> {
+fn temporary_run_namespace() -> krabb_core::Result<String> {
     let mut random = [0_u8; 8];
     getrandom::fill(&mut random).map_err(|error| {
         krabb_core::Error::Denied(format!("Could not create a one-shot session: {error}."))
@@ -4425,8 +4425,8 @@ mod tests {
 
     #[test]
     fn one_shot_session_ids_are_random_tui_sessions() {
-        let first = super::one_shot_session_id().unwrap();
-        let second = super::one_shot_session_id().unwrap();
+        let first = super::temporary_run_namespace().unwrap();
+        let second = super::temporary_run_namespace().unwrap();
 
         assert_ne!(first, second);
         assert!(first.starts_with("tui-once-"));

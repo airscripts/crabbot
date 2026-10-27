@@ -4,7 +4,10 @@ pre-commit:
 
   commands:
     fmt:
-      run: cargo fmt --check
+      run: cargo fmt --all --check
+
+    spacing:
+      run: bash krabb-scripts/spacing.sh --check
 
     check:
       run: CARGO_BUILD_JOBS=4 cargo check --workspace --locked
