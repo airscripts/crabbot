@@ -2714,12 +2714,148 @@ done"##;
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn tui_answers_use_configured_workspace_tools() {
+        use krabb_core::plugin::Process;
+
+        let mut state = state_at("tui-workspace-tools");
+        let workspace = std::env::temp_dir().join(format!(
+            "krabb-ipc-tui-tools-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&state.home).unwrap();
+        state.root = workspace.clone();
+        state.tui_tools.store(true, std::sync::atomic::Ordering::Release);
+
+        let provider_script = r#"
+count=0
+while IFS= read -r line; do
+    id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\),"method".*/\1/p')
+    case "$line" in
+        *'"method":"hello"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol":{"major":0,"minor":1},"id":"fixture","version":"0.1.0","capabilities":["model"]}}'
+            ;;
+        *'"method":"generate"'*)
+            if [ "$count" = 0 ]; then
+                count=1
+                case "$line" in
+                    *'"name":"read"'*)
+                        printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"text":"","stop":"tool","events":[{"kind":"tool","name":"read","args":{"path":"note.txt"},"approve":false}]}}'
+                        ;;
+                    *)
+                        printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"text":"workspace tools were not advertised","stop":"stop"}}'
+                        ;;
+                esac
+            else
+                printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"text":"The fixture note was read.","stop":"stop"}}'
+            fi
+            ;;
+        *'"method":"shutdown"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}'
+            exit 0
+            ;;
+    esac
+done
+"#;
+        let tool_script = r#"
+while IFS= read -r line; do
+    id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\),"method".*/\1/p')
+    case "$line" in
+        *'"method":"hello"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol":{"major":0,"minor":1},"id":"tools","version":"0.1.0","capabilities":["tool"]}}'
+            ;;
+        *'"method":"tools/list"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"read","description":"Read a fixture file.","schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}]}}'
+            ;;
+        *'"method":"read"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"text":"fixture note contents"}}'
+            ;;
+        *'"method":"shutdown"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}'
+            exit 0
+            ;;
+    esac
+done
+"#;
+        let provider = Process::start_with("sh", ["-c", provider_script]).await.unwrap();
+        let tool = Process::start_with("sh", ["-c", tool_script]).await.unwrap();
+        state.plugins.insert(crate::Live::new(provider)).await;
+        state.plugins.insert(crate::Live::new(tool)).await;
+
+        let session = "tui-tools-smoke";
+        let owner = "tui-tools-owner";
+        {
+            let mut sessions = state.sessions.lock().unwrap();
+            sessions.create(session, "fixture").unwrap();
+            sessions.reserve(session, owner.into()).unwrap();
+            sessions
+                .append_reserved(
+                    session,
+                    owner,
+                    Message {
+                        id: "user-1".into(),
+                        session: session.into(),
+                        role: Role::User,
+                        sender: Some("tui".into()),
+                        content: vec![Content::Text { text: "Read note.txt.".into() }],
+                    },
+                )
+                .unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (_, mut output) = server.into_split();
+        let request = IpcRequest::call(
+            7,
+            "secret",
+            "session.answer",
+            json!({"id": session, "plugin": "fixture"}),
+        );
+
+        super::session_answer(&request, &state, &mut output).await.unwrap();
+        drop(output);
+
+        let mut input = BufReader::new(client);
+        let mut final_response = None;
+
+        while let Some(response) = jsonl::read::<IpcResponse>(&mut input, FRAME).await.unwrap() {
+            if response.result.as_ref().is_some_and(|result| result["done"] == true) {
+                final_response = Some(response);
+            }
+        }
+
+        let response = final_response.expect("TUI turn should return a final response");
+        assert_eq!(response.result.unwrap()["text"], "The fixture note was read.");
+
+        let messages = state.sessions.lock().unwrap().sessions[session].messages.clone();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2].role, Role::Tool);
+        assert_eq!(messages[2].content[0].render(), "fixture note contents");
+        assert_eq!(messages[3].content[0].render(), "The fixture note was read.");
+
+        for (_, plugin) in state.plugins.all().await {
+            plugin.stop().await.unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(workspace);
+        let _ = std::fs::remove_dir_all(&state.home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn proxies_only_supported_capability_calls() {
         use std::os::unix::fs::PermissionsExt;
 
         let state = state_at("capability-call");
         let binary = PathBuf::from(format!("/tmp/krabb-ipc-capability-{}", std::process::id()));
         let script = r#"#!/bin/sh
+
 while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); case "$line" in *'"method":"hello"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol":{"major":0,"minor":1},"id":"scheduler","version":"0.1.0","capabilities":["scheduler"]}}' ;; *'"method":"list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"items":[{"id":7,"text":"scheduled task"}]}}' ;; *'"method":"run"'*|*'"method":"retry"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"id":7,"status":"active"}}' ;; *'"method":"shutdown"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}'; exit 0 ;; esac; done"#;
 
         std::fs::write(&binary, script).unwrap();
