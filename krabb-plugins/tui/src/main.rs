@@ -72,14 +72,8 @@ async fn main() -> std::process::ExitCode {
 
         krabb_log::initialize(krabb_log::Mode::Command { verbosity, json });
 
-        return match run(&args[1..]).await {
-            Ok(output) => {
-                if let Some(output) = output {
-                    println!("{output}");
-                }
-
-                std::process::ExitCode::SUCCESS
-            }
+        return match run_cli(&args[1..]).await {
+            Ok(()) => std::process::ExitCode::SUCCESS,
 
             Err(error) => {
                 eprintln!("{}", cli_error_message(&error));
@@ -278,6 +272,19 @@ async fn run(args: &[String]) -> krabb_core::Result<Option<String>> {
     run_interactive(options).await?;
 
     Ok(None)
+}
+
+async fn run_cli(args: &[String]) -> krabb_core::Result<()> {
+    let mut options = parse_options(args)?;
+
+    if let Some(prompt) = options.once.take() {
+        let output = run_one_shot(options, prompt).await?;
+        println!("{output}");
+
+        return Ok(());
+    }
+
+    run_interactive(options).await
 }
 
 async fn run_one_shot(options: TuiOptions, prompt: String) -> krabb_core::Result<String> {
