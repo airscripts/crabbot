@@ -369,7 +369,7 @@ fn temporary_run_namespace() -> krabb_core::Result<String> {
 
     let suffix = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
 
-    Ok(tui_session_id(&format!("once-{suffix}")))
+    Ok(format!("tui-once-{suffix}"))
 }
 
 async fn resolve_session_id<C, F>(
