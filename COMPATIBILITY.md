@@ -62,6 +62,7 @@ exercise native OS desktop behavior.
 | `make verify` (2026-10-27) | Passed | Linux x86_64 formatting, spacing, Clippy, workspace checks/tests, coverage, build, and metrics |
 | Plugin Protocol Smoke (2026-10-27) | Passed | All 23 built plugins matched manifest identity/capabilities, answered `ping`, and shut down cleanly using temporary state and no provider credentials |
 | Local Capability Smoke (2026-10-27) | Passed | Memory remember/list/forget, SQLite put/get/delete, pending scheduler add/list, and confined tools list/read against temporary state |
+| Local Daemon Capability Smoke (2026-10-27) | Passed | In an isolated home, six local capability plugins plus Codex loaded with healthy daemon status; Memory status/remember/list/forget and Scheduler list/add/pause/list passed. No provider request was sent; the temporary schedule was left paused |
 | Browser Integration Fixture | Passed | Linux x86_64 with Node.js 24.22.0, Playwright 1.64.1, and matching Chromium |
 | Computer Integration Fixture (2026-10-27) | Passed | Linux x86_64 with Xvfb, `xauth`, `xdotool`, ImageMagick, and Tk |
 | Browser Target Checks | Passed | Windows x86_64/aarch64 MSVC and macOS x86_64/aarch64; `cargo check --tests` |
@@ -81,7 +82,7 @@ live checks with operator-owned test accounts before release:
 | Model providers | Anthropic, Codex, Gemini, Ollama, OpenAI, OpenRouter | Generate and stream a short response with a test account or local Ollama service; verify tool and image behavior where supported |
 | Messaging channels | Discord, Signal, Slack, Telegram, WhatsApp | Verify account setup, receive, send, acknowledgement, media, and reconnect behavior with a test channel/account |
 | Agent and protocol bridges | A2A, ACP, AG-UI, MCP | Connect to a real external agent, client, or MCP server and exercise the advertised request lifecycle |
-| Local capabilities | Memory, Scheduler, SQLite, Tools, TUI, Whisper | Run each plugin through an installed daemon; use a real local transcription backend for Whisper |
+| Local capabilities | Memory, Scheduler, SQLite, Tools, TUI, Whisper | Memory and Scheduler passed daemon operations; SQLite and Tools passed direct capability smoke. Still exercise SQLite/Tools through a daemon model turn, TUI with a test model, and Whisper with a real local transcription backend |
 | Browser and computer | Browser, Computer | Use the deployment checklists below on each supported OS; the browser fixture requires Node.js and Playwright |
 
 All five groups passed the 2026-10-27 protocol smoke and workspace verification.
