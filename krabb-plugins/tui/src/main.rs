@@ -364,7 +364,7 @@ fn selected_session_id(session: Option<String>) -> String {
 fn temporary_run_namespace() -> krabb_core::Result<String> {
     let mut random = [0_u8; 8];
     getrandom::fill(&mut random).map_err(|error| {
-        krabb_core::Error::Denied(format!("Could not create a one-shot session: {error}."))
+        krabb_core::Error::Denied(format!("Could not create a temporary run namespace: {error}."))
     })?;
 
     let suffix = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
@@ -4424,7 +4424,7 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_session_ids_are_random_tui_sessions() {
+    fn temporary_run_names_are_random_tui_sessions() {
         let first = super::temporary_run_namespace().unwrap();
         let second = super::temporary_run_namespace().unwrap();
 
