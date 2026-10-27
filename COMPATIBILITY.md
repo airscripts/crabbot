@@ -62,12 +62,13 @@ exercise native OS desktop behavior.
 | `make verify` (2026-10-27) | Passed | Linux x86_64 formatting, spacing, Clippy, workspace checks/tests, coverage, build, and metrics |
 | Plugin Package Completeness Audit (2026-10-27) | Passed | All 23 plugins have a manifest, README, Rust binary source, and at least four tests; no `todo!`, `unimplemented!`, or `FIXME`. One Gemini 2 compatibility cleanup TODO remains documented in source |
 | Plugin Protocol Smoke (2026-10-27) | Passed | All 23 built plugins matched manifest identity/capabilities, answered `ping`, and shut down cleanly using isolated temporary state and no provider credentials. WhatsApp used an ephemeral loopback listener |
+| MCP HTTP Loopback Smoke (2026-10-27) | Passed | Built MCP plugin completed `hello`, forwarded an authenticated `tools/list` request to a local HTTP fixture, returned its response, and shut down over JSONL |
 | Whisper Process Smoke (2026-10-27) | Passed | Plugin binary completed `hello`, `ping`, `transcribe`, and `shutdown` over JSONL using an isolated media file and deterministic local transcriber fixture; no real transcription backend was exercised |
 | TUI Workspace Tools IPC (2026-10-27) | Passed | Daemon `session.answer` used an advertised read tool with a local fixture provider and tool process; the fixture verified the tool result was included in the final answer |
 | Local Capability Smoke (2026-10-27) | Passed | Memory remember/list/forget, SQLite put/get/delete, pending scheduler add/list, and confined tools list/read against temporary state |
 | Local Daemon Capability Smoke (2026-10-27) | Passed | In an isolated home, six local capability plugins plus Codex loaded with healthy daemon status; Memory status/remember/list/forget and Scheduler list/add/pause/list passed. No provider request was sent; the temporary schedule was left paused |
 | Browser Integration Fixture | Passed | Linux x86_64 with Node.js 24.22.0, Playwright 1.64.1, and matching Chromium |
-| Computer Integration Fixture (2026-10-27) | Passed | Linux x86_64 with Xvfb, `xauth`, `xdotool`, ImageMagick, and Tk |
+| Computer Integration Fixture (2026-10-27) | Passed | Linux x86_64 local rerun with the built plugin, authenticated isolated Xvfb, and a Tk fixture; verified dimensions, PNG capture, click, typing, and close |
 | Browser Target Checks | Passed | Windows x86_64/aarch64 MSVC and macOS x86_64/aarch64; `cargo check --tests` |
 | Computer Target Checks | Passed | Windows x86_64/aarch64 MSVC and macOS x86_64/aarch64; `cargo check --tests` |
 
@@ -86,7 +87,7 @@ live checks with operator-owned test accounts before release:
 | Messaging channels | Discord, Signal, Slack, Telegram, WhatsApp | Verify account setup, receive, send, acknowledgement, media, and reconnect behavior with a test channel/account |
 | Agent and protocol bridges | A2A, ACP, AG-UI, MCP | Connect to a real external agent, client, or MCP server and exercise the advertised request lifecycle |
 | Local capabilities | Memory, Scheduler, SQLite, Tools, TUI, Whisper | Memory and Scheduler passed daemon operations; SQLite passed daemon IPC smoke with the installed plugin binary; Tools passed direct capability smoke. TUI workspace tools passed both the daemon IPC fixture and installed CLI fixture smoke. The smoke exposed and verified a startup-readiness race fixed by publishing IPC after installed plugins finish loading. Whisper passed the fixture process smoke above. Still exercise Whisper with a real local transcription backend |
-| Browser and computer | Browser, Computer | Use the deployment checklists below on each supported OS; the browser fixture requires Node.js and Playwright |
+| Browser and computer | Browser, Computer | The isolated Computer Xvfb fixture passed locally; interactive macOS/Windows desktop behavior remains deployment-specific. Browser's local egress fixture passed earlier; this worktree lacks Node.js, Playwright, and Chromium for a rerun. Complete the deployment checklists on each supported OS |
 
 All five groups passed the 2026-10-27 protocol smoke and workspace verification.
 The plugin-specific manual checks in this table remain outstanding until their

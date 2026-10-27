@@ -350,6 +350,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwards_http_requests_to_a_loopback_mcp_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+
+                let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+
+                let headers_end = headers_end + 4;
+                let headers = String::from_utf8_lossy(&request[..headers_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length: ")
+                            .or_else(|| line.strip_prefix("Content-Length: "))
+                    })
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap();
+
+                if request.len() >= headers_end + content_length {
+                    let body = &request[headers_end..headers_end + content_length];
+                    let request: serde_json::Value = serde_json::from_slice(body).unwrap();
+
+                    assert!(headers.starts_with("POST /mcp HTTP/1.1\r\n"));
+                    assert!(
+                        headers.lines().any(|line| line == "authorization: Bearer fixture-token")
+                    );
+
+                    assert_eq!(request["method"], "tools/list");
+
+                    let response = serde_json::to_vec(&json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {"tools": [{"name": "fixture_tool"}]}
+                    }))
+                    .unwrap();
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response.len()
+                    );
+
+                    stream.write_all(headers.as_bytes()).await.unwrap();
+                    stream.write_all(&response).await.unwrap();
+                    return;
+                }
+            }
+        });
+
+        let response = call(
+            &Client::new(),
+            Request::call(
+                1,
+                "http",
+                json!({
+                    "url": format!("http://{address}/mcp"),
+                    "token": "fixture-token",
+                    "request": {"jsonrpc": "2.0", "id": 7, "method": "tools/list"}
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(response.result.unwrap()["result"]["tools"][0]["name"], "fixture_tool");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn bounds_http_bodies() {
         use futures_util::stream;
 
