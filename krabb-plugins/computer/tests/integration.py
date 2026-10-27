@@ -11,6 +11,7 @@ import time
 
 
 plugin = os.environ.get("KRABB_COMPUTER_PLUGIN")
+
 if not plugin:
     raise SystemExit("Set KRABB_COMPUTER_PLUGIN to the built plugin executable.")
 
@@ -50,6 +51,7 @@ def call(method, arguments=None, host=True):
     request_id = next_id
     next_id += 1
     params = {"arguments": arguments or {}}
+
     if host:
         params["host"] = {"session": "computer-integration", "turn": "integration-turn"}
 
@@ -60,16 +62,23 @@ def call(method, arguments=None, host=True):
     process.stdin.flush()
 
     deadline = time.monotonic() + 10
+
     while time.monotonic() < deadline:
         ready, _, _ = select.select([process.stdout], [], [], max(0, deadline - time.monotonic()))
+
         if not ready:
             break
 
         response = json.loads(process.stdout.readline())
+
         if response.get("id") != request_id:
             continue
+
         if "error" in response:
-            raise RuntimeError(f"{method} failed: {response['error'].get('message', response['error'])}")
+            raise RuntimeError(
+                f"{method} failed: {response['error'].get('message', response['error'])}"
+            )
+
         return response.get("result", {})
 
     raise TimeoutError(f"Timed out waiting for {method}.")
@@ -77,11 +86,15 @@ def call(method, arguments=None, host=True):
 
 def wait_for_title(title):
     deadline = time.monotonic() + 5
+
     while time.monotonic() < deadline:
         windows = call("computer_windows", {"session_id": session_id}).get("windows", [])
+
         if any(window["title"] == title for window in windows):
             return
+
         time.sleep(0.1)
+
     raise AssertionError(f"The isolated application did not reach window title {title!r}.")
 
 

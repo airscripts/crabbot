@@ -54,10 +54,11 @@ jobs:
       - name: Install Rust Components
         run: rustup component add rustfmt clippy
 
-      - name: Check Rust Formatting
+      - name: Check Formatting
         run: |
           cargo fmt --all --check
           bash krabb-scripts/spacing.sh --check
+          python3 krabb-scripts/code-spacing.py --check
 
       - name: Run Clippy
         run: CARGO_BUILD_JOBS=4 cargo clippy --workspace --all-targets --locked -- -D warnings

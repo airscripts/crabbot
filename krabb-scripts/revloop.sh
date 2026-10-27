@@ -1051,8 +1051,8 @@ run_fast_verification() {
         set -e
         cd "$REPO_ROOT"
 
-        print_info 'Applying Rust spacing formatter...'
-        run_verification_command 'Rust spacing formatter' make spacing || exit $?
+        print_info 'Applying code spacing formatter...'
+        run_verification_command 'Code spacing formatter' make spacing || exit $?
 
         print_info 'Running format check (1/4)...'
         run_verification_command 'Format check' make fmt || exit $?
@@ -1170,9 +1170,9 @@ run_final_verification() {
             exit "$EXIT_VERIFICATION"
         fi
 
-        print_info 'Applying Rust spacing formatter before complete verification...'
+        print_info 'Applying code spacing formatter before complete verification...'
         run_verification_command \
-            'Rust spacing formatter' \
+            'Code spacing formatter' \
             make spacing || exit $?
 
         print_info 'Running complete verification (1/10)...'

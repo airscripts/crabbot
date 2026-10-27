@@ -9,6 +9,9 @@ pre-commit:
     spacing:
       run: bash krabb-scripts/spacing.sh --check
 
+    code-spacing:
+      run: python3 krabb-scripts/code-spacing.py --check
+
     check:
       run: CARGO_BUILD_JOBS=4 cargo check --workspace --locked
 

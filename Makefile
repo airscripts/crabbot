@@ -13,8 +13,8 @@ help:
 	@printf '%s\n' '  all       Build the workspace, then install the CLI and daemon (default)'
 	@printf '%s\n' '  install   Install the krabb and krabb-daemon binaries only'
 	@printf '%s\n' '  hooks     Install Lefthook git hooks'
-	@printf '%s\n' '  fmt       Check Rust formatting and spacing'
-	@printf '%s\n' '  spacing   Apply Rust block spacing'
+	@printf '%s\n' '  fmt       Check Rust, JavaScript, and Python formatting and spacing'
+	@printf '%s\n' '  spacing   Apply code block spacing'
 	@printf '%s\n' '  clippy    Run Clippy with warnings denied'
 	@printf '%s\n' '  check     Type-check the workspace'
 	@printf '%s\n' '  test      Run all workspace tests without stopping at the first failure'
@@ -36,9 +36,11 @@ hooks:
 fmt:
 	$(CARGO) fmt --all --check
 	bash krabb-scripts/spacing.sh --check
+	python3 krabb-scripts/code-spacing.py --check
 
 spacing:
 	bash krabb-scripts/spacing.sh
+	python3 krabb-scripts/code-spacing.py --fix
 
 clippy:
 	CARGO_BUILD_JOBS=$(JOBS) $(CARGO) clippy --workspace --all-targets --locked -- -D warnings
