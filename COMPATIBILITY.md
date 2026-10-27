@@ -51,13 +51,15 @@ the commit being reviewed.
 
 ## Verification From This Worktree
 
-These checks were run locally for this change on 2026-10-26. Cross-target checks
-compile Rust tests for the target; they do not run the test binaries or exercise
-native OS desktop behavior.
+The integration and cross-target checks below ran locally on 2026-10-26.
+Workspace verification was rerun for this change on 2026-10-27. Cross-target
+checks compile Rust tests for the target; they do not run the test binaries or
+exercise native OS desktop behavior.
 
 | Check | Result | Scope |
 | --- | --- | --- |
-| `make verify` | Passed | Linux x86_64 formatting, Clippy, workspace checks/tests, coverage, build, and metrics |
+| `make verify` (2026-10-26) | Passed | Linux x86_64 formatting, Clippy, workspace checks/tests, coverage, build, and metrics |
+| `make verify` (2026-10-27) | Passed | Linux x86_64 formatting, spacing, Clippy, workspace checks/tests, coverage, build, and metrics |
 | Browser Integration Fixture | Passed | Linux x86_64 with Node.js 24.22.0, Playwright 1.64.1, and matching Chromium |
 | Computer Integration Fixture | Passed | Linux x86_64 with Xvfb, `xauth`, `xdotool`, ImageMagick, and Tk |
 | Browser Target Checks | Passed | Windows x86_64/aarch64 MSVC and macOS x86_64/aarch64; `cargo check --tests` |
