@@ -38,9 +38,11 @@ environment = {
     "KRABB_COMPUTER_STARTUP": sys.executable,
     "KRABB_COMPUTER_STARTUP_ARGS": json.dumps(["-c", application]),
 }
+
 process = subprocess.Popen(
     [plugin], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=environment, text=True, bufsize=1
 )
+
 next_id = 1
 session_id = None
 
@@ -59,8 +61,8 @@ def call(method, arguments=None, host=True):
         json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
         + "\n"
     )
-    process.stdin.flush()
 
+    process.stdin.flush()
     deadline = time.monotonic() + 10
 
     while time.monotonic() < deadline:

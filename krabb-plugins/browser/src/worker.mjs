@@ -11,12 +11,14 @@ const IMAGE_LIMIT = 4 * 1024 * 1024;
 const TEXT_LIMIT = 48 * 1024;
 const TAB_LIMIT = 8;
 const VIEWPORT = { width: 1280, height: 720 };
+
 const allowedHosts = new Set(
     (process.env.KRABB_BROWSER_ALLOWED_HOSTS || '')
         .split(',')
         .map((host) => host.trim().toLowerCase())
         .filter(Boolean),
 );
+
 const sessions = new Map();
 let browser;
 
@@ -187,6 +189,7 @@ function tab(state, params) {
     const entry = params.tab_id
         ? [params.tab_id, state.tabs.get(params.tab_id)]
         : state.tabs.entries().next().value;
+
     if (!entry || !entry[1]) throw new Error('Browser tab is unavailable.');
     return { id: entry[0], page: entry[1] };
 }
@@ -208,6 +211,7 @@ function locator(page, params) {
         case 'role':
             if (!params.role) throw new Error('role is required for role locators.');
             return page.getByRole(params.role, { name: params.name, exact: params.exact === true });
+
         case 'label': return page.getByLabel(target, { exact: params.exact === true });
         case 'placeholder': return page.getByPlaceholder(target, { exact: params.exact === true });
         case 'text': return page.getByText(target, { exact: params.exact === true });
@@ -222,6 +226,7 @@ async function snapshot(params) {
     const text = (
         await page.locator('body').innerText({ timeout: 5000 }).catch(() => '')
     ).slice(0, TEXT_LIMIT);
+
     const controls = await page
         .locator('button,input,textarea,select,a,[role="button"],[role="link"]')
         .evaluateAll((items) => items.slice(0, 100).flatMap((element) => {
@@ -232,8 +237,10 @@ async function snapshot(params) {
                 || style.visibility === 'hidden'
                 || style.display === 'none'
             ) return [];
+
             const label = element.getAttribute('aria-label') || element.labels?.[0]?.innerText
                 || element.innerText || element.getAttribute('placeholder') || '';
+
             return [{
                 role: element.getAttribute('role') || element.tagName.toLowerCase(),
                 label: String(label).trim().slice(0, 256),
@@ -281,6 +288,7 @@ async function screenshot(params) {
             width: document.documentElement.scrollWidth,
             height: document.documentElement.scrollHeight,
         }));
+
         width = bounds.width;
         height = bounds.height;
         coordinateSpace = 'document';
@@ -411,6 +419,7 @@ async function call(method, params) {
                 url: safeUrl(page.url()),
                 title: (await page.title()).slice(0, 256),
             })));
+
         case 'browser_new_tab': {
             if (state.tabs.size >= TAB_LIMIT) throw new Error('Tab capacity is full.');
             const page = await state.context.newPage();
@@ -433,18 +442,22 @@ async function call(method, params) {
             await locator(page, params).fill(params.value, { timeout: 10000 });
             state.observations.delete(tabId);
             return { filled: true };
+
         case 'browser_select':
             await locator(page, params).selectOption(params.value, { timeout: 10000 });
             state.observations.delete(tabId);
             return { selected: true };
+
         case 'browser_press':
             await page.keyboard.press(params.key);
             state.observations.delete(tabId);
             return { pressed: true };
+
         case 'browser_scroll':
             await page.mouse.wheel(params.delta_x || 0, params.delta_y);
             state.observations.delete(tabId);
             return { scrolled: true };
+
         case 'browser_wait':
             await locator(page, params).waitFor({
                 state: 'visible',

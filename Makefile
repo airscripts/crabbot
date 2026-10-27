@@ -36,11 +36,9 @@ hooks:
 fmt:
 	$(CARGO) fmt --all --check
 	bash krabb-scripts/spacing.sh --check
-	python3 krabb-scripts/code-spacing.py --check
 
 spacing:
 	bash krabb-scripts/spacing.sh
-	python3 krabb-scripts/code-spacing.py --fix
 
 clippy:
 	CARGO_BUILD_JOBS=$(JOBS) $(CARGO) clippy --workspace --all-targets --locked -- -D warnings
