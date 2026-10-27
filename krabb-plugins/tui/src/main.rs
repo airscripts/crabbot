@@ -29,9 +29,7 @@ use std::{
     pin::Pin,
 };
 
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, duplex,
-};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, duplex};
 
 use tokio::net::TcpStream;
 #[cfg(test)]
@@ -465,7 +463,8 @@ where
 {
     let (mut input, engine_input) = duplex(16 * 1024);
 
-    let (mut output, engine_output) = duplex(64 * 1024);
+    let (_output, engine_output) = duplex(64 * 1024);
+    let (engine_events, mut event_rx) = mpsc::unbounded_channel();
     let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
     drop(interrupt_tx);
 
@@ -474,7 +473,7 @@ where
         engine_output,
         EngineConfig { home, plugin, model, model_override, session },
         host,
-        EngineEvents::default(),
+        EngineEvents { engine: Some(engine_events), ..EngineEvents::default() },
         interrupt_rx,
     ));
 
@@ -482,15 +481,22 @@ where
     input.write_all(b"\n/quit\n").await?;
     drop(input);
 
-    let mut transcript = String::new();
-    output.read_to_string(&mut transcript).await?;
     engine.await.map_err(|error| krabb_core::Error::Denied(error.to_string()))??;
 
-    let bot_name = std::env::var("KRABB_NAME").unwrap_or_else(|_| DEFAULT_NAME.into());
-    let greeting = format!("{bot_name} terminal. Type /help for commands.\n> ");
-    let transcript = transcript.strip_prefix(&greeting).unwrap_or(&transcript);
+    let mut reply = String::new();
 
-    Ok(transcript.trim_end_matches("\n> ").trim().to_owned())
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            EngineEvent::AssistantText(text)
+            | EngineEvent::SystemText(text)
+            | EngineEvent::RequestFailed(text)
+            | EngineEvent::SystemNotice(text) => reply.push_str(&text),
+
+            _ => {}
+        }
+    }
+
+    Ok(reply)
 }
 
 async fn run_with<R, W, C, F>(
@@ -555,13 +561,17 @@ where
 
     output.flush().await?;
 
-    if !model_plugin_available && engine_events.is_none() {
-        output
-            .write_all(
-                format!("No intelligence plugin is installed at {plugin}. Install one to send prompts; session commands remain available.\n> ")
-                .as_bytes(),
-            )
-            .await?;
+    if !model_plugin_available {
+        let message = format!(
+            "No intelligence plugin is installed at {plugin}. Install one to send prompts; session commands remain available."
+        );
+
+        if let Some(events) = &engine_events {
+            let _ = events.send(EngineEvent::SystemNotice(message));
+        } else {
+            output.write_all(format!("{message}\n> ").as_bytes()).await?;
+        }
+
         output.flush().await?;
     }
 
@@ -1344,9 +1354,13 @@ where
                 Ok(value) => {
                     let reply = value["text"].as_str().unwrap_or_default();
 
-                    if !reply.is_empty() {
-                        output.write_all(reply.as_bytes()).await?;
-                        output.write_all(b"\n").await?;
+                    if !reply.is_empty() && !streaming_turn {
+                        if let Some(events) = &engine_events {
+                            let _ = events.send(EngineEvent::AssistantText(reply.to_owned()));
+                        } else {
+                            output.write_all(reply.as_bytes()).await?;
+                            output.write_all(b"\n").await?;
+                        }
                     }
                 }
 
