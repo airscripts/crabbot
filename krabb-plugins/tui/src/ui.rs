@@ -1113,6 +1113,10 @@ fn command_options(home: &str, has_model: bool) -> Vec<(&'static str, &'static s
         commands.push(("/memory <list|remember|forget>", "Manage memories."));
     }
 
+    if crate::has_capability(home, "store") {
+        commands.push(("/store <get|put|delete>", "Manage session-scoped SQLite values."));
+    }
+
     commands
 }
 
@@ -3752,6 +3756,7 @@ mod tests {
             ("channel", "channel"),
             ("scheduler", "scheduler"),
             ("memory", "memory"),
+            ("sqlite", "store"),
         ] {
             let plugin = home.join("plugins").join(id);
             let binary = krabb_core::plugin::binary_name(id);
@@ -3778,6 +3783,7 @@ mod tests {
             "/drop <id>",
             "/schedule <list|add|remove>",
             "/memory <list|remember|forget>",
+            "/store <get|put|delete>",
         ] {
             assert!(names.contains(&command), "missing command: {command}");
         }

@@ -639,6 +639,15 @@ where
                 continue;
             }
 
+            if line == "/store" || line.starts_with("/store ") {
+                let command = line.strip_prefix("/store").unwrap_or_default().trim();
+                let text = store_command(home.clone(), session.clone(), command, host).await;
+
+                output.write_all(text.as_bytes()).await?;
+                output.flush().await?;
+                continue;
+            }
+
             if line == "/plugin" || line.starts_with("/plugin ") {
                 let text = match parse_plugin_list_page(line) {
                     Ok(page) => {
@@ -1955,6 +1964,10 @@ fn command_help(home: &str, has_model: bool, daemon: bool) -> String {
         conditional.push(("/memory", "Manage memories."));
     }
 
+    if daemon && has_capability(home, "store") {
+        conditional.push(("/store", "Manage session-scoped SQLite values."));
+    }
+
     if !conditional.is_empty() {
         sections.push(format!(
             "Conditional commands (shown only when usable):\n{}",
@@ -3158,6 +3171,106 @@ fn configured_tui_shell(home: &str) -> bool {
         .unwrap_or(false)
 }
 
+async fn store_command<C, F>(home: String, session: String, command: &str, host: C) -> String
+where
+    C: Fn(String, String, Value) -> F + Copy,
+    F: Future<Output = krabb_core::Result<Value>>,
+{
+    if command.is_empty() || command == "help" {
+        return store_help().into();
+    }
+
+    let result = if let Some(value) = command.strip_prefix("put ") {
+        match value.split_once('=') {
+            Some((key, value)) if !key.trim().is_empty() => store_value(
+                home,
+                session,
+                "put",
+                key.trim(),
+                Some(Value::String(value.to_owned())),
+                host,
+            )
+            .await
+            .map(|_| "Stored session value.\n> ".into()),
+
+            _ => Ok("Usage: /store put KEY=VALUE. Run /store help for details.\n> ".into()),
+        }
+    } else if let Some(key) = command.strip_prefix("get ") {
+        store_value(home, session, "get", key.trim(), None, host).await.map(|value| {
+            if value["found"] != true {
+                return "No value is stored for that key.\n> ".into();
+            }
+
+            let rendered =
+                serde_json::to_string_pretty(&value["value"]).unwrap_or_else(|_| "null".into());
+            let mut shown = rendered.chars().take(4_096).collect::<String>();
+
+            if rendered.chars().count() > 4_096 {
+                shown.push_str("\n[value truncated]");
+            }
+
+            format!("{shown}\n> ")
+        })
+    } else if let Some(key) = command.strip_prefix("delete ") {
+        store_value(home, session, "delete", key.trim(), None, host).await.map(|value| {
+            if value["deleted"] == true {
+                "Deleted session value.\n> ".into()
+            } else {
+                "No value is stored for that key.\n> ".into()
+            }
+        })
+    } else {
+        Ok("Unknown store command. Run /store help for usage.\n> ".into())
+    };
+
+    result.unwrap_or_else(|error| {
+        format!("Store action failed: {}.\n> ", sentence(error.to_string()))
+    })
+}
+
+async fn store_value<C, F>(
+    home: String,
+    session: String,
+    method: &str,
+    key: &str,
+    value: Option<Value>,
+    host: C,
+) -> krabb_core::Result<Value>
+where
+    C: Fn(String, String, Value) -> F,
+    F: Future<Output = krabb_core::Result<Value>>,
+{
+    if key.is_empty() {
+        return Err(krabb_core::Error::Denied("A store key is required".into()));
+    }
+
+    if key.len() > 2_048 {
+        return Err(krabb_core::Error::Denied("The store key exceeds the size limit".into()));
+    }
+
+    let mut params = serde_json::json!({"key": format!("tui:{session}:{key}")});
+
+    if let Some(value) = value {
+        params["value"] = value;
+    }
+
+    capability(home, "sqlite", method, params, host).await
+}
+
+fn store_help() -> &'static str {
+    r#"Manage values stored in SQLite for this session.
+
+Commands:
+  /store help                       Show this help
+  /store put KEY=VALUE              Save a text value
+  /store get KEY                    Show a saved value
+  /store delete KEY                 Delete a saved value
+
+Keys are scoped to the active TUI session. Stored values persist in the local
+SQLite database. Selecting /store in the command picker shows this help.
+> "#
+}
+
 async fn memory_command<C, F>(home: String, session: String, command: &str, host: C) -> String
 where
     C: Fn(String, String, Value) -> F + Copy,
@@ -4247,6 +4360,57 @@ fn sentence(value: String) -> String {
 mod tests {
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn stores_values_through_the_session_scoped_sqlite_capability() {
+        let calls = std::sync::Mutex::new(Vec::new());
+        let host = |_: String, method: String, params: serde_json::Value| {
+            let calls = &calls;
+
+            async move {
+                assert_eq!(method, "capability.call");
+                assert_eq!(params["service"], "sqlite");
+                calls.lock().unwrap().push(params.clone());
+
+                match params["method"].as_str().unwrap() {
+                    "put" => Ok(json!({"ok": true})),
+                    "get" => Ok(json!({"found": true, "value": "stored text"})),
+                    "delete" => Ok(json!({"deleted": true})),
+                    method => panic!("unexpected SQLite method {method}"),
+                }
+            }
+        };
+
+        assert_eq!(
+            super::store_command(
+                "/tmp/krabb".into(),
+                "default".into(),
+                "put note=stored text",
+                host,
+            )
+            .await,
+            "Stored session value.\n> "
+        );
+
+        assert_eq!(
+            super::store_command("/tmp/krabb".into(), "default".into(), "get note", host).await,
+            "\"stored text\"\n> "
+        );
+
+        assert_eq!(
+            super::store_command("/tmp/krabb".into(), "default".into(), "delete note", host,).await,
+            "Deleted session value.\n> "
+        );
+
+        let calls = calls.lock().unwrap();
+
+        assert_eq!(calls[0]["method"], "put");
+        assert_eq!(calls[0]["params"]["key"], "tui:default:note");
+        assert_eq!(calls[0]["params"]["value"], "stored text");
+        assert_eq!(calls[1]["params"]["key"], "tui:default:note");
+        assert_eq!(calls[2]["method"], "delete");
+        assert_eq!(calls[2]["params"]["key"], "tui:default:note");
+    }
 
     #[tokio::test]
     async fn forgets_matching_session_memories_from_both_scopes() {

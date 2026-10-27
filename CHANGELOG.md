@@ -7,6 +7,7 @@ Semantic Versioning.
 
 ### Added
 
+- Expose SQLite session-scoped values through the TUI `/store` command.
 - Tool plugins can publish schemas through `tools/list`; the runtime routes
   calls across active providers and preserves validated image results for
   vision-capable model requests.

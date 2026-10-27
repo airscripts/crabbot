@@ -272,6 +272,8 @@ bounded private files; generated daemon replies currently remain text-only.
 The SQLite plugin uses WAL mode and idempotent schema migrations. Its store
 methods cover key/value data, owner-scoped leases, an idempotent durable
 outbox, acknowledgements, and expiring event deduplication.
+When installed, the TUI exposes `/store get`, `/store put`, and `/store delete`
+for session-scoped text values.
 Host outbox entries expose stable IDs and explicit uncertainty; plugins receive
 the ID with each send so operators can correlate a provider receipt.
 
