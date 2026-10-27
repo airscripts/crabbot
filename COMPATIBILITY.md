@@ -61,6 +61,7 @@ exercise native OS desktop behavior.
 | `make verify` (2026-10-26) | Passed | Linux x86_64 formatting, Clippy, workspace checks/tests, coverage, build, and metrics |
 | `make verify` (2026-10-27) | Passed | Linux x86_64 formatting, spacing, Clippy, workspace checks/tests, coverage, build, and metrics |
 | Plugin Protocol Smoke (2026-10-27) | Passed | All 23 built plugins matched manifest identity/capabilities, answered `ping`, and shut down cleanly using temporary state and no provider credentials |
+| Local Capability Smoke (2026-10-27) | Passed | Memory remember/list/forget, SQLite put/get/delete, pending scheduler add/list, and confined tools list/read against temporary state |
 | Browser Integration Fixture | Passed | Linux x86_64 with Node.js 24.22.0, Playwright 1.64.1, and matching Chromium |
 | Computer Integration Fixture (2026-10-27) | Passed | Linux x86_64 with Xvfb, `xauth`, `xdotool`, ImageMagick, and Tk |
 | Browser Target Checks | Passed | Windows x86_64/aarch64 MSVC and macOS x86_64/aarch64; `cargo check --tests` |
