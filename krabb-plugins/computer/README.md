@@ -75,6 +75,9 @@ Krabb's host approval policy still applies.
 - `computer_scroll`, `computer_keypress`, and `computer_type` perform input
   actions.
 
+`computer_keypress` supports function keys F1 through F12. Higher function keys
+are rejected.
+
 Screenshots are limited to 4 MiB and remain temporary model context. Input calls
 use Krabb's normal approval policy.
 

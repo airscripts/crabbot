@@ -433,6 +433,7 @@ where
             session: Some(session_tx),
             engine: Some(engine_event_tx),
             streaming_host: Some(crate::daemon_streaming_control),
+            stop_after_generation: false,
         },
         interrupt_rx,
     ));
@@ -1110,6 +1111,10 @@ fn command_options(home: &str, has_model: bool) -> Vec<(&'static str, &'static s
 
     if crate::has_capability(home, "memory") {
         commands.push(("/memory <list|remember|forget>", "Manage memories."));
+    }
+
+    if crate::has_capability(home, "store") {
+        commands.push(("/store <get|put|delete>", "Manage session-scoped SQLite values."));
     }
 
     commands
@@ -3751,6 +3756,7 @@ mod tests {
             ("channel", "channel"),
             ("scheduler", "scheduler"),
             ("memory", "memory"),
+            ("sqlite", "store"),
         ] {
             let plugin = home.join("plugins").join(id);
             let binary = krabb_core::plugin::binary_name(id);
@@ -3777,6 +3783,7 @@ mod tests {
             "/drop <id>",
             "/schedule <list|add|remove>",
             "/memory <list|remember|forget>",
+            "/store <get|put|delete>",
         ] {
             assert!(names.contains(&command), "missing command: {command}");
         }

@@ -9,8 +9,10 @@ curl -fsSL https://raw.githubusercontent.com/krabblab/krabb/main/install.sh | sh
 The host terminal client is available with `krabb tui`. Start the daemon with
 `krabb service start` or run `krabb-daemon` in the foreground first; the TUI
 requires it for both interactive and `--once` use. Prompts, session history,
-tools, and approvals go through the shared daemon runtime. TUI tools are
-disabled by default; enable them with `[clients.tui] tools = true` in the home
+tools, and approvals go through the shared daemon runtime. The `/store`
+command uses SQLite when the plugin is installed; its keys are scoped to the
+active TUI session. TUI tools are disabled by default; enable them with
+`[clients.tui] tools = true` in the home
 `config.toml` to opt in under the global approval policy.
 Run `krabb tui --once "prompt"` to print one response without opening the
 full-screen interface. It uses and deletes a fresh temporary session by
@@ -28,9 +30,10 @@ In an interactive terminal, use `/help`, `/status`, `/approval`, `/approvals`, `
 `/deny <id>`, `/session help`, `/session list`, `/deliveries`, `/retry <id>`,
 `/drop <id>`, `/model <name>`, `/new <id>`,
 `/plugin [page]`, `/history <list|clear|help>`, `/workspace [path|reset]`,
-`/schedule <help|list|add|approve|run|retry|pause|resume|remove>`, `/memory
-<list|remember|forget>`, `/compact`, `/clear`, and `/quit`. Plain lines are sent through
-the configured model plugin. Sessions, selected models, and completed turns
+`/schedule <help|list|add|approve|run|retry|pause|resume|remove>`,
+`/memory <list|remember|forget>`, `/store <help|get|put|delete>`, `/compact`,
+`/clear`, and `/quit`. Plain lines are sent through the configured model
+plugin. Sessions, selected models, and completed turns
 are persisted through authenticated daemon IPC. `/session switch <id>` resumes
 an existing session; `/new <id>` creates and selects one. `/session rename`
 renames the active session without losing history. `/session archive` and

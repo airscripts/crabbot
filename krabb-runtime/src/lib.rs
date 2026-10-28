@@ -4980,6 +4980,16 @@ async fn serve_inner(
     let _daemon_lock = daemon_lock(root)?;
     recover_plugins(root)?;
 
+    for name in ["ipc.token", "ipc.port"] {
+        match std::fs::remove_file(root.join(name)) {
+            Ok(()) => {}
+
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+
+            Err(error) => return Err(error.into()),
+        }
+    }
+
     let config: Config = toml::from_str(&std::fs::read_to_string(root.join("config.toml"))?)?;
     config
         .validate()
@@ -4995,13 +5005,11 @@ async fn serve_inner(
     let token = ipc::token()?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
-    secure(root.join("ipc.token"), token.as_bytes())?;
-    secure(root.join("ipc.port"), port.to_string().as_bytes())?;
     let stop = Arc::new(Stop::new());
     let cancels = Arc::new(Mutex::new(BTreeMap::new()));
     let plugins = Plugins::default();
     let ipc_state = Arc::new(ipc::State {
-        token,
+        token: token.clone(),
         sessions: Arc::clone(&sessions),
         stop: Arc::clone(&stop),
         slots: Arc::new(tokio::sync::Semaphore::new(64)),
@@ -5019,8 +5027,6 @@ async fn serve_inner(
         channel: channel_id.to_owned(),
         model: model_id.to_owned(),
     });
-
-    let ipc_task = tokio::spawn(ipc::serve(listener, ipc_state));
 
     if channel_id == model_id {
         if let Err(error) = load_plugin(root, channel_id, None, force, &config, &plugins).await {
@@ -5051,6 +5057,10 @@ async fn serve_inner(
             warn!(plugin = %id, error = %diagnostic(sentence(error.to_string())), "Plugin failed to start.");
         }
     }
+
+    secure(root.join("ipc.token"), token.as_bytes())?;
+    secure(root.join("ipc.port"), port.to_string().as_bytes())?;
+    let ipc_task = tokio::spawn(ipc::serve(listener, ipc_state));
 
     info!(channel = channel_id, model = model_id, "Daemon is running on local IPC.");
 
@@ -25888,8 +25898,11 @@ fn main() {
 
         let root = std::env::temp_dir().join(format!("krabb-start-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("ipc.token"), "stale").unwrap();
+        fs::write(root.join("ipc.port"), "1").unwrap();
 
-        for (id, capability) in [("channel", "channel"), ("model", "model")] {
+        for (id, capability) in [("channel", "channel"), ("model", "model"), ("tools", "tool")] {
             let bin = root.join(format!("plugins/{id}/bin/krabb-plugin-{id}"));
             fs::create_dir_all(bin.parent().unwrap()).unwrap();
             fs::write(
@@ -25897,8 +25910,10 @@ fn main() {
                 format!("id = '{id}'\nversion = '0.1.0'\nprotocol = {{ major = 0, minor = 1 }}\ncapabilities = ['{capability}']\n"),
             )
             .unwrap();
+            let delay = if id == "tools" { "sleep 0.2; " } else { "" };
+
             let script = format!(
-                "#!/bin/sh\nwhile IFS= read -r line; do case \"$line\" in *hello*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocol\":{{\"major\":0,\"minor\":1}},\"id\":\"{id}\",\"version\":\"0.1.0\",\"capabilities\":[\"{capability}\"]}}}}' ;; *poll*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":10,\"result\":{{\"events\":[]}}}}' ;; *shutdown*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":9999,\"result\":{{\"ok\":true}}}}'; exit 0 ;; esac; done\n"
+                "#!/bin/sh\nwhile IFS= read -r line; do case \"$line\" in *hello*) {delay}printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocol\":{{\"major\":0,\"minor\":1}},\"id\":\"{id}\",\"version\":\"0.1.0\",\"capabilities\":[\"{capability}\"]}}}}' ;; *poll*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":10,\"result\":{{\"events\":[]}}}}' ;; *shutdown*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":9999,\"result\":{{\"ok\":true}}}}'; exit 0 ;; esac; done\n"
             );
             fs::write(&bin, script).unwrap();
             let mut permissions = fs::metadata(&bin).unwrap().permissions();
@@ -25910,6 +25925,18 @@ fn main() {
         let task = tokio::spawn(async move {
             super::serve_inner(&task_root, "channel", "model", "test", true).await
         });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            !root.join("ipc.port").exists(),
+            "daemon IPC must stay unpublished while an installed plugin is loading"
+        );
+
+        assert!(
+            !root.join("ipc.token").exists(),
+            "stale daemon credentials must stay unpublished while plugins are loading"
+        );
 
         for _ in 0..100 {
             if root.join("ipc.port").is_file() {

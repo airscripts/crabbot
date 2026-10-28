@@ -29,9 +29,7 @@ use std::{
     pin::Pin,
 };
 
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, duplex,
-};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, duplex};
 
 use tokio::net::TcpStream;
 #[cfg(test)]
@@ -72,14 +70,8 @@ async fn main() -> std::process::ExitCode {
 
         krabb_log::initialize(krabb_log::Mode::Command { verbosity, json });
 
-        return match run(&args[1..]).await {
-            Ok(output) => {
-                if let Some(output) = output {
-                    println!("{output}");
-                }
-
-                std::process::ExitCode::SUCCESS
-            }
+        return match run_cli(&args[1..]).await {
+            Ok(()) => std::process::ExitCode::SUCCESS,
 
             Err(error) => {
                 eprintln!("{}", cli_error_message(&error));
@@ -181,6 +173,7 @@ struct EngineEvents {
     session: Option<mpsc::UnboundedSender<ui::SessionView>>,
     engine: Option<mpsc::UnboundedSender<EngineEvent>>,
     streaming_host: Option<StreamingHost>,
+    stop_after_generation: bool,
 }
 
 struct SessionReservation {
@@ -280,6 +273,19 @@ async fn run(args: &[String]) -> krabb_core::Result<Option<String>> {
     Ok(None)
 }
 
+async fn run_cli(args: &[String]) -> krabb_core::Result<()> {
+    let mut options = parse_options(args)?;
+
+    if let Some(prompt) = options.once.take() {
+        let output = run_one_shot(options, prompt).await?;
+        println!("{output}");
+
+        return Ok(());
+    }
+
+    run_interactive(options).await
+}
+
 async fn run_one_shot(options: TuiOptions, prompt: String) -> krabb_core::Result<String> {
     let model_override = options.model.clone();
     let plugin = options
@@ -299,7 +305,7 @@ async fn run_one_shot(options: TuiOptions, prompt: String) -> krabb_core::Result
     let temporary_session = options.session.is_none();
     let session = match options.session {
         Some(session) => selected_session_id(Some(session)),
-        None => one_shot_session_id()?,
+        None => temporary_run_namespace()?,
     };
 
     let result = run_once(
@@ -356,15 +362,15 @@ fn selected_session_id(session: Option<String>) -> String {
     tui_session_id(&session.unwrap_or_else(|| DEFAULT_SESSION_ID.into()))
 }
 
-fn one_shot_session_id() -> krabb_core::Result<String> {
+fn temporary_run_namespace() -> krabb_core::Result<String> {
     let mut random = [0_u8; 8];
     getrandom::fill(&mut random).map_err(|error| {
-        krabb_core::Error::Denied(format!("Could not create a one-shot session: {error}."))
+        krabb_core::Error::Denied(format!("Could not create a temporary run namespace: {error}."))
     })?;
 
     let suffix = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
 
-    Ok(tui_session_id(&format!("once-{suffix}")))
+    Ok(format!("tui-once-{suffix}"))
 }
 
 async fn resolve_session_id<C, F>(
@@ -458,7 +464,8 @@ where
 {
     let (mut input, engine_input) = duplex(16 * 1024);
 
-    let (mut output, engine_output) = duplex(64 * 1024);
+    let (_output, engine_output) = duplex(64 * 1024);
+    let (engine_events, mut event_rx) = mpsc::unbounded_channel();
     let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel();
     drop(interrupt_tx);
 
@@ -467,23 +474,37 @@ where
         engine_output,
         EngineConfig { home, plugin, model, model_override, session },
         host,
-        EngineEvents::default(),
+        EngineEvents {
+            engine: Some(engine_events),
+            stop_after_generation: true,
+            ..EngineEvents::default()
+        },
         interrupt_rx,
     ));
 
     input.write_all(serde_json::to_string(&prompt)?.as_bytes()).await?;
-    input.write_all(b"\n/quit\n").await?;
-    drop(input);
+    input.write_all(b"\n").await?;
 
-    let mut transcript = String::new();
-    output.read_to_string(&mut transcript).await?;
     engine.await.map_err(|error| krabb_core::Error::Denied(error.to_string()))??;
 
-    let bot_name = std::env::var("KRABB_NAME").unwrap_or_else(|_| DEFAULT_NAME.into());
-    let greeting = format!("{bot_name} terminal. Type /help for commands.\n> ");
-    let transcript = transcript.strip_prefix(&greeting).unwrap_or(&transcript);
+    let mut reply = String::new();
+    let mut failed = false;
 
-    Ok(transcript.trim_end_matches("\n> ").trim().to_owned())
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            EngineEvent::AssistantText(text) => reply.push_str(&text),
+
+            EngineEvent::RequestFailed(_) | EngineEvent::SystemNotice(_) => failed = true,
+
+            _ => {}
+        }
+    }
+
+    if failed {
+        return Err(krabb_core::Error::Denied("The one-shot request did not complete.".into()));
+    }
+
+    Ok(reply)
 }
 
 async fn run_with<R, W, C, F>(
@@ -501,7 +522,12 @@ where
     F: Future<Output = krabb_core::Result<Value>> + Send + 'static,
 {
     let EngineConfig { home, plugin, mut model, model_override, mut session } = config;
-    let EngineEvents { session: session_events, engine: engine_events, streaming_host } = events;
+    let EngineEvents {
+        session: session_events,
+        engine: engine_events,
+        streaming_host,
+        stop_after_generation,
+    } = events;
     let input = BufReader::new(input);
     let initial_session = ensure_session(&home, &session, &model, host).await?;
     let last_session_path = data::plugin_file(&home, "tui", "last-session.json");
@@ -548,14 +574,22 @@ where
 
     output.flush().await?;
 
-    if !model_plugin_available && engine_events.is_none() {
-        output
-            .write_all(
-                format!("No intelligence plugin is installed at {plugin}. Install one to send prompts; session commands remain available.\n> ")
-                .as_bytes(),
-            )
-            .await?;
+    if !model_plugin_available {
+        let message = format!(
+            "No intelligence plugin is installed at {plugin}. Install one to send prompts; session commands remain available."
+        );
+
+        if let Some(events) = &engine_events {
+            let _ = events.send(EngineEvent::SystemNotice(message));
+        } else {
+            output.write_all(format!("{message}\n> ").as_bytes()).await?;
+        }
+
         output.flush().await?;
+
+        if stop_after_generation {
+            return Ok(());
+        }
     }
 
     let mut sequence = 0_u64;
@@ -599,6 +633,15 @@ where
             if line == "/memory" || line.starts_with("/memory ") {
                 let command = line.strip_prefix("/memory").unwrap_or_default().trim();
                 let text = memory_command(home.clone(), session.clone(), command, host).await;
+
+                output.write_all(text.as_bytes()).await?;
+                output.flush().await?;
+                continue;
+            }
+
+            if line == "/store" || line.starts_with("/store ") {
+                let command = line.strip_prefix("/store").unwrap_or_default().trim();
+                let text = store_command(home.clone(), session.clone(), command, host).await;
 
                 output.write_all(text.as_bytes()).await?;
                 output.flush().await?;
@@ -1149,11 +1192,20 @@ where
             }
 
             if model == "unset" && terminal_command.is_none() {
-                output
-                    .write_all(b"No model is selected. Use /model list, then /model set <id>.\n> ")
-                    .await?;
+                let message = "No model is selected. Use /model list, then /model set <id>.";
+
+                if let Some(events) = &engine_events {
+                    let _ = events.send(EngineEvent::SystemNotice(message.into()));
+                } else {
+                    output.write_all(format!("{message}\n> ").as_bytes()).await?;
+                }
 
                 output.flush().await?;
+
+                if stop_after_generation {
+                    break;
+                }
+
                 continue;
             }
 
@@ -1239,6 +1291,11 @@ where
                 }
 
                 output.flush().await?;
+
+                if stop_after_generation {
+                    break;
+                }
+
                 continue;
             }
 
@@ -1337,9 +1394,13 @@ where
                 Ok(value) => {
                     let reply = value["text"].as_str().unwrap_or_default();
 
-                    if !reply.is_empty() {
-                        output.write_all(reply.as_bytes()).await?;
-                        output.write_all(b"\n").await?;
+                    if !reply.is_empty() && !streaming_turn {
+                        if let Some(events) = &engine_events {
+                            let _ = events.send(EngineEvent::AssistantText(reply.to_owned()));
+                        } else {
+                            output.write_all(reply.as_bytes()).await?;
+                            output.write_all(b"\n").await?;
+                        }
                     }
                 }
 
@@ -1374,6 +1435,11 @@ where
 
             output.write_all(b"> ").await?;
             output.flush().await?;
+
+            if stop_after_generation {
+                break;
+            }
+
             continue;
 
         }
@@ -1896,6 +1962,10 @@ fn command_help(home: &str, has_model: bool, daemon: bool) -> String {
 
     if daemon && has_capability(home, "memory") {
         conditional.push(("/memory", "Manage memories."));
+    }
+
+    if daemon && has_capability(home, "store") {
+        conditional.push(("/store", "Manage session-scoped SQLite values."));
     }
 
     if !conditional.is_empty() {
@@ -3101,6 +3171,106 @@ fn configured_tui_shell(home: &str) -> bool {
         .unwrap_or(false)
 }
 
+async fn store_command<C, F>(home: String, session: String, command: &str, host: C) -> String
+where
+    C: Fn(String, String, Value) -> F + Copy,
+    F: Future<Output = krabb_core::Result<Value>>,
+{
+    if command.is_empty() || command == "help" {
+        return store_help().into();
+    }
+
+    let result = if let Some(value) = command.strip_prefix("put ") {
+        match value.split_once('=') {
+            Some((key, value)) if !key.trim().is_empty() => store_value(
+                home,
+                session,
+                "put",
+                key.trim(),
+                Some(Value::String(value.to_owned())),
+                host,
+            )
+            .await
+            .map(|_| "Stored session value.\n> ".into()),
+
+            _ => Ok("Usage: /store put KEY=VALUE. Run /store help for details.\n> ".into()),
+        }
+    } else if let Some(key) = command.strip_prefix("get ") {
+        store_value(home, session, "get", key.trim(), None, host).await.map(|value| {
+            if value["found"] != true {
+                return "No value is stored for that key.\n> ".into();
+            }
+
+            let rendered =
+                serde_json::to_string_pretty(&value["value"]).unwrap_or_else(|_| "null".into());
+            let mut shown = rendered.chars().take(4_096).collect::<String>();
+
+            if rendered.chars().count() > 4_096 {
+                shown.push_str("\n[value truncated]");
+            }
+
+            format!("{shown}\n> ")
+        })
+    } else if let Some(key) = command.strip_prefix("delete ") {
+        store_value(home, session, "delete", key.trim(), None, host).await.map(|value| {
+            if value["deleted"] == true {
+                "Deleted session value.\n> ".into()
+            } else {
+                "No value is stored for that key.\n> ".into()
+            }
+        })
+    } else {
+        Ok("Unknown store command. Run /store help for usage.\n> ".into())
+    };
+
+    result.unwrap_or_else(|error| {
+        format!("Store action failed: {}.\n> ", sentence(error.to_string()))
+    })
+}
+
+async fn store_value<C, F>(
+    home: String,
+    session: String,
+    method: &str,
+    key: &str,
+    value: Option<Value>,
+    host: C,
+) -> krabb_core::Result<Value>
+where
+    C: Fn(String, String, Value) -> F,
+    F: Future<Output = krabb_core::Result<Value>>,
+{
+    if key.is_empty() {
+        return Err(krabb_core::Error::Denied("A store key is required".into()));
+    }
+
+    if key.len() > 2_048 {
+        return Err(krabb_core::Error::Denied("The store key exceeds the size limit".into()));
+    }
+
+    let mut params = serde_json::json!({"key": format!("tui:{session}:{key}")});
+
+    if let Some(value) = value {
+        params["value"] = value;
+    }
+
+    capability(home, "sqlite", method, params, host).await
+}
+
+fn store_help() -> &'static str {
+    r#"Manage values stored in SQLite for this session.
+
+Commands:
+  /store help                       Show this help
+  /store put KEY=VALUE              Save a text value
+  /store get KEY                    Show a saved value
+  /store delete KEY                 Delete a saved value
+
+Keys are scoped to the active TUI session. Stored values persist in the local
+SQLite database. Selecting /store in the command picker shows this help.
+> "#
+}
+
 async fn memory_command<C, F>(home: String, session: String, command: &str, host: C) -> String
 where
     C: Fn(String, String, Value) -> F + Copy,
@@ -4192,6 +4362,57 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
+    async fn stores_values_through_the_session_scoped_sqlite_capability() {
+        let calls = std::sync::Mutex::new(Vec::new());
+        let host = |_: String, method: String, params: serde_json::Value| {
+            let calls = &calls;
+
+            async move {
+                assert_eq!(method, "capability.call");
+                assert_eq!(params["service"], "sqlite");
+                calls.lock().unwrap().push(params.clone());
+
+                match params["method"].as_str().unwrap() {
+                    "put" => Ok(json!({"ok": true})),
+                    "get" => Ok(json!({"found": true, "value": "stored text"})),
+                    "delete" => Ok(json!({"deleted": true})),
+                    method => panic!("unexpected SQLite method {method}"),
+                }
+            }
+        };
+
+        assert_eq!(
+            super::store_command(
+                "/tmp/krabb".into(),
+                "default".into(),
+                "put note=stored text",
+                host,
+            )
+            .await,
+            "Stored session value.\n> "
+        );
+
+        assert_eq!(
+            super::store_command("/tmp/krabb".into(), "default".into(), "get note", host).await,
+            "\"stored text\"\n> "
+        );
+
+        assert_eq!(
+            super::store_command("/tmp/krabb".into(), "default".into(), "delete note", host,).await,
+            "Deleted session value.\n> "
+        );
+
+        let calls = calls.lock().unwrap();
+
+        assert_eq!(calls[0]["method"], "put");
+        assert_eq!(calls[0]["params"]["key"], "tui:default:note");
+        assert_eq!(calls[0]["params"]["value"], "stored text");
+        assert_eq!(calls[1]["params"]["key"], "tui:default:note");
+        assert_eq!(calls[2]["method"], "delete");
+        assert_eq!(calls[2]["params"]["key"], "tui:default:note");
+    }
+
+    #[tokio::test]
     async fn forgets_matching_session_memories_from_both_scopes() {
         let legacy_called = std::sync::atomic::AtomicBool::new(false);
         let host = |_: String, method: String, params: serde_json::Value| {
@@ -4403,9 +4624,9 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_session_ids_are_random_tui_sessions() {
-        let first = super::one_shot_session_id().unwrap();
-        let second = super::one_shot_session_id().unwrap();
+    fn temporary_run_names_are_random_tui_sessions() {
+        let first = super::temporary_run_namespace().unwrap();
+        let second = super::temporary_run_namespace().unwrap();
 
         assert_ne!(first, second);
         assert!(first.starts_with("tui-once-"));
@@ -5655,6 +5876,33 @@ mod tests {
         }
     }
 
+    async fn delayed_control(
+        home: String,
+        method: String,
+        params: serde_json::Value,
+    ) -> krabb_core::Result<serde_json::Value> {
+        if method == "session.answer" {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            return Ok(json!({"text": "Delayed reply"}));
+        }
+
+        mock_control(home, method, params).await
+    }
+
+    async fn session_id_error_control(
+        home: String,
+        method: String,
+        params: serde_json::Value,
+    ) -> krabb_core::Result<serde_json::Value> {
+        if method == "session.answer" {
+            let id = params["id"].as_str().unwrap_or_default();
+
+            return Err(krabb_core::Error::Denied(format!("Request for session {id} failed.")));
+        }
+
+        mock_control(home, method, params).await
+    }
+
     async fn mock_deep_delete(
         _home: String,
         method: String,
@@ -6010,6 +6258,56 @@ while IFS= read -r line; do case "$line" in *generate*) printf '%s\n' '{"jsonrpc
         assert_eq!(one_shot, "Reply");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn one_shot_waits_for_a_delayed_model_response() {
+        let root =
+            std::env::temp_dir().join(format!("krabb-tui-one-shot-delay-{}", std::process::id()));
+
+        let reply = super::run_once(
+            root.display().to_string(),
+            "codex".into(),
+            "base".into(),
+            None,
+            "once-delayed".into(),
+            "hello once".into(),
+            delayed_control,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reply, "Delayed reply");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn one_shot_does_not_print_session_ids_from_diagnostic_events() {
+        let root =
+            std::env::temp_dir().join(format!("krabb-tui-one-shot-error-{}", std::process::id()));
+        let session = "tui-once-sensitive-session-id";
+
+        let error = super::run_once(
+            root.display().to_string(),
+            "codex".into(),
+            "base".into(),
+            None,
+            session.into(),
+            "hello once".into(),
+            session_id_error_control,
+        )
+        .await
+        .unwrap_err();
+
+        let krabb_core::Error::Denied(message) = error else {
+            panic!("one-shot diagnostics should be reported with a generic message");
+        };
+
+        assert_eq!(message, "The one-shot request did not complete.");
+        assert!(!message.contains(session));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

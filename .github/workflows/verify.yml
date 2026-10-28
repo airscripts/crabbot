@@ -54,7 +54,7 @@ jobs:
       - name: Install Rust Components
         run: rustup component add rustfmt clippy
 
-      - name: Check Rust Formatting
+      - name: Check Formatting
         run: |
           cargo fmt --all --check
           bash krabb-scripts/spacing.sh --check
