@@ -4,6 +4,13 @@ Krabb is designed for least privilege and bounded failure. Safe defaults keep
 shell execution off, keep tools disabled for channels, and require explicit
 workspace configuration.
 
+## Table Of Contents
+
+- [Trust Boundaries](#trust-boundaries)
+- [Tools](#tools)
+- [Recovery](#recovery)
+- [Limits](#limits)
+
 ## Trust Boundaries
 
 The daemon trusts the local operator and treats model output, channel senders,

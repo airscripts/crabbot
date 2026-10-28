@@ -4,6 +4,15 @@ Providers are plugins selected by capability, not compiled into the core. A
 provider must normalize its API responses into Krabb protocol types and keep
 vendor-specific fields inside the plugin process.
 
+## Table Of Contents
+
+- [Models](#models)
+- [Channels](#channels)
+- [Platform Setup](#platform-setup)
+- [Selection](#selection)
+- [Other Capabilities](#other-capabilities)
+- [Agent Interoperability](#agent-interoperability)
+
 ## Models
 
 | Plugin | Service | Credential route |
@@ -71,6 +80,21 @@ policy have been reviewed.
 ## Selection
 
 Use `krabb plugin list` and `krabb doctor` to inspect installed providers.
+
+## Other Capabilities
+
+| Capability | Plugins | What it provides |
+| --- | --- | --- |
+| `tool` | Tools, Browser, Computer | Filesystem and Git operations, approved shell access, browser automation, and desktop control. |
+| `mcp`, `resource` | MCP | Access to tools and resources exposed by MCP servers. |
+| `memory` | Memory | Scoped agent memory records with search and management commands. |
+| `scheduler` | Scheduler | Persistent scheduled agent tasks and controlled execution. |
+| `store` | SQLite | Values, leases, durable delivery state, and event deduplication. |
+| `speech` | Whisper | Voice transcription through a local Whisper-compatible executable. |
+| `client` | TUI | A terminal interface connected to the daemon. |
+
+Model plugins also advertise the `vision` capability when they accept image
+inputs. The host checks that capability before dispatching an image turn.
 
 ## Agent Interoperability
 

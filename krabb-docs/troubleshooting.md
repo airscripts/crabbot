@@ -1,5 +1,16 @@
 # Troubleshooting
 
+Use these checks to diagnose installation, channel, tool, and provider problems.
+
+## Table Of Contents
+
+- [Check The Installation](#check-the-installation)
+- [No Channel Replies](#no-channel-replies)
+- [Tools Are Unavailable](#tools-are-unavailable)
+- [Provider Errors](#provider-errors)
+- [Stale State](#stale-state)
+- [Report A Bug](#report-a-bug)
+
 ## Check The Installation
 
 ```sh

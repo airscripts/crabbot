@@ -7,6 +7,14 @@ personal browser profile. The worker receives only the path, temporary
 directory, Playwright, browser cache, allowlist, and proxy settings it needs;
 Chromium does not inherit proxy credentials or the host process environment.
 
+## Table Of Contents
+
+- [Dependencies](#dependencies)
+- [Tools](#tools)
+- [Example](#example)
+- [Permissions And Limits](#permissions-and-limits)
+- [Development](#development)
+
 ## Dependencies
 
 - Node.js 22 or later.
@@ -121,19 +129,12 @@ cargo test --locked -p krabb-plugin-browser
 cargo build --locked -p krabb-plugin-browser
 ```
 
-Protocol tests use a fake worker and do not contact public sites or paid model
-APIs. Browser operations use a bounded worker process tree; canceling an
-in-flight operation terminates the worker and its Chromium descendants. On
-Windows the plugin requests process-tree cleanup through `taskkill`. A local
-Playwright integration run additionally requires the dependencies listed
-above. It starts a local mock HTTP proxy, serves a fixture page through it,
-checks context storage isolation, snapshots, viewport, full-page, and element
-PNG/JPEG screenshot bytes, dynamic waits, form interaction, scrolling, fresh
-and stale coordinate clicks, and tab lifecycle, delivery of untrusted page
-text, and redirect and popup attempts to reach loopback. The mock egress proxy
-and private destination use separate local endpoints, and the harness fails
-if either case reaches the private destination server. This integration passed
-locally on Linux with Playwright 1.64.1 and its matching Chromium build:
+Protocol tests use a fake worker and make no public or paid requests. The local
+Playwright fixture checks context isolation, navigation, screenshots, form
+interaction, coordinate freshness, tab lifecycle, and blocked private-network
+redirects. Cancellation stops the worker and Chromium process tree; Windows
+uses `taskkill` for process cleanup. The fixture passed on Linux with
+Playwright 1.64.1 and matching Chromium:
 
 ```sh
 cargo build --locked -p krabb-plugin-browser

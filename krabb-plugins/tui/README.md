@@ -1,84 +1,76 @@
 # TUI
 
-Install the released plugin with:
+The TUI is a terminal client for daemon-managed conversations, sessions, tools,
+and approvals. Install it with:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/krabblab/krabb/main/install.sh | sh -s -- tui
 ```
 
-The host terminal client is available with `krabb tui`. Start the daemon with
-`krabb service start` or run `krabb-daemon` in the foreground first; the TUI
-requires it for both interactive and `--once` use. Prompts, session history,
-tools, and approvals go through the shared daemon runtime. The `/store`
-command uses SQLite when the plugin is installed; its keys are scoped to the
-active TUI session. TUI tools are disabled by default; enable them with
-`[clients.tui] tools = true` in the home
-`config.toml` to opt in under the global approval policy.
-Run `krabb tui --once "prompt"` to print one response without opening the
-full-screen interface. It uses and deletes a fresh temporary session by
-default; pass `--session <id>` to continue an existing session.
-Markdown fenced code blocks appear in a labeled panel in the transcript; the
-fence's language tag is shown above the code.
-Prefix a line with `!` to run it directly through the daemon's shell. This
-requires `[clients.tui] shell = true`, but not the Tools plugin or separate
-approval; it is an explicit user action in the selected workspace.
-Set `[clients.tui] theme = false` to use the terminal's default text color
-instead of TUI colors; the theme is enabled by default and changes apply on the
-next `krabb tui` launch.
+## Table Of Contents
 
-In an interactive terminal, use `/help`, `/status`, `/approval`, `/approvals`, `/approve <id>`,
-`/deny <id>`, `/session help`, `/session list`, `/deliveries`, `/retry <id>`,
-`/drop <id>`, `/model <name>`, `/new <id>`,
-`/plugin [page]`, `/history <list|clear|help>`, `/workspace [path|reset]`,
-`/schedule <help|list|add|approve|run|retry|pause|resume|remove>`,
-`/memory <list|remember|forget>`, `/store <help|get|put|delete>`, `/compact`,
-`/clear`, and `/quit`. Plain lines are sent through the configured model
-plugin. Sessions, selected models, and completed turns
-are persisted through authenticated daemon IPC. `/session switch <id>` resumes
-an existing session; `/new <id>` creates and selects one. `/session rename`
-renames the active session without losing history. `/session archive` and
-`/session unarchive` accept multiple IDs or `--all`; `/session delete` accepts
-the same targets and prompts before deletion; use `-y` or `--yes` to skip it.
-The active session is kept when
-archiving or deleting all sessions. `/workspace <path>` selects and persists a
-canonical existing directory for that session.
-Without `--session`, the interactive TUI resumes the last session it opened, or
-starts the default session when none exist. Up/Down input history is saved under
-`<KRABB_HOME>/data/plugins/tui/history.json`.
-Multiple TUI windows following the same session refresh its saved transcript
-automatically once per second. A window shows the other client's
-messages as they are saved, reflects when another window is generating, and
-locks chat input until that turn finishes. The waiting state is shown as a
-System notice; approval commands remain available.
-`/workspace reset` uses `KRABB_ROOT` again. `/clear` removes the selected
-session's transcript and refuses to clear an active session.
-`/compact` asks the selected model to summarize older turns and keeps the two
-most recent user turns. The TUI also compacts automatically before a turn when
-the saved conversation exceeds its history threshold.
-While generation waits for an approval, start typing `/` from an empty input to
-enter `/approvals`, `/approve <id>`, or `/deny <id>` to resolve the current
-approval; ordinary chat stays locked. Hold Shift while dragging to select and
-copy transcript text; the mouse wheel remains available for scrolling.
-`/approvals` lists pending mutating-tool requests. `/approve <id>` and
-`/deny <id>` resolve a request through authenticated daemon IPC; the request
-ID expires with the pending approval.
-`/schedule add` accepts the same timing and retry options as the CLI, including
-`--after`, `--at`, `--every`, `--cron`, `--timezone`, `--missed`, `--retries`,
-and `--on-failure`; the legacy `/schedule add <seconds> <instruction>` form
-also works. Schedules activate immediately. Check one with `/schedule list
-[page]` (including the latest outcome), and use `/schedule
-run|retry|pause|resume|remove <id-or-name>` to control it through authenticated
-daemon IPC. Schedule names contain no spaces. Agent-proposed tasks activate
-without a separate approval and can opt into up to five automatic retries with
-backoff; retries can repeat side effects.
-Scheduled tasks run as isolated agent turns with their captured provider,
-model, and workspace. `/memory remember <key>=<value>` saves a session memory,
-and `/memory list [page] [--type global|session]` shows up to five global and
-session records in a paginated tree. Each row includes its `type:`. `/memory forget <key>`
-removes a unique matching record; use `/memory forget global <key>` or
-`/memory forget session <key>` to choose a scope explicitly. Entering `remember`
-authorizes a suggest-mode write.
+- [Start And Chat](#start-and-chat)
+- [Commands](#commands)
+- [Tools And Safety](#tools-and-safety)
+- [Preferences And History](#preferences-and-history)
 
-`/status`, `/session list [page]`, and `/plugin [page]` use authenticated daemon
-state over local IPC. Both lists are paginated and show compact status and
-metadata; the plugin view includes capabilities, commands, and permissions.
+## Start And Chat
+
+Start the daemon with `krabb service start` or run `krabb-daemon` in the
+foreground. Then open the client:
+
+```sh
+krabb tui
+krabb tui --once "prompt"
+```
+
+`--once` prints one reply without opening the full-screen UI. It uses and
+deletes a temporary session unless you pass `--session <id>`. Interactive
+sessions resume the last session or start `default`.
+
+Press Enter to send, Ctrl+O to add a line, and Escape or Ctrl+C to quit. Use
+Up/Down for input history, Page Up/Page Down to scroll, and Shift-drag to
+select text.
+
+## Commands
+
+Use `/help` for commands available in the current session. Common commands:
+
+- `/status`, `/approval`, `/approvals`, `/approve <id>`, `/deny <id>` manage
+  daemon status and pending approvals.
+- `/session`, `/new`, `/model`, and `/workspace` manage conversation context.
+- `/plugin`, `/deliveries`, `/retry`, and `/drop` inspect plugin and delivery
+  state.
+- `/schedule`, `/memory`, and `/store` are available when their plugins are
+  installed.
+- `/compact` summarizes older turns; `/clear` clears an idle session.
+
+The TUI stores its command exchanges and completed model turns in the shared
+session history. See [Commands](../../krabb-docs/commands.md) for CLI
+operations and plugin guides for detailed schedule and memory behavior.
+
+## Tools And Safety
+
+TUI model tools are disabled by default. Enable them in `config.toml`:
+
+```toml
+[clients.tui]
+tools = true
+```
+
+The global approval mode still controls mutating tools. To enable direct shell
+commands entered with `!`, also set `shell = true`; restart the daemon after
+changing that setting. A typed `!` command is an explicit user action, while
+shell commands requested by the model remain subject to approval policy.
+Workspace tools stay confined to the active session workspace.
+
+## Preferences And History
+
+Use `/history list`, `/history clear`, or `/history help` to manage input
+history. `/compact` asks the selected model to summarize older turns; the TUI
+also compacts automatically when saved conversation history reaches its limit.
+
+Set `theme = false` under `[clients.tui]` to use the terminal's default colors.
+Use `/statusline` to choose which details appear in the footer. Preferences are
+saved under `KRABB_HOME/data/plugins/tui/` and apply to the next launch where
+noted.

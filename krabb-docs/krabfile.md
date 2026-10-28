@@ -5,6 +5,11 @@
 The version is required at the top of the document so future formats can be
 validated without guessing which rules apply.
 
+## Table Of Contents
+
+- [Schema](#schema)
+- [Validation And Import](#validation-and-import)
+
 ## Schema
 
 ```toml

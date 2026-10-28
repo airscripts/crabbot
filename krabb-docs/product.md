@@ -6,6 +6,14 @@ describes the product’s purpose, capabilities, boundaries, and engineering
 principles. [PLAN.md](../PLAN.md) contains only active work, while
 [ROADMAP.md](../ROADMAP.md) contains future expansions.
 
+## Table Of Contents
+
+- [Summary](#summary)
+- [Architecture And Interfaces](#architecture-and-interfaces)
+- [Product Behavior](#product-behavior)
+- [Engineering, Governance, And Delivery](#engineering-governance-and-delivery)
+- [Verification And Acceptance](#verification-and-acceptance)
+
 ## Summary
 
 Build Krabb as a self-hosted Rust agent runtime with a deliberately

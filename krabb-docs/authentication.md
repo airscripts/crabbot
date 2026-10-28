@@ -3,6 +3,13 @@
 Krabb has two separate authentication decisions: whether a plugin can reach
 its provider and whether a channel sender can use a capability.
 
+## Table Of Contents
+
+- [Provider Credentials](#provider-credentials)
+- [Codex Compatibility](#codex-compatibility)
+- [Channel Trust](#channel-trust)
+- [Service Credentials](#service-credentials)
+
 ## Provider Credentials
 
 Plugins prefer their declared environment variables. The host can also pass a

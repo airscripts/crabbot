@@ -14,6 +14,14 @@ ACP, agent collaboration uses A2A, and user interfaces connect through AG-UI.
 > Krabb is pre-release software. Commands and configuration may change
 > incompatibly before version 1.0.
 
+## Table Of Contents
+
+- [Get Started](#get-started)
+- [Capabilities](#capabilities)
+- [Documentation](#documentation)
+- [Development](#development)
+- [Support And License](#support-and-license)
+
 ## Get Started
 
 Install the CLI, daemon, and the plugins you plan to use. The
@@ -35,12 +43,19 @@ run it in the background.
 
 ## Capabilities
 
-| Area | Examples |
-| --- | --- |
-| Intelligence | Codex, Anthropic, OpenAI, Gemini, Ollama, OpenRouter |
-| Messaging | Telegram, Discord, WhatsApp, Signal, Slack |
-| Agent protocols | ACP, A2A, AG-UI |
-| Other plugins | Tools, memory, scheduling, SQLite, MCP, speech, TUI |
+| Capability | Description | Plugins |
+| --- | --- | --- |
+| Intelligence | Sends prompts to hosted and local language models. | Codex, Anthropic, OpenAI, Gemini, Ollama, OpenRouter |
+| Vision | Sends image inputs to models that advertise image support. | Codex, Anthropic, OpenAI, Gemini, Ollama, OpenRouter |
+| Messaging | Connects Krabb to chat channels for receiving and sending messages. | Telegram, Discord, WhatsApp, Signal, Slack |
+| Agent Interoperability | Connects external agents and local agent clients. | ACP, A2A, AG-UI |
+| Tools | Provides filesystem, Git, shell, browser, and desktop operations under host policy. | Tools, Browser, Computer |
+| MCP | Connects MCP servers and exposes their tools and resources. | MCP |
+| Memory | Saves and searches scoped agent memories. | Memory |
+| Scheduling | Creates and runs scheduled agent tasks. | Scheduler |
+| Storage | Persists values, leases, and delivery state. | SQLite |
+| Speech | Transcribes voice recordings with a local Whisper-compatible executable. | Whisper |
+| Terminal Client | Provides an interactive terminal interface to the daemon. | TUI |
 
 All plugins are optional. Intelligence plugins live in
 `krabb-plugins/intelligence/`; messaging plugins live in
@@ -49,14 +64,13 @@ permissions.
 
 ## Documentation
 
-Start at the [documentation home](krabb-docs/home.md). It links to the
-[first-run workflows](krabb-docs/workflows.md),
-[configuration](krabb-docs/configuration.md),
-[provider setup](krabb-docs/providers.md),
-[commands](krabb-docs/commands.md),
-[architecture](krabb-docs/architecture.md),
-[plugin development](krabb-docs/plugins.md), and
-[security guidance](krabb-docs/security.md).
+Use the [documentation home](krabb-docs/home.md) for the full guide index.
+Common starting points:
+
+- [First run](krabb-docs/workflows.md)
+- [Provider setup](krabb-docs/providers.md)
+- [Configuration](krabb-docs/configuration.md)
+- [Plugin development](krabb-docs/plugins.md)
 
 ## Development
 

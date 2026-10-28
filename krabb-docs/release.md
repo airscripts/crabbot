@@ -14,6 +14,10 @@ x86_64 and ARM64, emits `SHA256SUMS` for all release archives, and publishes
 the artifacts. Installers verify checksums before activation. Krabb does not
 publish crates or containers.
 
+## Table Of Contents
+
+- [Release Checklist](#release-checklist)
+
 ## Release Checklist
 
 1. Update `VERSION`, the workspace manifests, `CITATION.cff`, and the matching

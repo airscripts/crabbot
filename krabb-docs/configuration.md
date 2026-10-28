@@ -27,6 +27,15 @@ when it is unset, media is stored under `KRABB_HOME/media` and expired files
 are removed during the next media request. Images accepted into a durable
 session are copied under `media/pinned` and are not removed by cache cleanup.
 
+## Table Of Contents
+
+- [Example](#example)
+- [Paths](#paths)
+- [Channel Policy](#channel-policy)
+- [Update Policy](#update-policy)
+- [State And Recovery](#state-and-recovery)
+- [Troubleshooting](#troubleshooting)
+
 ## Example
 
 ```toml

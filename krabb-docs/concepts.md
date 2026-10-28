@@ -4,6 +4,16 @@ Krabb separates the agent loop from the capabilities that make it useful.
 The background runtime receives normalized events, the core executes a bounded turn, and
 plugins provide models, channels, storage, memory, schedules, tools, or clients.
 
+## Table Of Contents
+
+- [Runtime And Service Terms](#runtime-and-service-terms)
+- [Events](#events)
+- [Sessions](#sessions)
+- [Agent Instructions And Conversation Context](#agent-instructions-and-conversation-context)
+- [Turns](#turns)
+- [Delivery](#delivery)
+- [Leases](#leases)
+
 ## Runtime And Service Terms
 
 Use **background runtime** as the platform-neutral user-facing name for

@@ -4,6 +4,15 @@ Official plugins are small Rust binaries under `krabb-plugins/`. Each folder
 contains a manifest and a one-line installation example. Community plugins may
 use another language if they implement the JSON-RPC 2.0 protocol.
 
+## Table Of Contents
+
+- [Manifest](#manifest)
+- [Requests](#requests)
+- [Authoring](#authoring)
+- [Create A Custom Plugin](#create-a-custom-plugin)
+- [Install And Update Lifecycle](#install-and-update-lifecycle)
+- [Agent Interoperability](#agent-interoperability)
+
 ## Manifest
 
 ```toml
@@ -137,19 +146,9 @@ never download executable packages. Its URL allowlist and request filters are
 defense in depth and do not replace an operating-system egress boundary. See
 [`krabb-plugins/browser/README.md`](../krabb-plugins/browser/README.md).
 
-The `computer` plugin supports an isolated X11 session on Linux. Set
-`KRABB_COMPUTER_MODE=isolated` and `KRABB_COMPUTER_DISPLAY=:N` (`N` greater
-than zero). The plugin starts Xvfb with a private Xauthority cookie and can
-start one operator-configured application. It also supports interactive desktop
-control on macOS and Windows when both `KRABB_COMPUTER_MODE=interactive` and
-`KRABB_COMPUTER_ALLOW_HOST_CONTROL=1` are set. Interactive mode controls the
-signed-in desktop and requires the OS privacy permissions for input and screen
-capture; it does not provide an isolated desktop. Its opaque session ID is
-required for every later action, and sessions expire after ten idle minutes.
-Linux requires Xvfb, `xauth`, `xdotool`, and ImageMagick `import`. A virtual
-display does not itself confine processes, files, or network access.
-See
-[`krabb-plugins/computer/README.md`](../krabb-plugins/computer/README.md).
+The [Computer plugin guide](../krabb-plugins/computer/README.md) covers its
+Linux isolated display and opt-in macOS/Windows desktop modes. A virtual display
+does not confine processes, files, or network access.
 
 ## Create A Custom Plugin
 
@@ -277,41 +276,15 @@ for session-scoped text values.
 Host outbox entries expose stable IDs and explicit uncertainty; plugins receive
 the ID with each send so operators can correlate a provider receipt.
 
-The memory plugin persists scoped records with `guided` and `autonomous`
-learning modes. Guided learning is the default and saves only when the user
-explicitly asks; autonomous learning may retain stable, useful facts while
-excluding secrets and sensitive inferences. Both modes preserve audit history,
-and records can be listed, searched, edited, recalled, or forgotten through
-the registered `memory` command. Memory tools are exposed only when the plugin
-is installed and channel tool policy permits them. The plugin lazily creates
-`KRABB_HOME/data/memories/` on its first persisted setting or record;
-`KRABB_MEMORY` can override the JSON index path. Markdown record files are linked from the index,
-stored under `records/`. Global memories apply across conversations, while
-provider and TUI memories stay within their conversation. The model receives
-only a bounded summary of global and current-conversation memories.
+The [Memory plugin guide](../krabb-plugins/memory/README.md) documents record
+scopes, learning modes, and commands. Memory tools still follow channel and
+client policy.
 
-The scheduler plugin persists pending tasks and active schedules atomically
-under `KRABB_HOME/data/schedules/`. Explicit schedule requests become active
-immediately; agent scheduling tool calls are authorized before activation.
-The daemon executes active tasks as
-isolated agent turns using their captured provider, model, and workspace, then
-reports results to the originating conversation and records append-only JSONL
-history under `KRABB_HOME/logs/schedules/<schedule-name>-<id>.jsonl`. Each
-record includes a schema version, RFC 3339 timestamp, schedule/run identifiers,
-status, attempt/retry details, scheduled/next-run times, captured
-provider/model/workspace, and redacted result text bounded to 4,000 characters.
-The outcome history has no fixed record-count limit and can be inspected
-directly. Tasks support one-time delays and
-exact RFC 3339 run times, plus five-field cron expressions in IANA timezones,
-including daylight-saving transitions. Active tasks can be run immediately;
-failed tasks can opt into up to five retries with exponential backoff or be
-retried manually after pausing. Interrupted runs pause for review because an
-action may already have happened. Missed recurring runs default to `skip`;
-schedules can choose `coalesce` or bounded `replay`.
+The [Scheduler plugin guide](../krabb-plugins/scheduler/README.md) documents
+task creation, authorization, timing, retries, recovery, and history.
 
-The Whisper plugin is an optional local adapter. It invokes an explicitly
-configured executable against a root-confined path and returns text, keeping
-native model dependencies outside the workspace core.
+The [Whisper plugin](../krabb-plugins/whisper/README.md) invokes a configured
+local executable and returns normalized transcription text.
 
 ## Agent Interoperability
 

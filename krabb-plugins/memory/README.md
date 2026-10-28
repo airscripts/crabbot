@@ -1,36 +1,47 @@
 # Memory
 
-Install the released plugin with:
+The memory plugin stores scoped records for later conversations. Install it
+with:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/krabblab/krabb/main/install.sh | sh -s -- memory
 ```
 
-The plugin persists records to `KRABB_HOME/data/memories/index.json` by
-default. The directory is created only when a setting or record is first saved.
-Set `KRABB_MEMORY` to override the JSON index path. Each record is also
-stored as a private Markdown file under `records/` beside the index, and the
-index links to those records. Older flat key/value JSON files remain readable
-as global records.
+## Table Of Contents
 
-Learning defaults to `guided`: a save requires an explicit user request or an
-operator-entered `memory remember` command. Set `krabb memory learning
-autonomous` to let the agent retain stable, useful facts; it must not save
-secrets or sensitive inferences. Return to the safer default with
+- [Storage](#storage)
+- [Learning Modes](#learning-modes)
+- [Commands](#commands)
+- [Scopes And Privacy](#scopes-and-privacy)
+
+## Storage
+
+The plugin creates `KRABB_HOME/data/memories/index.json` when a record or
+setting is first saved. Set `KRABB_MEMORY` to change the index path. Records
+are stored as private Markdown files beside the index; older flat key/value
+files remain readable as global records.
+
+## Learning Modes
+
+Learning defaults to `guided`. It saves only after an explicit user request or
+an operator-entered `memory remember` command. Set
+`krabb memory learning autonomous` to allow stable, useful facts to be saved.
+Secrets and sensitive inferences must not be stored. Return to the default with
 `krabb memory learning guided`.
 
-Use `krabb memory help` or `krabb memory --help` for command syntax. The
-registered `krabb memory` command supports `status`, `search`, `list`,
-`show`, `remember`, `edit`, `forget`, `audit`, `converge`, and `learning`. The
-`list [page] [--type global|session] [--scope ID]` command displays up to five
-records in a paginated tree; each row identifies its `type: global` or
-`type: session`. `--type` filters the listed records. The
-`converge` command reports likely contradictions within a scope and gives
-precedence to the newer saved preference without deleting either record. It
-uses text matching, not a model, and makes no changes. Each conflict includes a
-`krabb memory forget` command for the older record if you choose to remove it.
-Empty searches and lists report that no memories were found. Global records are
-available in every conversation; channel and TUI records are scoped to their
-conversation. Each model turn receives a bounded index of global and
-conversation memories. Memory tools remain subject to the channel or TUI tool
-policy.
+## Commands
+
+Run `krabb memory help` for syntax. Commands include `status`, `search`,
+`list`, `show`, `remember`, `edit`, `forget`, `audit`, `converge`, and
+`learning`.
+
+`list [page]` shows up to five records. Filter with `--type global|session`
+and `--scope <id>`. `converge` reports likely contradictions in a scope using
+text matching; it changes nothing and favors the newer saved preference.
+
+## Scopes And Privacy
+
+Global records are available in every conversation. Channel and TUI records
+are scoped to their conversation. Model turns receive a bounded index of global
+and current-conversation records. Memory tools still follow the channel or TUI
+tool policy.

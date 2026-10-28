@@ -1,10 +1,17 @@
 # Security Policy
 
+This policy describes supported versions and how to report vulnerabilities privately.
+
+## Table Of Contents
+
+- [Supported Versions](#supported-versions)
+- [Report A Vulnerability](#report-a-vulnerability)
+
 ## Supported Versions
 
 | Version | Supported |
 | --- | --- |
-| Current release line | yes |
+| v0.1 | yes |
 
 ## Report A Vulnerability
 

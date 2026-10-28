@@ -1,5 +1,16 @@
 # Roadmap
 
+This roadmap summarizes planned work across upcoming Krabb releases.
+
+## Table Of Contents
+
+- [v0.2 | Reliability](#v02--reliability)
+- [v0.3 | Experience](#v03--experience)
+- [v0.4 | Plugin Ecosystem](#v04--plugin-ecosystem)
+- [v0.5 | Deployments](#v05--deployments)
+- [v0.6 | Multi-Agent Runtime](#v06--multi-agent-runtime)
+- [v0.7 | Small-Footprint Runtime](#v07--small-footprint-runtime)
+
 ## v0.2 | Reliability
 
 Strengthen Krabb’s engineering foundation while keeping the core small and

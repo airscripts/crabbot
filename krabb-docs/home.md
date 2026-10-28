@@ -1,10 +1,6 @@
 # Documentation Home
 
-A self-hostable, open-source agent operating system for building, running,
-and orchestrating native and external AI agents. Krabb is made from a small
-host, a capability-free core, and replaceable process plugins.
-Start with the first-run workflow, then use
-these guides when operating or extending an installation:
+Use these guides to install, configure, operate, and extend Krabb.
 
 1. [Workflows](workflows.md) — first run, development, updates, and operations.
 2. [Configuration](configuration.md) — paths, credentials, channel policy,
@@ -22,33 +18,5 @@ these guides when operating or extending an installation:
 13. [Release](release.md) — packaging, checksums, and publication gates.
 14. [License](license.md) — Apache-2.0 rationale and contribution terms.
 15. [Product](product.md) — capabilities, boundaries, and engineering principles.
-16. [Compatibility And Deployment Checks](../COMPATIBILITY.md) — platform
-    support, automated coverage, and manual deployment checks.
-
-## Request Flow
-
-```mermaid
-flowchart LR
-    channel[Channel Plugin] -->|Normalized Event| daemon[Daemon]
-    daemon -->|Policy And Session State| core[Core Turn Loop]
-    core --> model[Model Plugin]
-    core --> tools[Tool Plugin]
-    daemon -->|Durable Reply And Acknowledgement| channel
-```
-
-The daemon owns authorization, leases, delivery state, and operator-controlled
-recovery. Plugins receive normalized protocol values and never call one another
-directly. Keep plugin stdout reserved for JSON-RPC frames; write diagnostics to
-stderr.
-
-## Local Development
-
-```sh
-lefthook install
-make verify
-```
-
-Tests use deterministic local fixtures. They do not call paid provider APIs.
-Before opening a pull request, update the relevant guide and run the complete
-verification workflow, including Linux package coverage gates and native core
-coverage checks on macOS and Windows x86_64.
+16. [Compatibility And Functional Verification](../COMPATIBILITY.md) — OS
+    functional status, CI coverage, and plugin tests.

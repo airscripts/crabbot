@@ -5,6 +5,14 @@ screenshot tools. Linux runs an isolated X11 session owned by the plugin.
 macOS and Windows can use an interactive backend that controls the signed-in
 desktop after explicit operator opt-in and OS permission grants.
 
+## Table Of Contents
+
+- [Platform Modes](#platform-modes)
+- [Session And Safety](#session-and-safety)
+- [Tools](#tools)
+- [Example](#example)
+- [Development And Verification](#development-and-verification)
+
 ## Platform Modes
 
 ### Linux Isolated Desktop
@@ -111,4 +119,5 @@ KRABB_COMPUTER_PLUGIN="$PWD/target/debug/krabb-plugin-computer" \
 The macOS and Windows native input and capture backends compile in the native
 workspace matrix. Their interactive desktop behavior still needs manual checks
 on deployments that opt into host control. See
-[`COMPATIBILITY.md`](../../COMPATIBILITY.md) for the per-platform checklist.
+[`COMPATIBILITY.md`](../../COMPATIBILITY.md) for the operating-system
+functional checks.

@@ -1,79 +1,83 @@
 # Scheduler
 
-Install the released plugin with:
+The scheduler runs one-time and recurring agent tasks through the daemon.
+Install the plugin with:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/krabblab/krabb/main/install.sh | sh -s -- scheduler
 ```
 
-The scheduler persists agent tasks under
-`KRABB_HOME/data/schedules/schedules.json`. Execution history is kept in
-`KRABB_HOME/logs/schedules/<id>.jsonl`.
-On upgrade, existing tasks from the configured `KRABB_TIMER` state file are
-imported and activated. The scheduler reports the number of imported tasks on
-stderr after saving them. Existing scheduler tasks are retained, and imported
-timer tasks are not duplicated on restart.
-The list operation returns 20 tasks per page, including each task's latest
-outcome without returning its full model response. Schedule names are unique,
-Docker-style single tokens such as `mighty-raccoon`; they can select tasks in
-CLI and TUI run commands. Full run output remains in the per-task JSONL history.
-Up to 1,000 tasks are retained;
-new tasks are refused at the limit rather than evicting an existing schedule.
+## Table Of Contents
 
-Tasks created by an explicit user scheduling request become active immediately.
-An explicitly requested agent scheduling tool call creates and activates the
-task without a second approval prompt. The daemon claims due tasks durably and runs up to four isolated agent
-turns in parallel using their captured provider, model, workspace, and enabled
-tools. The agent can create or update workspace files, use other configured
-tools, and run shell commands or scripts when shell access is enabled. It can
-queue messages through installed channel plugins only when task creation captures
-the exact destination authorized by the user. The task cannot send to another
-destination, and messaging is unavailable when no destination was captured.
-Scheduling explicitly authorizes that isolated task to use its
-captured capabilities; the daemon does not wait for an interactive approval at
-run time.
-The agent must explicitly confirm completion in its final response. Unmarked
-responses pause for review rather than being recorded as successful.
-Shell runs through the tools plugin and its configured confinement; shell is
-disabled by default. CLI schedules require `--shell`; TUI and channel schedules
-capture the shell setting for their originating client or channel. Shell
-commands run on the daemon's machine when shell isolation is off, so a task can
-use its configured local mail client or mail script without a separate Krabb
-email plugin. With Docker or Podman shell isolation, commands run inside that
-container and cannot access host-installed mail clients by default. Outbound
-channel messages use the durable delivery queue. Task results are recorded in
-the schedule history and reported to the originating TUI session or messaging
-conversation. A task can also deliver an explicitly requested message to a
-captured local TUI session. By default,
-tasks that fail after their configured retries are exhausted pause. Recurring
-tasks can instead skip that occurrence and keep the next run active. Tasks
-interrupted while running always pause for review instead of being replayed
-automatically.
-Channel-originated schedules can use local shell commands only when that
-channel has both `tools = true` and `shell = true` and the daemon approval mode
-is `prompt` or `auto`; channel shell access is off by default.
-One-time delays, exact RFC 3339 times, fixed repeat intervals, and five-field
-cron expressions are supported; cron requires an IANA timezone and accounts for
-daylight-saving transitions. Tasks can select `skip`, `coalesce`, or bounded `replay` behavior
-for occurrences missed while the daemon was offline. `skip` drops missed work,
-`coalesce` catches up once, and `replay` runs up to five missed occurrences.
-Active recurring tasks can be run immediately without moving their regular due
-time; manually running a one-time task completes it.
-Tasks can opt into up to five automatic retries with exponential backoff for
-failures before a mutating action starts. If a mutating action may already have
-happened, the task pauses for review instead of retrying it automatically.
-Interrupted runs also pause because their side effects may already have
-happened. Recurring tasks can choose `on_failure = "continue"` to skip an
-occurrence after its retries are exhausted and keep the next run active; the
-default is to pause. Uncertain side effects always pause for review. A
-configured missed-run policy is separate from failure retries.
-Removing an active schedule stops future runs. If its action is already
-running, removal requests cancellation and interrupts the agent turn; side
-effects that already happened cannot be undone.
+- [Create Tasks](#create-tasks)
+- [Execution And Safety](#execution-and-safety)
+- [Timing And Recovery](#timing-and-recovery)
+- [Inspect And Control Tasks](#inspect-and-control-tasks)
+- [Storage And Migration](#storage-and-migration)
 
-The plugin exposes `add`, `list`, `approve`, `run`, `retry`, `pause`,
-`resume`, `claim`, `finish`, `recover`, and `remove` operations over its
-private JSON state. It refuses to start when that state is unreadable or
-corrupt, preserving the file for repair instead of silently dropping scheduled
-work. The daemon owns model execution, workspace confinement, tool policy, and
-reporting.
+## Create Tasks
+
+CLI tasks require a provider and model. Choose a delay, start time, interval,
+or cron expression:
+
+```sh
+krabb schedule add --after 5m --provider codex --model <model> \
+  "<instruction>"
+krabb schedule add --at "2026-10-20 09:00" --timezone Europe/Rome \
+  --provider codex --model <model> "<instruction>"
+krabb schedule add --every 1d --provider codex --model <model> \
+  "<instruction>"
+krabb schedule add --cron '0 9 * * *' --timezone Europe/Rome \
+  --provider codex --model <model> "<instruction>"
+```
+
+`--every` can be combined with `--after` or `--at` to set the first run.
+Cron schedules require an IANA timezone. Tasks created by an explicit user
+request activate immediately; a second approval is not required.
+
+## Execution And Safety
+
+The daemon runs up to four tasks concurrently. Each task uses the provider,
+model, workspace, and tools captured at creation. It must explicitly confirm
+completion in its final response; otherwise the run pauses for review.
+
+- Shell is disabled by default. CLI tasks need `--shell` and the matching
+  configuration. TUI and channel tasks capture their client or channel settings.
+- A task can send a message only to a destination explicitly captured when it
+  was created. Messages use the durable delivery queue.
+- Scheduling authorizes only the task's captured capabilities. The daemon does
+  not wait for an interactive approval while a task runs.
+- Interrupted tasks and uncertain side effects pause for review. They are not
+  replayed automatically.
+
+## Timing And Recovery
+
+- `--missed skip` drops runs missed while the daemon was offline. `coalesce`
+  catches up once; `replay` runs up to five missed occurrences.
+- `--retries 1..5` retries failures only when no mutating action may have run.
+  Retries use exponential backoff.
+- Recurring tasks pause after retry exhaustion by default. Set
+  `--on-failure continue` to skip that occurrence and keep the schedule active.
+- If an action may already have happened, the task pauses even when retries
+  remain. Manual retries can repeat side effects.
+
+The schedule list shows 20 tasks per page and includes each task's latest
+outcome. Up to 1,000 tasks are retained; new tasks are rejected at the limit.
+
+## Inspect And Control Tasks
+
+Use `krabb schedule help` for command syntax. The CLI and TUI support listing,
+history, run, retry, pause, resume, and remove operations. `run` starts a task
+now without shifting a recurring task's next scheduled time. Removing a
+running task requests cancellation; completed side effects cannot be undone.
+
+Full results are stored in append-only JSONL files under
+`KRABB_HOME/logs/schedules/`. The daemon reports results to the originating
+conversation. See [Commands](../../krabb-docs/commands.md) for CLI usage.
+
+## Storage And Migration
+
+Task state is stored in `KRABB_HOME/data/schedules/schedules.json`. On upgrade,
+tasks in the configured `KRABB_TIMER` file are imported once and activated.
+Corrupt scheduler state prevents startup; the plugin preserves the file for
+repair instead of discarding tasks.

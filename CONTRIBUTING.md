@@ -4,6 +4,14 @@ Thanks for helping make Krabb useful, safe, and easy to extend. Discuss
 substantial changes through an issue before opening a pull request. Use
 [SECURITY.md](SECURITY.md) for private vulnerability reports.
 
+## Table Of Contents
+
+- [Local Setup](#local-setup)
+- [Formatting](#formatting)
+- [Change Rules](#change-rules)
+- [Commit Messages](#commit-messages)
+- [Pull Requests](#pull-requests)
+
 ## Local Setup
 
 ```sh

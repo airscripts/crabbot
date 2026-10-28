@@ -1,5 +1,15 @@
 # Workflows
 
+Use these workflows to set up, operate, and update a Krabb installation.
+
+## Table Of Contents
+
+- [First Run](#first-run)
+- [Local Development](#local-development)
+- [Background Service](#background-service)
+- [Session Operations](#session-operations)
+- [Updates](#updates)
+
 ## First Run
 
 Install the core and at least one intelligence and messaging plugin using the

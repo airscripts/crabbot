@@ -1,5 +1,16 @@
 # Architecture
 
+This guide explains Krabb’s process boundaries, runtime, and plugin protocol.
+
+## Table Of Contents
+
+- [Architecture Style](#architecture-style)
+- [Turn Flow](#turn-flow)
+- [Persistence](#persistence)
+- [Protocol](#protocol)
+- [Extension Rules](#extension-rules)
+- [Security](#security)
+
 ## Architecture Style
 
 Krabb uses a layered, hexagonal host/plugin architecture with a
@@ -26,26 +37,28 @@ Krabb is organized into six layers:
 5. `krabb-plugins/` contains optional capabilities. Plugins are separate
    processes that communicate with the runtime through bounded JSON-RPC 2.0
    messages.
-6. `krabb-libs/file` provides private, crash-safe file primitives shared by
-   the host and stateful plugins. It is a library, not a plugin process or an
-   agent capability.
+6. `krabb-libs/` contains shared libraries for dates, logging, files, and
+   process management. Consumers link only the libraries they need; these are
+   not plugin processes or agent capabilities.
 
 ```mermaid
 flowchart TB
-    cli[CLI] <-->|"Runtime API"| runtime[Runtime]
-    daemon[Daemon] <-->|"Runtime API"| runtime
-    cli <-->|"Local JSON-RPC IPC"| daemon
+    cli[CLI] <-->|"Authenticated IPC"| daemon[Daemon]
+    tui[TUI Client] <-->|"Authenticated IPC"| daemon
+    cli -. "In-Process API" .-> runtime[Runtime]
+    daemon -. "In-Process API" .-> runtime
     runtime <-->|"Core API"| core[Core]
-    runtime <-->|"Plugin JSON-RPC"| plugins[Plugins]
-    plugins -. "Commands And Capabilities" .-> runtime
-    runtime <-->|"File API"| file[File]
-    plugins -. "Persistence Helpers" .-> file
+    runtime <-->|"Plugin JSON-RPC"| plugins[Process Plugins]
+    runtime -. "Shared Crates" .-> libs[Shared Libraries]
+    plugins -. "Shared Crates" .-> libs
 ```
 
-The `Runtime API`, `Core API`, and `File API` edges are in-process library
-calls and returned values. Only CLI-to-Daemon IPC and Runtime-to-Plugin
-JSON-RPC cross process boundaries. Plugins do not connect to Core at runtime;
-they implement the contracts Core defines and communicate through Runtime.
+The CLI and TUI use authenticated IPC when they need daemon state or turns.
+Runtime and shared-library calls stay in-process; Runtime-to-plugin JSON-RPC
+and client-to-daemon IPC cross process boundaries. The `krabb-libs/` crates
+are compiled into their consumers, so plugins depend only on the libraries
+they use. Plugins do not connect to Core at runtime. They implement its
+contracts and communicate through Runtime.
 
 The TUI is a terminal client, not a second agent runtime. It submits turns over
 authenticated local IPC; the daemon selects the model plugin, applies tool and
