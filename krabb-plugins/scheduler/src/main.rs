@@ -72,6 +72,8 @@ struct Task {
     #[serde(default)]
     cancel_requested: bool,
     #[serde(default)]
+    pause_requested: bool,
+    #[serde(default)]
     run_id: Option<u64>,
     #[serde(default)]
     finished_run_id: Option<u64>,
@@ -406,6 +408,7 @@ async fn call_at(
                         manual_retry: false,
                         manual_origin: false,
                         cancel_requested: false,
+                        pause_requested: false,
                         run_id: None,
                         finished_run_id: None,
                         finish_result: None,
@@ -528,6 +531,7 @@ async fn call_at(
                         "cron": task.cron,
                         "zone": task.zone,
                         "status": task.status,
+                        "pause_requested": task.pause_requested,
                         "last_outcome": task.last_outcome,
                         "context": task.context,
                         "missed": task.missed,
@@ -690,15 +694,18 @@ async fn call_at(
 
             let manual_run = params["manual"].as_bool().unwrap_or(false);
             let cancelled = task.cancel_requested || params["cancelled"] == true;
+            let pause_requested = task.pause_requested || params["pause"] == true;
             let scheduled_for = task.due;
 
             if cancelled {
                 task.status = "cancelled".into();
-            } else if params["pause"] == true {
+                task.pause_requested = false;
+            } else if pause_requested {
                 task.status = "paused".into();
                 task.retry_at = None;
                 task.manual_run = false;
                 task.manual_retry = false;
+                task.pause_requested = false;
             } else if success && (task.cron.is_some() || task.repeat > 0) {
                 let current_time = now();
 
@@ -831,6 +838,7 @@ async fn call_at(
             let status = match method.as_str() {
                 "approve" if current.status == "pending" => "active",
                 "pause" if current.status == "active" => "paused",
+                "pause" if current.status == "running" => "running",
                 "resume" if current.status == "paused" => "active",
 
                 "run" if matches!(current.status.as_str(), "active" | "completed" | "skipped") => {
@@ -847,7 +855,7 @@ async fn call_at(
 
                 "pause" => {
                     return Err(krabb_core::Error::Denied(
-                        "Only active tasks can be paused.".into(),
+                        "Only active or running tasks can be paused.".into(),
                     ));
                 }
 
@@ -885,6 +893,7 @@ async fn call_at(
                     task.cancel_requested = false;
                     task.retry_at = None;
                     task.attempts = 0;
+                    task.pause_requested = false;
                 }
 
                 "retry" => {
@@ -893,6 +902,7 @@ async fn call_at(
                     task.cancel_requested = false;
                     task.retry_at = None;
                     task.attempts = 0;
+                    task.pause_requested = false;
                 }
 
                 "resume" => {
@@ -902,23 +912,30 @@ async fn call_at(
                     task.manual_retry = false;
                     task.manual_origin = false;
                     task.cancel_requested = false;
+                    task.pause_requested = false;
                 }
 
                 "pause" => {
-                    task.attempts = 0;
-                    task.retry_at = None;
-                    task.manual_run = false;
-                    task.manual_retry = false;
-                    task.manual_origin = false;
+                    if current.status == "running" {
+                        task.pause_requested = true;
+                    } else {
+                        task.attempts = 0;
+                        task.retry_at = None;
+                        task.manual_run = false;
+                        task.manual_retry = false;
+                        task.manual_origin = false;
+                        task.pause_requested = false;
+                    }
                 }
 
                 _ => {}
             }
 
             task.status = status.into();
+            let pause_requested = task.pause_requested;
             persist_locked_at(location, &next_tasks)?;
             *tasks = next_tasks;
-            json!({"id": task_id, "status": status})
+            json!({"id": task_id, "status": status, "pause_requested": pause_requested})
         }
 
         "recover" => {
@@ -950,6 +967,7 @@ async fn call_at(
                     task.manual_run = false;
                     task.manual_retry = false;
                     task.cancel_requested = false;
+                    task.pause_requested = false;
                     task.last_result =
                         Some("Execution was interrupted; review before resuming.".into());
                     task.last_outcome = Some("failed".into());
@@ -1617,6 +1635,7 @@ mod tests {
             manual_retry: false,
             manual_origin: false,
             cancel_requested: false,
+            pause_requested: false,
             run_id: None,
             finished_run_id: Some(1),
             finish_result: Some(json!({"success": true, "result": "done"})),
@@ -1882,6 +1901,7 @@ mod tests {
                     manual_retry: false,
                     manual_origin: false,
                     cancel_requested: false,
+                    pause_requested: false,
                     run_id: None,
                     finished_run_id: None,
                     finish_result: None,
@@ -2079,6 +2099,80 @@ mod tests {
         assert!(finished["retry_at"].is_null());
         assert_eq!(tasks.lock().unwrap()[&11].attempts, 1);
         assert_eq!(tasks.lock().unwrap()[&11].retries, 3);
+    }
+
+    #[tokio::test]
+    async fn pausing_a_running_schedule_waits_for_the_current_run_to_finish() {
+        let tasks = tasks();
+
+        call_at(
+            &tasks,
+            Request::call(
+                1,
+                "add",
+                json!({"id": 12, "text": "send a message", "repeat": 10, "activate": true}),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let running =
+            call_at(&tasks, Request::call(2, "claim", json!({"at": now(), "since": now()})), None)
+                .await
+                .unwrap()
+                .unwrap()
+                .result
+                .unwrap()["item"]
+                .clone();
+
+        let run_id = running["run_id"].as_u64().unwrap();
+
+        let paused = call_at(&tasks, Request::call(3, "pause", json!({"id": 12})), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+
+        assert_eq!(paused["status"], "running");
+        assert_eq!(paused["pause_requested"], true);
+
+        let listed = call_at(&tasks, Request::call(4, "list", json!({})), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+
+        assert_eq!(listed["items"][0]["pause_requested"], true);
+
+        let finished = call_at(
+            &tasks,
+            Request::call(
+                5,
+                "finish",
+                json!({"id": 12, "run_id": run_id, "success": true, "result": "sent"}),
+            ),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .result
+        .unwrap();
+
+        assert_eq!(finished["status"], "paused");
+        assert!(!tasks.lock().unwrap()[&12].pause_requested);
+
+        let due = call_at(&tasks, Request::call(6, "due", json!({"at": u64::MAX})), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap();
+
+        assert!(due["items"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2785,6 +2879,7 @@ mod tests {
                 manual_retry: false,
                 manual_origin: false,
                 cancel_requested: false,
+                pause_requested: false,
                 run_id: None,
                 finished_run_id: None,
                 finish_result: None,
@@ -3231,6 +3326,7 @@ mod tests {
                         manual_retry: false,
                         manual_origin: false,
                         cancel_requested: false,
+                        pause_requested: false,
                         run_id: None,
                         finished_run_id: None,
                         finish_result: None,

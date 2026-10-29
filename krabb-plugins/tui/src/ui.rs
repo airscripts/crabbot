@@ -207,6 +207,8 @@ struct App {
     status: String,
     session: String,
     model: String,
+    completed_system_messages: Vec<SavedSystemMessage>,
+    pending_snapshot_messages: Vec<(String, String)>,
     model_available: bool,
     context_usage: Option<krabb_core::types::ContextUsage>,
     workspace: String,
@@ -354,8 +356,14 @@ struct SavedInteraction {
     session: String,
     input: String,
     output: String,
-    sequence: u64,
-    system: bool,
+    user_message_id: String,
+    assistant_message_id: String,
+}
+
+struct SavedSystemMessage {
+    session: String,
+    id: String,
+    text: String,
 }
 
 pub(super) struct ModelOptions {
@@ -508,9 +516,7 @@ where
                         quit = handle_event(event, &mut app, &mut command_tx, engine_finished).await?;
                     }
 
-                    for interaction in app.take_persistable_interactions() {
-                        persist_interaction(&home, interaction, host).await?;
-                    }
+                    persist_pending(&home, &mut app, host).await?;
 
                     if app.statusline_changed {
                         save_preferences(
@@ -599,10 +605,6 @@ where
 
                     Some(crate::EngineEvent::GenerationFinished { interrupted }) => {
                         app.finish_generation(interrupted);
-
-                        for interaction in app.take_persistable_interactions() {
-                            persist_interaction(&home, interaction, host).await?;
-                        }
                     }
 
                     Some(crate::EngineEvent::AssistantText(text)) => {
@@ -631,6 +633,8 @@ where
 
                     None => engine_events_open = false,
                 }
+
+                persist_pending(&home, &mut app, host).await?;
             }
 
             _ = tokio::time::sleep(TYPEWRITER_INTERVAL), if !app.reveal_queue.is_empty() => {
@@ -674,9 +678,7 @@ where
                             }
                         }
 
-                        for interaction in app.take_persistable_interactions() {
-                            persist_interaction(&home, interaction, host).await?;
-                        }
+                        persist_pending(&home, &mut app, host).await?;
 
                         for interaction in app.finish_interactions() {
                             persist_interaction(&home, interaction, host).await?;
@@ -702,9 +704,7 @@ where
                         app.compaction_active = false;
                         app.reply_pending = false;
 
-                        for interaction in app.take_persistable_interactions() {
-                            persist_interaction(&home, interaction, host).await?;
-                        }
+                        persist_pending(&home, &mut app, host).await?;
 
                         for interaction in app.finish_interactions() {
                             persist_interaction(&home, interaction, host).await?;
@@ -819,21 +819,20 @@ where
     };
 
     let entries = [
-        ("user", Role::User, Some("tui".to_owned()), interaction.input.as_str()),
-        ("assistant", Role::Assistant, None, output),
+        (
+            interaction.user_message_id.as_str(),
+            Role::User,
+            Some("tui".to_owned()),
+            interaction.input.as_str(),
+        ),
+        (interaction.assistant_message_id.as_str(), Role::Assistant, None, output),
     ];
 
-    for (role_name, role, sender, text) in entries {
+    for (id, role, sender, text) in entries {
         let text = bounded_interaction_text(text);
         let session = interaction.session.clone();
         let message = Message {
-            id: crate::message_id(
-                &format!(
-                    "{}interaction-{role_name}",
-                    if interaction.system && role_name == "assistant" { "system-" } else { "" }
-                ),
-                interaction.sequence,
-            ),
+            id: id.to_owned(),
             session: session.clone(),
             role,
             sender,
@@ -846,6 +845,45 @@ where
             serde_json::json!({"id": session, "message": message}),
         )
         .await?;
+    }
+
+    Ok(())
+}
+
+async fn persist_system_message<C, F>(home: &str, saved: SavedSystemMessage, host: C) -> Result<()>
+where
+    C: Fn(String, String, serde_json::Value) -> F + Copy,
+    F: std::future::Future<Output = Result<serde_json::Value>>,
+{
+    let message = Message {
+        id: saved.id,
+        session: saved.session.clone(),
+        role: Role::Assistant,
+        sender: Some("system".into()),
+        content: vec![krabb_core::types::Content::Text { text: saved.text }],
+    };
+
+    host(
+        home.to_owned(),
+        "session.append".into(),
+        serde_json::json!({"id": saved.session, "message": message}),
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn persist_pending<C, F>(home: &str, app: &mut App, host: C) -> Result<()>
+where
+    C: Fn(String, String, serde_json::Value) -> F + Copy,
+    F: std::future::Future<Output = Result<serde_json::Value>>,
+{
+    for interaction in app.take_persistable_interactions() {
+        persist_interaction(home, interaction, host).await?;
+    }
+
+    for message in app.take_persistable_system_messages() {
+        persist_system_message(home, message, host).await?;
     }
 
     Ok(())
@@ -933,6 +971,7 @@ fn message_timestamp(id: &str) -> Option<String> {
         | ["tui", "interaction", "user", timestamp, ..]
         | ["tui", "interaction", "assistant", timestamp, ..] => *timestamp,
         ["tui", "system", "interaction", "assistant", timestamp, ..]
+        | ["tui", "system", "notice", timestamp, ..]
         | ["schedule", "notice", "at", timestamp, ..] => *timestamp,
         _ => return None,
     };
@@ -2941,7 +2980,29 @@ impl App {
             return Vec::new();
         }
 
-        std::mem::take(&mut self.completed_interactions)
+        let interactions = std::mem::take(&mut self.completed_interactions);
+
+        self.pending_snapshot_messages.extend(interactions.iter().flat_map(|interaction| {
+            [
+                (interaction.session.clone(), interaction.user_message_id.clone()),
+                (interaction.session.clone(), interaction.assistant_message_id.clone()),
+            ]
+        }));
+
+        interactions
+    }
+
+    fn take_persistable_system_messages(&mut self) -> Vec<SavedSystemMessage> {
+        if self.generation_active || self.compaction_active || self.reply_pending {
+            return Vec::new();
+        }
+
+        let messages = std::mem::take(&mut self.completed_system_messages);
+
+        self.pending_snapshot_messages
+            .extend(messages.iter().map(|message| (message.session.clone(), message.id.clone())));
+
+        messages
     }
 
     fn begin_interaction(&mut self, input: &str) {
@@ -3034,8 +3095,14 @@ impl App {
             session: interaction.session,
             input: interaction.input,
             output: interaction.output.trim_matches('\n').to_owned(),
-            sequence: self.interaction_sequence,
-            system: interaction.system,
+            user_message_id: crate::message_id("interaction-user", self.interaction_sequence),
+            assistant_message_id: crate::message_id(
+                &format!(
+                    "{}interaction-assistant",
+                    if interaction.system { "system-" } else { "" }
+                ),
+                self.interaction_sequence,
+            ),
         }
     }
 
@@ -3056,6 +3123,7 @@ impl App {
             || self.reply_pending
             || !self.pending_interactions.is_empty()
             || !self.completed_interactions.is_empty()
+            || !self.completed_system_messages.is_empty()
             || !self.reveal_queue.is_empty()
         {
             return;
@@ -3066,6 +3134,20 @@ impl App {
         let workspace = session.workspace.unwrap_or_else(|| self.default_workspace.clone());
         self.context_usage = session.context_usage;
         self.session_working = session.working;
+
+        let pending_message_missing = self
+            .pending_snapshot_messages
+            .iter()
+            .filter(|(id, _)| id == &session.id)
+            .any(|(_, id)| !session.messages.iter().any(|message| &message.id == id));
+
+        if pending_message_missing {
+            self.model = model;
+            self.workspace = workspace;
+            return;
+        }
+
+        self.pending_snapshot_messages.retain(|(id, _)| id != &session.id);
 
         if self.session != session.id
             || self.model != model
@@ -3127,6 +3209,9 @@ impl App {
             self.invalidate_transcript_layout();
             self.transcript_scroll.follow_latest();
             self.pending_clear = false;
+            let session = self.session.clone();
+            self.pending_snapshot_messages.retain(|(id, _)| id != &session);
+            self.completed_system_messages.clear();
         }
 
         if self.pending_model.is_none() && self.pending_workspace.is_none() && !self.pending_clear {
@@ -3257,7 +3342,17 @@ impl App {
 
     fn push_system(&mut self, value: &str) {
         self.push_system_label();
-        self.append_visible(&normalize_output(format!("{value}\n")));
+        let text = normalize_output(format!("{value}\n"));
+        self.append_visible(&text);
+
+        if !text.trim().is_empty() {
+            self.interaction_sequence = self.interaction_sequence.saturating_add(1);
+            self.completed_system_messages.push(SavedSystemMessage {
+                session: self.session.clone(),
+                id: crate::message_id("system-notice", self.interaction_sequence),
+                text: text.trim_end_matches('\n').to_owned(),
+            });
+        }
 
         if self.generation_active {
             self.reply_pending = true;
@@ -3485,10 +3580,116 @@ mod tests {
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].input, "ping");
         assert_eq!(saved[0].output, "Request failed: Codex supplied too many tools.");
-        assert!(saved[0].system);
+        assert!(saved[0].assistant_message_id.starts_with("tui-system-interaction-assistant-"));
         assert!(app.transcript.contains("ping"));
         assert!(app.transcript.contains("System |"));
         assert!(!app.transcript.contains("Krabb |"));
+    }
+
+    #[test]
+    fn stale_session_snapshot_does_not_erase_a_saved_request_error() {
+        let mut app = App { name: "Krabb".into(), session: "tui".into(), ..App::default() };
+        let error = "Request failed: Codex app-server closed its output.";
+
+        app.begin_interaction("ping");
+        app.push_user("ping");
+        app.push_request_failure(error);
+        app.finish_generation(false);
+
+        let saved = app.take_persistable_interactions();
+
+        assert_eq!(saved.len(), 1);
+
+        app.refresh_session(super::SessionView {
+            id: "tui".into(),
+            model: "codex".into(),
+            workspace: None,
+            context_usage: None,
+            messages: Vec::new(),
+            working: false,
+        });
+
+        assert!(app.transcript.contains(error));
+
+        let saved_interaction = &saved[0];
+        let messages = vec![
+            krabb_core::types::Message {
+                id: saved_interaction.user_message_id.clone(),
+                session: "tui".into(),
+                role: krabb_core::types::Role::User,
+                sender: Some("tui".into()),
+                content: vec![krabb_core::types::Content::Text {
+                    text: saved_interaction.input.clone(),
+                }],
+            },
+            krabb_core::types::Message {
+                id: saved_interaction.assistant_message_id.clone(),
+                session: "tui".into(),
+                role: krabb_core::types::Role::Assistant,
+                sender: None,
+                content: vec![krabb_core::types::Content::Text {
+                    text: saved_interaction.output.clone(),
+                }],
+            },
+        ];
+
+        app.refresh_session(super::SessionView {
+            id: "tui".into(),
+            model: "codex".into(),
+            workspace: None,
+            context_usage: None,
+            messages,
+            working: false,
+        });
+
+        assert!(app.transcript.contains(error));
+        assert!(app.pending_snapshot_messages.is_empty());
+    }
+
+    #[test]
+    fn persists_system_notices_and_keeps_them_when_snapshots_lag() {
+        let mut app = App { name: "Krabb".into(), session: "tui".into(), ..App::default() };
+        let notice = "Codex is unavailable.";
+
+        app.push_system(notice);
+
+        let saved = app.take_persistable_system_messages();
+
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].text, notice);
+        assert!(saved[0].id.starts_with("tui-system-notice-"));
+
+        app.refresh_session(super::SessionView {
+            id: "tui".into(),
+            model: "codex".into(),
+            workspace: None,
+            context_usage: None,
+            messages: Vec::new(),
+            working: false,
+        });
+
+        assert!(app.transcript.contains(notice));
+
+        let message = krabb_core::types::Message {
+            id: saved[0].id.clone(),
+            session: "tui".into(),
+            role: krabb_core::types::Role::Assistant,
+            sender: Some("system".into()),
+            content: vec![krabb_core::types::Content::Text { text: notice.into() }],
+        };
+
+        app.refresh_session(super::SessionView {
+            id: "tui".into(),
+            model: "codex".into(),
+            workspace: None,
+            context_usage: None,
+            messages: vec![message],
+            working: false,
+        });
+
+        assert!(app.transcript.contains(notice));
+        assert!(app.transcript.contains("System |"));
+        assert!(app.pending_snapshot_messages.is_empty());
     }
 
     #[test]

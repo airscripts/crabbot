@@ -3,7 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     future::Future,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -238,17 +238,7 @@ struct LogFile {
 
 impl LogFile {
     fn open(format: Format, mode: Mode, capture: bool) -> Option<Self> {
-        let home = std::env::var_os("KRABB_HOME").map(PathBuf::from).unwrap_or_else(|| {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    std::env::var_os("HOME")
-                        .or_else(|| std::env::var_os("USERPROFILE"))
-                        .map_or_else(|| PathBuf::from("."), PathBuf::from)
-                        .join(".config")
-                })
-                .join("krabb")
-        });
+        let home = application_home();
 
         let directory = home.join("logs");
         create_private_dir(&directory).ok()?;
@@ -328,6 +318,33 @@ impl Write for LogWriter {
 
 pub fn date_stamp() -> String {
     date_stamp_at(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+}
+
+pub fn application_log_path() -> PathBuf {
+    let extension = match std::env::var("KRABB_LOG_FORMAT").ok().as_deref() {
+        Some("json") => "jsonl",
+        _ => "log",
+    };
+
+    application_log_path_at(&application_home(), &date_stamp(), extension)
+}
+
+fn application_home() -> PathBuf {
+    std::env::var_os("KRABB_HOME").map(PathBuf::from).unwrap_or_else(|| {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from)
+                    .join(".config")
+            })
+            .join("krabb")
+    })
+}
+
+fn application_log_path_at(home: &Path, date: &str, extension: &str) -> PathBuf {
+    home.join("logs").join(format!("{date}.{extension}"))
 }
 
 fn date_stamp_at(seconds: u64) -> String {
@@ -444,6 +461,7 @@ pub fn redact_bytes(value: &[u8]) -> String {
 mod tests {
     use std::fs;
     use std::io::Write;
+    use std::path::{Path, PathBuf};
 
     use super::{
         Format, LogWriter, Mode, Settings, Verbosity, date_stamp_at, default_filter, redact_bytes,
@@ -611,6 +629,19 @@ mod tests {
         assert_eq!(
             super::command_log_filename("2024-03-01", "debug", 123, 456, "log"),
             "2024-03-01-debug-123-456.log"
+        );
+    }
+
+    #[test]
+    fn application_log_paths_use_daily_filenames_and_format_extensions() {
+        assert_eq!(
+            super::application_log_path_at(Path::new("/krabb"), "2026-10-28", "log"),
+            PathBuf::from("/krabb/logs/2026-10-28.log")
+        );
+
+        assert_eq!(
+            super::application_log_path_at(Path::new("/krabb"), "2026-10-28", "jsonl"),
+            PathBuf::from("/krabb/logs/2026-10-28.jsonl")
         );
     }
 

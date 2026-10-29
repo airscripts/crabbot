@@ -44,6 +44,7 @@ pub(crate) mod approval;
 pub(crate) mod ipc;
 pub(crate) mod logging;
 pub(crate) mod state;
+pub(crate) mod terminal;
 
 const NAME: &str = "krabb";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -651,21 +652,11 @@ fn sentence(value: impl Into<String>) -> String {
 }
 
 fn format_cli_error(message: &str) -> String {
-    let mut has_content = false;
-    let mut lines = Vec::new();
-
-    for line in message.lines() {
-        if line.trim().is_empty() {
-            lines.push(String::new());
-        } else if has_content {
-            lines.push(format!("  {}", line.trim_start()));
-        } else {
-            lines.push(line.to_owned());
-            has_content = true;
-        }
+    if message.trim().is_empty() {
+        return "The command could not be completed.".into();
     }
 
-    if has_content { lines.join("\n") } else { "The command could not be completed.".into() }
+    message.lines().map(str::trim_start).collect::<Vec<_>>().join("\n")
 }
 
 fn toml_position(input: &str, offset: usize) -> (usize, usize) {
@@ -970,8 +961,8 @@ enum PluginCommand {
     Install(PluginInstall),
     #[command(about = "Review available plugin updates; pass -y to apply them.")]
     Update(PluginUpdate),
-    #[command(name = "uninstall", about = "Uninstall a plugin.")]
-    Remove(PluginRemove),
+    #[command(name = "uninstall", about = "Uninstall one or more plugins.")]
+    Remove(PluginUninstall),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1283,13 +1274,18 @@ struct Name {
 }
 
 #[derive(Debug, Args)]
-struct PluginRemove {
-    #[arg(help = "Plugin identifier.")]
-    id: String,
+struct PluginUninstall {
+    #[arg(required = true, value_name = "ID", help = "Plugin identifiers.")]
+    ids: Vec<String>,
     #[arg(short, long, help = "Skip the confirmation prompt.")]
     yes: bool,
-    #[arg(long, help = "Purge its last capability's sessions or deliveries.")]
+    #[arg(long, help = "Purge state owned by the last capability plugin.")]
     force: bool,
+}
+
+struct PluginRemove {
+    id: String,
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2267,6 +2263,12 @@ fn import_krabfile_at_mode(
     let previous_config = std::fs::read(&destination).ok();
     init_at(root)?;
     secure(&destination, toml::to_string_pretty(&file.config)?.as_bytes())?;
+    let spinner = if !json && !file.plugins.is_empty() {
+        terminal::Spinner::start("Importing configuration and plugins...")
+    } else {
+        None
+    };
+
     let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for plugin in &file.plugins {
             let revision = (!plugin.revision.is_empty() && plugin.revision != "local")
@@ -2297,6 +2299,8 @@ fn import_krabfile_at_mode(
 
         Ok(())
     })();
+
+    drop(spinner);
 
     if let Err(error) = result {
         match previous_config {
@@ -2956,6 +2960,10 @@ async fn schedule_command(
                 format!("Schedule {name} ({id}) was not found.")
             }
         );
+    } else if method == "pause" && value["pause_requested"] == true {
+        println!(
+            "Pause requested for schedule {name} ({id}). The current run will finish, then the schedule will stay paused."
+        );
     } else {
         println!("Schedule {name} ({id}) is now {}.", value["status"].as_str().unwrap_or(action));
     }
@@ -3522,6 +3530,13 @@ fn format_schedule_list(value: &serde_json::Value) -> String {
 
             if item["run_requested"] == true {
                 details.push("A manual run is queued".into());
+            }
+
+            if item["pause_requested"] == true {
+                details.push(
+                    "Pause requested; the current run will finish before the schedule pauses"
+                        .into(),
+                );
             }
 
             if let Some(outcome) = item["last_outcome"].as_str() {
@@ -4352,26 +4367,32 @@ fn session_text(value: &serde_json::Value) -> String {
     let messages = value["messages"].as_array();
 
     if messages.is_none_or(Vec::is_empty) {
-        lines.push("  (empty)".into());
+        lines.push("(empty)".into());
     } else {
-        for message in messages.into_iter().flatten() {
-            let role = message["role"].as_str().unwrap_or("unknown");
-            let content = message["content"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|item| {
-                    item["text"]
-                        .as_str()
-                        .or_else(|| item["alt"].as_str())
-                        .or_else(|| item["name"].as_str())
-                        .unwrap_or_else(|| item["kind"].as_str().unwrap_or("attachment"))
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
+        let entries = messages
+            .into_iter()
+            .flatten()
+            .map(|message| {
+                let role = message["role"].as_str().unwrap_or("unknown");
+                let content = message["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|item| {
+                        item["text"]
+                            .as_str()
+                            .or_else(|| item["alt"].as_str())
+                            .or_else(|| item["name"].as_str())
+                            .unwrap_or_else(|| item["kind"].as_str().unwrap_or("attachment"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
 
-            lines.push(format!("  {role}: {content}"));
-        }
+                format!("{role}: {content}")
+            })
+            .collect::<Vec<_>>();
+
+        lines.push(format_tree_list(&entries));
     }
 
     lines.join("\n")
@@ -6155,7 +6176,7 @@ async fn execute_scheduled_task(
     let session = format!("schedule-{task_id}");
     let instruction = task["text"].as_str().ok_or("Scheduled instruction is missing.")?;
     let user = Message {
-        id: format!("schedule-user-{}", now()),
+        id: format!("schedule-user-{}", unix_timestamp_millis()),
         session: session.clone(),
         role: Role::User,
         sender: Some("scheduler".into()),
@@ -10546,6 +10567,21 @@ fn scheduled_delivery_id(session: &str, run_id: u64, tool_call: usize) -> String
     format!("{session}-run-{run_id}-tool-{tool_call}")
 }
 
+fn scheduled_tui_notice_id(
+    session: &str,
+    timestamp: u128,
+    run_id: u64,
+    tool_call: usize,
+) -> String {
+    format!("schedule-notice-at-{timestamp}-{session}-run-{run_id}-tool-{tool_call}")
+}
+
+fn unix_timestamp_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis())
+}
+
 fn matches_authorized_destination(
     message: &ScheduledMessage,
     destination: &AuthorizedDestination,
@@ -11545,6 +11581,10 @@ async fn tool_with_registry(
             ),
             "remove" if value["deleted"] == true => format!("Schedule {} cancelled.", args["id"]),
             "remove" => format!("Schedule {} was not found.", args["id"]),
+            "pause" if value["pause_requested"] == true => format!(
+                "Pause requested for schedule {}. The current run will finish, then the schedule will stay paused.",
+                args["id"]
+            ),
             _ => format!(
                 "Schedule {} is now {}.",
                 args["id"],
@@ -12140,14 +12180,16 @@ async fn execute_tool_with_registry(
 
         if message.channel == "tui" {
             let run_id = schedule_run_id.ok_or("Scheduled run ID is missing.")?;
-            let message_id = scheduled_delivery_id(session, run_id, tool_call);
+            let delivery_id = scheduled_delivery_id(session, run_id, tool_call);
+            let message_id =
+                scheduled_tui_notice_id(session, unix_timestamp_millis(), run_id, tool_call);
             let mut store = sessions.lock().map_err(|_| "Session lock is poisoned.")?;
             store.ensure(&message.chat, model)?;
 
             if store.sessions[&message.chat]
                 .messages
                 .iter()
-                .any(|existing| existing.id == message_id)
+                .any(|existing| existing.id == delivery_id || existing.id.ends_with(&delivery_id))
             {
                 return Ok(ToolResult::text(format!(
                     "Message was already added to TUI session {}.",
@@ -12775,9 +12817,9 @@ fn doctor_at(
                     "created_klaw_instructions" => "KLAW.md instructions",
                     _ => repair,
                 })
-                .map(|description| format!("  - {description}"))
+                .map(str::to_owned)
                 .collect::<Vec<_>>();
-            println!("Repairs applied:\n{}", descriptions.join("\n"));
+            println!("Repairs applied:\n{}", format_tree_list(&descriptions));
         }
     } else {
         let config_status = if config_valid == Some(true) { "valid" } else { "missing" };
@@ -12920,7 +12962,14 @@ fn service_environment_from(
         }
     }
 
+    if !environment.contains_key("KRABB_CODEX_BINARY")
+        && let Some(binary) = environment.get("PATH").and_then(|path| codex_binary_from_path(path))
+    {
+        values.push(("KRABB_CODEX_BINARY".into(), binary.display().to_string()));
+    }
+
     let configured = environment.get("KRABB_CREDENTIALS").map(PathBuf::from);
+
     let mut credentials = serde_json::Map::new();
     let mut direct = false;
 
@@ -12974,6 +13023,32 @@ fn service_environment_from(
     }
 
     Ok(values)
+}
+
+fn codex_binary_from_path(path: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let executable = "codex.exe";
+
+    #[cfg(not(windows))]
+    let executable = "codex";
+
+    std::env::split_paths(path)
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(executable))
+        .find_map(|candidate| {
+            let metadata = std::fs::metadata(&candidate).ok()?;
+
+            if !metadata.is_file() {
+                return None;
+            }
+
+            #[cfg(unix)]
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return None;
+            }
+
+            candidate.canonicalize().ok()
+        })
 }
 
 fn service_path_value(path: PathBuf) -> std::io::Result<String> {
@@ -13702,7 +13777,16 @@ fn service_action_with(
         ServiceAction::Restart => ("sc.exe", vec!["start".into(), "Krabb".into()]),
     };
 
+    let message = match action {
+        ServiceAction::Start => "Starting the Krabb service...",
+        ServiceAction::Stop => "Stopping the Krabb service...",
+        ServiceAction::Restart => "Restarting the Krabb service...",
+    };
+
+    let spinner = if json { None } else { terminal::Spinner::start(message) };
+
     let output = command_output(std::process::Command::new(program).args(args))?;
+    drop(spinner);
 
     if !output.status.success() {
         let detail = format!(
@@ -14871,37 +14955,34 @@ async fn plugin(
             let mut installed = Vec::new();
             let mut errors = Vec::new();
             let mut activation_errors = Vec::new();
-            let mut activations = Vec::new();
-            let requested = sources.len();
+            let mut waiting_for_credentials = false;
+            let mut outcomes = Vec::new();
+            let action = if linked { "Linking" } else { "Installing" };
 
-            for (index, source) in sources.into_iter().enumerate() {
+            let spinner =
+                if json { None } else { terminal::Spinner::start(format!("{action} plugins...")) };
+
+            for source in sources {
                 let id = source.id.clone();
-
-                if !json {
-                    if index == 0 {
-                        let label = if requested == 1 { "plugin" } else { "plugins" };
-
-                        let action = if linked { "Linking" } else { "Installing" };
-
-                        println!("{action} {requested} {label}:\n");
-                    }
-
-                    println!("{}", plugin_install_progress(index + 1, requested, &id, linked));
-                }
+                let existing_version =
+                    read_manifest(&root.join("plugins").join(&id)).map(|manifest| manifest.version);
+                let mut credentials_deferred = false;
 
                 match link(source, linked) {
                     Ok(manifest) => {
                         let state = match activate_at(&root, &manifest.id).await {
                             Ok(activation) => {
-                                let state =
-                                    if activation.is_some() { "active" } else { "deferred" };
-
-                                activations.push((manifest.id.clone(), activation.clone()));
-                                state
+                                if activation.is_some() {
+                                    "active"
+                                } else {
+                                    "deferred"
+                                }
                             }
 
                             Err(error) if plugin_activation_is_deferred(&error.to_string()) => {
                                 debug!(plugin = %id, "Plugin installed; activation is deferred.");
+                                waiting_for_credentials = true;
+                                credentials_deferred = true;
                                 "deferred"
                             }
 
@@ -14921,10 +15002,13 @@ async fn plugin(
                             info!(plugin = %manifest.id, version = %manifest.version, activation = state, "Plugin installed.");
                         }
 
-                        if !json && requested > 1 {
-                            println!("{}\n", plugin_install_version(linked, &manifest.version));
-                        }
-
+                        outcomes.push(serde_json::json!({
+                            "id": manifest.id.clone(),
+                            "version": manifest.version.clone(),
+                            "status": if state == "failed" { "activation_failed" } else { "installed" },
+                            "activation": state,
+                            "waiting_for_credentials": credentials_deferred
+                        }));
                         installed.push(serde_json::json!({
                             "id": manifest.id,
                             "version": manifest.version,
@@ -14936,9 +15020,16 @@ async fn plugin(
                     Err(error) => {
                         warn!(plugin = %id, error = %diagnostic(sentence(error.to_string())), "Plugin installation failed.");
                         errors.push(serde_json::json!({"id": id, "error": error.to_string()}));
+                        outcomes.push(serde_json::json!({
+                            "id": id,
+                            "version": existing_version,
+                            "status": "failed"
+                        }));
                     }
                 }
             }
+
+            drop(spinner);
 
             if json {
                 let failed = errors.len();
@@ -14961,141 +15052,128 @@ async fn plugin(
             } else {
                 let total = installed.len() + errors.len();
 
-                if let Some(summary) = plugin_install_summary(&installed, total, linked) {
-                    println!("{summary}");
-                }
-
-                let needs_daemon = activations.iter().any(|(_, activation)| activation.is_none());
-                let mut follow_up = Vec::new();
-
-                if needs_daemon {
-                    follow_up.push(
-                        "Start the Krabb daemon with `krabb service start` or run `krabb-daemon`."
-                            .to_owned(),
-                    );
-                }
-
-                for (id, activation) in activations {
-                    if let Some(note) = activation_note(&id, activation, needs_daemon) {
-                        follow_up.push(note);
-                    }
-                }
-
-                for failure in &activation_errors {
-                    let id = failure["id"].as_str().unwrap_or("unknown");
-                    let detail = failure["error"].as_str().unwrap_or("Activation failed.");
-                    println!("\nPlugin {id} was installed, but could not be activated: {detail}");
-                }
-
-                if !follow_up.is_empty() {
-                    println!("\n{}", follow_up.join("\n\n"));
-                }
+                println!("{}", plugin_install_output(&outcomes, linked));
 
                 if !errors.is_empty() {
+                    std::io::stdout().flush()?;
                     return Err(plugin_install_error(&errors, total, linked).into());
+                }
+
+                if !activation_errors.is_empty() {
+                    println!("\n{}", plugin_log_hint("failed activation"));
+                } else if installed.len() == total && !waiting_for_credentials {
+                    println!("\n{}", plugin_service_guidance(service_path().is_file()));
                 }
             }
         }
 
         PluginCommand::Update(update) => update_plugins(update.yes, update.json || json).await?,
 
-        PluginCommand::Remove(mut name) => {
-            if !valid(&name.id) {
-                return Err(format!("Invalid plugin ID: {}.", name.id).into());
-            }
+        PluginCommand::Remove(name) => {
+            let ids = plugin_uninstall_ids(name.ids)?;
+            let prompt = if ids.len() == 1 {
+                format!("Uninstall plugin {}?", ids[0])
+            } else {
+                format!("Uninstall plugins {}?", ids.join(", "))
+            };
 
-            if !confirm_action(name.yes, json, &format!("Uninstall plugin {}?", name.id))? {
+            if !confirm_action(name.yes, json, &prompt)? {
                 print_cancelled("Uninstall", json);
                 return Ok(());
             }
 
-            name.yes = true;
-
-            let id = name.id.clone();
             let root = home();
-            let lock = load_lock_at(&root)?;
-            let (purge_sessions, purge_deliveries) = last_plugin_state(&lock, &id, &root);
-
-            let purged = if name.force && (purge_sessions || purge_deliveries) {
-                Some(purge_state_at(&root, purge_sessions, purge_deliveries).await?)
+            let spinner = if ids.len() > 1 && !json {
+                terminal::Spinner::start("Uninstalling plugins...")
             } else {
-                ensure_no_orphaned_plugin_state(&lock, &id, &root)?;
                 None
             };
 
-            let unloaded =
-                unload_at(&root, &id).await?.is_some_and(|value| value["unloaded"] == true);
+            let mut outcomes = Vec::new();
+            let mut errors = Vec::new();
+            let mut display_rows = Vec::new();
 
-            if let Err(error) = remove_at(name, &root) {
-                if let Err(reload) = activate_at(&root, &id).await {
-                    return Err(format!(
-                        "Plugin uninstallation failed: {}. Runtime restoration also failed: {}.",
-                        sentence(error.to_string()),
-                        sentence(reload.to_string())
-                    )
-                    .into());
+            for id in &ids {
+                match uninstall_plugin_at(&root, id, name.force).await {
+                    Ok(outcome) => {
+                        let version = outcome["version"]
+                            .as_str()
+                            .map(|version| format!("@v{version}"))
+                            .unwrap_or_default();
+                        display_rows.push(format!("{id}{version} successfully uninstalled"));
+                        outcomes.push(outcome);
+                    }
+
+                    Err(error) => {
+                        warn!(plugin = %id, error = %diagnostic(sentence(error.to_string())), "Plugin uninstallation failed.");
+                        let version = load_lock_at(&root)
+                            .ok()
+                            .and_then(|lock| {
+                                lock.plugins.get(id).map(|entry| entry.version.clone())
+                            })
+                            .map(|version| format!("@v{version}"))
+                            .unwrap_or_default();
+                        display_rows.push(format!("{id}{version} uninstallation failed"));
+                        errors.push(serde_json::json!({
+                            "id": id,
+                            "error": sentence(error.to_string())
+                        }));
+                    }
                 }
-
-                return Err(error);
             }
 
-            info!(plugin = %id, unloaded, "Plugin uninstalled.");
+            drop(spinner);
 
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "action": "uninstall",
-                        "id": id,
-                        "status": "uninstalled",
-                        "unloaded": unloaded,
-                        "purged": purged,
-                    }))?
-                );
-            } else {
-                let mut details = Vec::new();
+                if ids.len() == 1 {
+                    if let Some(error) = errors.first() {
+                        return Err(error["error"]
+                            .as_str()
+                            .unwrap_or("Plugin uninstallation failed.")
+                            .into());
+                    }
 
-                if unloaded {
-                    details.push(
-                        "Runtime:\n  Plugin unloaded from the background runtime.".to_owned(),
+                    let outcome = &outcomes[0];
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "action": "uninstall",
+                            "id": outcome["id"],
+                            "status": "uninstalled",
+                            "unloaded": outcome["unloaded"],
+                            "purged": outcome["purged"],
+                        }))?
                     );
-                }
+                } else {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "action": "uninstall",
+                            "items": outcomes,
+                            "errors": errors,
+                        }))?
+                    );
 
-                if let Some(purged) = &purged {
-                    let sessions = purged["sessions"].as_u64().unwrap_or_default();
-                    let deliveries = purged["deliveries"].as_u64().unwrap_or_default();
-
-                    if sessions > 0 || deliveries > 0 {
-                        let session_noun = if sessions == 1 { "session" } else { "sessions" };
-
-                        let delivery_noun =
-                            if deliveries == 1 { "delivery record" } else { "delivery records" };
-
-                        details.push(format!(
-                            "Plugin data:\n  Removed {sessions} {session_noun} and {deliveries} {delivery_noun}."
-                        ));
-                    }
-
-                    if let Some(pending) = purged["pending_worktrees"].as_array()
-                        && !pending.is_empty()
-                    {
-                        let count = pending.len();
-                        let noun = if count == 1 { "session" } else { "sessions" };
-
-                        details.push(format!(
-                            "Workspace cleanup:\n  Cleanup is pending for {count} {noun}."
-                        ));
+                    if !errors.is_empty() {
+                        return Err(plugin_uninstall_error(errors.len(), ids.len()).into());
                     }
                 }
-
-                let mut output = format!("Uninstalled plugin {id}.");
-
-                if !details.is_empty() {
-                    output.push_str("\n\n");
-                    output.push_str(&details.join("\n\n"));
+            } else if ids.len() == 1 {
+                if let Some(error) = errors.first() {
+                    return Err(error["error"]
+                        .as_str()
+                        .unwrap_or("Plugin uninstallation failed.")
+                        .into());
                 }
 
-                println!("{output}");
+                println!("{}", plugin_uninstall_output(&outcomes[0]));
+            } else {
+                println!("{}", plugin_uninstall_batch_output(&display_rows, ids.len()));
+
+                if !errors.is_empty() {
+                    std::io::stdout().flush()?;
+                    return Err(plugin_uninstall_error(errors.len(), ids.len()).into());
+                }
             }
         }
     }
@@ -15144,73 +15222,209 @@ fn plugin_sources(
     Ok((install.link, sources))
 }
 
-fn activation_note(
-    id: &str,
-    value: Option<serde_json::Value>,
-    needs_daemon: bool,
-) -> Option<String> {
-    if value.is_some() || (id == "tui" && needs_daemon) {
-        return None;
-    }
-
-    Some(activation_text(id, value))
-}
-
-fn plugin_install_summary(
-    installed: &[serde_json::Value],
-    total: usize,
-    linked: bool,
-) -> Option<String> {
-    let count = installed.len();
-
-    if count == 0 {
-        return None;
-    }
-
-    if count == 1 && total == 1 {
-        let plugin = &installed[0];
-        let action = if linked { "Linked" } else { "Installed" };
-
-        return Some(format!(
-            "{action} plugin {} {} successfully.",
-            plugin["id"].as_str().unwrap_or("unknown"),
-            plugin["version"].as_str().unwrap_or("unknown")
-        ));
-    }
-
+fn plugin_install_output(outcomes: &[serde_json::Value], linked: bool) -> String {
+    let total = outcomes.len();
+    let failed = outcomes.iter().filter(|item| item["status"] == "failed").count();
+    let installed = total - failed;
     let action = if linked { "Linked" } else { "Installed" };
 
-    Some(format!("{action} {count} of {total} plugins successfully."))
-}
+    let heading = if failed == 0 {
+        format!("{action} {installed} {}", if installed == 1 { "plugin" } else { "plugins" })
+    } else {
+        format!("{action} {installed} of {total} plugins")
+    };
 
-fn plugin_install_progress(index: usize, total: usize, id: &str, linked: bool) -> String {
-    let action = if linked { "Linking" } else { "Installing" };
+    let rows = outcomes
+        .iter()
+        .map(|item| {
+            let id = item["id"].as_str().unwrap_or("unknown");
+            let version = item["version"].as_str().map(|version| format!("@v{version}"));
+            let label = format!("{}{}", id, version.as_deref().unwrap_or(""));
+            let result = match (item["status"].as_str(), item["activation"].as_str()) {
+                (Some("failed"), _) if linked => "link failed",
+                (Some("failed"), _) => "installation failed",
+                (Some("activation_failed"), _) => "successfully installed; activation failed",
 
-    format!("[{index}/{total}] {id}\n{action}...")
-}
+                (_, _) if item["waiting_for_credentials"] == true => {
+                    "successfully installed; waiting for credentials"
+                }
 
-fn plugin_install_version(linked: bool, version: &str) -> String {
-    let action = if linked { "Linked" } else { "Installed" };
+                (_, Some("deferred")) => "successfully installed; activation deferred",
+                _ if linked => "successfully linked",
+                _ => "successfully installed",
+            };
 
-    format!("{action} version {version}.")
+            format!("{label} {result}")
+        })
+        .collect::<Vec<_>>();
+
+    let mut output = heading;
+
+    if !rows.is_empty() {
+        output.push('\n');
+        output.push_str(&format_tree_list(&rows));
+    }
+
+    output
 }
 
 fn plugin_install_error(errors: &[serde_json::Value], total: usize, linked: bool) -> String {
-    let failed = errors.len();
-    let noun = if total == 1 { "plugin" } else { "plugins" };
-
     let action = if linked { "link" } else { "install" };
 
-    let mut message = format!("Could not {action} {failed} of {total} {noun}:");
+    format!(
+        "Failed to {action} {} of {total} plugins.\n{}",
+        errors.len(),
+        plugin_log_hint("failed installation")
+    )
+}
 
-    for error in errors {
-        let id = error["id"].as_str().unwrap_or("unknown");
-        let detail = sentence(error["error"].as_str().unwrap_or("Installation failed."));
+fn plugin_log_hint(failure: &str) -> String {
+    format!(
+        "For details about the {failure}, check the application logs:\n<{}>",
+        logging::application_log_path().display()
+    )
+}
 
-        message.push_str(&format!("\n- {id}: {detail}"));
+fn plugin_service_guidance(installed: bool) -> &'static str {
+    if installed {
+        "Restart the Krabb service to activate the new plugins:\nkrabb service restart"
+    } else {
+        "The Krabb service is not installed. Install it for full plugin functionality:\nkrabb service install"
+    }
+}
+
+fn plugin_uninstall_ids(
+    ids: Vec<String>,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    if ids.is_empty() {
+        return Err("At least one plugin ID is required.".into());
     }
 
-    message
+    let mut seen = std::collections::BTreeSet::new();
+
+    for id in &ids {
+        if !valid(id) {
+            return Err(format!("Invalid plugin ID: {id}.").into());
+        }
+
+        if !seen.insert(id) {
+            return Err(format!("Plugin ID {id} was listed more than once.").into());
+        }
+    }
+
+    Ok(ids)
+}
+
+async fn uninstall_plugin_at(
+    home_root: &Path,
+    id: &str,
+    force: bool,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let lock = load_lock_at(home_root)?;
+    let version = lock.plugins.get(id).map(|entry| entry.version.clone());
+    let (purge_sessions, purge_deliveries) = last_plugin_state(&lock, id, home_root);
+    let purged = if force && (purge_sessions || purge_deliveries) {
+        Some(purge_state_at(home_root, purge_sessions, purge_deliveries).await?)
+    } else {
+        ensure_no_orphaned_plugin_state(&lock, id, home_root)?;
+        None
+    };
+
+    let unloaded = unload_at(home_root, id).await?.is_some_and(|value| value["unloaded"] == true);
+
+    if let Err(error) = remove_at(PluginRemove { id: id.into(), yes: true }, home_root) {
+        if let Err(reload) = activate_at(home_root, id).await {
+            return Err(format!(
+                "Plugin uninstallation failed: {}. Runtime restoration also failed: {}.",
+                sentence(error.to_string()),
+                sentence(reload.to_string())
+            )
+            .into());
+        }
+
+        return Err(error);
+    }
+
+    info!(plugin = %id, unloaded, "Plugin uninstalled.");
+
+    Ok(serde_json::json!({
+        "id": id,
+        "version": version,
+        "status": "uninstalled",
+        "unloaded": unloaded,
+        "purged": purged,
+    }))
+}
+
+fn plugin_uninstall_output(outcome: &Value) -> String {
+    let id = outcome["id"].as_str().unwrap_or("unknown");
+    let mut output = format!("Uninstalled plugin {id}.");
+    let mut details = Vec::new();
+
+    if outcome["unloaded"] == true {
+        details.push("Plugin unloaded from the background runtime.".to_owned());
+    }
+
+    if let Some(purged) = outcome["purged"].as_object() {
+        let sessions = purged.get("sessions").and_then(Value::as_u64).unwrap_or_default();
+        let deliveries = purged.get("deliveries").and_then(Value::as_u64).unwrap_or_default();
+
+        if sessions > 0 || deliveries > 0 {
+            let session_noun = if sessions == 1 { "session" } else { "sessions" };
+
+            let delivery_noun =
+                if deliveries == 1 { "delivery record" } else { "delivery records" };
+
+            details.push(format!(
+                "Removed {sessions} {session_noun} and {deliveries} {delivery_noun}."
+            ));
+        }
+
+        if let Some(pending) = purged.get("pending_worktrees").and_then(Value::as_array)
+            && !pending.is_empty()
+        {
+            let count = pending.len();
+            let noun = if count == 1 { "session" } else { "sessions" };
+
+            details.push(format!("Workspace cleanup is pending for {count} {noun}."));
+        }
+    }
+
+    if !details.is_empty() {
+        output.push('\n');
+        output.push_str(&format_tree_list(&details));
+    }
+
+    output
+}
+
+fn plugin_uninstall_batch_output(rows: &[String], total: usize) -> String {
+    let successful = rows.iter().filter(|row| row.ends_with("successfully uninstalled")).count();
+    let heading = if successful == total {
+        format!("Uninstalled {successful} {}.", if successful == 1 { "plugin" } else { "plugins" })
+    } else {
+        format!("Uninstalled {successful} of {total} plugins.")
+    };
+
+    let mut output = heading;
+
+    if !rows.is_empty() {
+        output.push('\n');
+        output.push_str(&format_tree_list(rows));
+    }
+
+    if successful < total {
+        output.push('\n');
+    }
+
+    output
+}
+
+fn plugin_uninstall_error(failed: usize, total: usize) -> String {
+    format!(
+        "Failed to uninstall {failed} of {total} plugins.\n{}",
+        plugin_log_hint("failed uninstallation")
+    )
 }
 
 fn plugin_activation_is_deferred(error: &str) -> bool {
@@ -15230,33 +15444,50 @@ fn plugin_update_error(rows: &[serde_json::Value]) -> String {
         message.push_str(&format!("\n\nThe {id} plugin could not be updated. {detail}"));
     }
 
+    message.push_str(&format!("\n\n{}", plugin_log_hint("failed update")));
+
     message
 }
 
-fn activation_text(id: &str, value: Option<serde_json::Value>) -> String {
-    if id == "tui" && value.is_none() {
-        return "The TUI will be ready when the Krabb daemon is running.".into();
+fn plugin_update_output(rows: &[serde_json::Value]) -> String {
+    if rows.is_empty() {
+        return "No plugins to update.".into();
     }
 
-    if id == "codex" && value.is_none() {
-        return concat!(
-            "Codex is available through `krabb codex` now.\n",
-            "Daemon-hosted turns require the background runtime."
-        )
-        .into();
+    let updated = rows.iter().filter(|row| row["status"] == "updated").count();
+    let failed = rows.iter().filter(|row| row["status"] == "failed").count();
+    let heading = if failed == 0 && updated == 0 {
+        "All plugins are up to date.".to_owned()
+    } else if failed == 0 {
+        format!("Updated {updated} {}.", if updated == 1 { "plugin" } else { "plugins" })
+    } else {
+        format!("Updated {updated} of {} plugins.", rows.len())
+    };
+
+    let entries = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let id = row["id"].as_str().unwrap_or("unknown");
+            let version = row["version"].as_str().map(|version| format!("@v{version}"));
+            let label = format!("{}{}", id, version.as_deref().unwrap_or(""));
+            let result = match row["status"].as_str() {
+                Some("updated") => "successfully updated",
+                Some("failed") => "update failed",
+                _ => "already up to date",
+            };
+
+            format_tree_entry(&format!("{label} {result}"), &[], index + 1 == rows.len())
+        })
+        .collect::<Vec<_>>();
+    let mut output = heading;
+
+    if !entries.is_empty() {
+        output.push('\n');
+        output.push_str(&entries.join("\n\n"));
     }
 
-    match value {
-        Some(value) => format!(
-            "Plugin {} {} is active in the background runtime.",
-            value["id"].as_str().unwrap_or(id),
-            value["version"].as_str().unwrap_or("unknown")
-        ),
-
-        None => {
-            format!("Plugin {id} will be ready when the background runtime starts.")
-        }
-    }
+    output
 }
 
 async fn activate_at(
@@ -15481,6 +15712,8 @@ fn update_at_with_previews(
     let mut rows = Vec::new();
     let mut failed = false;
     let ids = lock.plugins.keys().cloned().collect::<Vec<_>>();
+    let spinner =
+        if json || ids.is_empty() { None } else { terminal::Spinner::start("Updating plugins...") };
 
     for id in ids {
         let previous_lock = lock.clone();
@@ -15504,7 +15737,11 @@ fn update_at_with_previews(
                     && candidate.source_revision == previous.revision
                     && candidate.manifest.version == previous.version =>
             {
-                rows.push(serde_json::json!({"id": id, "status": "unchanged"}));
+                rows.push(serde_json::json!({
+                    "id": id,
+                    "version": previous.version,
+                    "status": "unchanged"
+                }));
                 continue;
             }
 
@@ -15534,7 +15771,7 @@ fn update_at_with_previews(
 
                 if let Err(error) = save_lock_at(home_root, &lock) {
                     if let Some(entry) = lock.plugins.get_mut(&id) {
-                        *entry = previous;
+                        *entry = previous.clone();
                     }
 
                     let restored_lock = save_lock_at(home_root, &previous_lock);
@@ -15559,6 +15796,7 @@ fn update_at_with_previews(
 
                     rows.push(serde_json::json!({
                         "id": id,
+                        "version": previous.version,
                         "status": "failed",
                         "error": format!("Could not save the plugin lock: {}{detail}", sentence(error.to_string()))
                     }));
@@ -15583,6 +15821,7 @@ fn update_at_with_previews(
 
                 rows.push(serde_json::json!({
                     "id": id,
+                    "version": previous.version,
                     "status": "failed",
                     "error": sentence(error.to_string())
                 }));
@@ -15590,22 +15829,17 @@ fn update_at_with_previews(
         }
     }
 
-    if !json && rows.is_empty() {
-        println!("No plugins to update.");
-    } else if !json {
-        for row in &rows {
-            let status = row["status"].as_str().unwrap_or("unknown");
-            let id = row["id"].as_str().unwrap_or("unknown");
+    drop(spinner);
 
-            if status == "updated" {
-                println!("Updated {id} to {}.", row["version"].as_str().unwrap_or("unknown"));
-            } else if status == "unchanged" {
-                println!("{id} is already up to date.");
-            }
-        }
+    if !json {
+        println!("{}", plugin_update_output(&rows));
     }
 
     if failed {
+        if !json {
+            std::io::stdout().flush()?;
+        }
+
         return Err(plugin_update_error(&rows).into());
     }
 
@@ -15651,6 +15885,11 @@ fn preview_updates_at_inner(
     std::fs::write(preview_root.join("preview.json"), b"{}")?;
 
     let mut errors = Vec::new();
+    let spinner = if display && !json && !lock.plugins.is_empty() {
+        terminal::Spinner::start("Checking for plugin updates...")
+    } else {
+        None
+    };
 
     for (id, entry) in &lock.plugins {
         let candidate = match inspect_update(home_root, id, entry) {
@@ -15689,6 +15928,8 @@ fn preview_updates_at_inner(
         }
     }
 
+    drop(spinner);
+
     if display && json {
         println!(
             "{}",
@@ -15720,7 +15961,7 @@ fn preview_updates_at_inner(
         if !updates.is_empty() {
             let mut section = vec!["Updates available:".to_owned()];
 
-            for update in &updates {
+            for (index, update) in updates.iter().enumerate() {
                 let id = update["id"].as_str().unwrap_or("unknown");
                 let current = update["current_version"].as_str().unwrap_or("unknown");
                 let available = update["available_version"].as_str().unwrap_or("unknown");
@@ -15731,9 +15972,18 @@ fn preview_updates_at_inner(
                     ""
                 };
 
-                section.push(format!("  {id}: {current} → {available}{detail}"));
+                if index > 0 {
+                    section.push(String::new());
+                }
+
+                section.push(format_tree_entry(
+                    &format!("{id}@v{current} → v{available}{detail}"),
+                    &[],
+                    index + 1 == updates.len(),
+                ));
             }
 
+            section.push(String::new());
             section.push("Confirm at the prompt or run `krabb plugin update --yes`.".into());
             sections.push(section.join("\n"));
         }
@@ -15744,12 +15994,22 @@ fn preview_updates_at_inner(
 
             let mut section = vec![heading.to_owned()];
 
-            for error in &errors {
+            for (index, error) in errors.iter().enumerate() {
                 let id = error["id"].as_str().unwrap_or("unknown");
-                let detail = error["error"].as_str().unwrap_or("Unknown error.");
-                section.push(format!("  {id}: {detail}"));
+
+                if index > 0 {
+                    section.push(String::new());
+                }
+
+                section.push(format_tree_entry(
+                    &format!("{id} update check failed"),
+                    &[],
+                    index + 1 == errors.len(),
+                ));
             }
 
+            section.push(String::new());
+            section.push(plugin_log_hint("update check issue"));
             sections.push(section.join("\n"));
         }
 
@@ -17473,7 +17733,7 @@ fn format_plugin_list(items: &[Value], page: usize) -> Result<String, String> {
 
         output.push_str(&format!(
             "{separator}{}",
-            format_tree_entry(&format!("{id} | v{version}"), &details, index + 1 == end - start)
+            format_tree_entry(&format!("{id}@v{version}"), &details, index + 1 == end - start)
         ));
     }
 
@@ -17640,6 +17900,15 @@ fn format_tree_entry(label: &str, details: &[String], is_last: bool) -> String {
     }));
 
     lines.join("\n")
+}
+
+fn format_tree_list(entries: &[String]) -> String {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| format_tree_entry(entry, &[], index + 1 == entries.len()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn format_date(timestamp: u64) -> Option<String> {
@@ -18132,7 +18401,7 @@ done
                 .begin_with_roles(
                     "schedule-51",
                     Message {
-                        id: "schedule-user".into(),
+                        id: "schedule-user-1700000000000".into(),
                         session: "schedule-51".into(),
                         role: Role::User,
                         sender: Some("scheduler".into()),
@@ -18156,6 +18425,7 @@ done
         );
 
         let mut failed_tool = None;
+        let send_started = super::unix_timestamp_millis();
         let result = super::execute_tool(
             &Plugins::default(),
             1,
@@ -18189,12 +18459,20 @@ done
         )
         .await
         .unwrap();
+        let send_finished = super::unix_timestamp_millis();
 
         assert_eq!(result, "Message added to TUI session tui-default.");
         let message =
             sessions.lock().unwrap().sessions["tui-default"].messages.last().cloned().unwrap();
 
         assert_eq!(message.role, Role::Assistant);
+        let (timestamp, key) =
+            message.id.strip_prefix("schedule-notice-at-").unwrap().split_once('-').unwrap();
+        let timestamp = timestamp.parse::<u128>().unwrap();
+
+        assert!((send_started..=send_finished).contains(&timestamp));
+        assert_eq!(key, "schedule-51-run-9001-tool-0");
+        assert!(message.id.ends_with(&super::scheduled_delivery_id("schedule-51", 9001, 0)));
         assert_eq!(message.content, vec![Content::Text { text: "Ping!".into() }]);
 
         let _ = fs::remove_dir_all(root);
@@ -18584,45 +18862,6 @@ done
         assert!(!super::status_text(&value, 3).contains("Health details:"));
     }
 
-    #[test]
-    fn tui_activation_explains_the_background_runtime_requirement() {
-        assert_eq!(
-            super::activation_text("tui", None),
-            "The TUI will be ready when the Krabb daemon is running."
-        );
-
-        assert_eq!(
-            super::activation_text("memory", None),
-            "Plugin memory will be ready when the background runtime starts."
-        );
-
-        assert_eq!(
-            super::activation_text("codex", None),
-            concat!(
-                "Codex is available through `krabb codex` now.\n",
-                "Daemon-hosted turns require the background runtime."
-            )
-        );
-    }
-
-    #[test]
-    fn install_output_omits_plugins_already_active_in_the_runtime() {
-        assert_eq!(
-            super::activation_note(
-                "tools",
-                Some(serde_json::json!({"id": "tools", "version": "0.1.0"})),
-                false
-            ),
-            None
-        );
-
-        assert_eq!(super::activation_note("tui", None, true), None);
-        assert_eq!(
-            super::activation_note("tools", None, true).as_deref(),
-            Some("Plugin tools will be ready when the background runtime starts.")
-        );
-    }
-
     #[tokio::test]
     async fn tui_reports_a_human_readable_daemon_requirement() {
         let root = test_root("tui-daemon-required");
@@ -18638,92 +18877,73 @@ done
     }
 
     #[test]
-    fn formats_plugin_install_summaries() {
+    fn formats_plugin_install_results_as_compact_tree_rows() {
         assert_eq!(
-            super::plugin_install_summary(
-                &[serde_json::json!({"id": "tui", "version": "0.1.0"})],
-                1,
-                false
-            )
-            .as_deref(),
-            Some("Installed plugin tui 0.1.0 successfully.")
-        );
-
-        assert_eq!(
-            super::plugin_install_summary(
-                &[serde_json::json!({"id": "tui", "version": "0.1.0"})],
-                1,
-                true
-            )
-            .as_deref(),
-            Some("Linked plugin tui 0.1.0 successfully.")
-        );
-
-        assert_eq!(
-            super::plugin_install_summary(
+            super::plugin_install_output(
                 &[
-                    serde_json::json!({"id": "codex", "version": "0.1.0"}),
-                    serde_json::json!({"id": "tools", "version": "0.1.0"}),
-                    serde_json::json!({"id": "tui", "version": "0.1.0"}),
+                    serde_json::json!({
+                        "id": "codex",
+                        "version": "0.1.0",
+                        "status": "installed",
+                        "activation": "active"
+                    }),
+                    serde_json::json!({
+                        "id": "telegram",
+                        "version": "0.8.2",
+                        "status": "failed"
+                    }),
                 ],
-                3,
-                false
-            )
-            .as_deref(),
-            Some("Installed 3 of 3 plugins successfully.")
-        );
-
-        assert_eq!(
-            super::plugin_install_summary(
-                &[
-                    serde_json::json!({"id": "codex", "version": "0.1.0"}),
-                    serde_json::json!({"id": "tools", "version": "0.1.0"}),
-                ],
-                3,
-                false
-            )
-            .as_deref(),
-            Some("Installed 2 of 3 plugins successfully.")
-        );
-    }
-
-    #[test]
-    fn plugin_install_progress_lines_start_at_the_left_edge() {
-        assert_eq!(super::plugin_install_progress(1, 3, "tools", true), "[1/3] tools\nLinking...");
-        assert_eq!(super::plugin_install_version(true, "0.1.0"), "Linked version 0.1.0.");
-        assert_eq!(
-            super::plugin_install_progress(2, 3, "codex", false),
-            "[2/3] codex\nInstalling..."
-        );
-
-        assert_eq!(super::plugin_install_version(false, "0.2.0"), "Installed version 0.2.0.");
-    }
-
-    #[test]
-    fn plugin_install_errors_group_each_failure() {
-        assert_eq!(
-            super::plugin_install_error(
-                &[
-                    serde_json::json!({"id": "telegram", "error": "download failed"}),
-                    serde_json::json!({"id": "tools", "error": "binary missing."}),
-                ],
-                3,
                 false
             ),
             concat!(
-                "Could not install 2 of 3 plugins:\n",
-                "- telegram: Download failed.\n",
-                "- tools: Binary missing."
+                "Installed 1 of 2 plugins\n",
+                "├─ codex@v0.1.0 successfully installed\n",
+                "└─ telegram@v0.8.2 installation failed"
             )
         );
 
         assert_eq!(
-            super::plugin_install_error(
-                &[serde_json::json!({"id": "codex", "error": "binary missing"})],
-                4,
+            super::plugin_install_output(
+                &[serde_json::json!({
+                    "id": "tools",
+                    "version": "0.2.0",
+                    "status": "installed",
+                    "activation": "active"
+                })],
                 true
             ),
-            "Could not link 1 of 4 plugins:\n- codex: Binary missing."
+            "Linked 1 plugin\n└─ tools@v0.2.0 successfully linked"
+        );
+    }
+
+    #[test]
+    fn plugin_install_failures_point_to_the_daily_application_log() {
+        let error = super::plugin_install_error(
+            &[serde_json::json!({"id": "telegram", "error": "source unavailable"})],
+            3,
+            false,
+        );
+
+        assert!(error.starts_with("Failed to install 1 of 3 plugins."));
+        assert!(
+            error
+                .contains("For details about the failed installation, check the application logs:")
+        );
+
+        assert!(error.contains(&super::logging::application_log_path().display().to_string()));
+        assert!(!error.contains("source unavailable"));
+    }
+
+    #[test]
+    fn plugin_install_guidance_uses_the_service_state() {
+        assert_eq!(
+            super::plugin_service_guidance(false),
+            "The Krabb service is not installed. Install it for full plugin functionality:\nkrabb service install"
+        );
+
+        assert_eq!(
+            super::plugin_service_guidance(true),
+            "Restart the Krabb service to activate the new plugins:\nkrabb service restart"
         );
     }
 
@@ -18735,14 +18955,110 @@ done
     }
 
     #[test]
-    fn plugin_update_errors_group_each_failure() {
+    fn plugin_update_errors_point_to_the_daily_application_log() {
         assert_eq!(
             super::plugin_update_error(&[
-                serde_json::json!({"id": "tools", "status": "failed", "error": "Binary missing."}),
+                serde_json::json!({
+                    "id": "tools",
+                    "status": "failed",
+                    "error": "binary missing"
+                }),
                 serde_json::json!({"id": "tui", "status": "updated", "version": "0.1.0"}),
             ]),
-            "Could not update 1 plugin.\n\nThe tools plugin could not be updated. Binary missing."
+            format!(
+                "Could not update 1 plugin.\n\nThe tools plugin could not be updated. Binary missing.\n\nFor details about the failed update, check the application logs:\n<{}>",
+                super::logging::application_log_path().display()
+            )
         );
+    }
+
+    #[test]
+    fn formats_plugin_update_results_with_tree_spacing() {
+        assert_eq!(
+            super::plugin_update_output(&[
+                serde_json::json!({
+                    "id": "codex",
+                    "version": "0.2.0",
+                    "status": "updated"
+                }),
+                serde_json::json!({
+                    "id": "telegram",
+                    "version": "0.8.2",
+                    "status": "failed"
+                }),
+            ]),
+            concat!(
+                "Updated 1 of 2 plugins.\n",
+                "├─ codex@v0.2.0 successfully updated\n\n",
+                "└─ telegram@v0.8.2 update failed"
+            )
+        );
+
+        assert_eq!(
+            super::plugin_update_output(&[
+                serde_json::json!({"id": "tools", "version": "0.1.0", "status": "unchanged"}),
+            ]),
+            "All plugins are up to date.\n└─ tools@v0.1.0 already up to date"
+        );
+    }
+
+    #[test]
+    fn plugin_uninstall_details_follow_the_summary_without_an_empty_line() {
+        assert_eq!(
+            super::plugin_uninstall_output(&serde_json::json!({
+                "id": "tools",
+                "unloaded": true,
+                "purged": {"sessions": 1, "deliveries": 0}
+            }),),
+            concat!(
+                "Uninstalled plugin tools.\n",
+                "├─ Plugin unloaded from the background runtime.\n",
+                "└─ Removed 1 session and 0 delivery records."
+            )
+        );
+
+        assert_eq!(
+            super::plugin_uninstall_batch_output(
+                &[
+                    "codex@v0.1.0 successfully uninstalled".into(),
+                    "telegram@v0.8.2 successfully uninstalled".into(),
+                ],
+                2,
+            ),
+            concat!(
+                "Uninstalled 2 plugins.\n",
+                "├─ codex@v0.1.0 successfully uninstalled\n",
+                "└─ telegram@v0.8.2 successfully uninstalled"
+            )
+        );
+
+        assert_eq!(
+            super::plugin_uninstall_batch_output(
+                &[
+                    "tools uninstallation failed".into(),
+                    "scheduler uninstallation failed".into(),
+                    "foo uninstallation failed".into(),
+                ],
+                3,
+            ),
+            concat!(
+                "Uninstalled 0 of 3 plugins.\n",
+                "├─ tools uninstallation failed\n",
+                "├─ scheduler uninstallation failed\n",
+                "└─ foo uninstallation failed\n"
+            )
+        );
+    }
+
+    #[test]
+    fn plugin_uninstall_ids_require_unique_valid_identifiers() {
+        assert_eq!(
+            super::plugin_uninstall_ids(vec!["codex".into(), "telegram".into()]).unwrap(),
+            vec!["codex", "telegram"]
+        );
+
+        assert!(super::plugin_uninstall_ids(vec!["tools".into(), "tools".into()]).is_err());
+        assert!(super::plugin_uninstall_ids(vec!["bad_id".into()]).is_err());
     }
 
     #[test]
@@ -19089,12 +19405,19 @@ done
                 "retries": 3,
                 "retry_at": 1_700_000_010,
                 "run_requested": true,
+                "pause_requested": true,
                 "last_outcome": "retrying",
                 "last_result": "RETRYABLE: Provider is temporarily unavailable."
             }]
         }));
 
         assert!(output.contains("A manual run is queued"));
+        assert!(
+            output.contains(
+                "Pause requested; the current run will finish before the schedule pauses"
+            )
+        );
+
         assert!(output.contains("Automatic retries: 1 of 3 used"));
         assert!(output.contains("Next retry: 2023-11-14 22:13:30 UTC"));
         assert!(output.contains("Last result: failed; retry queued."));
@@ -21303,6 +21626,37 @@ done
     }
 
     #[test]
+    fn service_environment_pins_codex_found_on_installing_path() {
+        let root = test_root("service-codex-path");
+        let bin = root.join("user-bin");
+        fs::create_dir_all(&bin).unwrap();
+        let executable = bin.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+
+        fs::write(&executable, b"codex").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut environment = BTreeMap::new();
+        environment.insert("PATH".into(), bin.display().to_string());
+        let service = root.join("krabb.service");
+        let values = service_environment_from(&service, root.clone(), &environment).unwrap();
+        let expected = executable.canonicalize().unwrap().display().to_string();
+
+        assert!(
+            values
+                .iter()
+                .any(|(name, value)| { name == "KRABB_CODEX_BINARY" && value == &expected })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn manages_service_definition() {
         let path = std::env::temp_dir().join(format!("krabb-service-{}", std::process::id()));
         let _ = fs::remove_file(&path);
@@ -22064,11 +22418,9 @@ done
         assert_eq!(super::last_plugin_state(&lock, "channel-one", &root), (false, true));
         super::save_lock_at(&root, &lock).unwrap();
 
-        let error = super::remove_at(
-            super::PluginRemove { id: "channel-one".into(), yes: true, force: false },
-            &root,
-        )
-        .unwrap_err();
+        let error =
+            super::remove_at(super::PluginRemove { id: "channel-one".into(), yes: true }, &root)
+                .unwrap_err();
 
         assert!(error.to_string().contains("krabb delivery"), "{error}");
         assert!(super::load_lock_at(&root).unwrap().plugins.contains_key("channel-one"));
@@ -22170,12 +22522,26 @@ done
         assert!(matches!(
             cli.command,
             Command::Plugin {
-                command: super::PluginCommand::Remove(super::PluginRemove {
-                    id,
+                command: super::PluginCommand::Remove(super::PluginUninstall {
+                    ids,
                     yes: true,
                     force: true,
                 })
-            } if id == "tools"
+            } if ids == ["tools"]
+        ));
+
+        let cli = Cli::try_parse_from(["krabb", "plugin", "uninstall", "codex", "telegram", "-y"])
+            .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Plugin {
+                command: super::PluginCommand::Remove(super::PluginUninstall {
+                    ids,
+                    yes: true,
+                    force: false,
+                })
+            } if ids == ["codex", "telegram"]
         ));
 
         assert!(Cli::try_parse_from(["krabb", "plugin", "remove", "tools", "-y"]).is_err());
@@ -22746,7 +23112,7 @@ done
 
         assert_eq!(
             output,
-            "Plugins (1–1 of 1, page 1 of 1)\n└─ codex | v1.2.3\n   ├─ Health is ready\n   ├─ Capabilities include model, vision\n   ├─ Uses protocol version 0.1\n   ├─ Commands include codex\n   └─ Permissions include network, process"
+            "Plugins (1–1 of 1, page 1 of 1)\n└─ codex@v1.2.3\n   ├─ Health is ready\n   ├─ Capabilities include model, vision\n   ├─ Uses protocol version 0.1\n   ├─ Commands include codex\n   └─ Permissions include network, process"
         );
     }
 
@@ -22769,14 +23135,14 @@ done
 
         let first_page = super::format_plugin_list(&items, 1).unwrap();
 
-        assert!(first_page.starts_with("Plugins (1–5 of 7, page 1 of 2)\n├─ plugin-00 | v1.0.0"));
+        assert!(first_page.starts_with("Plugins (1–5 of 7, page 1 of 2)\n├─ plugin-00@v1.0.0"));
         assert!(first_page.contains("│  └─ No permissions\n\n├─ plugin-01"));
         assert!(!first_page.contains("plugin-05"));
 
         let second_page = super::format_plugin_list(&items, 2).unwrap();
 
         assert!(second_page.starts_with("Plugins (6–7 of 7, page 2 of 2)\n├─ plugin-05"));
-        assert!(second_page.contains("└─ plugin-06 | v1.0.0"));
+        assert!(second_page.contains("└─ plugin-06@v1.0.0"));
         assert!(super::format_plugin_list(&items, 3).unwrap_err().contains("1 to 2"));
         assert_eq!(super::format_plugin_list(&[], 1).unwrap(), "No plugins installed.");
     }
@@ -22856,12 +23222,12 @@ done
     }
 
     #[test]
-    fn cli_errors_keep_the_message_direct_and_indented() {
+    fn cli_errors_keep_all_message_lines_flush_left() {
         assert_eq!(
             super::format_cli_error(
                 "Could not update plugins.\n\nThe tools plugin could not be updated.\nBinary missing."
             ),
-            "Could not update plugins.\n\n  The tools plugin could not be updated.\n  Binary missing."
+            "Could not update plugins.\n\nThe tools plugin could not be updated.\nBinary missing."
         );
 
         assert_eq!(super::format_cli_error(""), "The command could not be completed.");
@@ -24288,29 +24654,19 @@ done
         );
 
         assert!(update_at(&root, false, false).is_err());
-        super::remove_at(
-            super::PluginRemove { id: "memory".into(), yes: true, force: false },
-            &root,
-        )
-        .unwrap();
+        super::remove_at(super::PluginRemove { id: "memory".into(), yes: true }, &root).unwrap();
 
         assert!(super::installed_at(&root).is_empty());
         super::list_at(&root, 1, false).unwrap();
 
         assert!(
-            super::remove_at(
-                super::PluginRemove { id: "missing".into(), yes: false, force: false },
-                &root
-            )
-            .is_err()
+            super::remove_at(super::PluginRemove { id: "missing".into(), yes: false }, &root)
+                .is_err()
         );
 
         assert!(
-            super::remove_at(
-                super::PluginRemove { id: "missing".into(), yes: true, force: false },
-                &root
-            )
-            .is_err()
+            super::remove_at(super::PluginRemove { id: "missing".into(), yes: true }, &root)
+                .is_err()
         );
 
         assert!(
@@ -24328,10 +24684,7 @@ done
             .is_err()
         );
 
-        assert!(
-            super::remove(super::PluginRemove { id: "bad_id".into(), yes: true, force: false })
-                .is_err()
-        );
+        assert!(super::remove(super::PluginRemove { id: "bad_id".into(), yes: true }).is_err());
 
         local_session(SessionCommand::List(super::ListOutput { page: 1, json: false }), &root)
             .unwrap();
