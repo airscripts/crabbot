@@ -15,7 +15,7 @@ krabb completion <bash|fish|powershell|zsh>
 krabb plugin list [<page>] [--json]
 krabb plugin install <id>... [--source <path-or-url>] [--revision <rev>] [--link] [-y|--yes] [--json]
 krabb plugin update [-y|--yes] [--json]
-krabb plugin uninstall <id> [-y|--yes] [--force] [--json]
+krabb plugin uninstall <id>... [-y|--yes] [--force] [--json]
 krabb memory <status|search|list|show|remember|edit|forget|audit|converge|learning|help> [arguments...]
 krabb session new <id> [--model <name>] [--json]
 krabb session list [<page>] [--json]
@@ -89,6 +89,7 @@ krabb completion powershell >> $PROFILE
 
 - `--json` writes structured command results to stdout. Diagnostics go to
   stderr; failures return a JSON error on stderr.
+- Multiline CLI error details are kept flush left for easier reading and copying.
 - `--verbose` shows progress and nested error causes. `--debug` also prints
   internal diagnostics.
 - `--help` (`-h`, `-H`) shows command help; `--version` (`-v`, `-V`) prints
@@ -147,16 +148,20 @@ commands.
 krabb plugin list [page]
 krabb plugin install <id>... [--source <path-or-url>] [--revision <rev>] [--link]
 krabb plugin update
-krabb plugin uninstall <id>
+krabb plugin uninstall <id>...
 ```
 
 Install accepts official IDs or one explicit source. Sources may be local
 paths, Git revisions, or HTTPS archives with a `#sha256=` digest. `--link` is
 for local development builds. Installation validates each manifest and stages
 files before activation; a running daemon loads new plugins over local IPC.
+Interactive install, update, and import operations show an in-place spinner.
+Plugin results use one-line tree entries; failed installs and updates point to
+the current application log file.
 
 `plugin update` previews changes, then replaces changed plugins after
-confirmation. Uninstall unloads the process before removing files. Removing
+confirmation. Uninstall accepts multiple plugin IDs and confirms the batch once;
+it unloads each process before removing its files. Removing
 the last model or messaging plugin can require deleting dependent session or
 delivery state; `--force` with confirmation performs that purge. See
 [Plugins](plugins.md) for manifests, permissions, and update behavior.
@@ -212,6 +217,8 @@ for a calendar schedule with a timezone. Other options include
 `--on-failure pause|continue`. Shell use requires explicit enablement. Message
 delivery requires an exact destination at task creation. Uncertain side effects
 pause for review, and interrupted mutating turns are not replayed.
+Pausing a running schedule lets its current run finish before preventing later
+occurrences.
 
 Use `krabb schedule help` for full syntax. The
 [Scheduler guide](../krabb-plugins/scheduler/README.md) covers task

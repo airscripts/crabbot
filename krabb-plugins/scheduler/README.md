@@ -70,6 +70,9 @@ Use `krabb schedule help` for command syntax. The CLI and TUI support listing,
 history, run, retry, pause, resume, and remove operations. `run` starts a task
 now without shifting a recurring task's next scheduled time. Removing a
 running task requests cancellation; completed side effects cannot be undone.
+Pausing a running task lets its current run finish, then keeps the schedule
+paused so no later occurrences start. The schedule list shows when this pause
+is pending.
 
 Full results are stored in append-only JSONL files under
 `KRABB_HOME/logs/schedules/`. The daemon reports results to the originating

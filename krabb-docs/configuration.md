@@ -168,7 +168,11 @@ system keyring. Personal Codex
 authentication is managed by the Codex CLI app-server. Krabb never reads or
 forwards Codex access tokens. `KRABB_CODEX_HOME` selects the Codex profile
 directory and defaults to the standard `.codex` directory. Set
-`KRABB_CODEX_BINARY` only when the Codex executable is not named `codex`.
+`KRABB_CODEX_BINARY` to select a non-default executable. When installing the
+background service, Krabb records the absolute path of `codex` found on the
+installing shell's `PATH`, so user-local installs remain available to the
+service. Reinstall with `krabb service install --force` after changing the
+executable or its path.
 
 All Krabb configuration variables use the `KRABB_` prefix:
 

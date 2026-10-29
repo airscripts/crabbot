@@ -50,9 +50,16 @@ requires `clients.tui.shell = true` and the configured approval mode.
 
 ## Provider Errors
 
-Verify the plugin's declared credential name and inspect the redacted daemon
-diagnostic. Do not paste provider responses or authorization headers into an
-issue. Use a local fixture when reproducing a provider parsing problem.
+For Codex, check `command -v codex` and `krabb codex status`. The background
+service records the absolute Codex executable path when it is installed. If
+Codex was installed or moved later, run `krabb service install --force` from a
+shell where `codex` is on `PATH`, then restart the service. You can set
+`KRABB_CODEX_BINARY` to choose a specific executable.
+
+For other providers, verify the plugin's declared credential name and inspect
+the redacted daemon diagnostic. Do not paste provider responses or
+authorization headers into an issue. Use a local fixture when reproducing a
+provider parsing problem.
 
 ## Stale State
 
