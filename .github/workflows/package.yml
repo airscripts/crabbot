@@ -210,7 +210,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $archives = @(Get-ChildItem "krabb-*-v$env:KRABB_VERSION-$env:KRABB_TARGET.zip")
-          if ($archives.Count -ne 19) { throw "Expected 19 plugin and core archives, found $($archives.Count)." }
+          if ($archives.Count -ne 24) { throw "Expected 24 plugin and core archives, found $($archives.Count)." }
 
           foreach ($archive in $archives) {
             $destination = Join-Path $env:RUNNER_TEMP $archive.BaseName

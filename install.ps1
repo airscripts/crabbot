@@ -26,7 +26,7 @@ if ($args.Count -gt 1) {
 }
 
 $plugin = if ($args.Count -eq 1) { $args[0] } else { "core" }
-$valid = @("core", "acp", "a2a", "ag-ui", "codex", "anthropic", "openai", "gemini", "ollama", "openrouter", "telegram", "discord", "whatsapp", "signal", "slack", "sqlite", "memory", "scheduler", "tools", "mcp", "whisper", "tui")
+$valid = @("core", "acp", "a2a", "ag-ui", "codex", "anthropic", "openai", "gemini", "ollama", "openrouter", "telegram", "discord", "whatsapp", "signal", "slack", "sqlite", "memory", "scheduler", "tools", "mcp", "whisper", "tui", "browser", "computer")
 if ($valid -notcontains $plugin) { Stop-Install "Unknown plugin '$plugin'." }
 
 $arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
