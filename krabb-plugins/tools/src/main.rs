@@ -191,6 +191,12 @@ async fn call_with_sandbox(
         }
 
         "patch" => {
+            policy.shell(params["approve"].as_bool() == Some(true))?;
+
+            if sandbox.is_some() {
+                return Err(denied("Use the sandboxed shell tool for Git-backed patches"));
+            }
+
             if params["approve"].as_bool() != Some(true) {
                 return Err(denied("Patch approval is required"));
             }
@@ -225,6 +231,17 @@ async fn call_with_sandbox(
         }
 
         "git" => {
+            let approved = params["approve"].as_bool() == Some(true);
+            policy.shell(approved)?;
+
+            if sandbox.is_some() {
+                return Err(denied("Use the sandboxed shell tool for Git operations"));
+            }
+
+            if !approved {
+                return Err(denied("Git execution approval is required"));
+            }
+
             let args = params["args"]
                 .as_array()
                 .ok_or_else(|| denied("git.args is required"))?
@@ -294,8 +311,14 @@ fn tool_specs(shell_enabled: bool) -> Vec<ToolSpec> {
         ("search", "Search workspace text.", &["path", "text"][..]),
         ("fetch", "Fetch bounded text from a public HTTPS URL.", &["url"][..]),
         ("patch", "Apply an approved Git patch.", &["text"][..]),
-        ("git", "Inspect or manage approved Git worktrees.", &["args"][..]),
+        (
+            "git",
+            "Run approved Git operations; repository filters may execute programs.",
+            &["args"][..],
+        ),
     ];
+
+    definitions.retain(|(name, _, _)| shell_enabled || !matches!(*name, "git" | "patch"));
 
     if shell_enabled {
         definitions.push((
@@ -1110,6 +1133,8 @@ fn file_at(policy: &Policy, path: &str, workspace: Option<&Path>) -> krabb_core:
 }
 
 struct Confined {
+    #[cfg(windows)]
+    _guards: Vec<std::fs::File>,
     display: PathBuf,
     #[cfg(unix)]
     directory: OwnedFd,
@@ -1200,14 +1225,17 @@ fn confined(
         Ok(Confined { display, directory, name })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        if create && let Some(parent) = display.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| denied(format!("Path is unavailable: {error}")))?;
-        }
+        let guards = lock_parents(&display, create)
+            .map_err(|error| denied(format!("Path is unavailable: {error}")))?;
+        Ok(Confined { path: display.clone(), display, _guards: guards })
+    }
 
-        Ok(Confined { path: display.clone(), display })
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (display, create);
+        Err(denied("Confined filesystem access is unsupported on this platform"))
     }
 }
 
@@ -1235,7 +1263,18 @@ impl Confined {
 #[cfg(not(unix))]
 impl Confined {
     fn child(&self, name: OsString) -> std::io::Result<Self> {
-        Ok(Self { display: self.display.join(&name), path: self.path.join(name) })
+        #[cfg(windows)]
+        {
+            let path = self.path.join(&name);
+            let guards = lock_parents(&path, false)?;
+            Ok(Self { display: path.clone(), path, _guards: guards })
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = name;
+            Err(std::io::Error::other("Confined filesystem access is unsupported"))
+        }
     }
 }
 
@@ -1310,6 +1349,41 @@ fn write_confined(path: &Confined, value: &str) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
+fn lock_parents(path: &Path, create: bool) -> std::io::Result<Vec<std::fs::File>> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ,
+    };
+
+    let mut guards = Vec::new();
+    let parents = path.parent().ok_or_else(|| std::io::Error::other("Path has no parent"))?;
+
+    for parent in parents.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        if create && !parent.exists() {
+            std::fs::create_dir(parent)?;
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(parent)?;
+
+        let metadata = file.metadata()?;
+
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::other("Reparse points are not allowed"));
+        }
+
+        guards.push(file);
+    }
+
+    Ok(guards)
+}
+
+#[cfg(windows)]
 fn open_confined(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
     use std::fs::OpenOptions;
 
@@ -1320,10 +1394,22 @@ fn open_confined(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
     options.read(!write).write(write).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
 
     if write {
-        options.create(true).truncate(true);
+        options.create(true);
     }
 
-    options.open(path)
+    let file = options.open(path)?;
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other("Reparse points are not allowed"));
+    }
+
+    if write {
+        file.set_len(0)?;
+    }
+
+    Ok(file)
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -1365,6 +1451,9 @@ fn list_confined(path: &Confined) -> std::io::Result<Vec<String>> {
     #[cfg(not(unix))]
     {
         let mut names = Vec::new();
+
+        #[cfg(windows)]
+        let _guards = lock_parents(&path.path.join(".krabb-directory-lock"), false)?;
 
         for entry in std::fs::read_dir(&path.path)? {
             let entry = entry?;
@@ -1602,6 +1691,10 @@ fn search_confined(
         budget.visit(depth, metadata.is_dir())?;
 
         if metadata.is_dir() {
+            #[cfg(windows)]
+            let _guards = lock_parents(&path.path.join(".krabb-directory-lock"), false)
+                .map_err(|error| denied(format!("Search failed: {error}")))?;
+
             for entry in std::fs::read_dir(&path.path)
                 .map_err(|error| denied(format!("Search failed: {error}")))?
             {
@@ -1625,7 +1718,7 @@ fn search_confined(
             budget.read(metadata.len())?;
 
             if let Ok(text) = read_text(
-                std::fs::File::open(&path.path)
+                open_confined(&path.path, false)
                     .map_err(|error| denied(format!("Search failed: {error}")))?,
             ) {
                 for (line, value) in text.lines().enumerate() {
@@ -1701,6 +1794,19 @@ mod tests {
 
     fn policy(root: &Path) -> Policy {
         Policy { shell: Shell::Off, root: Some(root.to_path_buf()) }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_guards_prevent_parent_replacement() {
+        let root = test_root("windows-directory-guards");
+        std::fs::create_dir_all(root.join("parent")).unwrap();
+        let guards = super::lock_parents(&root.join("parent/note"), false).unwrap();
+
+        assert!(std::fs::rename(root.join("parent"), root.join("moved")).is_err());
+        drop(guards);
+        std::fs::rename(root.join("parent"), root.join("moved")).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2117,15 +2223,15 @@ mod tests {
             call(&approved, Request::call(6, "list", json!({"path": "missing"}))).await.is_err()
         );
 
-        let git = call(&approved, Request::call(7, "git", json!({"args": ["status"]})))
-            .await
-            .unwrap()
-            .unwrap();
+        let git =
+            call(&approved, Request::call(7, "git", json!({"args": ["status"], "approve": true})))
+                .await
+                .unwrap()
+                .unwrap();
 
         assert!(git.result.unwrap()["status"].is_number());
-        assert!(call(&approved, Request::call(7, "git", json!({"args": ["diff"]}))).await.is_ok());
         assert!(
-            call(&approved, Request::call(7, "git", json!({"args": ["worktree", "list"]})))
+            call(&approved, Request::call(7, "git", json!({"args": ["diff"], "approve": true})))
                 .await
                 .is_ok()
         );
@@ -2133,7 +2239,20 @@ mod tests {
         assert!(
             call(
                 &approved,
-                Request::call(7, "git", json!({"args": ["worktree", "add", "../copy"]}))
+                Request::call(7, "git", json!({"args": ["worktree", "list"], "approve": true}))
+            )
+            .await
+            .is_ok()
+        );
+
+        assert!(
+            call(
+                &approved,
+                Request::call(
+                    7,
+                    "git",
+                    json!({"args": ["worktree", "add", "../copy"], "approve": true})
+                )
             )
             .await
             .is_err()
@@ -2145,7 +2264,7 @@ mod tests {
                 Request::call(
                     7,
                     "git",
-                    json!({"args": ["worktree", "add", "--detach", "../copy"]})
+                    json!({"args": ["worktree", "add", "--detach", "../copy"], "approve": true})
                 )
             )
             .await
@@ -2155,7 +2274,11 @@ mod tests {
         assert!(
             call(
                 &approved,
-                Request::call(7, "git", json!({"args": ["worktree", "remove", "../copy"]}))
+                Request::call(
+                    7,
+                    "git",
+                    json!({"args": ["worktree", "remove", "../copy"], "approve": true})
+                )
             )
             .await
             .is_err()
@@ -2184,11 +2307,18 @@ mod tests {
         );
 
         assert!(
-            call(&approved, Request::call(7, "git", json!({"args": ["status", 1]}))).await.is_err()
+            call(
+                &approved,
+                Request::call(7, "git", json!({"args": ["status", 1], "approve": true}))
+            )
+            .await
+            .is_err()
         );
 
         assert!(
-            call(&approved, Request::call(8, "git", json!({"args": ["reset"]}))).await.is_err()
+            call(&approved, Request::call(8, "git", json!({"args": ["reset"], "approve": true})))
+                .await
+                .is_err()
         );
 
         assert!(call(&approved, Request::call(9, "unknown", json!({}))).await.unwrap().is_none());
@@ -2238,7 +2368,7 @@ mod tests {
 
         let target = root.join("copy");
         let result = call(
-            &Arc::new(policy(&root)),
+            &Arc::new(Policy { shell: Shell::On, ..policy(&root) }),
             Request::call(
                 1,
                 "git",
@@ -2368,6 +2498,70 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_filters_require_shell_authorization_and_approval() {
+        let root = test_root("git-filter-authorization");
+        fs::create_dir_all(&root).unwrap();
+
+        for args in [vec!["init"], vec!["config", "filter.probe.clean", "touch filter-ran; cat"]] {
+            assert!(
+                git(&args.into_iter().map(str::to_owned).collect::<Vec<_>>(), &root)
+                    .await
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+
+        fs::write(root.join("note"), "before\n").unwrap();
+
+        assert!(git(&["add".into(), "note".into()], &root).await.unwrap().status.success());
+        fs::write(root.join(".gitattributes"), "note filter=probe\n").unwrap();
+        fs::write(root.join("note"), "after\n").unwrap();
+
+        for (shell, approved) in [(Shell::Off, true), (Shell::Ask, false), (Shell::On, false)] {
+            let policy = Policy { shell, ..policy(&root) };
+
+            assert!(
+                call(
+                    &policy,
+                    Request::call(1, "git", json!({"args": ["diff"], "approve": approved}))
+                )
+                .await
+                .is_err()
+            );
+
+            assert!(!root.join("filter-ran").exists());
+        }
+
+        let policy = Policy { shell: Shell::On, ..policy(&root) };
+        let sandbox = Sandbox { runtime: "unused".into(), image: "unused".into() };
+
+        for name in ["git", "patch"] {
+            assert!(
+                super::call_with_sandbox(
+                    &policy,
+                    Request::call(2, name, json!({"args": ["diff"], "approve": true})),
+                    Some(&sandbox),
+                )
+                .await
+                .is_err()
+            );
+
+            assert!(!root.join("filter-ran").exists());
+        }
+
+        assert!(
+            call(&policy, Request::call(2, "git", json!({"args": ["diff"], "approve": true})))
+                .await
+                .is_ok()
+        );
+
+        assert!(root.join("filter-ran").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn applies_approved_patches() {
         let root = test_root("krabb-tools-patch");
@@ -2380,7 +2574,7 @@ mod tests {
         let patch = "diff --git a/note.txt b/note.txt\nindex 8f6f5f0..9d5e3f4 100644\n--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-before\n+after\n";
 
         assert!(apply(&root, patch, true).await.unwrap().status.success());
-        let policy = Arc::new(policy(&root));
+        let policy = Arc::new(Policy { shell: Shell::On, ..policy(&root) });
 
         assert!(call(&policy, Request::call(1, "patch", json!({"text": patch}))).await.is_err());
         assert!(

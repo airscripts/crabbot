@@ -648,6 +648,15 @@ where
                 continue;
             }
 
+            if line == "/data" || line.starts_with("/data ") {
+                let command = line.strip_prefix("/data").unwrap_or_default().trim();
+                let text = data_command(home.clone(), session.clone(), command, host).await;
+
+                output.write_all(text.as_bytes()).await?;
+                output.flush().await?;
+                continue;
+            }
+
             if line == "/plugin" || line.starts_with("/plugin ") {
                 let text = match parse_plugin_list_page(line) {
                     Ok(page) => {
@@ -1965,7 +1974,7 @@ fn command_help(home: &str, has_model: bool, daemon: bool) -> String {
     }
 
     if daemon && has_capability(home, "store") {
-        conditional.push(("/store", "Manage session-scoped SQLite values."));
+        conditional.push(("/data", "Manage session-scoped SQLite values and structured data."));
     }
 
     if !conditional.is_empty() {
@@ -2007,11 +2016,20 @@ fn session_help() -> String {
         ("/new <id>", "Create and switch to a session (shortcut)."),
     ];
 
-    format!("Session commands:\n{}\n> ", format_help_rows(&commands))
+    format!("Manage sessions.\n\nCommands:\n{}\n> ", format_help_rows(&commands))
 }
 
-fn model_help() -> &'static str {
-    "Model commands:\n  /model help          Show these commands.\n  /model list          List Codex models (when Codex is selected).\n  /model show          Show the selected model.\n  /model set <id>      Select a model.\n  /model <id>          Select a model (shortcut).\n> "
+fn model_help() -> String {
+    format!(
+        "Manage the selected model.\n\nCommands:\n{}\n> ",
+        format_help_rows(&[
+            ("/model help", "Show this help."),
+            ("/model list", "List Codex models (when Codex is selected)."),
+            ("/model show", "Show the selected model."),
+            ("/model set <id>", "Select a model."),
+            ("/model <id>", "Select a model (shortcut)."),
+        ])
+    )
 }
 
 async fn compact_command<C, F>(
@@ -2829,9 +2847,9 @@ fn schedule_help() -> &'static str {
     r#"Schedule autonomous agent work.
 
 Commands:
-  /schedule help                          Show this help
-  /schedule list [PAGE]                   List schedules and latest outcomes
-  /schedule history ID|NAME [PAGE]        Show schedule run history
+  /schedule help                           Show this help
+  /schedule list [PAGE]                    List schedules and latest outcomes
+  /schedule history ID|NAME [PAGE]         Show schedule run history
   /schedule add TIMING [options] TEXT      Add a one-time or recurring task
   /schedule run ID|NAME                    Run a task now
   /schedule retry ID|NAME                  Retry a paused task
@@ -2840,14 +2858,14 @@ Commands:
   /schedule remove ID|NAME                 Cancel future runs
 
 Timing:
-  --after DURATION                        Run after a delay, such as 5m or "1 month"
-  --at DATE-TIME                          Run at "YYYY-MM-DD HH:MM" locally or RFC 3339
-  --every DURATION                        Repeat at a fixed interval
-  --cron 'FIELDS' --timezone AREA/CITY    Repeat on a cron schedule
+  --after DURATION                         Run after a delay, such as 5m or "1 month"
+  --at DATE-TIME                           Run at "YYYY-MM-DD HH:MM" locally or RFC 3339
+  --every DURATION                         Repeat at a fixed interval
+  --cron 'FIELDS' --timezone AREA/CITY     Repeat on a cron schedule
 
 Options:
-  --timezone AREA/CITY                    Timezone for local --at and cron
-  --name NAME                             Selectable name; no spaces
+  --timezone AREA/CITY                     Timezone for local --at and cron
+  --name NAME                              Selectable name; no spaces
   --missed skip|coalesce|replay            Handle runs missed while offline
   --retries 0..5                           Retry reported failures with backoff
   --on-failure pause|continue              Recurring task policy (default: pause)
@@ -3258,17 +3276,441 @@ where
 }
 
 fn store_help() -> &'static str {
-    r#"Manage values stored in SQLite for this session.
+    r#"`/store` is an alias for `/data value`.
 
 Commands:
-  /store help                       Show this help
-  /store put KEY=VALUE              Save a text value
-  /store get KEY                    Show a saved value
-  /store delete KEY                 Delete a saved value
+  /data value help                  Show this help
+  /data value put KEY=VALUE         Save a text value
+  /data value get KEY               Show a saved value
+  /data value delete KEY            Delete a saved value
 
 Keys are scoped to the active TUI session. Stored values persist in the local
-SQLite database. Selecting /store in the command picker shows this help.
+SQLite database. Use `/data` for both simple values and structured records.
 > "#
+}
+
+async fn data_command<C, F>(home: String, session: String, command: &str, host: C) -> String
+where
+    C: Fn(String, String, Value) -> F + Copy,
+    F: Future<Output = krabb_core::Result<Value>>,
+{
+    let args = command.split_whitespace().collect::<Vec<_>>();
+
+    if args.first() == Some(&"value") {
+        let result = store_command(home, session, &args[1..].join(" "), host).await;
+
+        return result.replace("/store", "/data value");
+    }
+
+    let parse = |value: &str| {
+        serde_json::from_str::<Value>(value)
+            .map_err(|_| krabb_core::Error::Denied("Data arguments must contain valid JSON".into()))
+    };
+
+    let mut params = serde_json::json!({"scope": format!("tui:{session}")});
+
+    let operation = match args.as_slice() {
+        [] | ["help"] | ["--help"] | ["-h"] => return data_help().into(),
+        ["database", "list"] => "list_databases",
+        ["database", "create", _] => "create_database",
+        ["database", "drop", _] => "drop_database",
+        ["table", "list", _] => "list_tables",
+        ["table", "create", _, _, ..] => "create_table",
+        ["table", "describe", _, _] => "describe_table",
+        ["column", "add", _, _, ..] => "add_column",
+        ["column", "remove", _, _, _] => "drop_column",
+        ["table", "drop", _, _] => "drop_table",
+        ["insert", _, _, ..] => "insert",
+        ["query", _, _] | ["query", _, _, ..] => "query",
+        ["update", _, _, _, ..] => "update",
+        ["delete", _, _, _] => "delete",
+        _ => return "Unknown data command. Run /data help for usage.\n> ".into(),
+    };
+
+    params["operation"] = Value::String(operation.into());
+
+    match args.as_slice() {
+        ["database", "list"] => {}
+        ["database", _, database] => params["database"] = Value::String((*database).into()),
+        ["table", "list", database] => params["database"] = Value::String((*database).into()),
+
+        ["table", "create", database, table, ..] => {
+            params["database"] = Value::String((*database).into());
+            params["table"] = Value::String((*table).into());
+
+            let columns = if args.len() == 4 {
+                Ok(Value::Array(Vec::new()))
+            } else {
+                parse(&args[4..].join(" "))
+            };
+
+            match columns {
+                Ok(value) => params["columns"] = value,
+
+                Err(error) => {
+                    return format!("Data action failed: {}.\n> ", sentence(error.to_string()));
+                }
+            }
+        }
+
+        ["column", "add", database, table, ..] => {
+            params["database"] = Value::String((*database).into());
+            params["table"] = Value::String((*table).into());
+
+            let column = match args.as_slice() {
+                ["column", "add", _, _, name, kind] => {
+                    Ok(serde_json::json!({"name": name, "type": column_type(kind)}))
+                }
+
+                ["column", "add", _, _, name, kind, "--required"] => Ok(serde_json::json!({
+                    "name": name,
+                    "type": column_type(kind),
+                    "required": true
+                })),
+
+                _ => parse(&args[4..].join(" ")),
+            };
+
+            match column {
+                Ok(value) => params["column"] = value,
+
+                Err(error) => {
+                    return format!("Data action failed: {}.\n> ", sentence(error.to_string()));
+                }
+            }
+        }
+
+        ["column", "remove", database, table, column] => {
+            params["database"] = Value::String((*database).into());
+            params["table"] = Value::String((*table).into());
+            params["column_name"] = Value::String((*column).into());
+        }
+
+        ["table", _, database, table] => {
+            params["database"] = Value::String((*database).into());
+            params["table"] = Value::String((*table).into());
+        }
+
+        ["insert", database, table, ..] => {
+            params["database"] = Value::String((*database).into());
+            params["table"] = Value::String((*table).into());
+
+            match parse(&args[3..].join(" ")) {
+                Ok(value) => params["record"] = value,
+
+                Err(error) => {
+                    return format!("Data action failed: {}.\n> ", sentence(error.to_string()));
+                }
+            }
+        }
+
+        ["query", database, table] => {
+            params["database"] = Value::String((*database).into());
+            params["table"] = Value::String((*table).into());
+        }
+
+        ["query", database, table, ..] => {
+            params["database"] = Value::String((*database).into());
+            params["table"] = Value::String((*table).into());
+            let after_id = args.last().and_then(|value| value.parse::<i64>().ok());
+            let filter_end = if after_id.is_some() { args.len() - 1 } else { args.len() };
+
+            match parse(&args[3..filter_end].join(" ")) {
+                Ok(value) => params["filter"] = value,
+
+                Err(error) => {
+                    return format!("Data action failed: {}.\n> ", sentence(error.to_string()));
+                }
+            }
+
+            if let Some(after_id) = after_id {
+                params["after_id"] = Value::from(after_id);
+            }
+        }
+
+        ["update", database, table, id, ..] => {
+            params["database"] = Value::String((*database).into());
+            params["table"] = Value::String((*table).into());
+            params["id"] = match id.parse::<i64>() {
+                Ok(value) => Value::from(value),
+                Err(_) => return "Data record ID must be a positive integer.\n> ".into(),
+            };
+
+            match parse(&args[4..].join(" ")) {
+                Ok(value) => params["record"] = value,
+
+                Err(error) => {
+                    return format!("Data action failed: {}.\n> ", sentence(error.to_string()));
+                }
+            }
+        }
+
+        ["delete", database, table, id] => {
+            params["database"] = Value::String((*database).into());
+            params["table"] = Value::String((*table).into());
+            params["id"] = match id.parse::<i64>() {
+                Ok(value) => Value::from(value),
+                Err(_) => return "Data record ID must be a positive integer.\n> ".into(),
+            };
+        }
+
+        _ => return "Unknown data command. Run /data help for usage.\n> ".into(),
+    }
+
+    match capability(home, "sqlite", "data", params, host).await {
+        Ok(value) => {
+            let rendered = format_data_output(&args, &value);
+            let shown = rendered.chars().take(4_096).collect::<String>();
+
+            if rendered.chars().count() > 4_096 {
+                format!("{shown}\n[data output truncated]\n> ")
+            } else {
+                format!("{shown}\n> ")
+            }
+        }
+
+        Err(error) => format!("Data action failed: {}.\n> ", sentence(error.to_string())),
+    }
+}
+
+fn format_data_output(args: &[&str], value: &Value) -> String {
+    match args {
+        ["database", "list"] => {
+            let Some(databases) = value["databases"].as_array() else {
+                return value.to_string();
+            };
+
+            if databases.is_empty() {
+                "No databases found.".into()
+            } else {
+                format!(
+                    "Databases:\n{}",
+                    format_data_tree_list(
+                        &databases
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    )
+                )
+            }
+        }
+
+        ["database", "create", database] => {
+            if value["created"] == true {
+                format!("Created database {database}.")
+            } else {
+                format!("Database {database} already exists.")
+            }
+        }
+
+        ["database", "drop", database] => {
+            if value["deleted"] == true {
+                format!("Deleted database {database}.")
+            } else {
+                format!("Database {database} was not found.")
+            }
+        }
+
+        ["table", "list", database] => {
+            let Some(tables) = value["tables"].as_array() else {
+                return value.to_string();
+            };
+
+            if tables.is_empty() {
+                format!("No tables found in database {database}.")
+            } else {
+                format!(
+                    "Tables in {database}:\n{}",
+                    format_data_tree_list(
+                        &tables
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    )
+                )
+            }
+        }
+
+        ["table", "create", database, table, ..] => {
+            let Some(columns) = value["columns"].as_array() else {
+                return value.to_string();
+            };
+
+            if columns.is_empty() {
+                format!(
+                    "Created empty table {database}.{table}.\n\nAdd a column with:\n  /data column add {database} {table} NAME TYPE"
+                )
+            } else {
+                format!("Created table {database}.{table}.")
+            }
+        }
+
+        ["table", "describe", database, table] => {
+            let Some(columns) = value["columns"].as_array() else {
+                return value.to_string();
+            };
+
+            if columns.is_empty() {
+                format!("Table {database}.{table} has no columns yet.")
+            } else {
+                format!(
+                    "Columns in {database}.{table}:\n{}",
+                    format_data_tree_list(
+                        &columns.iter().map(format_data_column).collect::<Vec<_>>()
+                    )
+                )
+            }
+        }
+
+        ["column", "add", database, table, ..] => {
+            format!("Added column {} to {database}.{table}.", format_data_column(&value["column"]))
+        }
+
+        ["column", "remove", database, table, column] => {
+            format!("Removed column {column} from {database}.{table}.")
+        }
+
+        ["table", "drop", database, table] => {
+            if value["deleted"] == true {
+                format!("Deleted table {database}.{table}.")
+            } else {
+                format!("Table {database}.{table} was not found.")
+            }
+        }
+
+        ["insert", database, table, ..] => {
+            format!("Inserted record #{} into {database}.{table}.", value["id"])
+        }
+
+        ["query", database, table, ..] => {
+            let Some(items) = value["items"].as_array() else {
+                return value.to_string();
+            };
+
+            if items.is_empty() {
+                return format!("No records found in {database}.{table}.");
+            }
+
+            let records = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let details = item["record"]
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .map(|(name, value)| format!("{name}={}", format_data_value(value)))
+                        .collect::<Vec<_>>();
+
+                    format_tree_entry(
+                        &format!("#{}", item["id"]),
+                        &details,
+                        index + 1 == items.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let mut output = format!("Records in {database}.{table}:\n{}", records.join("\n"));
+            output.push_str(&format!("\nShowing {} record(s).", items.len()));
+
+            if value["truncated"] == true {
+                output.push_str(&format!(" Continue after ID {}.", value["next_after"]));
+            }
+
+            output
+        }
+
+        ["update", database, table, id, ..] => {
+            format!("Updated record #{id} in {database}.{table}.")
+        }
+
+        ["delete", database, table, id] => {
+            if value["deleted"] == true {
+                format!("Deleted record #{id} from {database}.{table}.")
+            } else {
+                format!("Record #{id} was not found in {database}.{table}.")
+            }
+        }
+
+        _ => value.to_string(),
+    }
+}
+
+fn format_data_tree_list(entries: &[String]) -> String {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| format_tree_entry(entry, &[], index + 1 == entries.len()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_data_column(value: &Value) -> String {
+    let name = value["name"].as_str().unwrap_or("column");
+
+    let kind = value["type"].as_str().unwrap_or("json");
+    let required = if value["required"] == true { ", required" } else { "" };
+
+    format!("{name} ({kind}{required})")
+}
+
+fn format_data_value(value: &Value) -> String {
+    if let Some(value) = value.as_str() {
+        return value.replace('\n', "\\n");
+    }
+
+    value.to_string()
+}
+
+fn data_help() -> &'static str {
+    r#"Manage SQLite values and structured data for this TUI conversation.
+
+Usage: /data <COMMAND>
+
+Commands:
+  database list                                  List databases
+  database create <DB>                           Create a database
+  database drop <DB>                             Delete a database and its tables
+
+  value put KEY=VALUE                            Save a session-scoped text value
+  value get KEY                                  Read a session-scoped value
+  value delete KEY                               Delete a session-scoped value
+
+  table list <DB>                                List tables in a database
+  table create <DB> <TABLE>                      Create an empty table
+  table describe <DB> <TABLE>                    Show table columns
+  table drop <DB> <TABLE>                        Delete a table and its records
+
+  column add <DB> <TABLE> <NAME> <TYPE>          Add a column
+  column remove <DB> <TABLE> <COLUMN>            Remove a column
+
+  insert <DB> <TABLE> <RECORD_JSON>              Insert a record
+  query <DB> <TABLE> [FILTER_JSON] [AFTER_ID]    Query records
+  update <DB> <TABLE> <ID> <CHANGES_JSON>        Update a record
+  delete <DB> <TABLE> <ID>                       Delete a record
+
+  help                                           Show this help
+
+Options:
+  -h, --help  Show this help
+
+Notes:
+  Run /data value help for key/value storage. Create a table without a schema,
+  then add columns one at a time. JSON column definitions and table schemas are
+  also accepted. Column types are text (also accepted as string), integer,
+  real, boolean, and json. Use --required with column add to require a value on
+  insert. Required columns can only be added before records exist.
+  Each database supports 100 tables; each table supports 64 columns and 10,000
+  records. Queries match exact values and return at most 20 records/128 KiB.
+  Continue a truncated query with its next_after ID; use '{}' as the filter
+  when paging without a field filter. Data is scoped to the active TUI session.
+> "#
+}
+
+fn column_type(kind: &str) -> &str {
+    if kind == "string" { "text" } else { kind }
 }
 
 async fn memory_command<C, F>(home: String, session: String, command: &str, host: C) -> String
@@ -4410,6 +4852,162 @@ mod tests {
         assert_eq!(calls[1]["params"]["key"], "tui:default:note");
         assert_eq!(calls[2]["method"], "delete");
         assert_eq!(calls[2]["params"]["key"], "tui:default:note");
+    }
+
+    #[tokio::test]
+    async fn manages_structured_data_in_the_active_tui_scope() {
+        let calls = std::sync::Mutex::new(Vec::new());
+        let host = |_: String, method: String, params: serde_json::Value| {
+            let calls = &calls;
+            async move {
+                assert_eq!(method, "capability.call");
+                calls.lock().unwrap().push(params.clone());
+                Ok(match params["params"]["operation"].as_str() {
+                    Some("create_table") => serde_json::json!({"columns": []}),
+
+                    Some("add_column") => {
+                        serde_json::json!({"column": params["params"]["column"]})
+                    }
+
+                    Some("drop_column") => serde_json::json!({"records_updated": 0}),
+                    _ => serde_json::json!({"created": true}),
+                })
+            }
+        };
+
+        for command in ["", "help", "--help", "-h"] {
+            let help =
+                super::data_command("/tmp/krabb".into(), "default".into(), command, host).await;
+
+            assert!(help.contains("Usage: /data <COMMAND>"));
+            assert!(help.contains("Commands:"));
+            assert!(help.contains("Options:"));
+            assert!(help.contains("Notes:"));
+            assert!(help.contains("table create <DB> <TABLE>"));
+            assert!(help.contains("column add <DB> <TABLE> <NAME> <TYPE>"));
+            assert!(help.contains("column remove <DB> <TABLE> <COLUMN>"));
+            assert!(help.contains("\n\n  table list <DB>"));
+            assert!(help.contains("value put KEY=VALUE"));
+            assert!(!help.contains("/store"));
+        }
+
+        let value_help =
+            super::data_command("/tmp/krabb".into(), "default".into(), "value help", host).await;
+
+        assert!(value_help.contains("/data value get KEY"));
+        assert!(!value_help.contains("/store"));
+
+        assert!(calls.lock().unwrap().is_empty());
+
+        let response = super::data_command(
+            "/tmp/krabb".into(),
+            "default".into(),
+            "table create contacts people",
+            host,
+        )
+        .await;
+
+        assert!(response.contains(
+            "Created empty table contacts.people.\n\nAdd a column with:\n  /data column add contacts people NAME TYPE"
+        ));
+
+        let response = super::data_command(
+            "/tmp/krabb".into(),
+            "default".into(),
+            "column add contacts people name string --required",
+            host,
+        )
+        .await;
+
+        assert!(response.contains("Added column name (text, required) to contacts.people."));
+
+        let response = super::data_command(
+            "/tmp/krabb".into(),
+            "default".into(),
+            "column add contacts people active boolean",
+            host,
+        )
+        .await;
+
+        assert!(response.contains("Added column active (boolean) to contacts.people."));
+
+        let response = super::data_command(
+            "/tmp/krabb".into(),
+            "default".into(),
+            "column remove contacts people active",
+            host,
+        )
+        .await;
+
+        assert!(response.contains("Removed column active from contacts.people."));
+
+        let response = super::data_command(
+            "/tmp/krabb".into(),
+            "default".into(),
+            "value put note=stored",
+            host,
+        )
+        .await;
+
+        assert!(response.contains("Stored session value."));
+        let calls = calls.lock().unwrap();
+
+        assert_eq!(calls[0]["service"], "sqlite");
+        assert_eq!(calls[0]["method"], "data");
+        assert_eq!(calls[0]["params"]["scope"], "tui:default");
+        assert_eq!(calls[0]["params"]["operation"], "create_table");
+        assert_eq!(calls[0]["params"]["columns"], serde_json::json!([]));
+        assert_eq!(calls[1]["params"]["operation"], "add_column");
+        assert_eq!(calls[1]["params"]["column"]["name"], "name");
+        assert_eq!(calls[1]["params"]["column"]["required"], true);
+        assert_eq!(calls[2]["params"]["column"]["name"], "active");
+        assert_eq!(calls[3]["params"]["operation"], "drop_column");
+        assert_eq!(calls[3]["params"]["column_name"], "active");
+        assert_eq!(calls[4]["method"], "put");
+    }
+
+    #[tokio::test]
+    async fn formats_tui_data_lists_with_tree_branches() {
+        let host = |_: String, _: String, params: serde_json::Value| async move {
+            Ok(match params["params"]["operation"].as_str() {
+                Some("list_databases") => serde_json::json!({"databases": ["foo", "bar"]}),
+                Some("list_tables") => serde_json::json!({"tables": ["people", "notes"]}),
+                Some("describe_table") => serde_json::json!({
+                    "columns": [{"name": "name", "type": "text"}]
+                }),
+                Some("query") => serde_json::json!({
+                    "items": [{"id": 1, "record": {"name": "Ada"}}],
+                    "truncated": false
+                }),
+                _ => serde_json::json!({}),
+            })
+        };
+
+        let databases =
+            super::data_command("/tmp/krabb".into(), "default".into(), "database list", host).await;
+        assert!(databases.contains("Databases:\n├─ foo\n└─ bar\n> "));
+
+        let tables =
+            super::data_command("/tmp/krabb".into(), "default".into(), "table list foo", host)
+                .await;
+        assert!(tables.contains("Tables in foo:\n├─ people\n└─ notes\n> "));
+
+        let columns = super::data_command(
+            "/tmp/krabb".into(),
+            "default".into(),
+            "table describe foo people",
+            host,
+        )
+        .await;
+
+        assert!(columns.contains("Columns in foo.people:\n└─ name (text)\n> "));
+
+        let records =
+            super::data_command("/tmp/krabb".into(), "default".into(), "query foo people", host)
+                .await;
+        assert!(
+            records.contains("Records in foo.people:\n└─ #1\n   └─ name=Ada\nShowing 1 record(s).")
+        );
     }
 
     #[tokio::test]
@@ -6477,7 +7075,7 @@ done
         let mut output = String::new();
         output_rx.read_to_string(&mut output).await.unwrap();
 
-        assert!(output.contains("Model commands:"));
+        assert!(output.contains("Manage the selected model.\n\nCommands:"));
         assert!(output.contains("Current model: unset."));
         assert!(output.contains("gpt-test - Test model (default)"));
         assert!(output.contains("Using model gpt-test."));

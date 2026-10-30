@@ -1824,6 +1824,7 @@ dependencies = [
  "krabb-core",
  "krabb-log",
  "serde_json",
+ "subtle",
  "tokio",
  "tracing",
 ]
@@ -2026,6 +2027,7 @@ dependencies = [
  "krabb-core",
  "krabb-log",
  "rusqlite",
+ "serde",
  "serde_json",
  "tokio",
 ]

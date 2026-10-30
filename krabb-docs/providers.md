@@ -89,7 +89,7 @@ Use `krabb plugin list` and `krabb doctor` to inspect installed providers.
 | `mcp`, `resource` | MCP | Access to tools and resources exposed by MCP servers. |
 | `memory` | Memory | Scoped agent memory records with search and management commands. |
 | `scheduler` | Scheduler | Persistent scheduled agent tasks and controlled execution. |
-| `store` | SQLite | Values, leases, durable delivery state, and event deduplication. |
+| `store` | SQLite | Agent-accessible structured data, key/value values, leases, durable queue records, and event deduplication. |
 | `speech` | Whisper | Voice transcription through a local Whisper-compatible executable. |
 | `client` | TUI | A terminal interface connected to the daemon. |
 

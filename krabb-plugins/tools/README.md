@@ -6,14 +6,23 @@ Install the released plugin with:
 curl -fsSL https://raw.githubusercontent.com/krabblab/krabb/main/install.sh | sh -s -- tools
 ```
 
-The plugin confines reads, writes, searches, patches, and Git operations to
+The plugin confines reads, writes, searches, and declared patch targets to
 `KRABB_ROOT`, or to the active isolated workspace when the host supplies one.
 Unix operations use descriptor-relative no-follow access; Windows operations
-use canonical boundary checks and reparse-point-safe file handles. Writes reject
+hold parent directory handles that prohibit directory replacement and use
+reparse-point-safe file handles. Confined file operations fail closed on
+platforms other than Unix and Windows. Writes reject
 symbolic-link targets, and writes, patches, shell commands, and
 worktree mutations need explicit approval.
-Git inspection allows status, diff, worktree listing, and approved worktree
-add/remove operations within that active workspace.
+Git inspection allows status, diff, worktree listing, and worktree add/remove
+operations within that active workspace. All Git operations and Git-backed
+patches require shell access and the configured tool approval policy because
+Git can execute repository-configured filters, even during `diff`. They are
+unavailable when shell access is disabled; approval authorizes that execution. When a container sandbox is configured,
+use the sandboxed shell tool for Git operations and patches; the direct Git
+and patch tools reject execution on the host.
+Git runs in the active workspace, but repository-configured programs have
+shell permissions and may access paths outside that workspace.
 
 The read-only `fetch` tool retrieves bounded text from public HTTPS URLs. It
 blocks local and private network addresses, pins requests to validated DNS

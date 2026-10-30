@@ -831,6 +831,7 @@ fn read_output(input: impl Read) -> std::io::Result<Vec<u8>> {
     version = VERSION,
     about = "A self-hostable agent OS for native and external AI agents.",
     before_help = BANNER,
+    styles = cli_styles(),
     disable_help_flag = true,
     disable_version_flag = true
 )]
@@ -897,6 +898,9 @@ enum Command {
 
     #[command(hide = true, about = "Open the Krabb terminal interface.")]
     Tui(NativePluginCommandArgs),
+
+    #[command(hide = true, about = "Explore and manage structured SQLite data.")]
+    Data(NativePluginCommandArgs),
 
     #[command(
         about = "Install, uninstall, and control the native service.",
@@ -994,7 +998,7 @@ enum DeliveryCommand {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "session", about = "Manage durable agent sessions.")]
+#[command(name = "session", about = "Manage durable agent sessions.", styles = cli_styles())]
 struct SessionCli {
     #[arg(long, global = true, help = "Render command output as JSON where supported.")]
     json: bool,
@@ -1007,7 +1011,7 @@ struct SessionCli {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "delivery", about = "Manage pending channel deliveries.")]
+#[command(name = "delivery", about = "Manage pending channel deliveries.", styles = cli_styles())]
 struct DeliveryCli {
     #[arg(long, global = true, help = "Render command output as JSON where supported.")]
     json: bool,
@@ -1614,6 +1618,7 @@ struct Entry {
 struct Update {
     destination: PathBuf,
     backup: Option<PathBuf>,
+    linked: bool,
 }
 
 pub async fn cli() -> ExitCode {
@@ -1627,7 +1632,10 @@ pub async fn cli() -> ExitCode {
     if args.first().is_some_and(|name| name == "tui")
         && args.get(1).is_some_and(|argument| argument == "--help" || argument == "-h")
     {
-        println!("{}", external_command_help("tui", "Open the Krabb terminal interface."));
+        println!(
+            "{}",
+            style_cli_help(&external_command_help("tui", "Open the Krabb terminal interface."))
+        );
         return ExitCode::SUCCESS;
     }
 
@@ -1637,26 +1645,34 @@ pub async fn cli() -> ExitCode {
         args[1] = "help".into();
     }
 
+    if args.first().is_some_and(|name| name == "data")
+        && args.get(1).is_some_and(|argument| argument == "--help" || argument == "-h")
+    {
+        args[1] = "help".into();
+    }
+
     let mut cli = Cli::parse_from(std::iter::once(NAME.to_owned()).chain(args));
 
     let runtime_command_args = match &cli.command {
         Command::Memory(command_args) | Command::Tui(command_args) => {
-            Some(command_args.args.as_slice())
+            Some((command_args.args.as_slice(), true))
         }
+
+        Command::Data(command_args) => Some((command_args.args.as_slice(), false)),
 
         Command::External(args)
             if args.first().is_some_and(|name| {
                 matches!(name.as_str(), "session" | "delivery" | "schedule")
             }) =>
         {
-            Some(args.as_slice())
+            Some((args.as_slice(), true))
         }
 
         _ => None,
     };
 
-    if let Some(args) = runtime_command_args {
-        for argument in args.iter().skip(1) {
+    if let Some((args, skip_first)) = runtime_command_args {
+        for argument in args.iter().skip(usize::from(skip_first)) {
             match argument.as_str() {
                 "--json" => cli.json = true,
                 "--debug" => cli.debug = true,
@@ -1888,6 +1904,7 @@ fn command_label(command: &Command) -> &'static str {
         Command::Schedule(_) => "schedule",
         Command::Memory(_) => "memory",
         Command::Tui(_) => "tui",
+        Command::Data(_) => "data",
         Command::Service { .. } => "service",
         Command::Export(_) => "export",
         Command::Validate(_) => "validate",
@@ -1896,6 +1913,7 @@ fn command_label(command: &Command) -> &'static str {
             Some("session") => "session",
             Some("delivery") => "delivery",
             Some("schedule") => "schedule",
+            Some("data") => "data",
             _ => "external",
         },
     }
@@ -1941,6 +1959,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .await?;
         }
 
+        Command::Data(args) => {
+            external_command(std::iter::once("data".to_owned()).chain(args.args).collect(), json)
+                .await?;
+        }
+
         Command::Service { command } => service(command, json)?,
         Command::Export(args) => export_krabfile(args, json)?,
         Command::Validate(args) => validate_krabfile(args, json)?,
@@ -1963,7 +1986,7 @@ fn completion(shell: CompletionShell) -> std::io::Result<()> {
 fn completion_command() -> clap::Command {
     let mut command = Cli::command();
 
-    for name in ["schedule", "memory", "tui"] {
+    for name in ["schedule", "memory", "tui", "data"] {
         command = command.mut_subcommand(name, |subcommand| subcommand.hide(false));
     }
 
@@ -2003,7 +2026,7 @@ fn completion_name_from(argv0: Option<&std::ffi::OsStr>) -> &'static str {
 }
 
 fn print_help_with_plugins(root: &Path) {
-    print!("{}", help_text_with_plugins(root));
+    print!("{}", style_cli_help(&help_text_with_plugins(root)));
 }
 
 fn help_text_with_plugins(root: &Path) -> String {
@@ -2636,12 +2659,12 @@ async fn schedule_command(
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let Some(action) = args.first().map(String::as_str) else {
-        println!("{}", schedule_help());
+        println!("{}", style_cli_help(schedule_help()));
         return Ok(());
     };
 
     if matches!(action, "help" | "--help" | "-h") {
-        println!("{}", schedule_help());
+        println!("{}", style_cli_help(schedule_help()));
         return Ok(());
     }
 
@@ -2985,7 +3008,7 @@ Commands:
   pause <ID|NAME>           Pause a task
   resume <ID|NAME>          Resume a paused task
   cancel <ID|NAME>          Cancel a task
-  history <ID|NAME> [PAGE] [OPTIONS] Show task execution history
+  history <ID|NAME> [PAGE]  Show task execution history
   help                      Show this help
 
 Options:
@@ -6908,6 +6931,7 @@ fn native_command(name: &str) -> bool {
             | "schedule"
             | "memory"
             | "tui"
+            | "data"
             | "service"
             | "ask"
             | "export"
@@ -6917,7 +6941,7 @@ fn native_command(name: &str) -> bool {
 }
 
 fn krabb_owned_plugin_command(name: &str, owner: &str) -> bool {
-    matches!((name, owner), ("memory", "memory") | ("tui", "tui"))
+    matches!((name, owner), ("memory", "memory") | ("tui", "tui") | ("data", "sqlite"))
 }
 
 fn validate_commands(
@@ -6955,7 +6979,13 @@ fn available_commands(root: &Path) -> BTreeMap<String, Vec<(String, CommandSpec)
 
     for (id, entry) in &lock.plugins {
         for command in &entry.commands {
-            let owner = if krabb_owned_plugin_command(&command.name, id) {
+            let krabb_owned = krabb_owned_plugin_command(&command.name, id);
+
+            if krabb_owned && binary_at(id, root).is_none() {
+                continue;
+            }
+
+            let owner = if krabb_owned {
                 format!("{RUNTIME_COMMAND_OWNER}{}", command.name)
             } else {
                 id.clone()
@@ -6973,10 +7003,10 @@ fn available_commands(root: &Path) -> BTreeMap<String, Vec<(String, CommandSpec)
             && binary_at(id, root).is_some()
     });
 
-    let has_scheduler = lock
-        .plugins
-        .values()
-        .any(|entry| entry.capabilities.iter().any(|capability| capability == "scheduler"));
+    let has_scheduler = lock.plugins.iter().any(|(id, entry)| {
+        entry.capabilities.iter().any(|capability| capability == "scheduler")
+            && binary_at(id, root).is_some()
+    });
 
     for (available, name, description) in [
         (
@@ -7030,6 +7060,7 @@ fn env_for(manifest: &Manifest, config: &Config, root: &Path) -> Vec<(String, St
         "KRABB_ACP_ARGS",
         "KRABB_A2A_AGENT_CARD",
         "KRABB_AG_UI_LISTEN",
+        "KRABB_AG_UI_ORIGINS",
         "KRABB_OPENROUTER_MODEL",
         "KRABB_OPENROUTER_BASE_URL",
         "KRABB_OPENROUTER_REFERER",
@@ -10140,8 +10171,10 @@ fn tools(shell_enabled: bool) -> Vec<ToolSpec> {
         ("search", "Search workspace text.", &["path", "text"]),
         ("fetch", "Fetch bounded text from a public HTTPS URL.", &["url"]),
         ("patch", "Apply an approved Git patch.", &["text"]),
-        ("git", "Inspect or manage approved Git worktrees.", &["args"]),
+        ("git", "Run approved Git operations; repository filters may execute programs.", &["args"]),
     ];
+
+    definitions.retain(|(name, _, _)| shell_enabled || !matches!(*name, "git" | "patch"));
 
     if shell_enabled {
         definitions.push((
@@ -10187,8 +10220,9 @@ fn tools(shell_enabled: bool) -> Vec<ToolSpec> {
 #[cfg(test)]
 mod tool_availability_tests {
     use super::{
-        ToolContent, ToolRegistry, ToolResult, decode_tool_result, schedule_listing_allowed,
-        scheduler_tools, tool_result_value, tools, validate_registered_args, validate_tool_spec,
+        ToolContent, ToolRegistry, ToolResult, data_tools, decode_tool_result,
+        schedule_listing_allowed, scheduler_tools, tool_result_value, tools,
+        validate_registered_args, validate_tool_spec,
     };
 
     #[test]
@@ -10205,6 +10239,17 @@ mod tool_availability_tests {
 
         assert_eq!(fetch.schema["required"], serde_json::json!(["url"]));
         assert_eq!(fetch.schema["properties"]["url"]["type"], "string");
+    }
+
+    #[test]
+    fn structured_data_tool_has_a_bounded_schema_and_guidance() {
+        let data = data_tools().pop().unwrap();
+        validate_tool_spec(&data).unwrap();
+
+        assert_eq!(data.name, "data");
+        assert!(data.description.unwrap().contains("structured data"));
+        assert_eq!(data.schema["properties"]["columns"]["maxItems"], 64);
+        assert!(data.schema["properties"]["columns"].get("minItems").is_none());
     }
 
     #[test]
@@ -10357,6 +10402,59 @@ fn memory_tools() -> Vec<ToolSpec> {
             }),
         },
     ]
+}
+
+fn data_tools() -> Vec<ToolSpec> {
+    vec![ToolSpec {
+        name: "data".into(),
+        description: Some(
+            "Use this capability when the user asks to model, organize, save, retrieve, update, or explore structured data. First list existing databases and tables, then reuse a compatible schema or create a database and table with named, typed columns before inserting records. Add optional columns or remove columns when the user asks to change a schema. Query records by exact field values; continue a truncated query with its next_after ID. Data is durable and scoped to this conversation identity. Do not use workspace files or memory for structured records. Ask the user to resolve ambiguous fields or types before creating a schema. Mutations follow Krabb's configured tool approval policy.".into(),
+        ),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "enum": [
+                    "create_database", "list_databases", "drop_database",
+                    "create_table", "list_tables", "describe_table", "drop_table",
+                    "add_column", "drop_column",
+                    "insert", "query", "update", "delete"
+                ]},
+                "database": {"type": "string", "description": "Database name; defaults to default."},
+                "table": {"type": "string"},
+                "columns": {
+                    "type": "array", "maxItems": 64,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "type": {"type": "string", "enum": ["text", "integer", "real", "boolean", "json"]},
+                            "required": {"type": "boolean"}
+                        },
+                        "required": ["name", "type"],
+                        "additionalProperties": false
+                    }
+                },
+                "column": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "type": {"type": "string", "enum": ["text", "integer", "real", "boolean", "json"]},
+                        "required": {"type": "boolean"}
+                    },
+                    "required": ["name", "type"],
+                    "additionalProperties": false
+                },
+                "column_name": {"type": "string"},
+                "record": {"type": "object", "description": "Record fields; values must match the table columns."},
+                "filter": {"type": "object", "description": "Exact field/value matches; omit to list records."},
+                "id": {"type": "integer", "minimum": 1},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                "after_id": {"type": "integer", "minimum": 1, "description": "Use next_after from the previous query page."}
+            },
+            "required": ["operation"],
+            "additionalProperties": false
+        }),
+    }]
 }
 
 fn scheduler_tools(
@@ -10918,6 +11016,12 @@ async fn answer(
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let memory_plugin = plugins.find(Capability::Memory).await;
     let mut registry = tool_registry(plugins, tools_enabled, shell_enabled).await?;
+
+    if plugins.get("sqlite").await.is_some_and(|plugin| plugin.supports(Capability::Store))
+        && tools_enabled
+    {
+        registry.specs.extend(data_tools());
+    }
 
     if !provider.supports(Capability::Vision) {
         registry.specs.retain(|spec| !requires_vision_tool(&spec.name));
@@ -11492,12 +11596,12 @@ fn mutating(name: &str, args: &serde_json::Value) -> bool {
         | "computer_screenshot"
         | "computer_windows" => false,
 
-        "git" => !args["args"].as_array().is_some_and(|values| {
-            matches!(
-                values.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>().as_slice(),
-                ["status"] | ["diff"] | ["worktree", "list"]
-            )
-        }),
+        "data" => !matches!(
+            args["operation"].as_str(),
+            Some("list_databases" | "list_tables" | "describe_table" | "query")
+        ),
+
+        "git" => true,
 
         name if name.starts_with("browser_") => {
             !matches!(name, "browser_tabs" | "browser_snapshot" | "browser_screenshot")
@@ -11544,6 +11648,34 @@ async fn tool_with_registry(
     turn_id: &str,
     failed_tool: &mut Option<String>,
 ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+    if name == "data" {
+        let plugin = plugins
+            .get("sqlite")
+            .await
+            .filter(|plugin| plugin.supports(Capability::Store))
+            .ok_or("The SQLite data capability is not installed.")?;
+        let serde_json::Value::Object(values) = &mut args else {
+            return Err("Data tool arguments must be an object.".into());
+        };
+
+        values.insert("scope".into(), serde_json::Value::String(memory_scope.into()));
+        let response = match plugin.call(Request::call(id, "data", args)).await {
+            Ok(response) => response,
+
+            Err(error) => {
+                *failed_tool = Some("sqlite".into());
+                return Err(error.into());
+            }
+        };
+
+        if let Some(error) = response.error {
+            return Err(error.message.into());
+        }
+
+        let value = response.result.ok_or("The SQLite plugin returned no data result.")?;
+        return Ok(ToolResult::text(clip(value.to_string(), TEXT_LIMIT)));
+    }
+
     if let Some(action) = name.strip_prefix("schedule_")
         && action != "propose"
     {
@@ -12041,7 +12173,7 @@ async fn execute_tool_with_registry(
     schedule_run_id: Option<u64>,
     tool_call: usize,
 ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
-    if name == "shell" && !shell_enabled {
+    if matches!(name, "shell" | "git" | "patch") && !shell_enabled {
         return Err("Shell access is not authorized for this turn.".into());
     }
 
@@ -12355,14 +12487,20 @@ fn approval_text(name: &str, args: &serde_json::Value) -> String {
         }
 
         "patch" => {
-            format!("apply a patch containing {} bytes", args["text"].as_str().map_or(0, str::len))
+            format!(
+                "apply a Git patch containing {} bytes, which may execute repository-configured programs",
+                args["text"].as_str().map_or(0, str::len)
+            )
         }
 
         "shell" => format!(
             "run this shell command: {}",
             clip(args["command"].as_str().unwrap_or("unknown").into(), 1_000)
         ),
-        "git" => format!("run this Git operation: {}", clip(args["args"].to_string(), 1_000)),
+        "git" => format!(
+            "run this Git operation, which may execute repository-configured programs: {}",
+            clip(args["args"].to_string(), 1_000)
+        ),
         _ => format!("run the {name} tool"),
     };
 
@@ -12894,6 +13032,7 @@ const SERVICE_VARIABLES: &[&str] = &[
     "KRABB_ACP_ARGS",
     "KRABB_A2A_AGENT_CARD",
     "KRABB_AG_UI_LISTEN",
+    "KRABB_AG_UI_ORIGINS",
     "KRABB_OPENROUTER_MODEL",
     "KRABB_OPENROUTER_BASE_URL",
     "KRABB_OPENROUTER_REFERER",
@@ -14310,6 +14449,7 @@ async fn external_command(
             "delivery" => return delivery_command(&args[1..], &root, json).await,
             "schedule" => return schedule_command(&args[1..], &root, json).await,
             "memory" | "tui" => name.clone(),
+            "data" => "sqlite".into(),
             _ => return Err(format!("Unknown native command {name}.").into()),
         }
     } else {
@@ -14318,8 +14458,8 @@ async fn external_command(
 
     let help_requested = external_command_help_requested(name, &args);
 
-    if help_requested && name != "memory" {
-        println!("{}", external_command_help(name, &owners[0].1.description));
+    if help_requested && !matches!(name.as_str(), "memory" | "data") {
+        println!("{}", style_cli_help(&external_command_help(name, &owners[0].1.description)));
         return Ok(());
     }
 
@@ -14491,8 +14631,23 @@ async fn external_command(
     }
 
     let value = response.result.ok_or("Plugin command returned no result.")?;
+    let output = if name == "data" && !json {
+        format_data_command_output(&command_args, &value)
+    } else {
+        external_command_output(&value, json)?
+    };
 
-    println!("{}", external_command_output(&value, json)?);
+    let is_custom_help = !json
+        && matches!(name.as_str(), "memory" | "data")
+        && command_args
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "help" | "--help" | "-h"));
+
+    if is_custom_help {
+        println!("{}", style_cli_help(&output));
+    } else {
+        println!("{output}");
+    }
 
     Ok(())
 }
@@ -14660,6 +14815,87 @@ fn verify_plugin_binary(
     Ok(())
 }
 
+fn cli_styles() -> clap::builder::Styles {
+    use clap::builder::styling::{RgbColor, Style};
+
+    if !cli_colors_enabled() {
+        return clap::builder::Styles::plain();
+    }
+
+    let accent = Style::new().fg_color(Some(RgbColor(255, 140, 0).into())).bold();
+
+    clap::builder::Styles::styled().header(accent).usage(accent).literal(Style::new().bold())
+}
+
+fn cli_colors_enabled() -> bool {
+    std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && !std::env::var("TERM")
+            .is_ok_and(|term| matches!(term.as_str(), "dumb" | "mono" | "vt100"))
+}
+
+fn style_cli_help(help: &str) -> String {
+    if !cli_colors_enabled() {
+        return help.to_owned();
+    }
+
+    let mut output = String::with_capacity(help.len() + 64);
+
+    for line in help.split_inclusive('\n') {
+        let (content, newline) =
+            line.strip_suffix('\n').map_or((line, ""), |content| (content, "\n"));
+
+        if matches!(
+            content,
+            "Commands:"
+                | "Options:"
+                | "Notes:"
+                | "Timing:"
+                | "History options:"
+                | "Conditional Commands:"
+                | "Plugin Commands:"
+        ) {
+            output.push_str("\x1b[1;38;2;255;140;0m");
+            output.push_str(content);
+            output.push_str("\x1b[0m");
+        } else if let Some(usage) = content.strip_prefix("Usage: ") {
+            output.push_str("\x1b[1;38;2;255;140;0mUsage:\x1b[0m \x1b[1m");
+            output.push_str(usage);
+            output.push_str("\x1b[0m");
+        } else if let Some(gap) = cli_help_row_gap(content) {
+            output.push_str("\x1b[1m");
+            output.push_str(&content[..gap]);
+            output.push_str("\x1b[0m\x1b[90m");
+            output.push_str(&content[gap..]);
+            output.push_str("\x1b[0m");
+        } else {
+            output.push_str(content);
+        }
+
+        output.push_str(newline);
+    }
+
+    output
+}
+
+fn cli_help_row_gap(line: &str) -> Option<usize> {
+    let trimmed = line.trim_start();
+    let indent = line.len() - trimmed.len();
+
+    if indent == 0 {
+        return None;
+    }
+
+    if indent + 1 >= line.len() {
+        return None;
+    }
+
+    line[indent + 1..]
+        .match_indices("  ")
+        .map(|(index, _)| indent + 1 + index)
+        .find(|index| *index > indent + 1)
+}
+
 fn external_command_help(name: &str, description: &str) -> String {
     if name == "tui" {
         return format!(
@@ -14683,11 +14919,207 @@ fn external_command_help_requested(name: &str, args: &[String]) -> bool {
 }
 
 fn external_command_args(name: &str, args: &[String]) -> Vec<String> {
-    if name == "memory" && args.first().is_some_and(|arg| arg == "--help" || arg == "-h") {
+    if (name == "data" && args.iter().any(|arg| arg == "--help" || arg == "-h"))
+        || (name == "memory" && args.first().is_some_and(|arg| arg == "--help" || arg == "-h"))
+    {
         vec!["help".into()]
+    } else if name == "data" {
+        args.iter()
+            .filter(|argument| !matches!(argument.as_str(), "--json" | "--debug" | "--verbose"))
+            .cloned()
+            .collect()
     } else {
         args.to_vec()
     }
+}
+
+fn format_data_command_output(args: &[String], value: &Value) -> String {
+    if let Some(help) = value.as_str() {
+        return help.to_owned();
+    }
+
+    let args = if args.first().is_some_and(|argument| argument == "--scope") {
+        args.get(2..).unwrap_or_default()
+    } else {
+        args
+    };
+
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+
+    match args.as_slice() {
+        ["database", "list"] => {
+            let Some(databases) = value["databases"].as_array() else {
+                return value.to_string();
+            };
+
+            if databases.is_empty() {
+                return "No databases found.".into();
+            }
+
+            format!(
+                "Databases:\n{}",
+                format_tree_list(
+                    &databases
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                )
+            )
+        }
+
+        ["database", "create", database] => {
+            if value["created"] == true {
+                format!("Created database {database}.")
+            } else {
+                format!("Database {database} already exists.")
+            }
+        }
+
+        ["database", "drop", database] => {
+            if value["deleted"] == true {
+                format!("Deleted database {database}.")
+            } else {
+                format!("Database {database} was not found.")
+            }
+        }
+
+        ["table", "list", database] => {
+            let Some(tables) = value["tables"].as_array() else {
+                return value.to_string();
+            };
+
+            if tables.is_empty() {
+                return format!("No tables found in database {database}.");
+            }
+
+            format!(
+                "Tables in {database}:\n{}",
+                format_tree_list(
+                    &tables.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()
+                )
+            )
+        }
+
+        ["table", "create", database, table, ..] => {
+            let Some(columns) = value["columns"].as_array() else {
+                return value.to_string();
+            };
+
+            if columns.is_empty() {
+                format!(
+                    "Created empty table {database}.{table}.\n\nAdd a column with:\n  krabb data column add {database} {table} NAME TYPE"
+                )
+            } else {
+                let columns = columns.iter().map(format_data_column).collect::<Vec<_>>().join(", ");
+                format!("Created table {database}.{table} with columns: {columns}.")
+            }
+        }
+
+        ["table", "describe", database, table] => {
+            let Some(columns) = value["columns"].as_array() else {
+                return value.to_string();
+            };
+
+            if columns.is_empty() {
+                format!("Table {database}.{table} has no columns yet.")
+            } else {
+                format!(
+                    "Columns in {database}.{table}:\n{}",
+                    format_tree_list(&columns.iter().map(format_data_column).collect::<Vec<_>>())
+                )
+            }
+        }
+
+        ["column", "add", database, table, ..] => {
+            let column = format_data_column(&value["column"]);
+            format!("Added column {column} to {database}.{table}.")
+        }
+
+        ["column", "remove", database, table, column] => {
+            format!("Removed column {column} from {database}.{table}.")
+        }
+
+        ["table", "drop", database, table] => {
+            if value["deleted"] == true {
+                format!("Deleted table {database}.{table}.")
+            } else {
+                format!("Table {database}.{table} was not found.")
+            }
+        }
+
+        ["insert", database, table, ..] => {
+            format!("Inserted record #{} into {database}.{table}.", value["id"])
+        }
+
+        ["query", database, table, ..] => {
+            let Some(items) = value["items"].as_array() else {
+                return value.to_string();
+            };
+
+            if items.is_empty() {
+                return format!("No records found in {database}.{table}.");
+            }
+
+            let records = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let details = item["record"]
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .map(|(name, value)| format!("{name}={}", format_data_value(value)))
+                        .collect::<Vec<_>>();
+
+                    format_tree_entry(
+                        &format!("#{}", item["id"]),
+                        &details,
+                        index + 1 == items.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut output = format!("Records in {database}.{table}:\n{}", records.join("\n"));
+
+            output.push_str(&format!("Showing {} record(s).", items.len()));
+
+            if value["truncated"] == true {
+                output.push_str(&format!(" Continue after ID {}.", value["next_after"]));
+            }
+
+            output
+        }
+
+        ["update", database, table, id, ..] => {
+            format!("Updated record #{id} in {database}.{table}.")
+        }
+
+        ["delete", database, table, id] => {
+            if value["deleted"] == true {
+                format!("Deleted record #{id} from {database}.{table}.")
+            } else {
+                format!("Record #{id} was not found in {database}.{table}.")
+            }
+        }
+
+        _ => value.to_string(),
+    }
+}
+
+fn format_data_column(value: &Value) -> String {
+    let name = value["name"].as_str().unwrap_or("column");
+    let kind = value["type"].as_str().unwrap_or("json");
+    let required = if value["required"] == true { ", required" } else { "" };
+
+    format!("{name} ({kind}{required})")
+}
+
+fn format_data_value(value: &Value) -> String {
+    if let Some(value) = value.as_str() {
+        return value.replace('\n', "\\n");
+    }
+
+    value.to_string()
 }
 
 fn external_command_output(
@@ -15484,7 +15916,7 @@ fn plugin_update_output(rows: &[serde_json::Value]) -> String {
 
     if !entries.is_empty() {
         output.push('\n');
-        output.push_str(&entries.join("\n\n"));
+        output.push_str(&entries.join("\n"));
     }
 
     output
@@ -15651,7 +16083,11 @@ where
         (Ok(()), true) => Ok(()),
 
         (Ok(()), false) => {
-            Err(format!("Plugins were updated, but runtime activation was incomplete.{}", restore)
+            if !json {
+                println!();
+            }
+
+            Err(format!("Plugins were updated, but runtime activation was incomplete.\n{restore}")
                 .into())
         }
 
@@ -15675,16 +16111,13 @@ where
         match activate(id.clone()).await {
             Ok(Some(_)) => {}
             Ok(None) => failures.push(format!(
-                " {id} could not be reloaded because the background runtime is unavailable; it will load when the background runtime starts."
+                "{id} could not be reloaded because the background runtime is unavailable; it will load when the background runtime starts."
             )),
-            Err(error) => failures.push(format!(
-                " {id} could not be reloaded: {}",
-                sentence(error.to_string())
-            )),
+            Err(error) => failures.push(format!("{id} could not be reloaded: {}", sentence(error.to_string()))),
         }
     }
 
-    if failures.is_empty() { String::new() } else { failures.join("") }
+    if failures.is_empty() { String::new() } else { failures.join("\n") }
 }
 
 fn update_at(
@@ -15762,6 +16195,7 @@ fn update_at_with_previews(
                     entry.version = manifest.version.clone();
                     entry.revision = source_revision;
                     entry.hash = hash;
+                    entry.linked = update.linked;
                     entry.protocol = manifest.protocol;
                     entry.capabilities = manifest.capabilities.clone();
                     entry.permissions = manifest.permissions.clone();
@@ -15832,11 +16266,13 @@ fn update_at_with_previews(
     drop(spinner);
 
     if !json {
-        println!("{}", plugin_update_output(&rows));
+        println!("\n{}", plugin_update_output(&rows));
+        std::io::stdout().flush()?;
     }
 
     if failed {
         if !json {
+            println!();
             std::io::stdout().flush()?;
         }
 
@@ -15971,10 +16407,6 @@ fn preview_updates_at_inner(
                 } else {
                     ""
                 };
-
-                if index > 0 {
-                    section.push(String::new());
-                }
 
                 section.push(format_tree_entry(
                     &format!("{id}@v{current} → v{available}{detail}"),
@@ -16332,7 +16764,7 @@ fn update_one(
         return Err(format!("Invalid plugin ID: {id}.").into());
     }
 
-    let resolved = if preview.is_none() {
+    let resolved = if preview.is_none() || entry.linked {
         let pin = entry.pinned.then_some(entry.revision.as_str());
         Some(resolve(&entry.source, pin)?)
     } else {
@@ -16373,8 +16805,33 @@ fn update_one(
     validate_commands(home_root, id, &manifest.commands)?;
 
     let name = plugin_name(id);
-    let binary = preview
-        .map(|candidate| candidate.binary.clone())
+    let linked_binary = if entry.linked {
+        let source = resolved.as_ref().ok_or("Linked plugin source disappeared.")?;
+
+        if source.temp.is_some() {
+            return Err(format!("Linked plugin source is not stable: {id}.").into());
+        }
+
+        let binary = plugin_binary(&source.path, id, entry.default).ok_or_else(|| {
+            format!("Binary {} was not found; build the plugin first.", plugin_name(id))
+        })?;
+
+        let matches_preview = match preview {
+            Some(candidate) => {
+                digest(&source.path.join("krabb-plugin.toml"), &binary)? == candidate.hash
+            }
+
+            None => true,
+        };
+
+        matches_preview.then_some(binary)
+    } else {
+        None
+    };
+
+    let linked = linked_binary.is_some();
+    let binary = linked_binary
+        .or_else(|| preview.map(|candidate| candidate.binary.clone()))
         .or_else(|| plugin_binary(source_path, id, entry.default));
 
     let Some(binary) = binary else {
@@ -16404,10 +16861,7 @@ fn update_one(
 
         let staged = stage.join("bin").join(&name);
 
-        if entry.linked
-            && preview.is_none()
-            && resolved.as_ref().is_some_and(|source| source.temp.is_none())
-        {
+        if linked {
             link_binary(&binary, &staged)?;
         } else {
             copy_binary(&binary, &staged)?;
@@ -16447,6 +16901,7 @@ fn update_one(
             Update {
                 destination: destination.clone(),
                 backup: had_destination.then_some(backup.clone()),
+                linked,
             },
         ))
     })();
@@ -18989,7 +19444,7 @@ done
             ]),
             concat!(
                 "Updated 1 of 2 plugins.\n",
-                "├─ codex@v0.2.0 successfully updated\n\n",
+                "├─ codex@v0.2.0 successfully updated\n",
                 "└─ telegram@v0.8.2 update failed"
             )
         );
@@ -22010,6 +22465,7 @@ done
         assert!(super::native_command("schedule"));
         assert!(super::native_command("memory"));
         assert!(super::native_command("tui"));
+        assert!(super::native_command("data"));
         let root = test_root("commands");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -22066,6 +22522,19 @@ done
                 }]
             )
             .is_err()
+        );
+
+        assert!(
+            super::validate_commands(
+                &root,
+                "sqlite",
+                &[CommandSpec {
+                    name: "data".into(),
+                    description: "Manage structured SQLite data.".into(),
+                    interactive: false,
+                }]
+            )
+            .is_ok()
         );
 
         assert!(
@@ -22141,6 +22610,7 @@ done
         assert!(!super::available_commands(&root).contains_key("ask"));
         assert!(!super::available_commands(&root).contains_key("session"));
         assert!(!super::available_commands(&root).contains_key("delivery"));
+        assert!(!super::available_commands(&root).contains_key("data"));
 
         let help = super::help_text_with_plugins(&root);
         let native = help
@@ -22235,6 +22705,9 @@ done
             },
         );
         super::save_lock_at(&root, &lock).unwrap();
+
+        assert!(!super::available_commands(&root).contains_key("schedule"));
+
         let binary = root.join("plugins/scheduler/bin").join(super::plugin_name("scheduler"));
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
         fs::write(binary, b"plugin").unwrap();
@@ -22291,13 +22764,27 @@ done
         let mut lock = super::Lock::default();
         lock.plugins.insert("memory".into(), entry("memory", "memory", "memory", false));
         lock.plugins.insert("tui".into(), entry("tui", "client", "tui", true));
+        lock.plugins.insert("sqlite".into(), entry("sqlite", "store", "data", false));
         lock.plugins.insert("codex".into(), entry("codex", "model", "codex", false));
         super::save_lock_at(&root, &lock).unwrap();
+
+        let unavailable = super::available_commands(&root);
+
+        for name in ["memory", "tui", "data"] {
+            assert!(!unavailable.contains_key(name));
+        }
+
+        for id in ["memory", "tui", "sqlite"] {
+            let binary = root.join("plugins").join(id).join("bin").join(super::plugin_name(id));
+            fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            fs::write(binary, b"plugin").unwrap();
+        }
 
         let commands = super::available_commands(&root);
 
         assert_eq!(commands["memory"][0].0, "__runtime.memory");
         assert_eq!(commands["tui"][0].0, "__runtime.tui");
+        assert_eq!(commands["data"][0].0, "__runtime.data");
         assert_eq!(commands["codex"][0].0, "codex");
 
         let help = super::help_text_with_plugins(&root);
@@ -22313,7 +22800,7 @@ done
             .unwrap();
         let plugin = help.split("Plugin Commands:").nth(1).unwrap();
 
-        for name in ["memory", "tui"] {
+        for name in ["memory", "tui", "data"] {
             assert!(!native.lines().any(|line| line.trim_start().starts_with(&format!("{name} "))));
             assert!(
                 conditional.lines().any(|line| line.trim_start().starts_with(&format!("{name} ")))
@@ -22330,6 +22817,19 @@ done
                 &[CommandSpec {
                     name: "memory".into(),
                     description: "Shadow memory.".into(),
+                    interactive: false,
+                }]
+            )
+            .is_err()
+        );
+
+        assert!(
+            super::validate_commands(
+                &root,
+                "third-party",
+                &[CommandSpec {
+                    name: "data".into(),
+                    description: "Shadow SQLite data.".into(),
                     interactive: false,
                 }]
             )
@@ -22639,9 +23139,65 @@ done
         );
 
         assert_eq!(super::external_command_args("memory", &["--help".into()]), ["help"]);
+        assert_eq!(super::external_command_args("data", &["--help".into()]), ["help"]);
+        assert_eq!(
+            super::external_command_args(
+                "data",
+                &["table".into(), "create".into(), "--help".into()]
+            ),
+            ["help"]
+        );
+
+        assert_eq!(
+            super::external_command_args(
+                "data",
+                &["--json".into(), "database".into(), "list".into()]
+            ),
+            ["database", "list"]
+        );
+
         assert_eq!(
             super::external_command_args("memory", &["search".into(), "tea".into()]),
             ["search", "tea"]
+        );
+
+        assert_eq!(
+            super::format_data_command_output(
+                &["database".into(), "list".into()],
+                &serde_json::json!({"databases": []})
+            ),
+            "No databases found."
+        );
+
+        assert_eq!(
+            super::format_data_command_output(
+                &["database".into(), "list".into()],
+                &serde_json::json!({"databases": ["foo", "bar"]})
+            ),
+            "Databases:\n├─ foo\n└─ bar"
+        );
+
+        assert_eq!(
+            super::format_data_command_output(
+                &["table".into(), "list".into(), "foo".into()],
+                &serde_json::json!({"tables": ["bar", "baz"]})
+            ),
+            "Tables in foo:\n├─ bar\n└─ baz"
+        );
+
+        assert_eq!(
+            super::format_data_command_output(
+                &["table".into(), "create".into(), "notes".into(), "note".into(),],
+                &serde_json::json!({"columns": []})
+            ),
+            "Created empty table notes.note.\n\nAdd a column with:\n  krabb data column add notes note NAME TYPE"
+        );
+
+        let structured = serde_json::json!({"databases": ["notes"]});
+
+        assert_eq!(
+            super::external_command_output(&structured, true).unwrap(),
+            "{\n  \"databases\": [\n    \"notes\"\n  ]\n}"
         );
 
         let session =
@@ -22827,6 +23383,7 @@ done
 
             assert!(output.contains(expected), "completion output for {name} was unexpected");
             assert!(output.contains("schedule"), "schedule missing from {name} completion");
+            assert!(output.contains("data"), "data missing from {name} completion");
             assert!(output.contains("retry"), "schedule actions missing from {name} completion");
         }
 
@@ -22886,6 +23443,21 @@ done
         assert!(matches!(
             tui.command,
             Command::Tui(super::NativePluginCommandArgs { args }) if args == ["--once", "ping"]
+        ));
+
+        let data = Cli::try_parse_from(["krabb", "data", "database", "list"]).unwrap();
+
+        assert!(matches!(
+            data.command,
+            Command::Data(super::NativePluginCommandArgs { args })
+                if args == ["database", "list"]
+        ));
+
+        let data_help = Cli::try_parse_from(["krabb", "data", "help"]).unwrap();
+
+        assert!(matches!(
+            data_help.command,
+            Command::Data(super::NativePluginCommandArgs { args }) if args == ["help"]
         ));
 
         let memory_help = Cli::try_parse_from(["krabb", "memory", "help"]).unwrap();
@@ -23592,6 +24164,8 @@ done
         assert!(super::mutating("patch", &serde_json::json!({})));
         assert!(super::mutating("shell", &serde_json::json!({})));
         assert!(super::mutating("memory_remember", &serde_json::json!({})));
+        assert!(super::mutating("data", &serde_json::json!({"operation":"insert"})));
+        assert!(!super::mutating("data", &serde_json::json!({"operation":"query"})));
         assert!(super::mutating("schedule_propose", &serde_json::json!({})));
         assert!(super::mutating("schedule_run", &serde_json::json!({"id": 1})));
         assert!(super::mutating("schedule_retry", &serde_json::json!({"id": 1})));
@@ -23611,7 +24185,7 @@ done
         assert!(!super::mutating("read", &serde_json::json!({})));
         assert!(!super::mutating("browser_screenshot", &serde_json::json!({})));
         assert!(!super::mutating("computer_screenshot", &serde_json::json!({})));
-        assert!(!super::mutating("git", &serde_json::json!({"args": ["status"]})));
+        assert!(super::mutating("git", &serde_json::json!({"args": ["status"]})));
         assert!(super::requires_vision_tool("browser_screenshot"));
         assert!(super::requires_vision_tool("computer_screenshot"));
         assert!(!super::requires_vision_tool("browser_snapshot"));
@@ -25084,6 +25658,10 @@ done
                 super::update_at_with_previews(&root, true, &snapshot.candidates, true).unwrap();
 
                 assert_eq!(super::load_lock_at(&root).unwrap().plugins["memory"].version, "0.2.0");
+                assert!(!super::load_lock_at(&root).unwrap().plugins["memory"].linked);
+                let installed = super::binary_at("memory", &root).unwrap();
+
+                assert!(super::verify_plugin_integrity(&root, "memory", &installed).is_ok());
             }
         }
 
@@ -25097,6 +25675,61 @@ done
             super::update_at_with_previews(&root, true, &snapshot.candidates, true).unwrap_err();
 
         assert!(error.to_string().contains("preview for memory is stale"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn applying_an_unchanged_linked_preview_keeps_the_source_link_valid() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("linked-plugin-preview-integrity");
+        let _ = fs::remove_dir_all(&root);
+        super::init_at(&root).unwrap();
+
+        let source = root.join("sources/memory");
+        fs::create_dir_all(source.join("bin")).unwrap();
+
+        for version in ["0.1.0", "0.2.0"] {
+            fs::write(
+                source.join("krabb-plugin.toml"),
+                format!(
+                    "id = 'memory'\nversion = '{version}'\nprotocol = {{ major = 0, minor = 1 }}\ncapabilities = ['memory']\n"
+                ),
+            )
+            .unwrap();
+
+            let binary = source.join("bin/krabb-plugin-memory");
+            write_test_plugin(&binary, "memory", "memory", version);
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+            if version == "0.1.0" {
+                super::link_at(
+                    Source {
+                        id: "memory".into(),
+                        source: Some(source.display().to_string()),
+                        revision: None,
+                        yes: true,
+                    },
+                    true,
+                    &root,
+                )
+                .unwrap();
+            }
+        }
+
+        super::preview_updates_at(&root, false).unwrap();
+        let snapshot = super::load_update_preview_snapshot_at(&root).unwrap();
+        super::update_at_with_previews(&root, true, &snapshot.candidates, true).unwrap();
+
+        let lock = super::load_lock_at(&root).unwrap();
+
+        assert!(lock.plugins["memory"].linked);
+
+        let installed = super::binary_at("memory", &root).unwrap();
+
+        assert!(super::verify_plugin_integrity(&root, "memory", &installed).is_ok());
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -25385,7 +26018,9 @@ done
         .await
         .unwrap_err();
 
-        assert!(error.to_string().contains("activation was incomplete"));
+        assert!(
+            error.to_string().contains("activation was incomplete.\nmemory could not be reloaded")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

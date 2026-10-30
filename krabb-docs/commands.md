@@ -53,14 +53,29 @@ krabb <plugin-command> [arguments...]
 
 ## Command Tree And Help
 
-`krabb help` and `krabb --help` show native, conditional, and plugin commands.
+`krabb help` and `krabb --help` group commands into three types:
 
-- `session` appears with a model plugin; `delivery` appears with a messaging
-  plugin. `schedule`, `memory`, and `tui` depend on their respective plugins.
-- Plugin commands update when plugins are installed or linked.
-- `ask` is always listed and reports an actionable error if no model is ready.
+- **Native commands** are part of the Krabb CLI and do not depend on a plugin,
+  such as `init`, `doctor`, and `plugin`.
+- **Conditional native commands** are first-party Krabb commands that need an
+  installed plugin or capability. For example, `session` needs a model,
+  `delivery` needs a messaging channel, `schedule` needs the scheduler, and
+  `memory`, `tui`, and `data` need their respective plugins. These commands
+  expose a Krabb-managed capability and appear in help when usable; an
+  underlying plugin may implement the capability.
+- **Plugin commands** are declared by a plugin and delegated to it. They appear
+  under Plugin Commands when installed, for example `codex`.
 - `krabb service` prints service help; use `krabb service status` for its
   current state. `krabb --version` and `krabb version` are equivalent.
+
+`ask` is a native command that is always listed and reports an actionable error
+if no model is ready. SQLite's `data` command is a first-party conditional
+command: runtime exposes it when SQLite is installed and routes its data
+operations to the plugin. The agent-facing data tool uses the same conditional
+capability.
+
+For the boundary between the core library, runtime, and plugins, see
+[Product Architecture](product.md#architecture-and-interfaces).
 
 ## Shell Completion
 
@@ -137,8 +152,10 @@ without opening the full-screen client; pass `--session` to continue an
 existing session.
 
 The TUI supports `/help`, `/status`, `/model`, `/session`, `/workspace`,
-`/approvals`, `/schedule`, `/memory`, `/store`, and `/plugin`. Use `/help` for the
-commands available in the current session. See the
+`/approvals`, `/schedule`, `/memory`, `/data`, and `/plugin`. Use `/help` for
+the commands available in the current session. `/data value` manages simple
+session-scoped values; `/data database`, `/data table`, and `/data column`
+manage structured records. `/store` remains as a compatibility alias. See the
 [TUI guide](../krabb-plugins/tui/README.md) for controls, sessions, and client
 commands.
 
@@ -173,6 +190,24 @@ Use `krabb memory help` for syntax. Learning defaults to `guided`; autonomous
 learning is opt-in. See the
 [Memory plugin guide](../krabb-plugins/memory/README.md) for scopes and record
 behavior.
+
+## Structured Data
+
+When SQLite is installed, `krabb data` exposes commands to create and inspect
+logical databases and tables, and insert, query, update, and delete structured
+records. The TUI offers the same operations through `/data`; those commands
+share the active TUI session's data with the agent. CLI data uses a separate
+local scope by default; use `krabb data --scope tui:default ...` to inspect
+that TUI conversation's data. Running `krabb data` without a subcommand or
+passing `krabb data help` shows the full usage, commands, options, and notes.
+CLI results are human-readable by default; add `--json` for JSON output. Tables
+can be created empty, then defined with `krabb data column add DB TABLE NAME TYPE`
+and `krabb data column remove DB TABLE COLUMN`; JSON schemas remain available
+for bulk creation. Use `text` or `string` for text columns. List results use
+tree branches like other Krabb inventories.
+See the
+[SQLite guide](../krabb-plugins/sqlite/README.md) for examples, limits, and
+column types.
 
 ## Sessions And Deliveries
 

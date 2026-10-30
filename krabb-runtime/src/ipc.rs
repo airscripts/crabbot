@@ -1225,7 +1225,7 @@ async fn capability_call(request: &IpcRequest, state: &State) -> IpcResponse {
             ["audit", "forget", "index", "learning", "list", "recall", "remember", "search"]
                 .as_slice(),
         ),
-        "sqlite" => (Capability::Store, ["delete", "get", "put"].as_slice()),
+        "sqlite" => (Capability::Store, ["data", "delete", "get", "put"].as_slice()),
 
         _ => {
             return IpcResponse::fail(
@@ -2927,9 +2927,9 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn proxies_only_value_operations_to_the_sqlite_store() {
+    async fn proxies_value_and_structured_data_operations_to_the_sqlite_store() {
         let state = state_at("sqlite-capability-call");
-        let script = r#"while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); case "$line" in *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol":{"major":0,"minor":1},"id":"sqlite","version":"0.1.0","capabilities":["store"]}}' ;; *put*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}' ;; *get*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"found":true,"value":"stored"}}' ;; *delete*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"deleted":true}}' ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}'; exit 0 ;; esac; done"#;
+        let script = r#"while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); case "$line" in *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol":{"major":0,"minor":1},"id":"sqlite","version":"0.1.0","capabilities":["store"]}}' ;; *put*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}' ;; *get*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"found":true,"value":"stored"}}' ;; *delete*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"deleted":true}}' ;; *data*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"items":[]}}' ;; *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}'; exit 0 ;; esac; done"#;
         let process = krabb_core::plugin::Process::start_with("sh", ["-c", script]).await.unwrap();
         state.plugins.insert(crate::Live::new(process)).await;
 
@@ -2937,6 +2937,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
             (1, "put", serde_json::json!({"ok": true})),
             (2, "get", serde_json::json!({"found": true, "value": "stored"})),
             (3, "delete", serde_json::json!({"deleted": true})),
+            (4, "data", serde_json::json!({"items": []})),
         ] {
             let response = capability_call(
                 &IpcRequest::call(
@@ -2954,7 +2955,7 @@ while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][
 
         let denied = capability_call(
             &IpcRequest::call(
-                4,
+                5,
                 "secret",
                 "capability.call",
                 json!({"service": "sqlite", "method": "enqueue", "params": {}}),

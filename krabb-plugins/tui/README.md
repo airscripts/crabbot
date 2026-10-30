@@ -41,8 +41,9 @@ Use `/help` for commands available in the current session. Common commands:
 - `/session`, `/new`, `/model`, and `/workspace` manage conversation context.
 - `/plugin`, `/deliveries`, `/retry`, and `/drop` inspect plugin and delivery
   state.
-- `/schedule`, `/memory`, and `/store` are available when their plugins are
-  installed.
+- `/schedule`, `/memory`, and `/data` are available when their plugins are
+  installed. Use `/data value` for simple session values; `/store` remains a
+  compatibility alias.
 - `/compact` summarizes older turns; `/clear` clears an idle session.
 
 The TUI stores its command exchanges and completed model turns in the shared

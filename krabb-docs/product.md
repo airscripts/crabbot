@@ -59,6 +59,25 @@ Brand positioning:
 - Official plugins include intelligence providers, messaging channels, tools,
   memory and storage, browser and isolated desktop controls, and optional agent
   interoperability through ACP, A2A, and AG-UI.
+
+### Core, Runtime, And Plugin Responsibilities
+
+- **Core** owns provider-neutral agent behavior and contracts: normalized
+  messages and tools, the turn loop, context, policy, and plugin protocol types.
+  It does not know SQLite, plugin IDs, or database schemas.
+- **Runtime** hosts the core behavior. It owns daemon lifecycle, configuration,
+  plugin discovery and process management, IPC, and routing between agent
+  requests and installed plugins. It can expose a first-party command or tool
+  only when the plugin that implements its capability is available.
+- **Plugins** implement capabilities and their external I/O. The SQLite plugin
+  owns database and record persistence. Runtime exposes the agent's `data`
+  tool and routes its requests to SQLite; core sees only the generic tool and
+  plugin contracts.
+
+This division means a capability can be a first-party Krabb feature while its
+implementation remains an optional plugin. Its command can therefore be
+conditional on that plugin being installed.
+
 - Every plugin uses versioned JSON-RPC 2.0 over strict LF-delimited stdio. stdout is
   protocol-only and stderr is for redacted logs. Require handshake, protocol
   range negotiation, capability advertisement, health, shutdown, correlated
@@ -88,10 +107,12 @@ Brand positioning:
   credentials, protected-file fallback, and systemd-user, launchd-agent, and
   Windows Service support.
 - CLI commands include init, doctor, status, version, plugin
-  install/link/list/update/uninstall, session, delivery, service, export, validate,
-  and import. The host-managed `ask` command appears when an installed model
-  plugin can run; other optional commands are registered by plugins such as
-  `code`, `codex`, `memory`, and `tui`. Human output is default; JSON and noninteractive
+  install/link/list/update/uninstall, session, delivery, service, export,
+  validate, and import. Conditional native commands such as `session`,
+  `delivery`, `schedule`, `memory`, `tui`, and `data` appear when their backing
+  capability is available. The `ask` command is always listed and reports an
+  actionable error if no model is ready. Other plugin-specific commands include
+  `code` and `codex`. Human output is default; JSON and noninteractive
   confirmation are explicit.
 - TUI supports chat, sessions, model/workspace switching, approvals, schedules,
   memory, plugin health, and streamed activity. Session transcripts retain
@@ -122,8 +143,10 @@ Brand positioning:
   is not isolated; process, filesystem, and network isolation remain the
   operator's responsibility.
 - Whisper downloads local models separately and is CPU-first.
-- SQLite supplies WAL persistence, migrations, leases, deduplication, and
-  durable outbox support.
+- SQLite gives the agent durable structured databases and typed tables for
+  user data, with scoped record CRUD and bounded queries. Its separate store
+  methods also provide key/value values, leases, and deduplication; daemon
+  message delivery remains in runtime state.
 - The optional memory plugin provides scoped, auditable, searchable, editable,
   and deletable records. Guided learning is the default and saves only on an
   explicit user request; autonomous learning retains stable, useful facts

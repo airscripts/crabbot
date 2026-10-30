@@ -3,8 +3,15 @@
 The AG-UI plugin serves a local HTTP endpoint that accepts AG-UI run input and
 streams events as chunked server-sent events. It calls the configured Krabb
 model through the host. The listener binds to `127.0.0.1:8787` by default; set
-`KRABB_AG_UI_LISTEN` to change it. Cross-origin browser requests are accepted
-only from loopback origins.
+`KRABB_AG_UI_LISTEN` to change it. Every POST requires `Authorization: Bearer <token>`. Set `KRABB_AG_UI_TOKEN`
+to a cryptographically random token of at least 32 ASCII characters before
+starting Krabb; the plugin refuses to start without it. Keep this token secret.
+Browser access is disabled by default. Set `KRABB_AG_UI_ORIGINS` to a
+comma-separated list of exact loopback origins, for example
+`http://localhost:3000`. Other origins are rejected even with a valid token.
+Preflight requests do not need a token; actual requests always do.
+Incomplete request headers and bodies time out after 10 seconds, releasing
+the connection slot. At most four requests are processed concurrently.
 
 Run `krabb ag-ui`. The command stays active until interrupted and prints its
 bound address. Send a JSON run input to `POST /` with `threadId`, `runId`, and
