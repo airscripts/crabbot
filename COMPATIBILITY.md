@@ -67,7 +67,7 @@ checks that still need a real provider, channel, backend, or installation.
 | Discord, Signal, Slack, Telegram, WhatsApp           | Workspace tests and protocol smoke passed on 2026-10-27.                           | Verify receive, send, acknowledgement, media, and reconnect with test accounts. |
 | A2A, ACP, AG-UI                                      | Workspace tests and protocol smoke passed on 2026-10-27.                           | Exercise a request lifecycle with a compatible external agent or client.        |
 | MCP                                                  | Protocol smoke and a loopback HTTP `tools/list` fixture passed on 2026-10-27.      | Exercise the configured transport against an intended MCP server.               |
-| Memory, Scheduler, SQLite, Tools, TUI                | Local capability smoke and daemon or IPC checks passed on 2026-10-27.              | Repeat the relevant workflow in the target installation.                        |
+| Memory, Scheduler, SQLite, Tools, TUI                | Local capability smoke and daemon or IPC checks passed on 2026-10-27.              | Verify SQLite tool discovery, conditional `data` command/help visibility, scope isolation, approval, and database/table/column/record commands in the target installation. |
 | Whisper                                              | Process smoke with a deterministic local transcriber fixture passed on 2026-10-27. | Verify transcription with the intended local backend.                           |
 | Browser                                              | Linux x86_64 Playwright fixture passed on 2026-10-27.                              | Verify the installed browser dependencies and workflows on each target OS.      |
 | Computer                                             | Linux x86_64 isolated Xvfb fixture passed on 2026-10-27.                           | Verify interactive desktop behavior on macOS and Windows where enabled.         |
@@ -110,7 +110,7 @@ handshake has passed.
 | Scheduler  | [ ]          | [x]           | [ ]          | [ ]           | [ ]            | [ ]             |
 | Signal     | [ ]          | [ ]           | [ ]          | [ ]           | [ ]            | [ ]             |
 | Slack      | [ ]          | [ ]           | [ ]          | [ ]           | [ ]            | [ ]             |
-| SQLite     | [ ]          | [ ]           | [ ]          | [ ]           | [ ]            | [ ]             |
+| SQLite     | [ ]          | [x]           | [ ]          | [ ]           | [ ]            | [ ]             |
 | Telegram   | [ ]          | [ ]           | [ ]          | [ ]           | [ ]            | [ ]             |
 | Tools      | [ ]          | [x]           | [ ]          | [ ]           | [ ]            | [ ]             |
 | TUI        | [ ]          | [x]           | [ ]          | [ ]           | [ ]            | [ ]             |
@@ -121,3 +121,11 @@ Keep fixture, credentialed integration, and full installation results distinct.
 Do not mark a component complete based only on a successful build or protocol
 handshake. Record OS versions and detailed results in the corresponding
 [operating-system status row](#operating-system-functional-status).
+
+AG-UI now requires a bearer token (`KRABB_AG_UI_TOKEN`) and explicit browser
+origins (`KRABB_AG_UI_ORIGINS`). Windows filesystem confinement uses directory
+locks; its replacement regression test requires Windows execution.
+
+Git inspection and Git-backed patches now require shell authorization and
+the configured tool approval policy. The filter-execution regression test
+checks that blocked operations cannot invoke a repository clean filter.

@@ -134,6 +134,7 @@ jobs:
         env:
           KRABB_VERSION: ${{ inputs.version }}
           KRABB_TARGET: ${{ matrix.target }}
+          KRABB_OS: ${{ matrix.os }}
 
         run: |
           set -euo pipefail
@@ -162,8 +163,14 @@ jobs:
               HOME="$smoke/home" XDG_CONFIG_HOME="$smoke/config" KRABB_HOME="$smoke/home/krabb" \
                 "$package/bin/krabb" service status
 
-              test -f "$smoke/config/systemd/user/krabb.service"
-              rm -f "$smoke/config/systemd/user/krabb.service"
+              case "$KRABB_OS" in
+                linux) service="$smoke/config/systemd/user/krabb.service" ;;
+                macos) service="$smoke/home/Library/LaunchAgents/it.airscript.krabb.plist" ;;
+                *) exit 1 ;;
+              esac
+
+              test -f "$service"
+              rm -f "$service"
             else
               [[ -f "$package/krabb-plugin.toml" ]]
               plugin=${name#krabb-}

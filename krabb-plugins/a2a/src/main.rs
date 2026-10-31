@@ -348,6 +348,8 @@ async fn stream_message(
     let mut buffer = Vec::new();
     let mut bytes = 0_usize;
     let mut result = Value::Null;
+    let mut pending = String::new();
+    let mut emitted = 0_usize;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk
@@ -383,8 +385,9 @@ async fn stream_message(
                     )));
                 }
 
-                result = value.get("result").cloned().unwrap_or(value);
-                emit_stream_event(&result, emitter).await?;
+                let event = value.get("result").unwrap_or(&value);
+                accumulate_event(&mut result, event);
+                emit_stream_event(event, emitter, &mut pending, &mut emitted).await?;
             }
         }
     }
@@ -393,7 +396,57 @@ async fn stream_message(
         return Err(krabb_core::Error::Protocol("A2A stream returned no events.".into()));
     }
 
+    if !pending.is_empty() {
+        emitter.event(json!({"kind":"text","text":pending})).await?;
+    }
+
     Ok(result)
+}
+
+fn accumulate_event(result: &mut Value, event: &Value) {
+    let Some(update) = event.get("statusUpdate").or_else(|| event.get("artifactUpdate")) else {
+        *result = event.get("task").or_else(|| event.get("message")).unwrap_or(event).clone();
+        return;
+    };
+
+    if !result.is_object() {
+        *result = json!({});
+    }
+
+    result["id"] = update["taskId"].clone();
+    result["contextId"] = update["contextId"].clone();
+
+    if event.get("statusUpdate").is_some() {
+        result["status"] = update["status"].clone();
+        return;
+    }
+
+    let artifact = &update["artifact"];
+
+    if !result["artifacts"].is_array() {
+        result["artifacts"] = json!([]);
+    }
+
+    let artifacts = result["artifacts"].as_array_mut().unwrap();
+
+    if let Some(previous) = artifacts.iter_mut().find(|previous| {
+        artifact["artifactId"].is_string() && previous["artifactId"] == artifact["artifactId"]
+    }) {
+        if update["append"] == true {
+            if !previous["parts"].is_array() {
+                previous["parts"] = json!([]);
+            }
+
+            previous["parts"]
+                .as_array_mut()
+                .unwrap()
+                .extend(artifact["parts"].as_array().into_iter().flatten().cloned());
+        } else {
+            *previous = artifact.clone();
+        }
+    } else {
+        artifacts.push(artifact.clone());
+    }
 }
 
 async fn read_json(response: reqwest::Response, label: &str) -> krabb_core::Result<Value> {
@@ -420,21 +473,27 @@ async fn read_json(response: reqwest::Response, label: &str) -> krabb_core::Resu
         .map_err(|error| krabb_core::Error::Protocol(format!("{label} was invalid JSON: {error}.")))
 }
 
-async fn emit_stream_event(event: &Value, emitter: &mut Emitter) -> krabb_core::Result<()> {
+async fn emit_stream_event(
+    event: &Value,
+    emitter: &mut Emitter,
+    pending: &mut String,
+    emitted: &mut usize,
+) -> krabb_core::Result<()> {
     let status = &event["statusUpdate"]["status"];
 
     let task = event.get("task").unwrap_or(event);
 
     if let Some(text) = task_text(task) {
-        emitter.event(json!({"kind":"text","text":text})).await?;
+        pending.push_str(&text);
     }
 
     if let Some(state) = status["state"].as_str() {
-        emitter.event(json!({"kind":"text","text":format!("[A2A task: {state}]")})).await?;
+        pending.push_str(&format!("[A2A task: {state}]"));
     }
 
-    if let Some(text) = artifact_text(&event["artifactUpdate"]["artifact"]) {
-        emitter.event(json!({"kind":"text","text":text})).await?;
+    if !pending.is_empty() && *emitted < 255 {
+        emitter.event(json!({"kind":"text","text":std::mem::take(pending)})).await?;
+        *emitted += 1;
     }
 
     Ok(())
@@ -756,6 +815,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coalesces_external_updates_without_losing_artifact_text() {
+        let (output, mut events) = tokio::sync::mpsc::channel(256);
+        let mut emitter = krabb_core::plugin::Emitter::new(output);
+        let mut pending = String::new();
+        let mut emitted = 0;
+
+        for _ in 0..300 {
+            super::emit_stream_event(
+                &json!({"artifactUpdate":{"artifact":{"parts":[{"text":"piece"}]}}}),
+                &mut emitter,
+                &mut pending,
+                &mut emitted,
+            )
+            .await
+            .unwrap();
+        }
+
+        emitter.event(json!({"kind":"text","text":pending})).await.unwrap();
+        let mut text = String::new();
+        let mut count = 0;
+
+        while let Ok(event) = events.try_recv() {
+            text.push_str(event["params"]["event"]["text"].as_str().unwrap());
+            count += 1;
+        }
+
+        assert_eq!(count, 256);
+        assert_eq!(text, "piece".repeat(300));
+    }
+
+    #[tokio::test]
     async fn streams_agent_task_updates_as_normalized_text_events() {
         let event = format!("data: {}\n\n", task());
         let (endpoint, server) = mock_server(vec![
@@ -776,6 +866,122 @@ mod tests {
         assert_eq!(result["text"], "answer");
         assert_eq!(events.recv().await.unwrap()["params"]["event"]["text"], "answer");
         assert!(server.await.unwrap()[1].contains("SendStreamingMessage"));
+    }
+
+    #[tokio::test]
+    async fn retains_streamed_artifacts_in_the_final_summary() {
+        let updates = [
+            json!({"artifactUpdate":{
+                "taskId":"task-1", "contextId":"context-1",
+                "artifact":{"artifactId":"answer", "parts":[{"text":"answer"}]}
+            }}),
+            json!({"statusUpdate":{
+                "taskId":"task-1", "contextId":"context-1",
+                "status":{"state":"TASK_STATE_COMPLETED"}
+            }}),
+        ];
+
+        let body = updates
+            .into_iter()
+            .map(|result| format!("data: {}\n\n", json!({"jsonrpc":"2.0","id":1,"result":result})))
+            .collect::<String>();
+
+        let (endpoint, server) = mock_server(vec![
+            ("application/json".into(), card("MOCK_ENDPOINT", true)),
+            ("text/event-stream".into(), body),
+        ])
+        .await;
+
+        let client = reqwest::Client::new();
+        let (output, mut events) = tokio::sync::mpsc::channel(8);
+        let mut emitter = krabb_core::plugin::Emitter::new(output);
+        let request =
+            A2aRequest::parse(&[json!("send"), json!("--card"), json!(endpoint), json!("hello")])
+                .unwrap();
+
+        let result = execute(&client, request, &mut emitter).await.unwrap();
+
+        assert_eq!(
+            result,
+            json!({
+                "taskId":"task-1", "contextId":"context-1",
+                "status":"TASK_STATE_COMPLETED", "text":"answer"
+            })
+        );
+
+        assert_eq!(events.recv().await.unwrap()["params"]["event"]["text"], "answer");
+        assert_eq!(
+            events.recv().await.unwrap()["params"]["event"]["text"],
+            "[A2A task: TASK_STATE_COMPLETED]"
+        );
+
+        assert!(events.try_recv().is_err());
+        assert!(server.await.unwrap()[1].contains("SendStreamingMessage"));
+    }
+
+    #[test]
+    fn accumulates_task_status_and_artifact_replacements_and_appends() {
+        let mut result = serde_json::Value::Null;
+        super::accumulate_event(
+            &mut result,
+            &json!({"task":{
+                "id":"task-1", "contextId":"context-1",
+                "status":{"state":"TASK_STATE_WORKING"},
+                "artifacts":[{"artifactId":"answer", "parts":[{"text":"draft"}]}]
+            }}),
+        );
+
+        for (id, text, append) in [
+            ("answer", " discarded", true),
+            ("other", "second", true),
+            ("answer", "final", false),
+            ("answer", " answer", true),
+        ] {
+            super::accumulate_event(
+                &mut result,
+                &json!({"artifactUpdate":{
+                    "taskId":"task-1", "contextId":"context-1", "append":append,
+                    "artifact":{"artifactId":id, "parts":[{"text":text}]}
+                }}),
+            );
+        }
+
+        super::accumulate_event(
+            &mut result,
+            &json!({"statusUpdate":{
+                "taskId":"task-1", "contextId":"context-1",
+                "status":{"state":"TASK_STATE_COMPLETED"}
+            }}),
+        );
+
+        assert_eq!(
+            task_summary(&result),
+            json!({
+                "taskId":"task-1", "contextId":"context-1",
+                "status":"TASK_STATE_COMPLETED", "text":"final answer\nsecond"
+            })
+        );
+
+        super::accumulate_event(
+            &mut result,
+            &json!({"task":{
+                "id":"task-1", "contextId":"context-1",
+                "status":{"state":"TASK_STATE_COMPLETED"},
+                "artifacts":[{"artifactId":"answer", "parts":[{"text":"snapshot"}]}]
+            }}),
+        );
+
+        assert_eq!(task_summary(&result)["text"], "snapshot");
+
+        super::accumulate_event(
+            &mut result,
+            &json!({"message":{
+                "contextId":"context-2", "parts":[{"text":"instant"}]
+            }}),
+        );
+
+        assert_eq!(task_summary(&result)["text"], "instant");
+        assert_eq!(task_summary(&result)["status"], "message");
     }
 
     #[tokio::test]

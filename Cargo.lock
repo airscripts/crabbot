@@ -1752,6 +1752,7 @@ dependencies = [
 name = "krabb-core"
 version = "0.1.0"
 dependencies = [
+ "krabb-process",
  "rustix 1.1.5",
  "serde",
  "serde_json",
@@ -1824,7 +1825,9 @@ dependencies = [
  "krabb-core",
  "krabb-log",
  "serde_json",
+ "subtle",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -2026,6 +2029,7 @@ dependencies = [
  "krabb-core",
  "krabb-log",
  "rusqlite",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -2050,6 +2054,7 @@ version = "0.1.0"
 dependencies = [
  "krabb-core",
  "krabb-log",
+ "krabb-process",
  "reqwest",
  "rustix 1.1.5",
  "serde_json",

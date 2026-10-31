@@ -108,6 +108,8 @@ pub struct Session {
     pub reservation_until: Option<u64>,
     #[serde(default)]
     pub reservation_owner: Option<String>,
+    #[serde(skip)]
+    pub(crate) reservation_active: bool,
     #[serde(default)]
     pub inflight_roles: Vec<String>,
     #[serde(default)]
@@ -123,7 +125,8 @@ impl Session {
     pub fn has_live_tui_reservation(&self) -> bool {
         self.status == "working"
             && self.inflight.is_none()
-            && !reservation_expired(self.reservation_until, self.updated, now())
+            && (self.reservation_active
+                || !reservation_expired(self.reservation_until, self.updated, now()))
     }
 }
 
@@ -182,6 +185,10 @@ pub struct Store {
 struct SessionIndex {
     version: u8,
     sessions: BTreeMap<String, String>,
+    #[serde(default)]
+    clients: Option<ClientState>,
+    #[serde(default)]
+    deliveries: Option<DeliveryIndex>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -203,7 +210,13 @@ impl Store {
         let path = path.into();
 
         if session_catalog(&path) {
-            return load_catalog(&path);
+            let mut store = load_catalog(&path)?;
+
+            if store.normalize_restart()? {
+                store.save()?;
+            }
+
+            return Ok(store);
         }
 
         let bytes = match load_file(&path, BYTE_LIMIT) {
@@ -242,7 +255,21 @@ impl Store {
         changed |=
             migrate_delivery_routes(&mut store.dead, document.get("dead"), &store.sessions, false)?;
 
-        for (id, session) in &mut store.sessions {
+        changed |= store.normalize_restart()?;
+
+        store.path = Some(path);
+
+        if changed {
+            store.save()?;
+        }
+
+        Ok(store)
+    }
+
+    fn normalize_restart(&mut self) -> std::io::Result<bool> {
+        let mut changed = false;
+
+        for (id, session) in &mut self.sessions {
             if !valid(id) || session.id != *id {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -293,10 +320,11 @@ impl Store {
                 session.status = "interrupted".into();
                 session.reservation_until = None;
                 session.reservation_owner = None;
+                changed = true;
             }
         }
 
-        for delivery in &mut store.outbox {
+        for delivery in &mut self.outbox {
             if delivery.updated == 0 {
                 delivery.updated = delivery.created;
                 changed = true;
@@ -311,10 +339,10 @@ impl Store {
         }
 
         let mut users =
-            store.sessions.values().filter(|session| !session.scheduled).collect::<Vec<_>>();
+            self.sessions.values().filter(|session| !session.scheduled).collect::<Vec<_>>();
 
         let mut schedules =
-            store.sessions.values().filter(|session| session.scheduled).collect::<Vec<_>>();
+            self.sessions.values().filter(|session| session.scheduled).collect::<Vec<_>>();
 
         users.sort_by_key(|session| session.updated);
         schedules.sort_by_key(|session| session.updated);
@@ -327,35 +355,30 @@ impl Store {
             .collect::<Vec<_>>();
 
         for id in discarded {
-            store.sessions.remove(&id);
+            self.sessions.remove(&id);
             changed = true;
         }
 
-        if store.outbox.len() > LIMIT {
-            store.outbox.drain(..store.outbox.len() - LIMIT);
+        if self.outbox.len() > LIMIT {
+            self.outbox.drain(..self.outbox.len() - LIMIT);
         }
 
-        if store.dead.len() > LIMIT {
-            store.dead.drain(..store.dead.len() - LIMIT);
+        if self.dead.len() > LIMIT {
+            self.dead.drain(..self.dead.len() - LIMIT);
         }
 
-        if store.offsets.len() > LIMIT {
-            let excess = store.offsets.len() - LIMIT;
-            let keys = store.offsets.keys().take(excess).cloned().collect::<Vec<_>>();
+        if self.offsets.len() > LIMIT {
+            let excess = self.offsets.len() - LIMIT;
+            let keys = self.offsets.keys().take(excess).cloned().collect::<Vec<_>>();
 
             for key in keys {
-                store.offsets.remove(&key);
+                self.offsets.remove(&key);
             }
         }
 
-        trim_seen(&mut store.seen, None);
-        store.path = Some(path);
+        trim_seen(&mut self.seen, None);
 
-        if changed {
-            store.save()?;
-        }
-
-        Ok(store)
+        Ok(changed)
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -462,6 +485,7 @@ impl Store {
                     inflight: None,
                     reservation_until: None,
                     reservation_owner: None,
+                    reservation_active: false,
                     inflight_roles: Vec::new(),
                     stream_delivery: None,
                     phase: safe(),
@@ -585,7 +609,7 @@ impl Store {
             ));
         }
 
-        if session.status == "working" || session.inflight.is_some() {
+        if session.reservation_active || session.status == "working" || session.inflight.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "A working session cannot be renamed.",
@@ -1300,7 +1324,7 @@ impl Store {
             ));
         };
 
-        if session.inflight.is_some() || session.status == "working" {
+        if session.reservation_active || session.inflight.is_some() || session.status == "working" {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "Session is already working.",
@@ -1323,6 +1347,7 @@ impl Store {
         let expired = self.sessions.values().any(|session| {
             session.status == "working"
                 && session.inflight.is_none()
+                && !session.reservation_active
                 && reservation_expired(session.reservation_until, session.updated, current)
         });
 
@@ -1334,6 +1359,7 @@ impl Store {
             for session in store.sessions.values_mut() {
                 if session.status == "working"
                     && session.inflight.is_none()
+                    && !session.reservation_active
                     && reservation_expired(session.reservation_until, session.updated, current)
                 {
                     session.status = "idle".into();
@@ -1532,6 +1558,7 @@ impl Store {
                     inflight: None,
                     reservation_until: None,
                     reservation_owner: None,
+                    reservation_active: false,
                     inflight_roles: Vec::new(),
                     stream_delivery: None,
                     phase: safe(),
@@ -2278,7 +2305,7 @@ fn load_catalog(path: &Path) -> std::io::Result<Store> {
 
     let index: SessionIndex = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
 
-    if index.version != 1 {
+    if !matches!(index.version, 1 | 2) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Unsupported session catalog version.",
@@ -2323,46 +2350,56 @@ fn load_catalog(path: &Path) -> std::io::Result<Store> {
         store.sessions.insert(id, session);
     }
 
-    if let Some(bytes) = load_file(root.join("state/clients/runtime.json"), BYTE_LIMIT)? {
-        let client: ClientState = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
-        store.deferred = client.deferred;
-        store.deferred_acknowledged = client.deferred_acknowledged;
-        store.offsets = client.offsets;
-        store.seen = client.seen;
-    }
+    let (client, deliveries) = if index.version == 1 {
+        let client = load_file(root.join("state/clients/runtime.json"), BYTE_LIMIT)?
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(std::io::Error::other))
+            .transpose()?
+            .unwrap_or_default();
+        let deliveries = load_file(root.join("state/deliveries/index.json"), BYTE_LIMIT)?
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(std::io::Error::other))
+            .transpose()?
+            .unwrap_or_default();
+        (client, deliveries)
+    } else {
+        let missing = || {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "Session snapshot is incomplete.")
+        };
 
-    if let Some(bytes) = load_file(root.join("state/deliveries/index.json"), BYTE_LIMIT)? {
-        let index: DeliveryIndex = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        (index.clients.ok_or_else(missing)?, index.deliveries.ok_or_else(missing)?)
+    };
 
-        for (key, dead) in index
-            .outbox
-            .into_iter()
-            .map(|key| (key, false))
-            .chain(index.dead.into_iter().map(|key| (key, true)))
-        {
-            let record = load_file(
-                root.join("state/deliveries/records").join(format!("{key}.json")),
-                BYTE_LIMIT,
-            )?
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "Delivery record is missing.")
-            })?;
+    store.deferred = client.deferred;
+    store.deferred_acknowledged = client.deferred_acknowledged;
+    store.offsets = client.offsets;
+    store.seen = client.seen;
 
-            let delivery: Delivery =
-                serde_json::from_slice(&record).map_err(std::io::Error::other)?;
+    for (key, dead) in deliveries
+        .outbox
+        .into_iter()
+        .map(|key| (key, false))
+        .chain(deliveries.dead.into_iter().map(|key| (key, true)))
+    {
+        let record = load_file(
+            root.join("state/deliveries/records").join(format!("{key}.json")),
+            BYTE_LIMIT,
+        )?
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "Delivery record is missing.")
+        })?;
 
-            if session_record_key(&record) != key {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Delivery record key is invalid.",
-                ));
-            }
+        let delivery: Delivery = serde_json::from_slice(&record).map_err(std::io::Error::other)?;
 
-            if dead {
-                store.dead.push(delivery);
-            } else {
-                store.outbox.push(delivery);
-            }
+        if session_record_key(&record) != key {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Delivery record key is invalid.",
+            ));
+        }
+
+        if dead {
+            store.dead.push(delivery);
+        } else {
+            store.outbox.push(delivery);
         }
     }
 
@@ -2397,6 +2434,21 @@ fn migrate_schedule_sessions(
 }
 
 fn save_catalog(path: &Path, store: &Store) -> std::io::Result<()> {
+    let index = stage_catalog(path, store)?;
+    save_json(path, &index)?;
+
+    let root = path.parent().expect("catalog has parent");
+    let deliveries = index.deliveries.expect("staged snapshot includes deliveries");
+    let _ = cleanup_session_records(&root.join("records"), &index.sessions);
+    let _ = cleanup_records(
+        &root.join("state/deliveries/records"),
+        deliveries.outbox.into_iter().chain(deliveries.dead).collect(),
+    );
+
+    Ok(())
+}
+
+fn stage_catalog(path: &Path, store: &Store) -> std::io::Result<SessionIndex> {
     let root = path.parent().expect("catalog has parent");
     let mut sessions = BTreeMap::new();
 
@@ -2429,10 +2481,7 @@ fn save_catalog(path: &Path, store: &Store) -> std::io::Result<()> {
         seen: store.seen.clone(),
     };
 
-    save_json(&root.join("state/clients/runtime.json"), &state)?;
-
     let mut delivery_index = DeliveryIndex::default();
-    let mut delivery_records = BTreeSet::new();
 
     for (delivery, dead) in store
         .outbox
@@ -2444,7 +2493,6 @@ fn save_catalog(path: &Path, store: &Store) -> std::io::Result<()> {
 
         let key = session_record_key(&bytes);
         save_file(root.join("state/deliveries/records").join(format!("{key}.json")), bytes)?;
-        delivery_records.insert(key.clone());
 
         if dead {
             delivery_index.dead.push(key);
@@ -2453,13 +2501,12 @@ fn save_catalog(path: &Path, store: &Store) -> std::io::Result<()> {
         }
     }
 
-    save_json(&root.join("state/deliveries/index.json"), &delivery_index)?;
-    save_json(path, &SessionIndex { version: 1, sessions: sessions.clone() })?;
-
-    let _ = cleanup_session_records(&root.join("records"), &sessions);
-    let _ = cleanup_records(&root.join("state/deliveries/records"), delivery_records);
-
-    Ok(())
+    Ok(SessionIndex {
+        version: 2,
+        sessions,
+        clients: Some(state),
+        deliveries: Some(delivery_index),
+    })
 }
 
 fn cleanup_session_records(
@@ -2643,6 +2690,108 @@ mod tests {
             sender: None,
             content: vec![Content::Text { text: "hello".into() }],
         }
+    }
+
+    #[test]
+    fn catalog_publishes_reply_and_delivery_as_one_snapshot() {
+        for committed in [false, true] {
+            let root = std::env::temp_dir()
+                .join(format!("krabb-snapshot-{}-{committed}", std::process::id(),));
+            let _ = std::fs::remove_dir_all(&root);
+            let path = root.join("data/sessions/index.json");
+            let mut store = Store::load(&path).unwrap();
+            store.create("main", "model").unwrap();
+            store.begin("main", message(1, "main")).unwrap();
+            store.path = None;
+            store
+                .reply("main", message(2, "main"), "reply", "telegram", "7", None, "answer")
+                .unwrap();
+
+            let staged = super::stage_catalog(&path, &store).unwrap();
+
+            if committed {
+                super::save_json(&path, &staged).unwrap();
+            }
+
+            let recovered = Store::load(&path).unwrap();
+            let session = &recovered.sessions["main"];
+
+            assert!(session.inflight.is_none());
+            assert_eq!(recovered.outbox.len(), usize::from(committed));
+            assert_eq!(session.queued.len(), usize::from(!committed));
+            assert_eq!(
+                session.messages.iter().filter(|message| message.id == "2").count(),
+                usize::from(committed)
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn catalog_reads_legacy_indexes_and_ignores_them_after_snapshot_commit() {
+        let root = std::env::temp_dir().join(format!("krabb-index-upgrade-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("data/sessions/index.json");
+        let mut store = Store::load(&path).unwrap();
+        store.create("main", "model").unwrap();
+        store.commit("telegram", "event", Some(9)).unwrap();
+        store.reply("main", message(2, "main"), "reply", "telegram", "7", None, "answer").unwrap();
+        let mut index = super::stage_catalog(&path, &store).unwrap();
+        let state = path.parent().unwrap().join("state");
+        super::save_json(&state.join("clients/runtime.json"), &index.clients.take().unwrap())
+            .unwrap();
+        super::save_json(&state.join("deliveries/index.json"), &index.deliveries.take().unwrap())
+            .unwrap();
+
+        index.version = 1;
+        super::save_json(&path, &index).unwrap();
+
+        let mut loaded = Store::load(&path).unwrap();
+
+        assert_eq!(loaded.outbox.len(), 1);
+        assert_eq!(loaded.offset("telegram"), 9);
+        loaded.outbox.clear();
+        loaded.save().unwrap();
+        std::fs::write(state.join("clients/runtime.json"), b"invalid legacy file").unwrap();
+
+        let upgraded = Store::load(&path).unwrap();
+
+        assert!(upgraded.outbox.is_empty());
+        assert_eq!(upgraded.offset("telegram"), 9);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn catalog_recovers_safe_turns_without_replaying_mutations() {
+        let root =
+            std::env::temp_dir().join(format!("krabb-catalog-restart-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("data/sessions/index.json");
+        let mut store = Store::load(&path).unwrap();
+
+        for id in ["safe", "unsafe", "cancelled"] {
+            store.create(id, "model").unwrap();
+            store.begin(id, message(1, id)).unwrap();
+        }
+
+        store.phase("unsafe", "unsafe").unwrap();
+        store.sessions.get_mut("cancelled").unwrap().status = "cancelled".into();
+        store.save().unwrap();
+        let recovered = Store::load(&path).unwrap();
+
+        assert_eq!(recovered.sessions["safe"].queued.len(), 1);
+
+        for id in ["safe", "unsafe", "cancelled"] {
+            assert!(recovered.sessions[id].inflight.is_none());
+            assert_eq!(recovered.sessions[id].status, "interrupted");
+        }
+
+        assert!(recovered.sessions["unsafe"].queued.is_empty());
+        assert!(recovered.sessions["cancelled"].queued.is_empty());
+        assert_eq!(Store::load(&path).unwrap().sessions["safe"].queued.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3089,6 +3238,7 @@ mod tests {
                 inflight: None,
                 reservation_until: None,
                 reservation_owner: None,
+                reservation_active: false,
                 inflight_roles: Vec::new(),
                 stream_delivery: None,
                 phase: "safe".into(),
@@ -3326,24 +3476,26 @@ mod tests {
 
     #[test]
     fn interrupted_streams_are_uncertain_and_not_replayed() {
-        let root = std::env::temp_dir()
-            .join(format!("krabb-state-stream-recovery-{}", std::process::id()));
+        for relative in ["sessions.json", "data/sessions/index.json"] {
+            let root = std::env::temp_dir()
+                .join(format!("krabb-state-stream-recovery-{}", std::process::id()));
 
-        let path = root.join("sessions.json");
-        let mut store = Store::load(&path).unwrap();
-        store.create("main", "model").unwrap();
-        store.begin("main", message(1, "main")).unwrap();
-        store.start_stream("main", "discord-1", "discord", "7", None, "Working…").unwrap();
-        store.stream_started("discord-1", "9").unwrap();
+            let path = root.join(relative);
+            let mut store = Store::load(&path).unwrap();
+            store.create("main", "model").unwrap();
+            store.begin("main", message(1, "main")).unwrap();
+            store.start_stream("main", "discord-1", "discord", "7", None, "Working…").unwrap();
+            store.stream_started("discord-1", "9").unwrap();
 
-        let loaded = Store::load(&path).unwrap();
+            let loaded = Store::load(&path).unwrap();
 
-        assert_eq!(loaded.sessions["main"].status, "interrupted");
-        assert!(loaded.sessions["main"].queued.is_empty());
-        assert!(loaded.sessions["main"].stream_delivery.is_none());
-        assert_eq!(loaded.outbox[0].status, DeliveryStatus::Uncertain);
-        assert_eq!(loaded.outbox[0].message_id.as_deref(), Some("9"));
-        let _ = std::fs::remove_dir_all(root);
+            assert_eq!(loaded.sessions["main"].status, "interrupted");
+            assert!(loaded.sessions["main"].queued.is_empty());
+            assert!(loaded.sessions["main"].stream_delivery.is_none());
+            assert_eq!(loaded.outbox[0].status, DeliveryStatus::Uncertain);
+            assert_eq!(loaded.outbox[0].message_id.as_deref(), Some("9"));
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -3375,23 +3527,25 @@ mod tests {
 
     #[test]
     fn recovers_sending_deliveries_as_uncertain() {
-        let root =
-            std::env::temp_dir().join(format!("krabb-state-delivery-{}", std::process::id()));
+        for relative in ["sessions.json", "data/sessions/index.json"] {
+            let root =
+                std::env::temp_dir().join(format!("krabb-state-delivery-{}", std::process::id()));
 
-        let _ = std::fs::remove_dir_all(&root);
-        let path = root.join("sessions.json");
-        let mut store = Store::load(&path).unwrap();
-        store.create("main", "model").unwrap();
-        store
-            .reply("main", message(1, "main"), "delivery", "telegram", "7", None, "hello")
-            .unwrap();
+            let _ = std::fs::remove_dir_all(&root);
+            let path = root.join(relative);
+            let mut store = Store::load(&path).unwrap();
+            store.create("main", "model").unwrap();
+            store
+                .reply("main", message(1, "main"), "delivery", "telegram", "7", None, "hello")
+                .unwrap();
 
-        store.sending("delivery").unwrap();
-        let recovered = Store::load(&path).unwrap();
+            store.sending("delivery").unwrap();
+            let recovered = Store::load(&path).unwrap();
 
-        assert_eq!(recovered.outbox[0].status, DeliveryStatus::Uncertain);
-        assert!(recovered.outbox[0].last_error.is_some());
-        let _ = std::fs::remove_dir_all(root);
+            assert_eq!(recovered.outbox[0].status, DeliveryStatus::Uncertain);
+            assert!(recovered.outbox[0].last_error.is_some());
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -3873,7 +4027,7 @@ mod tests {
         let catalog: serde_json::Value = serde_json::from_str(&index).unwrap();
         let loaded = Store::load(&path).unwrap();
 
-        assert_eq!(catalog["version"], 1);
+        assert_eq!(catalog["version"], 2);
         assert_eq!(catalog["sessions"], serde_json::json!({}));
         assert_eq!(store.offset("telegram"), 9);
         assert_eq!(loaded.offset("telegram"), 9);

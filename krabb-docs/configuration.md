@@ -92,8 +92,9 @@ The default is `Krabb`.
 The default update mode is `prompt`, approval is `off`, shell execution is
 disabled, and isolated Git worktrees are enabled for group turns.
 
-Approved shell commands run directly on the host unless an optional container
-sandbox is configured. Set `KRABB_SANDBOX_RUNTIME` to `docker` or `podman`
+On Linux and Windows, approved shell commands run directly on the host unless a container
+sandbox is configured. macOS and other Unix hosts require the sandbox for shell containment.
+Set `KRABB_SANDBOX_RUNTIME` to `docker` or `podman`
 and `KRABB_SANDBOX_IMAGE` to an image already present in the local runtime.
 Krabb does not pull images. The sandbox disables networking, makes its root
 filesystem read-only, drops Linux capabilities, applies process, CPU, memory,
@@ -240,7 +241,7 @@ All Krabb configuration variables use the `KRABB_` prefix:
 | `KRABB_A2A_AGENT_CARD` | Remote A2A agent card URL |
 | `KRABB_A2A_TOKEN` | Optional A2A bearer token |
 | `KRABB_AG_UI_LISTEN` | Loopback AG-UI address; defaults to `127.0.0.1:8787` |
-| `KRABB_SANDBOX_RUNTIME` | Optional `docker`, `podman`, or `off` shell sandbox |
+| `KRABB_SANDBOX_RUNTIME` | `docker`, `podman`, or `off`; shell sandbox required on macOS and other non-Linux Unix hosts |
 | `KRABB_SANDBOX_IMAGE` | Locally available image used by the shell sandbox |
 
 The default host model is unset when `KRABB_MODEL` is unset; select a model

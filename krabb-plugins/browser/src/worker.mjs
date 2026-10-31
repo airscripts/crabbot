@@ -58,7 +58,7 @@ function privateAddress(address) {
         || first === 0x3fff;
 }
 
-async function permitted(raw) {
+async function permitted(raw, protocols = ['http:', 'https:']) {
     let url;
     try {
         url = new URL(raw);
@@ -67,7 +67,7 @@ async function permitted(raw) {
     }
 
     const host = url.hostname.toLowerCase();
-    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password
+    if (!protocols.includes(url.protocol) || url.username || url.password
             || !allowedHosts.has(host)) {
         return false;
     }
@@ -93,7 +93,7 @@ async function installRoutes(context) {
 
     if (typeof context.routeWebSocket === 'function') {
         await context.routeWebSocket('**/*', async (route) => {
-            if (await permitted(route.url())) {
+            if (await permitted(route.url(), ['ws:', 'wss:'])) {
                 await route.connectToServer();
             } else {
                 await route.close();
@@ -111,6 +111,11 @@ function registerTab(state, page) {
     const tabId = id();
     state.tabs.set(tabId, page);
     page.on('popup', (popup) => registerTab(state, popup));
+    page.on('close', () => {
+        state.tabs.delete(tabId);
+        state.observations.delete(tabId);
+    });
+
     return tabId;
 }
 
@@ -384,6 +389,31 @@ async function call(method, params) {
     }
 
     const state = session(params);
+    switch (method) {
+        case 'browser_tabs': {
+            const tabs = await Promise.all([...state.tabs].map(async ([id, page]) => {
+                try {
+                    return {
+                        id,
+                        url: safeUrl(page.url()),
+                        title: (await page.title()).slice(0, 256),
+                    };
+                } catch (error) {
+                    if (!page.isClosed()) throw error;
+                    return null;
+                }
+            }));
+
+            return tabs.filter(Boolean);
+        }
+
+        case 'browser_new_tab': {
+            if (state.tabs.size >= TAB_LIMIT) throw new Error('Tab capacity is full.');
+            const page = await state.context.newPage();
+            return { tab_id: registerTab(state, page) };
+        }
+    }
+
     const { id: tabId, page } = tab(state, params);
     switch (method) {
         case 'browser_navigate': {
@@ -413,25 +443,10 @@ async function call(method, params) {
             return { url: safeUrl(page.url()), title: (await page.title()).slice(0, 512) };
         }
 
-        case 'browser_tabs':
-            return Promise.all([...state.tabs].map(async ([id, page]) => ({
-                id,
-                url: safeUrl(page.url()),
-                title: (await page.title()).slice(0, 256),
-            })));
-
-        case 'browser_new_tab': {
-            if (state.tabs.size >= TAB_LIMIT) throw new Error('Tab capacity is full.');
-            const page = await state.context.newPage();
-            return { tab_id: registerTab(state, page) };
-        }
-
         case 'browser_close_tab': {
             const selected = state.tabs.get(params.tab_id);
             if (!selected) throw new Error('Browser tab is unavailable.');
             await selected.close();
-            state.tabs.delete(params.tab_id);
-            state.observations.delete(params.tab_id);
             return { closed: true };
         }
 

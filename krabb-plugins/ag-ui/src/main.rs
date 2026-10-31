@@ -11,12 +11,55 @@ use krabb_core::{
 use serde_json::{Value, json};
 use std::future::Future;
 use std::{net::SocketAddr, sync::Arc};
+use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{Semaphore, mpsc},
 };
 
+#[derive(Clone)]
+struct Security {
+    token: String,
+    origins: Vec<String>,
+}
+
+impl Security {
+    fn configured() -> krabb_core::Result<Self> {
+        let token = std::env::var("KRABB_AG_UI_TOKEN").unwrap_or_default();
+        let origins = std::env::var("KRABB_AG_UI_ORIGINS").unwrap_or_default();
+
+        Self::parse(token, &origins)
+    }
+
+    fn parse(token: String, origins: &str) -> krabb_core::Result<Self> {
+        if token.len() < 32 || !token.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(krabb_core::Error::Denied(
+                "Set KRABB_AG_UI_TOKEN to a random token of at least 32 ASCII characters.".into(),
+            ));
+        }
+
+        let origins = origins
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        if origins.iter().any(|origin| !loopback_origin(origin) || origin.contains(['\r', '\n'])) {
+            return Err(krabb_core::Error::Denied(
+                "AG-UI origins must be loopback HTTP origins.".into(),
+            ));
+        }
+
+        Ok(Self { token, origins })
+    }
+}
+
+#[cfg(not(test))]
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 const HEADER_LIMIT: usize = 8 * 1024;
 const BODY_LIMIT: usize = 128 * 1024;
 
@@ -38,7 +81,7 @@ fn hello() -> Hello {
         capabilities: vec![Capability::Agent],
         commands: vec![CommandSpec {
             name: "ag-ui".into(),
-            description: "Serve the local AG-UI run endpoint.".into(),
+            description: "Serve the AG-UI run endpoint for local agent clients.".into(),
             interactive: false,
         }],
     }
@@ -63,7 +106,7 @@ async fn start_command(
     address: SocketAddr,
     emitter: Emitter,
 ) -> krabb_core::Result<Option<Response>> {
-    let bound_address = start_listener(address, emitter.clone()).await?;
+    let bound_address = start_listener(address, emitter.clone(), Security::configured()?).await?;
     let mut emitter = emitter;
     emitter.event(json!({"text":format!("AG-UI listening on {bound_address}")})).await?;
 
@@ -80,7 +123,11 @@ fn listen_address(value: Option<&str>) -> krabb_core::Result<SocketAddr> {
     })
 }
 
-async fn start_listener(address: SocketAddr, emitter: Emitter) -> krabb_core::Result<SocketAddr> {
+async fn start_listener(
+    address: SocketAddr,
+    emitter: Emitter,
+    security: Security,
+) -> krabb_core::Result<SocketAddr> {
     if !address.ip().is_loopback() {
         return Err(krabb_core::Error::Denied("AG-UI can only bind to a loopback address.".into()));
     }
@@ -93,12 +140,12 @@ async fn start_listener(address: SocketAddr, emitter: Emitter) -> krabb_core::Re
         krabb_core::Error::Protocol(format!("AG-UI listener address failed: {error}."))
     })?;
 
-    tokio::spawn(serve(listener, emitter));
+    tokio::spawn(serve(listener, emitter, security));
 
     Ok(bound_address)
 }
 
-async fn serve(listener: TcpListener, emitter: Emitter) {
+async fn serve(listener: TcpListener, emitter: Emitter, security: Security) {
     let capacity = Arc::new(Semaphore::new(4));
 
     loop {
@@ -117,13 +164,16 @@ async fn serve(listener: TcpListener, emitter: Emitter) {
             Err(_) => {
                 let mut stream = stream;
 
-                if let Err(error) = write_response(
-                    &mut stream,
-                    503,
-                    "Service Unavailable",
-                    "application/json",
-                    "{}",
-                    None,
+                if let Err(error) = tokio::time::timeout(
+                    REQUEST_TIMEOUT,
+                    write_response(
+                        &mut stream,
+                        503,
+                        "Service Unavailable",
+                        "application/json",
+                        "{}",
+                        None,
+                    ),
                 )
                 .await
                 {
@@ -135,11 +185,12 @@ async fn serve(listener: TcpListener, emitter: Emitter) {
         };
 
         let emitter = emitter.clone();
+        let security = security.clone();
 
         tokio::spawn(async move {
             let _permit = permit;
 
-            if let Err(error) = handle_connection(stream, |params, events| async move {
+            if let Err(error) = handle_connection(stream, security, |params, events| async move {
                 let response = emitter
                     .call_stream("host/model_stream", params, |event| {
                         let _ = events.send(event);
@@ -162,13 +213,22 @@ async fn serve(listener: TcpListener, emitter: Emitter) {
     }
 }
 
-async fn handle_connection<F, Fut>(mut stream: TcpStream, generate: F) -> krabb_core::Result<()>
+async fn handle_connection<F, Fut>(
+    mut stream: TcpStream,
+    security: Security,
+    generate: F,
+) -> krabb_core::Result<()>
 where
     F: FnOnce(Value, mpsc::UnboundedSender<Value>) -> Fut,
     Fut: Future<Output = krabb_core::Result<ModelReply>>,
 {
-    let request = read_request(&mut stream).await?;
-    let origin = request.origin.as_deref().filter(|origin| loopback_origin(origin));
+    let request = tokio::time::timeout(REQUEST_TIMEOUT, read_request(&mut stream))
+        .await
+        .map_err(|_| krabb_core::Error::Denied("AG-UI request timed out.".into()))??;
+    let origin = request
+        .origin
+        .as_deref()
+        .filter(|origin| security.origins.iter().any(|allowed| allowed == origin));
 
     if request.origin.is_some() && origin.is_none() {
         return write_response(&mut stream, 403, "Forbidden", "application/json", "{}", None).await;
@@ -176,6 +236,15 @@ where
 
     if request.method == "OPTIONS" {
         return write_response(&mut stream, 204, "No Content", "", "", origin).await;
+    }
+
+    let expected = format!("Bearer {}", security.token);
+
+    if !bool::from(
+        request.authorization.as_deref().unwrap_or_default().as_bytes().ct_eq(expected.as_bytes()),
+    ) {
+        return write_response(&mut stream, 401, "Unauthorized", "application/json", "{}", origin)
+            .await;
     }
 
     if request.method != "POST" || request.path != "/" {
@@ -244,6 +313,12 @@ where
             result = &mut generation => {
                 match result {
                     Ok(reply) => {
+                        while let Ok(event) = event_receiver.try_recv() {
+                            for event in stream_state.push(&run, event)? {
+                                write_sse_event(&mut stream, &event).await?;
+                            }
+                        }
+
                         for event in stream_state.fallback(&run, &reply)? {
                             write_sse_event(&mut stream, &event).await?;
                         }
@@ -283,8 +358,8 @@ where
 struct RunStream {
     message_id: String,
     message_open: bool,
-    text_seen: bool,
-    event_seen: bool,
+    text: String,
+    tools: Vec<Value>,
     pending_tools: Vec<String>,
     error: Option<String>,
     index: usize,
@@ -295,8 +370,8 @@ impl RunStream {
         Self {
             message_id: format!("{}-message", run.run_id),
             message_open: false,
-            text_seen: false,
-            event_seen: false,
+            text: String::new(),
+            tools: Vec::new(),
             pending_tools: Vec::new(),
             error: None,
             index: 0,
@@ -307,11 +382,14 @@ impl RunStream {
         let event: Event = serde_json::from_value(value).map_err(|error| {
             krabb_core::Error::Protocol(format!("Invalid model stream event: {error}."))
         })?;
-        self.event_seen = true;
+
+        if matches!(event, Event::Tool { .. }) {
+            self.tools.push(serde_json::to_value(&event)?);
+        }
 
         let mapped = match event {
             Event::Text { text } | Event::Done { text } if !text.is_empty() => {
-                self.text_seen = true;
+                self.text.push_str(&text);
                 let mut events = Vec::new();
 
                 if !self.message_open {
@@ -351,22 +429,42 @@ impl RunStream {
     fn fallback(&mut self, run: &RunInput, reply: &ModelReply) -> krabb_core::Result<Vec<Value>> {
         let mut events = Vec::new();
 
-        if !self.event_seen {
-            for event in &reply.events {
-                events.extend(self.push(run, serde_json::to_value(event)?)?);
+        let mut delivered = self.tools.clone();
+
+        for event in &reply.events {
+            if matches!(event, Event::Text { .. } | Event::Done { .. }) {
+                continue;
+            }
+
+            let value = serde_json::to_value(event)?;
+
+            if let Some(index) = delivered.iter().position(|seen| seen == &value) {
+                delivered.remove(index);
+            } else {
+                events.extend(self.push(run, value)?);
             }
         }
 
-        if self.text_seen || reply.text.is_empty() {
-            return Ok(events);
-        }
+        let final_text = if reply.text.is_empty() {
+            reply
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Text { text } | Event::Done { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        } else {
+            reply.text.clone()
+        };
 
-        self.message_open = true;
-        self.text_seen = true;
-        events.extend([
-            json!({"type":"TEXT_MESSAGE_START","messageId":self.message_id,"role":"assistant"}),
-            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":self.message_id,"delta":reply.text}),
-        ]);
+        if let Some(missing) = final_text.strip_prefix(&self.text)
+            && !missing.is_empty()
+        {
+            events.extend(
+                self.push(run, serde_json::to_value(Event::Text { text: missing.to_owned() })?)?,
+            );
+        }
 
         Ok(events)
     }
@@ -421,6 +519,7 @@ struct HttpRequest {
     path: String,
     body: Vec<u8>,
     origin: Option<String>,
+    authorization: Option<String>,
 }
 
 async fn read_request(stream: &mut TcpStream) -> krabb_core::Result<HttpRequest> {
@@ -464,6 +563,7 @@ async fn read_request(stream: &mut TcpStream) -> krabb_core::Result<HttpRequest>
     let path = request_line.next().unwrap_or_default().to_owned();
     let mut content_length = 0_usize;
     let mut origin = None;
+    let mut authorization = None;
 
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
@@ -471,6 +571,14 @@ async fn read_request(stream: &mut TcpStream) -> krabb_core::Result<HttpRequest>
                 content_length = value.trim().parse().map_err(|_| {
                     krabb_core::Error::Protocol("AG-UI Content-Length is invalid.".into())
                 })?;
+            } else if name.eq_ignore_ascii_case("authorization") {
+                if authorization.is_some() {
+                    return Err(krabb_core::Error::Denied(
+                        "Duplicate authorization header.".into(),
+                    ));
+                }
+
+                authorization = Some(value.trim().to_owned());
             } else if name.eq_ignore_ascii_case("origin") {
                 origin = Some(value.trim().to_owned());
             }
@@ -493,7 +601,7 @@ async fn read_request(stream: &mut TcpStream) -> krabb_core::Result<HttpRequest>
         })?;
     }
 
-    Ok(HttpRequest { method, path, body, origin })
+    Ok(HttpRequest { method, path, body, origin, authorization })
 }
 
 fn loopback_origin(origin: &str) -> bool {
@@ -530,7 +638,7 @@ async fn write_response(
         .unwrap_or_default();
 
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\n{access_control_origin}Access-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept\r\nConnection: close\r\n\r\n{body}"
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\n{access_control_origin}Access-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, Accept\r\nConnection: close\r\n\r\n{body}"
     );
 
     stream
@@ -544,7 +652,7 @@ async fn write_sse_headers(stream: &mut TcpStream, origin: Option<&str>) -> krab
         .map(|value| format!("Access-Control-Allow-Origin: {value}\r\nVary: Origin\r\n"))
         .unwrap_or_default();
     let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n{access_control_origin}Access-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n{access_control_origin}Access-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, Accept\r\nConnection: close\r\n\r\n"
     );
 
     stream.write_all(headers.as_bytes()).await?;
@@ -848,15 +956,87 @@ impl RunInput {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn validates_authentication_configuration() {
+        for token in ["".into(), "short".into(), format!("{}\n", "a".repeat(32))] {
+            assert!(Security::parse(token, "").is_err());
+        }
+
+        assert!(Security::parse("a".repeat(32), "https://example.com").is_err());
+        assert!(Security::parse("a".repeat(32), "http://localhost:3000/\r\nfoo").is_err());
+        let security = Security::parse("a".repeat(32), "").unwrap();
+
+        assert!(security.origins.is_empty());
+        assert!(
+            Security::parse("a".repeat(32), "http://localhost:3000,http://127.0.0.1:3000").is_ok()
+        );
+    }
+
+    fn test_security() -> Security {
+        Security {
+            token: "test-token".into(),
+            origins: vec!["http://localhost:3000".into(), "http://127.0.0.1:3000".into()],
+        }
+    }
+
     use super::*;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn rejects_missing_and_incorrect_credentials() {
+        for authorization in ["", "Authorization: Bearer wrong\r\n"] {
+            let response = exchange(
+                format!("POST / HTTP/1.1\r\n{authorization}Content-Length: 2\r\n\r\n{{}}"),
+                ModelReply {
+                    text: String::new(),
+                    stop: "end".into(),
+                    input: None,
+                    output: None,
+                    context_usage: None,
+                    events: Vec::new(),
+                },
+            )
+            .await;
+
+            assert!(response.starts_with("HTTP/1.1 401"));
+        }
+    }
+
+    #[tokio::test]
+    async fn releases_stalled_request_slots() {
+        for fragment in ["", "POST / HTTP/1.1\r\nContent-Length: 100\r\n\r\n{"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            client.write_all(fragment.as_bytes()).await.unwrap();
+            let result = handle_connection(server, test_security(), |_, _| async {
+                panic!("stalled request reached model")
+            })
+            .await;
+
+            assert!(result.unwrap_err().to_string().contains("timed out"));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_unlisted_loopback_origins_with_valid_credentials() {
+        let response = exchange(
+            "POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\nOrigin: http://localhost:9999\r\nContent-Length: 2\r\n\r\n{}".into(),
+            ModelReply { text: String::new(), stop: "end".into(), input: None, output: None, context_usage: None, events: Vec::new() },
+        ).await;
+
+        assert!(response.starts_with("HTTP/1.1 403"));
+    }
 
     async fn exchange(request: String, reply: ModelReply) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(address).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
-        let handler = tokio::spawn(handle_connection(server, move |_, _| async move { Ok(reply) }));
+        let handler =
+            tokio::spawn(handle_connection(server, test_security(), move |_, _| async move {
+                Ok(reply)
+            }));
 
         client.write_all(request.as_bytes()).await.unwrap();
 
@@ -872,7 +1052,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(address).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
-        let handler = tokio::spawn(handle_connection(server, |_, _| async {
+        let handler = tokio::spawn(handle_connection(server, test_security(), |_, _| async {
             Err(krabb_core::Error::Denied("model unavailable".into()))
         }));
 
@@ -908,6 +1088,72 @@ mod tests {
     fn emitter() -> Emitter {
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
         Emitter::new(sender)
+    }
+
+    #[test]
+    fn reconciles_partial_text_and_final_tools_without_duplicates() {
+        let run = RunInput::parse(&json!({
+            "threadId":"thread", "runId":"run", "messages":[{"role":"user","content":"hello"}],
+        }))
+        .unwrap();
+        let tool = Event::Tool {
+            name: "confirm".into(),
+            args: json!({"ok": true}),
+            id: Some("call".into()),
+            thought_signature: None,
+        };
+
+        for streamed_tool in [false, true] {
+            let mut stream = RunStream::new(&run);
+            stream.push(&run, json!({"kind":"text", "text":"part"})).unwrap();
+
+            if streamed_tool {
+                stream.push(&run, serde_json::to_value(&tool).unwrap()).unwrap();
+            }
+
+            let mut reply = reply("partial response");
+            reply.events = vec![Event::Text { text: "partial response".into() }, tool.clone()];
+            let events = stream.fallback(&run, &reply).unwrap();
+
+            assert_eq!(stream.text, "partial response");
+            assert_eq!(
+                events.iter().filter(|event| event["type"] == "TEXT_MESSAGE_START").count(),
+                0
+            );
+
+            assert_eq!(
+                events.iter().filter(|event| event["type"] == "TOOL_CALL_START").count(),
+                usize::from(!streamed_tool)
+            );
+
+            assert_eq!(stream.pending_tools, vec!["call"]);
+            assert!(stream.fallback(&run, &reply).unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn drains_notifications_queued_with_the_final_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let handler =
+            tokio::spawn(handle_connection(server, test_security(), |_, events| async move {
+                events.send(json!({"kind":"text", "text":"part"})).unwrap();
+                Ok(reply("partial response"))
+            }));
+        let body =
+            r#"{"threadId":"thread","runId":"run","messages":[{"role":"user","content":"hello"}]}"#;
+        client.write_all(format!(
+            "POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\nContent-Length: {}\r\n\r\n{body}", body.len(),
+        ).as_bytes()).await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        handler.await.unwrap().unwrap();
+
+        assert_eq!(response.matches("TEXT_MESSAGE_START").count(), 1);
+        assert_eq!(response.matches("TEXT_MESSAGE_CONTENT").count(), 2);
+        assert!(response.contains("ial response"));
+        assert!(response.contains("RUN_FINISHED"));
     }
 
     #[test]
@@ -1027,6 +1273,13 @@ mod tests {
         assert_eq!(hello.capabilities, vec![Capability::Agent]);
         assert_eq!(hello.commands[0].name, "ag-ui");
         assert!(!hello.commands[0].interactive);
+
+        let manifest: serde_json::Value =
+            toml::from_str(include_str!("../krabb-plugin.toml")).unwrap();
+        let commands: Vec<CommandSpec> =
+            serde_json::from_value(manifest["commands"].clone()).unwrap();
+
+        assert_eq!(hello.commands, commands);
     }
 
     #[test]
@@ -1038,14 +1291,16 @@ mod tests {
 
     #[tokio::test]
     async fn starts_only_a_loopback_listener() {
-        let result = start_listener("0.0.0.0:0".parse().unwrap(), emitter()).await;
+        let result = start_listener("0.0.0.0:0".parse().unwrap(), emitter(), test_security()).await;
 
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn keeps_the_bound_endpoint_available() {
-        let address = start_listener("127.0.0.1:0".parse().unwrap(), emitter()).await.unwrap();
+        let address = start_listener("127.0.0.1:0".parse().unwrap(), emitter(), test_security())
+            .await
+            .unwrap();
         let _connection = TcpStream::connect(address).await.unwrap();
     }
 
@@ -1068,7 +1323,7 @@ mod tests {
         })
         .to_string();
         let request = format!(
-            "POST / HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost:3000\r\nContent-Length: {}\r\n\r\n{}",
+            "POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\nHost: localhost\r\nOrigin: http://localhost:3000\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
             body
         );
@@ -1093,7 +1348,7 @@ mod tests {
         })
         .to_string();
         let request = format!(
-            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            "POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
             body
         );
@@ -1112,14 +1367,15 @@ mod tests {
         let mut client = TcpStream::connect(address).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
         let (release, wait) = oneshot::channel();
-        let handler = tokio::spawn(handle_connection(server, move |_, events| async move {
-            events.send(json!({"kind":"text","text":"live"})).unwrap();
-            let _ = wait.await;
-            Ok(reply("live"))
-        }));
+        let handler =
+            tokio::spawn(handle_connection(server, test_security(), move |_, events| async move {
+                events.send(json!({"kind":"text","text":"live"})).unwrap();
+                let _ = wait.await;
+                Ok(reply("live"))
+            }));
         let body = r#"{"threadId":"thread-1","runId":"run-live","messages":[{"role":"user","content":"hello"}]}"#;
         let request = format!(
-            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
 
@@ -1163,14 +1419,15 @@ mod tests {
         let mut client = TcpStream::connect(address).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
         let (cancelled, cancelled_rx) = oneshot::channel::<()>();
-        let handler = tokio::spawn(handle_connection(server, move |_, _| async move {
-            let _cancelled = cancelled;
-            std::future::pending::<()>().await;
-            Ok(reply("unreachable"))
-        }));
+        let handler =
+            tokio::spawn(handle_connection(server, test_security(), move |_, _| async move {
+                let _cancelled = cancelled;
+                std::future::pending::<()>().await;
+                Ok(reply("unreachable"))
+            }));
         let body = r#"{"threadId":"thread-1","runId":"run-cancel","messages":[{"role":"user","content":"hello"}]}"#;
         let request = format!(
-            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
 
@@ -1191,11 +1448,14 @@ mod tests {
 
     #[tokio::test]
     async fn returns_http_errors_for_unavailable_routes_and_untrusted_origins() {
-        let not_found =
-            exchange("GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n".into(), reply("unused"))
-                .await;
+        let not_found = exchange(
+            "GET /health HTTP/1.1\r\nAuthorization: Bearer test-token\r\nHost: localhost\r\n\r\n"
+                .into(),
+            reply("unused"),
+        )
+        .await;
         let forbidden = exchange(
-            "OPTIONS / HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.com\r\n\r\n".into(),
+            "OPTIONS / HTTP/1.1\r\nAuthorization: Bearer test-token\r\nHost: localhost\r\nOrigin: https://example.com\r\n\r\n".into(),
             reply("unused"),
         )
         .await;
@@ -1207,7 +1467,7 @@ mod tests {
     #[tokio::test]
     async fn accepts_loopback_preflight_requests() {
         let response = exchange(
-            "OPTIONS / HTTP/1.1\r\nHost: localhost\r\nOrigin: http://127.0.0.1:3000\r\n\r\n".into(),
+            "OPTIONS / HTTP/1.1\r\nAuthorization: Bearer test-token\r\nHost: localhost\r\nOrigin: http://127.0.0.1:3000\r\n\r\n".into(),
             reply("unused"),
         )
         .await;
@@ -1218,9 +1478,11 @@ mod tests {
 
     #[tokio::test]
     async fn serves_http_requests_from_the_background_listener() {
-        let address = start_listener("127.0.0.1:0".parse().unwrap(), emitter()).await.unwrap();
+        let address = start_listener("127.0.0.1:0".parse().unwrap(), emitter(), test_security())
+            .await
+            .unwrap();
         let mut client = TcpStream::connect(address).await.unwrap();
-        client.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        client.write_all(b"GET /health HTTP/1.1\r\nAuthorization: Bearer test-token\r\nHost: localhost\r\n\r\n").await.unwrap();
 
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
@@ -1231,9 +1493,11 @@ mod tests {
     #[tokio::test]
     async fn reads_bounded_http_headers_and_request_bodies() {
         let oversized_body =
-            parse_request(b"POST / HTTP/1.1\r\nContent-Length: 131073\r\n\r\n").await;
-        let invalid_length =
-            parse_request(b"POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n").await;
+            parse_request(b"POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\nContent-Length: 131073\r\n\r\n").await;
+        let invalid_length = parse_request(
+            b"POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\nContent-Length: nope\r\n\r\n",
+        )
+        .await;
         let oversized_headers =
             parse_request(&[vec![b'a'; HEADER_LIMIT + 1], b"\r\n\r\n".to_vec()].concat()).await;
 

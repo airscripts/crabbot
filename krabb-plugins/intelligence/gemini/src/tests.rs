@@ -389,6 +389,10 @@ fn routes_default_legacy_transcripts_to_gemini_two() {
     };
 
     assert_eq!(effective_model(&request), LEGACY_MODEL);
+    let mut request = request;
+    request.model = "unset".into();
+
+    assert_eq!(effective_model(&request), LEGACY_MODEL);
     let body = request_body(&request).unwrap();
 
     assert_eq!(body["contents"][0]["parts"][1]["functionCall"]["name"], "read");
@@ -404,6 +408,10 @@ fn routes_the_host_default_model_to_gemini_default() {
         stream: false,
         tools: Vec::new(),
     };
+
+    assert_eq!(effective_model(&request), DEFAULT_MODEL);
+    let mut request = request;
+    request.model = "unset".into();
 
     assert_eq!(effective_model(&request), DEFAULT_MODEL);
 }
@@ -428,6 +436,10 @@ fn routes_default_signatureless_tool_history_to_gemini_two() {
         stream: false,
         tools: Vec::new(),
     };
+
+    assert_eq!(effective_model(&request), LEGACY_MODEL);
+    let mut request = request;
+    request.model = "unset".into();
 
     assert_eq!(effective_model(&request), LEGACY_MODEL);
     let body = request_body(&request).unwrap();
@@ -666,5 +678,82 @@ async fn rejects_failed_and_invalid_responses() {
         );
 
         server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn transport_failure_omits_credentials() {
+    let request = ModelRequest {
+        model: "test".into(),
+        workspace: None,
+        messages: Vec::new(),
+        stream: false,
+        tools: Vec::new(),
+    };
+
+    let error =
+        generate_at(&reqwest::Client::new(), 1, request, "dummy-secret-key", "http://127.0.0.1:0")
+            .await
+            .unwrap_err()
+            .to_string();
+
+    assert!(error.contains("Gemini request failed"));
+    assert!(!error.contains("dummy-secret-key"));
+    assert!(!error.contains("key="));
+}
+
+#[test]
+fn tool_results_preserve_pixels_with_current_and_legacy_calls() {
+    for (model, signature, legacy) in [
+        ("gemini-3.8-flash", Some("signature"), false),
+        ("gemini-3.8-flash", None, true),
+        ("gemini-2.5-flash", None, false),
+    ] {
+        let input = ModelRequest {
+            model: model.into(),
+            workspace: None,
+            messages: vec![
+                Message {
+                    id: "call".into(),
+                    session: "s".into(),
+                    role: Role::Assistant,
+                    sender: None,
+                    content: vec![Content::ToolCall {
+                        name: "browser_screenshot".into(),
+                        args: json!({}),
+                        id: Some("call-1".into()),
+                        thought_signature: signature.map(str::to_owned),
+                    }],
+                },
+                Message {
+                    id: "result".into(),
+                    session: "s".into(),
+                    role: Role::Tool,
+                    sender: Some("browser_screenshot".into()),
+                    content: vec![
+                        Content::Text { text: "Screenshot".into() },
+                        Content::Image {
+                            uri: "data:image/png;base64,aW1hZ2U=".into(),
+                            alt: Some("Screen".into()),
+                        },
+                    ],
+                },
+            ],
+            stream: false,
+            tools: Vec::new(),
+        };
+
+        let body = request_body(&input).unwrap();
+        let parts = body["contents"][1]["parts"].as_array().unwrap();
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1], json!({"inlineData": {"mimeType": "image/png", "data": "aW1hZ2U="}}));
+
+        if legacy {
+            assert_eq!(parts[0]["text"], "[Tool result browser_screenshot]: Screenshot\nScreen");
+        } else {
+            assert_eq!(parts[0]["functionResponse"]["id"], "call-1");
+            assert_eq!(parts[0]["functionResponse"]["response"]["output"], "Screenshot\nScreen");
+        }
     }
 }

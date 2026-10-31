@@ -21,7 +21,8 @@ Set `KRABB_TELEGRAM_TOKEN`. With `KRABB_KEYRING=1`, the plugin can use the
 ## Messages And Media
 
 The plugin normalizes private and group messages, topics, text, photos,
-documents, and voice notes.
+documents, and voice notes. Media downloads preserve raw bytes in the confined
+cache; only textual Bot API responses are decoded as UTF-8.
 
 - Images: PNG, JPEG, GIF, or WebP; up to 4 MiB total per turn. The selected
   model must support image input.

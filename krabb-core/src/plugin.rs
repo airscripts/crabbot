@@ -1,23 +1,23 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     ffi::OsString,
     future::Future,
     path::PathBuf,
     process::Stdio,
     sync::{
-        Arc,
+        Arc, Mutex as SyncMutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
 #[cfg(unix)]
-use rustix::process::{Pid, Signal, getpgid, getpgrp, kill_process, kill_process_group};
+use rustix::process::{Pid, Signal, getpgid, getpgrp, getsid, kill_process, kill_process_group};
 use serde_json::{Value, json};
 
 use tokio::{
-    io::{AsyncBufRead, AsyncWrite, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, BufReader},
     process::{Child, Command},
-    sync::{Mutex, mpsc, oneshot},
+    sync::{mpsc, oneshot},
     time::{Duration, timeout},
 };
 
@@ -41,8 +41,8 @@ pub struct Emitter {
     output: mpsc::Sender<Value>,
     events: Arc<AtomicUsize>,
     calls: Arc<AtomicU64>,
-    replies: Arc<Mutex<BTreeMap<u64, oneshot::Sender<crate::types::Response>>>>,
-    streams: Arc<Mutex<BTreeMap<u64, mpsc::UnboundedSender<Value>>>>,
+    replies: Arc<SyncMutex<BTreeMap<u64, oneshot::Sender<crate::types::Response>>>>,
+    streams: Arc<SyncMutex<BTreeMap<u64, mpsc::UnboundedSender<Value>>>>,
 }
 
 impl Emitter {
@@ -51,8 +51,8 @@ impl Emitter {
             output,
             events: Arc::new(AtomicUsize::new(0)),
             calls: Arc::new(AtomicU64::new(1)),
-            replies: Arc::new(Mutex::new(BTreeMap::new())),
-            streams: Arc::new(Mutex::new(BTreeMap::new())),
+            replies: Arc::new(SyncMutex::new(BTreeMap::new())),
+            streams: Arc::new(SyncMutex::new(BTreeMap::new())),
         }
     }
 
@@ -105,16 +105,17 @@ impl Emitter {
         }
 
         let (sender, mut receiver) = oneshot::channel();
-        self.replies.lock().await.insert(id, sender);
+        self.replies.lock().expect("call registry poisoned").insert(id, sender);
         let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
-        self.streams.lock().await.insert(id, event_sender);
+        self.streams.lock().expect("call registry poisoned").insert(id, event_sender);
+        let mut registration = Registration { emitter: self.clone(), id, sent: false };
         let value = serde_json::to_value(request)?;
+        self.output
+            .send(value)
+            .await
+            .map_err(|_| Error::Protocol("plugin output is unavailable".into()))?;
 
-        if self.output.send(value).await.is_err() {
-            self.replies.lock().await.remove(&id);
-            self.streams.lock().await.remove(&id);
-            return Err(Error::Protocol("plugin output is unavailable".into()));
-        }
+        registration.sent = true;
 
         let result = timeout(Duration::from_secs(120), async {
             loop {
@@ -146,15 +147,43 @@ impl Emitter {
         .await
         .unwrap_or_else(|_| Err(Error::Protocol("host response timed out".into())));
 
-        self.replies.lock().await.remove(&id);
-        self.streams.lock().await.remove(&id);
+        if result.is_ok() {
+            registration.sent = false;
+        }
 
         result
     }
 }
 
+struct Registration {
+    emitter: Emitter,
+    id: u64,
+    sent: bool,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.emitter.replies.lock().expect("call registry poisoned").remove(&self.id);
+        self.emitter.streams.lock().expect("call registry poisoned").remove(&self.id);
+
+        if self.sent {
+            let cancel = json!({"jsonrpc": "2.0", "method": "cancel", "params": {"id": self.id}});
+
+            if let Err(mpsc::error::TrySendError::Full(cancel)) =
+                self.emitter.output.try_send(cancel)
+            {
+                let output = self.emitter.output.clone();
+                tokio::spawn(async move {
+                    let _ = output.send(cancel).await;
+                });
+            }
+        }
+    }
+}
+
 pub async fn serve(hello: Hello) -> Result<()> {
     let stdin = tokio::io::stdin();
+
     let stdout = tokio::io::stdout();
     serve_io(hello, BufReader::new(stdin), stdout, |_| async { Ok(None) }).await
 }
@@ -203,11 +232,16 @@ where
 {
     let (sender, mut receiver) = mpsc::channel::<Value>(OUTPUT);
     let (incoming, mut requests) = mpsc::channel::<Incoming>(OUTPUT);
-    let replies = Arc::new(Mutex::new(BTreeMap::new()));
-    let streams = Arc::new(Mutex::new(BTreeMap::new()));
+    let replies = Arc::new(SyncMutex::new(BTreeMap::new()));
+    let streams = Arc::new(SyncMutex::new(BTreeMap::new()));
     let calls = Arc::new(AtomicU64::new(1));
-    let reader =
-        tokio::spawn(read_input(input, incoming, Arc::clone(&replies), Arc::clone(&streams)));
+    let reader = tokio::spawn(read_input(
+        input,
+        incoming,
+        Arc::clone(&replies),
+        Arc::clone(&streams),
+        Arc::clone(&calls),
+    ));
 
     let writer = tokio::spawn(async move {
         let mut output = output;
@@ -328,11 +362,16 @@ where
 {
     let (sender, mut receiver) = mpsc::channel::<Value>(OUTPUT);
     let (incoming, mut requests) = mpsc::channel::<Incoming>(OUTPUT);
-    let replies = Arc::new(Mutex::new(BTreeMap::new()));
-    let streams = Arc::new(Mutex::new(BTreeMap::new()));
+    let replies = Arc::new(SyncMutex::new(BTreeMap::new()));
+    let streams = Arc::new(SyncMutex::new(BTreeMap::new()));
     let calls = Arc::new(AtomicU64::new(1));
-    let reader =
-        tokio::spawn(read_input(input, incoming, Arc::clone(&replies), Arc::clone(&streams)));
+    let reader = tokio::spawn(read_input(
+        input,
+        incoming,
+        Arc::clone(&replies),
+        Arc::clone(&streams),
+        Arc::clone(&calls),
+    ));
 
     let writer = tokio::spawn(async move {
         let mut output = output;
@@ -398,6 +437,8 @@ where
 
                         continue;
                     }
+
+                    active.retain(|_, handle| !handle.is_finished());
 
                     if id.is_some_and(|id| active.contains_key(&id)) {
                         if let Some(id) = id {
@@ -480,7 +521,6 @@ where
                             });
 
                             if let Some(id) = id {
-                                active.retain(|_, handle| !handle.is_finished());
                                 active.insert(id, worker);
                             }
                         }
@@ -547,8 +587,9 @@ enum Incoming {
 async fn read_input<R>(
     mut input: R,
     incoming: mpsc::Sender<Incoming>,
-    replies: Arc<Mutex<BTreeMap<u64, oneshot::Sender<crate::types::Response>>>>,
-    streams: Arc<Mutex<BTreeMap<u64, mpsc::UnboundedSender<Value>>>>,
+    replies: Arc<SyncMutex<BTreeMap<u64, oneshot::Sender<crate::types::Response>>>>,
+    streams: Arc<SyncMutex<BTreeMap<u64, mpsc::UnboundedSender<Value>>>>,
+    calls: Arc<AtomicU64>,
 ) where
     R: AsyncBufRead + Unpin,
 {
@@ -578,7 +619,8 @@ async fn read_input<R>(
                     if let Request::Note { method, params, .. } = &request
                         && method == "event"
                         && let Some(id) = params["callId"].as_u64()
-                        && let Some(stream) = streams.lock().await.get(&id).cloned()
+                        && let Some(stream) =
+                            streams.lock().expect("call registry poisoned").get(&id).cloned()
                     {
                         let _ = stream.send(params["event"].clone());
                         continue;
@@ -614,8 +656,13 @@ async fn read_input<R>(
             }
         };
 
-        let reply = replies.lock().await.remove(&response.id);
+        let reply = replies.lock().expect("call registry poisoned").remove(&response.id);
         let Some(reply) = reply else {
+            // IDs are never reused. An issued ID without a registration is retired.
+            if response.id > 0 && response.id < calls.load(Ordering::Relaxed) {
+                continue;
+            }
+
             let _ = incoming
                 .send(Incoming::Error(Error::Protocol(
                     "host sent an unknown server response".into(),
@@ -714,11 +761,28 @@ where
     Ok(())
 }
 
+async fn read_frame(input: &mut (impl AsyncBufRead + Unpin), frame: &mut Vec<u8>) -> Result<Value> {
+    let remaining = FRAME.saturating_add(1).saturating_sub(frame.len());
+    let count = input.take(remaining as u64).read_until(b'\n', frame).await?;
+
+    if frame.len() > FRAME {
+        return Err(Error::Limit("plugin frame exceeds the size limit".into()));
+    }
+
+    if count == 0 || frame.last() != Some(&b'\n') {
+        return Err(Error::Protocol("plugin closed stdout during a frame".into()));
+    }
+
+    let value = serde_json::from_slice(frame)?;
+    frame.clear();
+    Ok(value)
+}
+
 pub struct Process {
     pub hello: Hello,
-    child: Child,
-    group: Option<u32>,
+    tree: Tree,
     input: BufReader<tokio::process::ChildStdout>,
+    frame: Vec<u8>,
     output: tokio::process::ChildStdin,
     stderr: Option<mpsc::Receiver<Vec<u8>>>,
     path: PathBuf,
@@ -726,17 +790,24 @@ pub struct Process {
     env: Option<Vec<(OsString, OsString)>>,
 }
 
-impl Drop for Process {
+struct Tree {
+    child: Child,
+    group: Option<u32>,
+}
+
+impl Drop for Tree {
     fn drop(&mut self) {
         #[cfg(unix)]
         if let Some(group) = self.group.and_then(external_group) {
-            kill_group(group, Signal::KILL);
+            kill_session(group, Signal::KILL);
         }
 
         #[cfg(windows)]
         if let Some(id) = self.group {
             let _ = std::process::Command::new("taskkill")
                 .args(["/PID", &id.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status();
         }
 
@@ -790,7 +861,7 @@ impl Process {
         #[cfg(unix)]
         let mut command = {
             let mut command = Command::new(&path);
-            command.process_group(0);
+            krabb_process::isolate_session(command.as_std_mut());
             command
         };
 
@@ -805,10 +876,22 @@ impl Process {
                 .env("KRABB_PLUGIN_GROUP", "1");
         }
 
-        let mut child =
-            command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
 
-        let stderr = child.stderr.take().map(|mut stream| {
+        #[cfg(unix)]
+        let group = child.id().and_then(child_group);
+
+        #[cfg(windows)]
+        let group = child.id();
+
+        let mut tree = Tree { child, group };
+
+        let stderr = tree.child.stderr.take().map(|mut stream| {
             let (sender, receiver) = mpsc::channel(64);
 
             tokio::spawn(async move {
@@ -828,21 +911,18 @@ impl Process {
             receiver
         });
 
-        #[cfg(unix)]
-        let group = child.id().and_then(child_group);
-
-        #[cfg(windows)]
-        let group = child.id();
-
         let result = async {
-            let stdout =
-                child.stdout.take().ok_or_else(|| Error::Handshake("missing stdout".into()))?;
+            let stdout = tree
+                .child
+                .stdout
+                .take()
+                .ok_or_else(|| Error::Handshake("missing stdout".into()))?;
 
             let mut input = BufReader::new(stdout);
             let request = Request::call(1, "hello", json!({"protocol": Protocol::CURRENT}));
 
             let mut stdin =
-                child.stdin.take().ok_or_else(|| Error::Handshake("missing stdin".into()))?;
+                tree.child.stdin.take().ok_or_else(|| Error::Handshake("missing stdin".into()))?;
 
             jsonl::write(&mut stdin, &request).await?;
             let response: Response =
@@ -877,11 +957,11 @@ impl Process {
 
         match result {
             Ok((hello, input, output)) => {
-                Ok(Self { hello, child, group, input, output, stderr, path, args, env })
+                Ok(Self { hello, tree, input, frame: Vec::new(), output, stderr, path, args, env })
             }
 
             Err(error) => {
-                stop_tree(&mut child, group).await;
+                stop_tree(&mut tree.child, tree.group).await;
                 Err(error)
             }
         }
@@ -961,7 +1041,7 @@ impl Process {
         &mut self,
         request: Request,
         limit: Duration,
-        mut note: F,
+        note: F,
         mut call: C,
     ) -> Result<Response>
     where
@@ -970,82 +1050,45 @@ impl Process {
         C: FnMut(Request) -> Cfut,
         Cfut: Future<Output = Result<Response>>,
     {
-        if !request.valid() {
-            return Err(Error::Protocol("requests must use JSON-RPC 2.0".into()));
-        }
-
-        let id = request.id().ok_or_else(|| Error::Protocol("calls need an id".into()))?;
-
-        let result = timeout(limit, async {
-            jsonl::write(&mut self.output, &request).await?;
-            let mut notes = 0_usize;
-            let mut calls = 0_usize;
-
-            loop {
-                let value: Value = jsonl::read(&mut self.input, FRAME)
-                    .await?
-                    .ok_or_else(|| Error::Protocol("plugin closed stdout".into()))?;
-
-                if value.get("method").is_some() {
-                    let request: Request = serde_json::from_value(value)?;
-
-                    if !request.valid() {
-                        return Err(Error::Protocol("plugin sent an invalid request".into()));
-                    }
-
-                    if let Some(id) = request.id() {
-                        calls = calls.saturating_add(1);
-
-                        if calls > NOTES {
-                            return Err(Error::Limit(
-                                "plugin sent too many server requests".into(),
-                            ));
-                        }
-
-                        let response = call(request).await?;
-
-                        if !response.valid() || response.id != id {
-                            return Err(Error::Protocol(
-                                "server request handler returned an invalid response".into(),
-                            ));
-                        }
-
-                        jsonl::write(&mut self.output, &response).await?;
-                    } else {
-                        notes = notes.saturating_add(1);
-
-                        if notes > NOTES {
-                            return Err(Error::Limit(
-                                "plugin emitted too many stream notifications".into(),
-                            ));
-                        }
-
-                        note(request).await?;
-                    }
-
-                    continue;
-                }
-
-                let response: Response = serde_json::from_value(value)?;
-
-                if !response.valid() {
-                    return Err(Error::Protocol("plugin sent an invalid response".into()));
-                }
-
-                if response.id == id {
-                    return Ok(response);
-                }
-            }
-        })
-        .await;
-
-        result.map_err(|_| Error::Protocol("plugin response timed out".into()))?
+        self.call_stream_with_lifetime(request, Some(limit), note, move |request, _| call(request))
+            .await
     }
 
     pub async fn call_full_timeout_stream_async<F, Fut, C, Cfut>(
         &mut self,
         request: Request,
         limit: Duration,
+        note: F,
+        call: C,
+    ) -> Result<Response>
+    where
+        F: FnMut(Request) -> Fut,
+        Fut: Future<Output = Result<()>>,
+        C: FnMut(Request, mpsc::UnboundedSender<Request>) -> Cfut,
+        Cfut: Future<Output = Result<Response>>,
+    {
+        self.call_stream_with_lifetime(request, Some(limit), note, call).await
+    }
+
+    pub async fn listen_stream_async<F, Fut, C, Cfut>(
+        &mut self,
+        request: Request,
+        note: F,
+        call: C,
+    ) -> Result<Response>
+    where
+        F: FnMut(Request) -> Fut,
+        Fut: Future<Output = Result<()>>,
+        C: FnMut(Request, mpsc::UnboundedSender<Request>) -> Cfut,
+        Cfut: Future<Output = Result<Response>>,
+    {
+        self.call_stream_with_lifetime(request, None, note, call).await
+    }
+
+    async fn call_stream_with_lifetime<F, Fut, C, Cfut>(
+        &mut self,
+        request: Request,
+        limit: Option<Duration>,
         mut note: F,
         mut call: C,
     ) -> Result<Response>
@@ -1062,16 +1105,21 @@ impl Process {
         let id = request.id().ok_or_else(|| Error::Protocol("calls need an id".into()))?;
         let (outgoing, mut outgoing_events) = mpsc::unbounded_channel();
 
-        let result = timeout(limit, async {
+        let operation = async {
             jsonl::write(&mut self.output, &request).await?;
             let mut notes = 0_usize;
             let mut calls = 0_usize;
             let mut events_closed = false;
+            let mut queued = VecDeque::new();
 
             loop {
-                let value: Value = jsonl::read(&mut self.input, FRAME)
-                    .await?
-                    .ok_or_else(|| Error::Protocol("plugin closed stdout".into()))?;
+                let (value, received) = match queued.pop_front() {
+                    Some(value) => value,
+                    None => (
+                        read_frame(&mut self.input, &mut self.frame).await?,
+                        tokio::time::Instant::now(),
+                    ),
+                };
 
                 if value.get("method").is_some() {
                     let request: Request = serde_json::from_value(value)?;
@@ -1080,20 +1128,86 @@ impl Process {
                         return Err(Error::Protocol("plugin sent an invalid request".into()));
                     }
 
+                    if let Request::Note { method, params, .. } = &request
+                        && method == "cancel"
+                    {
+                        if let Some(cancelled) = params["id"].as_u64() {
+                            queued.retain(|(value, _)| value["id"].as_u64() != Some(cancelled));
+                        }
+
+                        continue;
+                    }
+
                     if let Some(server_id) = request.id() {
+                        let deadline = received + limit.unwrap_or(Duration::from_secs(120));
+
+                        if tokio::time::Instant::now() >= deadline {
+                            jsonl::write(
+                                &mut self.output,
+                                &Response::fail(server_id, -32800, "host request expired"),
+                            )
+                            .await?;
+                            continue;
+                        }
+
                         calls = calls.saturating_add(1);
 
-                        if calls > NOTES {
+                        if limit.is_some() && calls > NOTES {
                             return Err(Error::Limit(
                                 "plugin sent too many server requests".into(),
                             ));
                         }
 
-                        let handler = call(request, outgoing.clone());
+                        let handler = async {
+                            let result =
+                                tokio::time::timeout_at(deadline, call(request, outgoing.clone()))
+                                    .await
+                                    .unwrap_or_else(|_| {
+                                        Err(Error::Protocol("host request timed out".into()))
+                                    });
+
+                            if limit.is_none() {
+                                Ok(result.unwrap_or_else(|error| {
+                                    Response::fail(server_id, -32000, error.to_string())
+                                }))
+                            } else {
+                                result
+                            }
+                        };
+
+                        let mut emitted = 0_usize;
                         tokio::pin!(handler);
                         let response = loop {
                             tokio::select! {
                                 biased;
+
+                                incoming = read_frame(&mut self.input, &mut self.frame) => {
+                                    let value = incoming?;
+
+                                    if value["method"] == "cancel" && value.get("id").is_none() {
+                                        let cancel: Request = serde_json::from_value(value)?;
+
+                                        if !cancel.valid() {
+                                            return Err(Error::Protocol("plugin sent an invalid cancellation".into()));
+                                        }
+
+                                        if let Request::Note { params, .. } = cancel
+                                            && let Some(cancelled) = params["id"].as_u64()
+                                        {
+                                            queued.retain(|(value, _)| value["id"].as_u64() != Some(cancelled));
+
+                                            if cancelled == server_id {
+                                                break Response::fail(server_id, -32800, "host request cancelled");
+                                            }
+                                        }
+                                    } else {
+                                        if queued.len() >= OUTPUT {
+                                            return Err(Error::Limit("plugin sent too many queued requests".into()));
+                                        }
+
+                                        queued.push_back((value, tokio::time::Instant::now()));
+                                    }
+                                }
 
                                 event = outgoing_events.recv(), if !events_closed => {
                                     match event {
@@ -1107,6 +1221,14 @@ impl Process {
                                             if serde_json::to_vec(&event)?.len().saturating_add(1) > FRAME {
                                                 return Err(Error::Limit(
                                                     "host stream notification exceeds the frame limit".into(),
+                                                ));
+                                            }
+
+                                            emitted += 1;
+
+                                            if emitted > NOTES {
+                                                return Err(Error::Limit(
+                                                    "host emitted too many stream notifications".into(),
                                                 ));
                                             }
 
@@ -1134,6 +1256,14 @@ impl Process {
                                 ));
                             }
 
+                            emitted += 1;
+
+                            if emitted > NOTES {
+                                return Err(Error::Limit(
+                                    "host emitted too many stream notifications".into(),
+                                ));
+                            }
+
                             jsonl::write(&mut self.output, &event).await?;
                         }
 
@@ -1144,6 +1274,10 @@ impl Process {
                         }
 
                         jsonl::write(&mut self.output, &response).await?;
+
+                        if limit.is_none() {
+                            notes = 0;
+                        }
                     } else {
                         notes = notes.saturating_add(1);
 
@@ -1169,14 +1303,18 @@ impl Process {
                     return Ok(response);
                 }
             }
-        })
-        .await;
+        };
 
-        result.map_err(|_| Error::Protocol("plugin response timed out".into()))?
+        match limit {
+            Some(limit) => timeout(limit, operation)
+                .await
+                .map_err(|_| Error::Protocol("plugin response timed out".into()))?,
+            None => operation.await,
+        }
     }
 
     pub async fn restart(&mut self) -> Result<()> {
-        stop_tree(&mut self.child, self.group).await;
+        stop_tree(&mut self.tree.child, self.tree.group).await;
 
         let replacement =
             Self::start_owned(self.path.clone(), self.args.clone(), self.env.clone()).await?;
@@ -1189,8 +1327,8 @@ impl Process {
         let shutdown = self.call(Request::call(9_999, "shutdown", serde_json::json!({})));
         let _ = timeout(Duration::from_secs(2), shutdown).await;
 
-        let _ = timeout(Duration::from_secs(2), self.child.wait()).await;
-        stop_tree(&mut self.child, self.group).await;
+        let _ = timeout(Duration::from_secs(2), self.tree.child.wait()).await;
+        stop_tree(&mut self.tree.child, self.tree.group).await;
         Ok(())
     }
 }
@@ -1198,14 +1336,19 @@ impl Process {
 async fn stop_tree(child: &mut Child, group: Option<u32>) {
     #[cfg(unix)]
     if let Some(group) = group.and_then(external_group) {
-        let _ = kill_process_group(group, Signal::TERM);
+        kill_session(group, Signal::TERM);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        kill_group(group, Signal::KILL);
+        kill_session(group, Signal::KILL);
     }
 
     #[cfg(windows)]
     if let Some(id) = group {
-        let _ = Command::new("taskkill").args(["/PID", &id.to_string(), "/T", "/F"]).status().await;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &id.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
     }
 
     let _ = child.kill().await;
@@ -1225,7 +1368,7 @@ fn external_group(id: u32) -> Option<Pid> {
 }
 
 #[cfg(unix)]
-fn kill_group(group: Pid, signal: Signal) {
+fn kill_session(group: Pid, signal: Signal) {
     if group == getpgrp() {
         return;
     }
@@ -1253,7 +1396,10 @@ fn kill_group(group: Pid, signal: Signal) {
             continue;
         };
 
-        if pgid == group && pid.as_raw_pid() as u32 != current {
+        if pid.as_raw_pid() as u32 != current
+            && (pgid == group || getsid(Some(pid)).ok() == Some(group))
+        {
+            let _ = kill_process_group(pgid, signal);
             let _ = kill_process(pid, signal);
         }
     }
@@ -1448,15 +1594,26 @@ fn main() {
             }
         }
 
-        "stream_server_request" => {
+        "stream_server_request" | "listener_budget" | "operation_budget" => {
             while let Some(Ok(line)) = lines.next() {
                 if line.contains("\"method\":\"hello\"") {
                     send(r#"{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"test","version":"0.1.0","capabilities":[]}}"#);
                 } else if line.contains("\"method\":\"command\"") {
-                    send(r#"{"jsonrpc":"2.0","id":7,"method":"host/model_stream","params":{}}"#);
+                    let count = if mode == "stream_server_request" { 1 } else { 300 };
 
-                    let _ = lines.next();
-                    let _ = lines.next();
+                    for _ in 0..count {
+                        if mode != "stream_server_request" {
+                            send(r#"{"jsonrpc":"2.0","method":"event","params":{}}"#);
+                        }
+
+                        send(r#"{"jsonrpc":"2.0","id":7,"method":"host/model_stream","params":{}}"#);
+                        let _ = lines.next();
+
+                        if mode == "stream_server_request" {
+                            let _ = lines.next();
+                        }
+                    }
+
                     send(r#"{"jsonrpc":"2.0","id":2,"result":{"done":true}}"#);
                 } else if line.contains("\"method\":\"shutdown\"") {
                     send(r#"{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}"#);
@@ -1644,6 +1801,58 @@ fn main() {
     }
 
     #[tokio::test]
+    async fn concurrent_handlers_accept_sequential_id_reuse() {
+        use std::{future::Future, task::Poll};
+
+        let (client, server) = duplex(16 * 1024);
+        let (client_read, mut client_write) = split(client);
+        let (server_read, server_write) = split(server);
+        let server = serve_io_events_concurrent(
+            hello(),
+            BufReader::new(server_read),
+            server_write,
+            |request, _| async move {
+                Ok(Some(Response::ok(request.id().unwrap(), json!({"done": true}))))
+            },
+        );
+        tokio::pin!(server);
+        let mut input = BufReader::new(client_read);
+
+        std::future::poll_fn(|cx| {
+            assert!(server.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        for _ in 0..64 {
+            jsonl::write(&mut client_write, &Request::call(1, "generate", json!({})))
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+
+            // Leave completed workers unjoined until the next request is queued.
+            std::future::poll_fn(|cx| {
+                assert!(server.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+
+            let response: Response =
+                timeout(Duration::from_secs(1), jsonl::read(&mut input, super::FRAME))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+
+            assert!(response.error.is_none(), "{response:?}");
+            assert_eq!(response.result.unwrap()["done"], true);
+        }
+
+        jsonl::write(&mut client_write, &Request::call(2, "shutdown", json!({}))).await.unwrap();
+        timeout(Duration::from_secs(1), server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn cancellation_aborts_a_request_without_stopping_the_plugin() {
         let (client, server) = duplex(16 * 1024);
         let (mut client_read, mut client_write) = split(client);
@@ -1684,6 +1893,129 @@ fn main() {
         let shutdown: Response = serde_json::from_str(&line).unwrap();
         assert_eq!(shutdown.id, 2);
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_host_calls_release_registrations_and_accept_late_responses() {
+        let (output, mut sent) = tokio::sync::mpsc::channel(1);
+        let emitter = Emitter::new(output);
+        let task_emitter = emitter.clone();
+        let call =
+            tokio::spawn(async move { task_emitter.call("host/model_stream", json!({})).await });
+        let request = sent.recv().await.unwrap();
+        let id = request["id"].as_u64().unwrap();
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+
+        assert!(emitter.replies.lock().unwrap().is_empty());
+        assert!(emitter.streams.lock().unwrap().is_empty());
+        let cancel = sent.recv().await.unwrap();
+
+        assert_eq!(cancel["method"], "cancel");
+        assert_eq!(cancel["params"]["id"], id);
+
+        let mut input = Vec::new();
+        jsonl::write(&mut input, &Response::ok(id, json!({}))).await.unwrap();
+        jsonl::write(&mut input, &Request::call(90, "ping", json!({}))).await.unwrap();
+        jsonl::write(&mut input, &Response::ok(id + 1, json!({}))).await.unwrap();
+        let (incoming, mut received) = tokio::sync::mpsc::channel(8);
+        super::read_input(
+            BufReader::new(input.as_slice()),
+            incoming,
+            emitter.replies.clone(),
+            emitter.streams.clone(),
+            emitter.calls.clone(),
+        )
+        .await;
+
+        assert!(matches!(
+            received.recv().await,
+            Some(super::Incoming::Request(Request::Call { id: 90, .. }))
+        ));
+        assert!(matches!(received.recv().await, Some(super::Incoming::Error(_))));
+    }
+
+    #[tokio::test]
+    async fn preserves_partial_frames_when_reading_is_interrupted() {
+        let (mut writer, reader) = duplex(1024);
+        let mut input = BufReader::new(reader);
+        let mut frame = Vec::new();
+        writer.write_all(b"{\"jsonrpc\":").await.unwrap();
+
+        assert!(
+            timeout(Duration::from_millis(10), super::read_frame(&mut input, &mut frame))
+                .await
+                .is_err()
+        );
+        writer.write_all(b"\"2.0\",\"id\":1,\"result\":{}}\n").await.unwrap();
+        let value = super::read_frame(&mut input, &mut frame).await.unwrap();
+
+        assert_eq!(value["id"], 1);
+        assert!(frame.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancels_active_and_queued_host_requests_while_listening() {
+        let script = r#"while IFS= read -r line; do
+            case "$line" in
+                *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"test","version":"0.1.0","capabilities":[]}}' ;;
+                *command*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":7,"method":"host/model_stream","params":{}}'
+                    IFS= read -r event
+                    printf '%s\n' '{"jsonrpc":"2.0","id":8,"method":"host/model_stream","params":{}}'
+                    printf '%s\n' '{"jsonrpc":"2.0","method":"cancel","params":{"id":8}}'
+                    printf '%s\n' '{"jsonrpc":"2.0","method":"cancel","params":{"id":7}}'
+                    IFS= read -r cancelled
+                    printf '%s\n' '{"jsonrpc":"2.0","id":9,"method":"host/model_stream","params":{}}'
+                    IFS= read -r reply
+                    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"done":true}}' ;;
+                *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{}}'; exit 0 ;;
+            esac
+        done"#;
+        let mut process = start_test_plugin("host_cancel", script).await.unwrap();
+        let (dropped, mut cancelled) = tokio::sync::oneshot::channel::<()>();
+        let mut dropped = Some(dropped);
+        let mut calls = Vec::new();
+        let result = timeout(
+            Duration::from_secs(5),
+            process.listen_stream_async(
+                Request::call(2, "command", json!({})),
+                |_| async { Ok(()) },
+                |request, events| {
+                    let id = request.id().unwrap();
+                    calls.push(id);
+                    let guard = dropped.take();
+                    async move {
+                        if id == 7 {
+                            let _guard = guard;
+                            events
+                                .send(Request::Note {
+                                    jsonrpc: "2.0".into(),
+                                    method: "event".into(),
+                                    params: json!({}),
+                                })
+                                .unwrap();
+                            std::future::pending::<()>().await;
+                        }
+
+                        Ok(Response::ok(id, json!({})))
+                    }
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(calls, vec![7, 9]);
+        assert!(matches!(
+            cancelled.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+
+        assert_eq!(result.result.unwrap()["done"], true);
+        process.stop().await.unwrap();
     }
 
     #[tokio::test]
@@ -1918,6 +2250,70 @@ fn main() {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_handshakes_stops_and_reaps_starting_processes() {
+        for restart in [false, true] {
+            let marker = temp_path("cancelled-handshake", "pid");
+            let script = format!("sleep 30 & printf '%s\\n' $$ $! > '{}'; wait", marker.display());
+
+            let task = tokio::spawn(async move {
+                if restart {
+                    let ready = r#"printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"test","version":"0.1.0","capabilities":[]}}'; cat >/dev/null"#;
+                    let mut process = Process::start_with("sh", ["-c", ready]).await.unwrap();
+                    process.args = vec!["-c".into(), script.into()];
+                    process.restart().await
+                } else {
+                    Process::start_with("sh", ["-c", &script]).await.map(|_| ())
+                }
+            });
+
+            let pids = timeout(Duration::from_secs(3), async {
+                loop {
+                    let pids = std::fs::read_to_string(&marker).unwrap_or_default();
+                    let pids = pids.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+
+                    if pids.len() == 2 {
+                        break pids;
+                    }
+
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+
+            timeout(Duration::from_secs(3), async {
+                for (index, pid) in pids.iter().enumerate() {
+                    loop {
+                        let status = std::process::Command::new("ps")
+                            .args(["-o", "stat=", "-p", pid])
+                            .output()
+                            .unwrap();
+
+                        let state = String::from_utf8_lossy(&status.stdout);
+
+                        // The direct child must be reaped; orphan descendants may await init.
+                        if state.trim().is_empty()
+                            || (index > 0 && state.trim_start().starts_with('Z'))
+                        {
+                            break;
+                        }
+
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            })
+            .await
+            .expect("cancelled handshake left a live process or an unreaped child");
+
+            std::fs::remove_file(marker).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn process_cleanup_rejects_its_own_group() {
         let group = u32::try_from(getpgrp().as_raw_pid()).unwrap();
@@ -2059,6 +2455,67 @@ fn main() {
 
         assert_eq!(response.result.unwrap()["ok"], true);
         process.stop().await.unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn listener_budgets_are_per_request_and_handler_errors_are_recoverable() {
+        let script = r#"while IFS= read -r line; do
+            case "$line" in
+                *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"test","version":"0.1.0","capabilities":[]}}' ;;
+                *command*)
+                    count=0
+                    while [ "$count" -lt 300 ]; do
+                        printf '%s\n' '{"jsonrpc":"2.0","method":"event","params":{}}'
+                        printf '%s\n' '{"jsonrpc":"2.0","id":7,"method":"host/model_stream","params":{}}'
+                        IFS= read -r reply
+                        count=$((count + 1))
+                    done
+                    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"done":true}}' ;;
+                *shutdown*) printf '%s\n' '{"jsonrpc":"2.0","id":9999,"result":{"ok":true}}'; exit 0 ;;
+            esac
+        done"#;
+
+        let mut process = start_test_plugin("listener_budget", script).await.unwrap();
+        let mut calls = 0;
+        let mut notes = 0;
+
+        let response = process
+            .listen_stream_async(
+                Request::call(2, "command", json!({})),
+                |_| {
+                    notes += 1;
+                    std::future::ready(Ok(()))
+                },
+                |_, _| {
+                    calls += 1;
+                    std::future::ready(if calls == 1 {
+                        Err(crate::Error::Denied("failed run".into()))
+                    } else {
+                        Ok(Response::ok(7, json!({"text":"done"})))
+                    })
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls, 300);
+        assert_eq!(notes, 300);
+        assert_eq!(response.result.unwrap()["done"], true);
+        process.stop().await.unwrap();
+
+        let mut process = start_test_plugin("operation_budget", script).await.unwrap();
+        let result = process
+            .call_full_timeout_stream_async(
+                Request::call(2, "command", json!({})),
+                Duration::from_secs(5),
+                |_| async { Ok(()) },
+                |_, _| async { Ok(Response::ok(7, json!({"text":"done"}))) },
+            )
+            .await;
+
+        assert!(matches!(result, Err(crate::Error::Limit(_))));
+        drop(process);
     }
 
     #[cfg(any(unix, windows))]

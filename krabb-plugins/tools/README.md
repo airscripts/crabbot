@@ -6,14 +6,23 @@ Install the released plugin with:
 curl -fsSL https://raw.githubusercontent.com/krabblab/krabb/main/install.sh | sh -s -- tools
 ```
 
-The plugin confines reads, writes, searches, patches, and Git operations to
+The plugin confines reads, writes, searches, and declared patch targets to
 `KRABB_ROOT`, or to the active isolated workspace when the host supplies one.
 Unix operations use descriptor-relative no-follow access; Windows operations
-use canonical boundary checks and reparse-point-safe file handles. Writes reject
+hold parent directory handles that prohibit directory replacement and use
+reparse-point-safe file handles. Confined file operations fail closed on
+platforms other than Unix and Windows. Writes reject
 symbolic-link targets, and writes, patches, shell commands, and
 worktree mutations need explicit approval.
-Git inspection allows status, diff, worktree listing, and approved worktree
-add/remove operations within that active workspace.
+Git inspection allows status, diff, worktree listing, and worktree add/remove
+operations within that active workspace. All Git operations and Git-backed
+patches require shell access and the configured tool approval policy because
+Git can execute repository-configured filters, even during `diff`. They are
+unavailable when shell access is disabled; approval authorizes that execution. When a container sandbox is configured,
+use the sandboxed shell tool for Git operations and patches; the direct Git
+and patch tools reject execution on the host.
+Git runs in the active workspace, but repository-configured programs have
+shell permissions and may access paths outside that workspace.
 
 The read-only `fetch` tool retrieves bounded text from public HTTPS URLs. It
 blocks local and private network addresses, pins requests to validated DNS
@@ -22,8 +31,11 @@ addresses, rechecks redirects, caps redirects at three and response bodies at
 deadline and a four-request concurrency limit. The plugin declares its network
 permission in the manifest.
 
-Approved shell commands run on the host only when no container sandbox is
-configured. To isolate them, set `KRABB_SANDBOX_RUNTIME` to `docker` or
+On Linux and Windows, approved shell commands run on the host when no container sandbox is
+configured. Linux shells reject process-group and session changes so descendants cannot
+escape cancellation. On macOS and other Unix hosts, shell execution requires the container
+sandbox; host execution fails before running the command.
+To configure the sandbox, set `KRABB_SANDBOX_RUNTIME` to `docker` or
 `podman` and `KRABB_SANDBOX_IMAGE` to an image already available locally.
 The tools plugin never pulls images. The container has no network, a read-only
 root filesystem, dropped Linux capabilities, bounded CPU, memory, process and

@@ -36,6 +36,15 @@ The adapter validates app-server responses and fails closed if required
 operations are incompatible. Run `krabb codex login` or
 `krabb codex login --device` to authenticate.
 
+OpenAI and OpenRouter send the full tool catalog supplied by the host. The
+runtime permits up to 16 tool invocations per turn, counted once each across
+model steps. OpenAI, OpenRouter, Anthropic, Ollama, and the Codex API-key adapter
+coalesce text by size or a short timer and send at most 256 text notifications
+per request. The final reply retains all generated text within
+the response size limit, including text received after notifications stop.
+OpenRouter uses `KRABB_OPENROUTER_MODEL` for new daemon sessions when `KRABB_MODEL`
+is absent, as well as for empty or `default` model requests. Explicit models take precedence.
+
 Telegram images are inlined only after the host confines and bounds their
 cached files. Codex-compatible chat completions use image URL content parts;
 Anthropic uses base64 or HTTPS image blocks; Ollama receives base64 image data;
@@ -45,6 +54,10 @@ the selected adapter does not advertise it. The selected model must still
 support vision; Krabb does not silently substitute another model. Historical
 downloaded images expire from the cache after 24 hours, while images committed
 to a session are retained in its protected media area.
+
+Codex sign-in forwards normalized screenshot results as app-server image items,
+with the complete response bounded by the protocol frame limit. Gemini preserves
+inline screenshot pixels alongside function responses and legacy tool history.
 
 ## Channels
 
@@ -89,7 +102,7 @@ Use `krabb plugin list` and `krabb doctor` to inspect installed providers.
 | `mcp`, `resource` | MCP | Access to tools and resources exposed by MCP servers. |
 | `memory` | Memory | Scoped agent memory records with search and management commands. |
 | `scheduler` | Scheduler | Persistent scheduled agent tasks and controlled execution. |
-| `store` | SQLite | Values, leases, durable delivery state, and event deduplication. |
+| `store` | SQLite | Agent-accessible structured data, key/value values, leases, durable queue records, and event deduplication. |
 | `speech` | Whisper | Voice transcription through a local Whisper-compatible executable. |
 | `client` | TUI | A terminal interface connected to the daemon. |
 
@@ -103,7 +116,10 @@ The `acp` plugin starts a configured local executable that implements ACP. The
 a loopback run endpoint with run, text, frontend tool-call, state snapshot, and
 error events. These protocols connect compatible agents; they do not imply
 compatibility with unrelated agent-specific interfaces. See each plugin README
-for supported features and limits.
+for supported features and limits. ACP and A2A coalesce updates after the first
+255 notifications, reserving one final notification for the remaining text.
+ACP filesystem calls are routed through Krabb's tools plugin with the selected
+workspace confined to `KRABB_ROOT` and writes subject to the approval mode.
 The daemon reports a missing or incompatible capability instead of silently
 substituting another provider. Select a model for a session with
 `krabb session model <id> <model>`. When a model plugin is installed, use

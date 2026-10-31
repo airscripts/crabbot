@@ -14,7 +14,8 @@ use std::collections::BTreeMap;
 use tokio::time::Duration;
 
 const BODY_LIMIT: usize = krabb_core::jsonl::MAX / 2;
-const TOOL_LIMIT: usize = 16;
+const TOOL_CALLS: usize = 16;
+const TEXT_EVENTS: usize = 256;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -62,13 +63,11 @@ async fn generate(
 
     let input: ModelRequest = serde_json::from_value(params)?;
     let key = credential()?;
-    let model = if input.model.trim().is_empty() || input.model == "default" {
+    let model = resolve_model(&input.model, || {
         std::env::var("KRABB_OPENROUTER_MODEL").map_err(|_| {
             krabb_core::Error::Denied("KRABB_OPENROUTER_MODEL is not configured.".into())
-        })?
-    } else {
-        input.model.clone()
-    };
+        })
+    })?;
 
     let base = base_url()?;
     let request = ModelRequest { model, ..input };
@@ -78,6 +77,13 @@ async fn generate(
     } else {
         complete(client, id, request, &key, &base).await
     }
+}
+
+fn resolve_model(
+    model: &str,
+    default: impl FnOnce() -> krabb_core::Result<String>,
+) -> krabb_core::Result<String> {
+    if matches!(model.trim(), "" | "default" | "unset") { default() } else { Ok(model.to_owned()) }
 }
 
 fn base_url() -> krabb_core::Result<String> {
@@ -262,7 +268,20 @@ fn image(uri: &str) -> krabb_core::Result<&str> {
 }
 
 fn tools(input: &ModelRequest) -> Vec<Value> {
-    input.tools.iter().take(TOOL_LIMIT).map(|tool| json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.schema}})).collect()
+    input
+        .tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.schema,
+                },
+            })
+        })
+        .collect()
 }
 
 async fn stream_body<S, C, E>(
@@ -281,6 +300,7 @@ where
     let mut pending = String::new();
     let mut calls = BTreeMap::<usize, (String, String)>::new();
     let mut bytes: usize = 0;
+    let mut emitted = 0;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
@@ -305,12 +325,8 @@ where
             }
 
             if pending.len() >= 128 {
-                emit(&mut pending, emitter).await?;
+                emit(&mut pending, &mut emitted, emitter).await?;
             }
-        }
-
-        if !pending.is_empty() {
-            emit(&mut pending, emitter).await?;
         }
     }
 
@@ -318,7 +334,7 @@ where
         stream_line(&buffer, &mut text, &mut pending, &mut calls)?;
     }
 
-    emit(&mut pending, emitter).await?;
+    emit(&mut pending, &mut emitted, emitter).await?;
     let events = calls
         .into_values()
         .map(|(name, args)| {
@@ -371,7 +387,7 @@ fn stream_line(
             let index = value["index"]
                 .as_u64()
                 .and_then(|value| usize::try_from(value).ok())
-                .filter(|value| *value < TOOL_LIMIT)
+                .filter(|value| *value < TOOL_CALLS)
                 .ok_or_else(|| {
                     krabb_core::Error::Denied(
                         "OpenRouter stream exceeded the tool-call limit.".into(),
@@ -393,11 +409,17 @@ fn stream_line(
     Ok(false)
 }
 
-async fn emit(pending: &mut String, emitter: &mut Emitter) -> krabb_core::Result<()> {
-    if !pending.is_empty() {
+async fn emit(
+    pending: &mut String,
+    emitted: &mut usize,
+    emitter: &mut Emitter,
+) -> krabb_core::Result<()> {
+    if !pending.is_empty() && *emitted < TEXT_EVENTS {
         emitter.event(json!({"kind":"text","text":std::mem::take(pending)})).await?;
+        *emitted += 1;
     }
 
+    pending.clear();
     Ok(())
 }
 
@@ -478,8 +500,9 @@ fn credential() -> krabb_core::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::resolve_model;
     use super::{
-        BODY_LIMIT, TOOL_LIMIT, base_url, collect, credential, generate, headers, headers_with,
+        BODY_LIMIT, TOOL_CALLS, base_url, collect, credential, generate, headers, headers_with,
         image, messages, response, response_body, stream_body, stream_line, tools,
         validate_base_url,
     };
@@ -530,6 +553,31 @@ mod tests {
     }
 
     #[test]
+    fn resolves_daemon_model_sentinels_without_overriding_explicit_models() {
+        for sentinel in ["unset", "default", "", "  "] {
+            let mut request = model();
+            request.model = sentinel.into();
+
+            assert_eq!(
+                resolve_model(&request.model, || Ok("configured/model".into())).unwrap(),
+                "configured/model"
+            );
+
+            assert!(
+                resolve_model(&request.model, || Err(krabb_core::Error::Denied(
+                    "Model is not configured.".into()
+                )))
+                .is_err()
+            );
+        }
+
+        assert_eq!(
+            resolve_model("explicit/model", || panic!("unexpected default")).unwrap(),
+            "explicit/model"
+        );
+    }
+
+    #[test]
     fn builds_messages_tools_and_images() {
         let input = model();
 
@@ -551,8 +599,8 @@ mod tests {
 
         assert_eq!(messages(&tool).unwrap().last().unwrap()["role"], "user");
 
-        let mut too_many = input;
-        too_many.tools = (0..TOOL_LIMIT + 2)
+        let mut catalog = input;
+        catalog.tools = (0..TOOL_CALLS + 2)
             .map(|index| ToolSpec {
                 name: format!("tool-{index}"),
                 description: None,
@@ -560,7 +608,14 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(tools(&too_many).len(), TOOL_LIMIT);
+        let definitions = tools(&catalog);
+
+        assert_eq!(definitions.len(), catalog.tools.len());
+
+        for (definition, tool) in definitions.iter().zip(&catalog.tools) {
+            assert_eq!(definition["function"]["name"], tool.name);
+            assert_eq!(definition["function"]["parameters"], tool.schema);
+        }
     }
 
     #[test]
@@ -762,6 +817,42 @@ mod tests {
         )]);
 
         assert!(stream_body(3, incomplete, &mut emitter).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn completes_streams_beyond_the_notification_budget() {
+        for (fragment, count) in [("x".to_owned(), 600), ("x".repeat(128), 300)] {
+            let line = format!("data: {}\n", json!({"choices":[{"delta":{"content":fragment}}]}));
+
+            let chunks =
+                stream::iter((0..count).map(|_| Ok::<_, std::io::Error>(line.as_bytes().to_vec())));
+
+            let (output, mut events) = tokio::sync::mpsc::channel(256);
+            let mut emitter = krabb_core::plugin::Emitter::new(output);
+            let response = stream_body(2, chunks, &mut emitter).await.unwrap().unwrap();
+            let expected = fragment.repeat(count);
+
+            assert_eq!(response.result.unwrap()["text"], expected);
+
+            let mut notifications = 0;
+            let mut streamed = String::new();
+
+            while let Ok(event) = events.try_recv() {
+                notifications += 1;
+                streamed.push_str(event["params"]["event"]["text"].as_str().unwrap());
+            }
+
+            assert!(notifications > 0 && notifications <= 256);
+            assert!(notifications < count);
+            assert!(expected.starts_with(&streamed));
+
+            if fragment.len() == 1 {
+                assert_eq!(streamed, expected);
+            } else {
+                assert_eq!(notifications, 256);
+                assert!(streamed.len() < expected.len());
+            }
+        }
     }
 
     #[tokio::test]

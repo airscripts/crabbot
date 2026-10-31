@@ -556,9 +556,13 @@ async fn api_at(
     body: Value,
     base: &str,
 ) -> krabb_core::Result<Value> {
-    let base = reqwest::Url::parse(base).map_err(|error| {
+    let mut base = reqwest::Url::parse(base).map_err(|error| {
         krabb_core::Error::Denied(format!("Slack API URL was invalid: {error}."))
     })?;
+
+    if !base.path().ends_with('/') {
+        base.set_path(&format!("{}/", base.path()));
+    }
 
     let url = base.join(method).map_err(|error| {
         krabb_core::Error::Denied(format!("Slack API URL was invalid: {error}."))
@@ -1420,7 +1424,7 @@ mod tests {
         }
     }
 
-    async fn read_http_request(stream: &mut tokio::net::TcpStream) {
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
         let mut request = Vec::new();
         let mut buffer = [0; 1024];
 
@@ -1444,7 +1448,7 @@ mod tests {
                 .unwrap_or(0);
 
             if request.len() >= headers_end + 4 + content_length {
-                return;
+                return request;
             }
         }
     }
@@ -1835,8 +1839,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).await.unwrap();
+            let request = read_http_request(&mut stream).await;
+
+            assert!(
+                String::from_utf8_lossy(&request)
+                    .starts_with("POST /api/conversations.history HTTP/1.1\r\n")
+            );
+
             let body = br#"{"ok":true,"messages":[]}"#;
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1851,7 +1860,7 @@ mod tests {
             "xoxb-test",
             "conversations.history",
             json!({"channel":"C1"}),
-            &format!("http://{address}"),
+            &format!("http://{address}/api"),
         )
         .await
         .unwrap();
@@ -1880,8 +1889,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).await.unwrap();
+            let request = read_http_request(&mut stream).await;
+
+            assert!(
+                String::from_utf8_lossy(&request)
+                    .starts_with("POST /api/chat.postMessage HTTP/1.1\r\n")
+            );
+
             let body = br#"{"ok":true,"ts":"1"}"#;
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1895,7 +1909,7 @@ mod tests {
             &test_client(),
             "xoxb-test",
             &json!({"chat":"C1","text":"hello"}),
-            &format!("http://{address}"),
+            &format!("http://{address}/api/"),
         )
         .await
         .unwrap();

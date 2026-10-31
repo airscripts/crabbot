@@ -148,7 +148,7 @@ run_workflow "Security" workflow_dispatch \
 
 run_workflow "Test Agent" workflow_dispatch \
     --workflows "$workspace_dir/.github/workflows/test.yml" \
-    --job agent \
+    --job krabb \
     --matrix "target:${ci_target}" \
     --input local=true
 
@@ -159,7 +159,7 @@ run_workflow "Test Sandbox" workflow_dispatch \
 
 run_workflow "Build Agent" workflow_dispatch \
     --workflows "$workspace_dir/.github/workflows/build.yml" \
-    --job agent \
+    --job krabb \
     --matrix "target:${ci_target}" \
     --input local=true
 

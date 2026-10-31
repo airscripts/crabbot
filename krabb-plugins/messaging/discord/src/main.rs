@@ -271,10 +271,13 @@ async fn call_with_state(
 }
 
 async fn read(response: reqwest::Response) -> krabb_core::Result<String> {
-    collect(response.bytes_stream()).await
+    let bytes = collect(response.bytes_stream()).await?;
+
+    String::from_utf8(bytes)
+        .map_err(|_| krabb_core::Error::Denied("Discord response failed.".into()))
 }
 
-async fn collect<S, C, E>(mut stream: S) -> krabb_core::Result<String>
+async fn collect<S, C, E>(mut stream: S) -> krabb_core::Result<Vec<u8>>
 where
     S: Stream<Item = Result<C, E>> + Unpin,
     C: AsRef<[u8]>,
@@ -294,8 +297,7 @@ where
         bytes.extend_from_slice(chunk.as_ref());
     }
 
-    String::from_utf8(bytes)
-        .map_err(|_| krabb_core::Error::Denied("Discord response failed.".into()))
+    Ok(bytes)
 }
 
 enum Operation {
@@ -565,6 +567,7 @@ async fn media(
     let reference = uri
         .strip_prefix("discord://attachment/")
         .ok_or_else(|| krabb_core::Error::Denied("Discord media URI is invalid.".into()))?;
+
     let parts = reference.split('/').collect::<Vec<_>>();
     let (channel, message, id) = match parts.as_slice() {
         [id] if snowflake(id) => (None, None, (*id).to_owned()),
@@ -608,19 +611,7 @@ async fn media(
         return Err(krabb_core::Error::Denied("Discord attachment is too large.".into()));
     }
 
-    let response = client
-        .get(&attachment.url)
-        .header(AUTHORIZATION, format!("Bot {token}"))
-        .send()
-        .await
-        .map_err(|error| krabb_core::Error::Denied(format!("Discord media failed: {error}.")))?;
-
-    let status = response.status();
-    let bytes = collect(response.bytes_stream()).await?;
-
-    if !status.is_success() || bytes.len() > MEDIA_LIMIT {
-        return Err(krabb_core::Error::Denied("Discord media download failed.".into()));
-    }
+    let bytes = download(client, &attachment.url, token).await?;
 
     let root = media_root()?;
     cleanup(&root);
@@ -638,6 +629,22 @@ async fn media(
         "name": attachment.name,
         "mime": attachment.mime,
     }))
+}
+
+async fn download(client: &reqwest::Client, url: &str, token: &str) -> krabb_core::Result<Vec<u8>> {
+    let response =
+        client.get(url).header(AUTHORIZATION, format!("Bot {token}")).send().await.map_err(
+            |error| krabb_core::Error::Denied(format!("Discord media failed: {error}.")),
+        )?;
+
+    let status = response.status();
+    let bytes = collect(response.bytes_stream()).await?;
+
+    if !status.is_success() || bytes.len() > MEDIA_LIMIT {
+        return Err(krabb_core::Error::Denied("Discord media download failed.".into()));
+    }
+
+    Ok(bytes)
 }
 
 async fn refresh_attachment(
@@ -826,6 +833,7 @@ fn edit_requests(
     text: &str,
 ) -> krabb_core::Result<Vec<(reqwest::Method, String, Value)>> {
     let mut parts = chunks(text, 2_000).into_iter();
+
     let first = parts
         .next()
         .filter(|part| !part.is_empty())
@@ -856,6 +864,7 @@ async fn message(
             krabb_core::Error::Denied(format!("Discord token is invalid: {error}."))
         })?,
     );
+
     let request = if body.is_null() { request } else { request.json(&body) };
 
     let response = request
@@ -1498,6 +1507,7 @@ fn normalize_interaction(value: &Value) -> Option<Value> {
     }
 
     let sender = value["member"]["user"]["id"].as_str().or_else(|| value["user"]["id"].as_str())?;
+
     let roles = value["member"]["roles"].as_array().cloned().unwrap_or_default();
     Some(json!({
         "id": id,
@@ -1606,6 +1616,7 @@ mod tests {
             normalize(&attachment).unwrap()["content"][0]["uri"],
             "discord://attachment/2/1/4"
         );
+
         let file = json!({"id":"2","channel_id":"2","guild_id":"9","content":"","thread":{"id":"thread"},"attachments":[{"id":"5","url":"https://cdn.discordapp.com/a.txt","content_type":"text/plain","filename":"a.txt"}],"author":{"id":"3","bot":false}});
         let normalized = normalize(&file).unwrap();
 
@@ -1820,6 +1831,7 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
+
         let dispatches = [json!({"op": 0, "t": "MESSAGE_CREATE", "s": 7})].into();
 
         assert!(load_dispatches_at(&path).is_empty());
@@ -2022,6 +2034,7 @@ mod tests {
             .await
             .is_err()
         );
+
         let note =
             Request::Note { jsonrpc: "2.0".into(), method: "send".into(), params: json!({}) };
 
@@ -2154,6 +2167,7 @@ mod tests {
         }
 
         assert_eq!(super::acknowledge(&state, 7).await.unwrap()["acknowledged"], true);
+
         let queued = super::gateway(&state, "token", 2, &base).await.unwrap();
 
         assert_eq!(queued["events"][0]["text"], "queued");
@@ -2414,6 +2428,43 @@ mod tests {
             .await
             .is_err()
         );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn downloads_binary_attachments() {
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
+
+        let address = listener.local_addr().unwrap();
+        let image = b"\x89PNG\r\n\x1a\n\xff\x00";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let count = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..count]);
+
+            assert!(request.starts_with("GET /image.png HTTP/1.1\r\n"));
+            assert!(request.contains("authorization: Bot fixture-token"));
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                image.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(image).await.unwrap();
+        });
+
+        let bytes = super::download(
+            &reqwest::Client::new(),
+            &format!("http://{address}/image.png"),
+            "fixture-token",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, image);
         server.await.unwrap();
     }
 
@@ -2423,10 +2474,16 @@ mod tests {
 
         assert_eq!(
             collect(stream::iter(vec![Ok::<_, std::io::Error>(b"ok".to_vec())])).await.unwrap(),
-            "ok"
+            b"ok"
         );
 
-        assert!(collect(stream::iter(vec![Ok::<_, std::io::Error>(vec![0xff])])).await.is_err());
+        let image = b"\x89PNG\r\n\x1a\n\xff\x00";
+        let bytes =
+            collect(stream::iter(vec![Ok::<_, std::io::Error>(&image[..5]), Ok(&image[5..])]))
+                .await
+                .unwrap();
+
+        assert_eq!(bytes, image);
         assert!(
             collect(stream::iter(vec![Ok::<_, std::io::Error>(vec![b'x'; BODY_LIMIT + 1])]))
                 .await
@@ -2506,6 +2563,7 @@ mod tests {
         assert!(
             operation("send", &json!({"channel":"1", "content": [{"kind":"unknown"}]})).is_err()
         );
+
         let too_many =
             serde_json::Value::Array((0..9).map(|_| json!({"kind":"text","text":"x"})).collect());
 

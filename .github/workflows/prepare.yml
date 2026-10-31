@@ -4,13 +4,13 @@ on:
   workflow_call:
     outputs:
       tag:
-        value: ${{ jobs.prepare.outputs.tag }}
+        value: ${{ jobs.release.outputs.tag }}
 
       version:
-        value: ${{ jobs.prepare.outputs.version }}
+        value: ${{ jobs.release.outputs.version }}
 
       prerelease:
-        value: ${{ jobs.prepare.outputs.prerelease }}
+        value: ${{ jobs.release.outputs.prerelease }}
 
 permissions:
   contents: read

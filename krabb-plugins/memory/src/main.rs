@@ -82,7 +82,7 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn plugin_main() -> krabb_core::Result<()> {
-    let items = load();
+    let items = Arc::new(Mutex::new(State::default()));
 
     serve_with(
         Hello {
@@ -98,14 +98,18 @@ async fn plugin_main() -> krabb_core::Result<()> {
         },
         move |request| {
             let items = Arc::clone(&items);
-            async move { call(&items, request) }
+            async move {
+                tokio::task::spawn_blocking(move || call(&items, request))
+                    .await
+                    .map_err(|error| krabb_core::Error::Denied(error.to_string()))?
+            }
         },
     )
     .await
 }
 
 fn call(items: &Arc<Mutex<State>>, request: Request) -> krabb_core::Result<Option<Response>> {
-    call_at(items, request, path().as_deref())
+    call_at(items, request, path()?.as_deref())
 }
 
 fn call_at(
@@ -114,6 +118,15 @@ fn call_at(
     location: Option<&Path>,
 ) -> krabb_core::Result<Option<Response>> {
     let operation = interaction_name(&request);
+
+    let _lock = location.map(lock).transpose()?;
+
+    if let Some(location) = location {
+        *items
+            .lock()
+            .map_err(|_| krabb_core::Error::Denied("Memory lock is poisoned.".into()))? =
+            load_at(Some(location))?.lock().unwrap().clone();
+    }
 
     let result = call_inner_at(items, request, location);
 
@@ -130,6 +143,66 @@ fn call_at(
     }
 
     result
+}
+
+fn lock(path: &Path) -> std::io::Result<std::fs::File> {
+    let lock = path.with_extension("lock");
+
+    if let Some(parent) = lock.parent()
+        && !parent.is_dir()
+    {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+
+    if std::fs::symlink_metadata(&lock).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Memory lock cannot be a symbolic link.",
+        ));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+
+    let file = options.open(&lock)?;
+
+    krabb_file::private(&lock)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+fn command_at(
+    items: &Arc<Mutex<State>>,
+    id: u64,
+    params: &serde_json::Value,
+    location: Option<&Path>,
+) -> krabb_core::Result<Option<Response>> {
+    call_at(items, Request::call(id, "command", params.clone()), location)
 }
 
 fn interaction_name(request: &Request) -> &'static str {
@@ -171,7 +244,7 @@ fn call_inner_at(
     };
 
     if method == "command" {
-        return command_at(items, id, &params, location);
+        return command_inner_at(items, id, &params, location);
     }
 
     let mut state =
@@ -608,23 +681,21 @@ fn list_memories(
     Ok(json!({"items": items, "total": total, "page": page, "pages": pages}))
 }
 
-fn load() -> Arc<Mutex<State>> {
-    load_at(path().as_deref())
+#[cfg(test)]
+fn load() -> std::io::Result<Arc<Mutex<State>>> {
+    let location = path()?;
+    let _lock = location.as_deref().map(lock).transpose()?;
+
+    load_at(location.as_deref())
 }
 
-fn load_at(path: Option<&std::path::Path>) -> Arc<Mutex<State>> {
+fn load_at(path: Option<&std::path::Path>) -> std::io::Result<Arc<Mutex<State>>> {
     let Some(path) = path else {
-        return Arc::new(Mutex::new(State::default()));
+        return Ok(Arc::new(Mutex::new(State::default())));
     };
 
-    let bytes = match load_file(path, BYTE_LIMIT as u64) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return Arc::new(Mutex::new(State::default())),
-
-        Err(_) => {
-            quarantine(path);
-            return Arc::new(Mutex::new(State::default()));
-        }
+    let Some(bytes) = load_file(path, BYTE_LIMIT as u64)? else {
+        return Ok(Arc::new(Mutex::new(State::default())));
     };
 
     let state = String::from_utf8(bytes).ok().and_then(|text| {
@@ -679,25 +750,31 @@ fn load_at(path: Option<&std::path::Path>) -> Arc<Mutex<State>> {
         state.audit.drain(..state.audit.len() - LIMIT);
     }
 
-    Arc::new(Mutex::new(state))
+    Ok(Arc::new(Mutex::new(state)))
 }
 
-fn path() -> Option<PathBuf> {
-    std::env::var_os("KRABB_MEMORY")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("KRABB_HOME").map(PathBuf::from).map(default_path))
+fn path() -> std::io::Result<Option<PathBuf>> {
+    if let Some(path) = std::env::var_os("KRABB_MEMORY") {
+        return Ok(Some(PathBuf::from(path)));
+    }
+
+    std::env::var_os("KRABB_HOME").map(PathBuf::from).map(default_path).transpose()
 }
 
-fn default_path(root: PathBuf) -> PathBuf {
+fn default_path(root: PathBuf) -> std::io::Result<PathBuf> {
     let current = root.join("data").join("memories").join("index.json");
+    let _current = lock(&current)?;
+    krabb_file::recover(&current)?;
 
     if current.is_file() {
-        return current;
+        return Ok(current);
     }
 
     let legacy = root.join("memory").join("index.json");
+    let _legacy = lock(&legacy)?;
+    krabb_file::recover(&legacy)?;
 
-    if legacy.is_file() { legacy } else { current }
+    Ok(if legacy.is_file() { legacy } else { current })
 }
 
 fn storage(scope: &str, key: &str) -> String {
@@ -731,7 +808,7 @@ fn summary(value: &str) -> String {
     summary
 }
 
-fn command_at(
+fn command_inner_at(
     items: &Arc<Mutex<State>>,
     id: u64,
     params: &serde_json::Value,
@@ -1377,6 +1454,65 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
+    fn independent_clients_reload_reads_writes_and_deletions() {
+        let root =
+            std::env::temp_dir().join(format!("krabb-memory-clients-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let index = root.join("index.json");
+        let lock = super::lock(&index).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(std::fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+
+        drop(lock);
+
+        let first = items();
+        let second = items();
+
+        for (client, key) in [(&first, "first"), (&second, "second")] {
+            command_at(client, 1, &json!({"args":["remember", key, "value"]}), Some(&index))
+                .unwrap();
+        }
+
+        let status = command_at(&first, 2, &json!({"args":["status"], "json":true}), Some(&index))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(status.result.unwrap()["records"], 2);
+        command_at(&second, 3, &json!({"args":["forget", "first"]}), Some(&index)).unwrap();
+        command_at(&first, 4, &json!({"args":["remember", "third", "value"]}), Some(&index))
+            .unwrap();
+        let loaded = load_at(Some(&index)).unwrap();
+
+        let state = loaded.lock().unwrap();
+
+        assert!(!state.items.contains_key(&storage("global", "first")));
+        assert!(state.items.contains_key(&storage("global", "second")));
+        assert!(state.items.contains_key(&storage("global", "third")));
+        drop(state);
+
+        let guard = super::lock(&index).unwrap();
+        let path = index.clone();
+        let waiting = std::thread::spawn(move || {
+            command_at(&items(), 5, &json!({"args":["remember", "fourth", "value"]}), Some(&path))
+                .unwrap();
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        assert!(!waiting.is_finished());
+        drop(guard);
+        waiting.join().unwrap();
+
+        assert_eq!(load_at(Some(&index)).unwrap().lock().unwrap().items.len(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn hex_digest_preserves_lowercase_byte_encoding() {
         assert_eq!(super::hex_digest([0x00, 0x0a, 0xab, 0xff]), "000aabff");
     }
@@ -1640,23 +1776,24 @@ mod tests {
         persist_at(Some(&path), &state).unwrap();
 
         assert_eq!(
-            load_at(Some(&path)).lock().unwrap().items[&storage("global", "key")].value,
+            load_at(Some(&path)).unwrap().lock().unwrap().items[&storage("global", "key")].value,
             "value"
         );
 
         std::fs::write(&path, r#"{"legacy":"value"}"#).unwrap();
 
         assert_eq!(
-            load_at(Some(&path)).lock().unwrap().items[&storage("global", "legacy")].scope,
+            load_at(Some(&path)).unwrap().lock().unwrap().items[&storage("global", "legacy")].scope,
             "global"
         );
 
         std::fs::write(&path, "broken").unwrap();
 
-        assert!(load_at(Some(&path)).lock().unwrap().items.is_empty());
+        assert!(load_at(Some(&path)).unwrap().lock().unwrap().items.is_empty());
         std::fs::File::create(&path).unwrap().set_len(BYTE_LIMIT as u64 + 1).unwrap();
 
-        assert!(load_at(Some(&path)).lock().unwrap().items.is_empty());
+        assert_eq!(load_at(Some(&path)).unwrap_err().kind(), std::io::ErrorKind::FileTooLarge);
+        assert!(path.is_file());
         let lazy_root =
             std::env::temp_dir().join(format!("krabb-memory-lazy-{}", std::process::id()));
 
@@ -1785,6 +1922,8 @@ mod tests {
                 record: old_record.into(),
             },
         );
+
+        super::save_file(&index, serde_json::to_vec(&*state.lock().unwrap()).unwrap()).unwrap();
 
         call_at(
             &state,
@@ -1917,7 +2056,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let index = root.join("index.json");
-        let state = load_at(Some(&index));
+        let state = load_at(Some(&index)).unwrap();
 
         assert_eq!(state.lock().unwrap().learning, "guided");
 
@@ -1939,7 +2078,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(load_at(Some(&index)).lock().unwrap().learning, "autonomous");
+        assert_eq!(load_at(Some(&index)).unwrap().lock().unwrap().learning, "autonomous");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2152,15 +2291,88 @@ mod tests {
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, "{}").unwrap();
 
-        assert_eq!(default_path(root.clone()), legacy);
+        assert_eq!(default_path(root.clone()).unwrap(), legacy);
 
         let current = root.join("data/memories/index.json");
         std::fs::create_dir_all(current.parent().unwrap()).unwrap();
         std::fs::write(&current, "{}").unwrap();
 
-        assert_eq!(default_path(root.clone()), current);
+        assert_eq!(default_path(root.clone()).unwrap(), current);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn memory_default_path_recovers_interrupted_indexes_under_the_writer_lock() {
+        let root =
+            std::env::temp_dir().join(format!("krabb-memory-recovery-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        for directory in ["memory", "data/memories"] {
+            let index = root.join(directory).join("index.json");
+            let guard = super::lock(&index).unwrap();
+            let parent = index.parent().unwrap();
+            let backup = parent.join(".index.json.backup-test");
+            let temporary = parent.join(".index.json.tmp-test");
+            let journal = parent.join(".index.json.txn-test");
+            std::fs::write(&backup, r#"{"key":"old"}"#).unwrap();
+            std::fs::write(&temporary, r#"{"key":"saved"}"#).unwrap();
+            std::fs::write(
+                &journal,
+                json!({
+                    "path": "index.json",
+                    "temporary": ".index.json.tmp-test",
+                    "backup": ".index.json.backup-test",
+                    "phase": "backed_up"
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let home = root.clone();
+            let reader = std::thread::spawn(move || sender.send(default_path(home)).unwrap());
+
+            assert!(receiver.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+            assert!(journal.exists());
+            assert!(!index.exists());
+
+            drop(guard);
+            let selected =
+                receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+
+            reader.join().unwrap();
+
+            assert_eq!(selected, index);
+            assert!(!journal.exists());
+            assert_eq!(
+                load_at(Some(&selected)).unwrap().lock().unwrap().items[&storage("global", "key")]
+                    .value,
+                "saved"
+            );
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn memory_default_path_propagates_selection_errors() {
+        let root =
+            std::env::temp_dir().join(format!("krabb-memory-path-error-{}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("data"), "blocked").unwrap();
+
+        assert!(default_path(root.clone()).is_err());
+
+        std::fs::remove_file(root.join("data")).unwrap();
+        std::fs::write(root.join("memory"), "blocked").unwrap();
+
+        assert!(default_path(root.clone()).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2225,8 +2437,8 @@ mod tests {
     fn handles_disabled_persistence() {
         let _ = path();
 
-        assert!(load().lock().unwrap().items.is_empty());
-        assert!(load_at(None).lock().unwrap().items.is_empty());
+        assert!(load().unwrap().lock().unwrap().items.is_empty());
+        assert!(load_at(None).unwrap().lock().unwrap().items.is_empty());
         persist_at(None, &State::default()).unwrap();
     }
 
@@ -2374,7 +2586,7 @@ mod tests {
             std::fs::set_permissions(&path, permissions).unwrap();
         }
 
-        let loaded = load_at(Some(&path)).lock().unwrap().clone();
+        let loaded = load_at(Some(&path)).unwrap().lock().unwrap().clone();
 
         assert_eq!(loaded.items.len(), LIMIT);
         assert_eq!(loaded.audit.len(), LIMIT);
@@ -2471,19 +2683,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ignores_shared_state_files() {
+    fn rejects_shared_state_without_replacing_memories() {
         use std::os::unix::fs::PermissionsExt;
 
-        let path =
-            std::env::temp_dir().join(format!("krabb-memory-shared-{}.json", std::process::id()));
+        let root = std::env::temp_dir().join(format!("krabb-memory-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("index.json");
+        let state = items();
+        call_at(
+            &state,
+            Request::call(
+                1,
+                "remember",
+                json!({"key": "saved", "value": "memory", "mode": "auto"}),
+            ),
+            Some(&path),
+        )
+        .unwrap();
 
-        let _ = std::fs::remove_file(&path);
-        std::fs::write(&path, r#"{"items":{},"audit":[]}"#).unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o644);
-        std::fs::set_permissions(&path, permissions).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        assert!(load_at(Some(&path)).lock().unwrap().items.is_empty());
-        let _ = std::fs::remove_file(path);
+        assert_eq!(load_at(Some(&path)).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+
+        for (method, params) in [
+            ("list", json!({})),
+            ("remember", json!({"key": "new", "value": "replacement", "mode": "auto"})),
+        ] {
+            assert!(call_at(&state, Request::call(2, method, params), Some(&path)).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(state.lock().unwrap().items.len(), 1);
+        }
+
+        assert!(
+            !std::fs::read_dir(&root).unwrap().any(|entry| {
+                entry.unwrap().file_name().to_string_lossy().contains(".corrupt-")
+            })
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(load_at(Some(&path)).unwrap().lock().unwrap().items.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

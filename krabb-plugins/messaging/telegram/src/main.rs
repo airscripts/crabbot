@@ -518,10 +518,13 @@ async fn send(
 }
 
 async fn read(response: reqwest::Response) -> krabb_core::Result<String> {
-    collect(response.bytes_stream()).await
+    let bytes = collect(response.bytes_stream()).await?;
+
+    String::from_utf8(bytes)
+        .map_err(|_| krabb_core::Error::Denied("Telegram response failed.".into()))
 }
 
-async fn collect<S, C, E>(mut stream: S) -> krabb_core::Result<String>
+async fn collect<S, C, E>(mut stream: S) -> krabb_core::Result<Vec<u8>>
 where
     S: Stream<Item = Result<C, E>> + Unpin,
     C: AsRef<[u8]>,
@@ -541,8 +544,7 @@ where
         bytes.extend_from_slice(chunk.as_ref());
     }
 
-    String::from_utf8(bytes)
-        .map_err(|_| krabb_core::Error::Denied("Telegram response failed.".into()))
+    Ok(bytes)
 }
 
 fn response_body(
@@ -618,6 +620,7 @@ fn normalize_update(update: &serde_json::Value) -> Option<serde_json::Value> {
     }
 
     let text = message["text"].as_str().or_else(|| message["caption"].as_str());
+
     let role = &message["from"]["role"];
     let roles = role
         .as_array()
@@ -720,6 +723,7 @@ mod tests {
             callback["events"][0]["data"],
             "a0123456789abcdef.0123456789abcdef0123456789abcdef"
         );
+
         let voice = normalize(
             json!([{"update_id": 6, "message": {"chat": {"id": 8}, "voice": {"file_id": "voice", "mime_type": "audio/ogg"}}}]),
         );
@@ -785,7 +789,7 @@ mod tests {
                 let body = if index == 0 {
                     br#"{"ok":true,"result":{"file_path":"photos/p.bin"}}"#.to_vec()
                 } else {
-                    b"abc".to_vec()
+                    b"\xff\xd8\x00\xfe".to_vec()
                 };
 
                 let header = format!(
@@ -810,7 +814,7 @@ mod tests {
 
         let path = value["uri"].as_str().unwrap().strip_prefix("file://").unwrap();
 
-        assert_eq!(std::fs::read(path).unwrap(), b"abc");
+        assert_eq!(std::fs::read(path).unwrap(), b"\xff\xd8\x00\xfe");
         server.await.unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1211,10 +1215,14 @@ mod tests {
 
         assert_eq!(
             collect(stream::iter(vec![Ok::<_, std::io::Error>(b"ok".to_vec())])).await.unwrap(),
-            "ok"
+            b"ok"
         );
 
-        assert!(collect(stream::iter(vec![Ok::<_, std::io::Error>(vec![0xff])])).await.is_err());
+        assert_eq!(
+            collect(stream::iter(vec![Ok::<_, std::io::Error>(vec![0xff])])).await.unwrap(),
+            vec![0xff]
+        );
+
         assert!(
             collect(stream::iter(vec![Ok::<_, std::io::Error>(vec![b'x'; BODY_LIMIT + 1])]))
                 .await

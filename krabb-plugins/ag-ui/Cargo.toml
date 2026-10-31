@@ -10,5 +10,9 @@ publish = false
 krabb-log.workspace = true
 krabb-core = { path = "../../krabb-core" }
 serde_json.workspace = true
+subtle.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

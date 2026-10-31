@@ -19,7 +19,15 @@ curl -fsSL https://raw.githubusercontent.com/krabblab/krabb/main/install.sh | sh
 The plugin creates `KRABB_HOME/data/memories/index.json` when a record or
 setting is first saved. Set `KRABB_MEMORY` to change the index path. Records
 are stored as private Markdown files beside the index; older flat key/value
-files remain readable as global records.
+files remain readable as global records. Processes coordinate access through a
+private lock file beside the index and reload it before every operation, so CLI
+and daemon changes remain visible to one another. A busy lock is retried for up
+to five seconds before the operation reports an error. Access, size-limit, and I/O
+errors leave the index and active memories intact and fail the operation. Only
+invalid file contents are quarantined for corruption recovery.
+Default path selection also takes the writer locks and recovers interrupted saves
+before checking either the current index or the legacy `KRABB_HOME/memory/index.json`.
+An interrupted replacement therefore keeps using the existing store.
 
 ## Learning Modes
 

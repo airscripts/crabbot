@@ -417,7 +417,10 @@ where
 
     let statusline = preferences.statusline;
     let typewriter = preferences.typewriter;
-    let theme_enabled = std::env::var("KRABB_TUI_THEME").as_deref() != Ok("off");
+    let theme_enabled = std::env::var("KRABB_TUI_THEME").as_deref() != Ok("off")
+        && std::env::var_os("NO_COLOR").is_none()
+        && !std::env::var("TERM")
+            .is_ok_and(|term| matches!(term.as_str(), "dumb" | "mono" | "vt100"));
     let history_path = super::data::plugin_file(&home, "tui", "history.json");
     let history = super::data::load_history(&history_path);
 
@@ -1153,7 +1156,10 @@ fn command_options(home: &str, has_model: bool) -> Vec<(&'static str, &'static s
     }
 
     if crate::has_capability(home, "store") {
-        commands.push(("/store <get|put|delete>", "Manage session-scoped SQLite values."));
+        commands.push((
+            "/data <operation>",
+            "Manage session-scoped SQLite values and structured data.",
+        ));
     }
 
     commands
@@ -2011,6 +2017,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     frame.render_widget(statusline, footer_areas[0]);
     frame.render_widget(footer, footer_areas[1]);
 
+    if !app.theme_enabled {
+        for cell in &mut frame.buffer_mut().content {
+            cell.fg = Color::Reset;
+            cell.bg = Color::Reset;
+            cell.underline_color = Color::Reset;
+        }
+    }
+
     let input_area = areas[4];
     app.input_area = Some(input_area);
 
@@ -2800,9 +2814,17 @@ fn wrap_transcript_line(line: &str, name: &str, width: usize) -> Vec<Line<'stati
         vec![(line.to_owned(), Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD))]
     } else if line == "System" || line.starts_with("System | ") {
         vec![(line.to_owned(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))]
+    } else if let Some((label, usage)) = line.split_once(": ")
+        && label == "Usage"
+    {
+        vec![
+            ("Usage: ".to_owned(), Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD)),
+            (usage.to_owned(), Style::default().add_modifier(Modifier::BOLD)),
+        ]
     } else if let Some((command, description)) = help_command_segments(line) {
         return wrap_help_command(command, description, width);
-    } else if line == "Commands:"
+    } else if is_help_heading(line)
+        || line == "Commands:"
         || line.starts_with("Conditional Commands")
         || line.starts_with("Conditional commands")
         || line == "Session commands:"
@@ -2833,6 +2855,20 @@ fn wrap_transcript_line(line: &str, name: &str, width: usize) -> Vec<Line<'stati
     };
 
     wrap_styled_segments(&segments, width)
+}
+
+fn is_help_heading(line: &str) -> bool {
+    matches!(
+        line,
+        "Commands:"
+            | "Options:"
+            | "Notes:"
+            | "Timing:"
+            | "History options:"
+            | "Session commands:"
+            | "Model commands:"
+            | "Input history commands:"
+    )
 }
 
 fn wrap_help_command(command: &str, description: &str, width: usize) -> Vec<Line<'static>> {
@@ -2889,22 +2925,20 @@ fn wrap_help_command(command: &str, description: &str, width: usize) -> Vec<Line
 
 fn help_command_segments(line: &str) -> Option<(&str, &str)> {
     let trimmed = line.trim_start();
+    let indent = line.len() - trimmed.len();
 
-    if !trimmed.starts_with('/') && !trimmed.starts_with("!<") {
+    if indent == 0 {
         return None;
     }
 
-    let indent = line.len() - trimmed.len();
+    if indent + 1 >= line.len() {
+        return None;
+    }
+
     let gap = line[indent + 1..]
         .match_indices("  ")
         .map(|(index, _)| indent + 1 + index)
-        .find(|index| *index > indent + 1)
-        .or_else(|| line.find("> ").map(|index| index + 1))
-        .or_else(|| {
-            line.starts_with("  /statusline ")
-                .then(|| line.find("] ").map(|index| index + 1))
-                .flatten()
-        })?;
+        .find(|index| *index > indent + 1)?;
 
     Some((&line[..gap], &line[gap..]))
 }
@@ -3472,7 +3506,14 @@ impl App {
                 "Input history cleared.".into()
             }
 
-            "help" => "Input history commands:\n  /history list   List saved inputs.\n  /history clear  Clear saved input history.\n  /history help   Show these commands.".into(),
+            "help" => format!(
+                "Manage saved input history.\n\nCommands:\n{}",
+                super::format_help_rows(&[
+                    ("/history list", "List saved inputs."),
+                    ("/history clear", "Clear saved input history."),
+                    ("/history help", "Show this help."),
+                ])
+            ),
             _ => "Usage: /history [list|clear|help].".into(),
         }
     }
@@ -3984,10 +4025,12 @@ mod tests {
             "/drop <id>",
             "/schedule <list|add|remove>",
             "/memory <list|remember|forget>",
-            "/store <get|put|delete>",
+            "/data <operation>",
         ] {
             assert!(names.contains(&command), "missing command: {command}");
         }
+
+        assert!(!names.iter().any(|command| command.starts_with("/store")));
 
         let _ = std::fs::remove_dir_all(home);
     }
@@ -4814,6 +4857,26 @@ mod tests {
             span.style.fg.is_none()
                 && span.style.bg.is_none()
                 && span.style.underline_color.is_none()
+        }));
+    }
+
+    #[test]
+    fn monochrome_frame_preserves_help_without_emitting_colors() {
+        let mut app = App { theme_enabled: false, ..App::default() };
+        app.push_bot("Commands:\n  /history help  Show this help.\n".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer.content().iter().map(|cell| cell.symbol()).collect::<String>();
+
+        assert!(rendered.contains("Commands:"));
+        assert!(rendered.contains("/history help"));
+        assert!(buffer.content().iter().all(|cell| {
+            cell.fg == Color::Reset
+                && cell.bg == Color::Reset
+                && cell.underline_color == Color::Reset
         }));
     }
 

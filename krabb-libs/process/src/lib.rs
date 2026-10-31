@@ -1,5 +1,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(unix)]
+mod session;
+#[cfg(unix)]
+pub use session::isolate_session;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -9,3 +14,6 @@ pub use linux::restrict_process_group;
 mod windows;
 #[cfg(windows)]
 pub use windows::{CREATE_SUSPENDED, TerminalJob};
+
+#[cfg(windows)]
+pub mod service;

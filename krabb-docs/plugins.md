@@ -261,18 +261,37 @@ requests require an explicit `approved: true` flag because they start an
 operator-selected process. HTTP accepts only HTTPS or loopback endpoints,
 with strict host-boundary checks, never invokes a shell, and forwards
 normalized JSON-RPC requests without allowing one plugin to call another
-directly.
+directly. Stdio initializes the child and sends `notifications/initialized` before
+performing an operation. HTTP negotiates JSON/SSE responses and accepts empty 202
+acknowledgements. HTTP callers perform initialization and pass the returned
+`session_id` and negotiated `protocol_version` on subsequent calls to the same
+authenticated endpoint; see the [MCP transport contract](../krabb-plugins/mcp/README.md).
 
 Channel plugins split outgoing text at Telegram, Discord, and WhatsApp message
 limits and retain normalized attachment metadata for providers. Telegram,
 Discord, and WhatsApp media operations resolve opaque provider references into
-bounded private files; generated daemon replies currently remain text-only.
+bounded private files, preserving binary image and audio bytes; generated daemon replies currently remain text-only.
 
-The SQLite plugin uses WAL mode and idempotent schema migrations. Its store
-methods cover key/value data, owner-scoped leases, an idempotent durable
-outbox, acknowledgements, and expiring event deduplication.
-When installed, the TUI exposes `/store get`, `/store put`, and `/store delete`
-for session-scoped text values.
+The SQLite plugin uses WAL mode and idempotent schema migrations. When it is
+installed and agent tools are enabled, Krabb adds a `data` tool to model
+requests. The agent can create logical databases and tables with typed columns,
+insert structured JSON records, query by exact field values, update a record by
+ID, add or remove optional columns, and delete records or structures. The tool
+receives a host-assigned scope for the current channel and conversation; models
+cannot select or change that scope. Mutating operations follow the configured
+tool approval policy. Raw SQL is not exposed.
+
+SQLite data is available through `krabb data ...` in the local CLI and `/data
+...` in the TUI. CLI data is in its own local scope; TUI commands share the
+active TUI conversation scope with the agent. See the
+[SQLite plugin guide](../krabb-plugins/sqlite/README.md) for commands, limits,
+column types, and examples.
+
+The plugin also retains key/value methods, owner-scoped leases, a durable
+queue, acknowledgements, retries, and expiring event deduplication. These are
+SQLite persistence methods; daemon messaging delivery and its retry policy
+remain in runtime state. The TUI manages session-scoped values through
+`/data value`; `/store` remains as a compatibility alias.
 Host outbox entries expose stable IDs and explicit uncertainty; plugins receive
 the ID with each send so operators can correlate a provider receipt.
 
@@ -296,11 +315,19 @@ does not implement cancellation. ACP agents run their own tools and model
 workflow.
 
 A2A is a client for discovering remote agents, sending messages, streaming
-task updates, checking status, and requesting cancellation. It does not expose
+task updates, checking status, and requesting cancellation. Streamed artifact
+replacements and appended parts are accumulated in the final command result,
+so `--json` retains the answer after a completion status update. It does not expose
 Krabb agents as A2A services or implement OAuth. AG-UI accepts runs on a
 loopback HTTP endpoint and emits run, text, frontend tool-call, state snapshot,
 and error events. Frontend tools are returned to the client for execution; the
 backend does not invoke client-supplied tools.
+
+AG-UI requires `Authorization: Bearer <token>` on every POST. Configure a random
+token of at least 32 ASCII characters through `KRABB_AG_UI_TOKEN`. Browser
+origins must be explicitly listed in `KRABB_AG_UI_ORIGINS` as comma-separated,
+exact loopback origins. Browser access is disabled when that list is empty.
+Incomplete HTTP requests expire after 10 seconds.
 
 AG-UI's transport emits chunked SSE events, but the host model call returns a
 complete reply before text and tool events are written. It does not provide
@@ -317,3 +344,7 @@ tools must be adapted to the chosen external agent and its supported protocol.
 
 Secret declarations must use the `KRABB_` prefix. The host rejects manifests
 that declare unprefixed configuration variables.
+
+Git tools and Git-backed patches require shell access and tool approval,
+including status and diff: Git filters can execute repository-configured
+programs. These tools are unavailable when shell access is disabled.

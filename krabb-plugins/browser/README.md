@@ -42,9 +42,10 @@ On Windows, use PowerShell to install the separate package and browser build:
 ```powershell
 $PlaywrightHome = Join-Path $env:LOCALAPPDATA 'Krabb\playwright'
 npm install --prefix $PlaywrightHome playwright@1.64.1
+$env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PlaywrightHome 'browsers'
 node (Join-Path $PlaywrightHome 'node_modules/playwright/cli.js') install chromium
 $env:KRABB_PLAYWRIGHT_MODULE = Join-Path $PlaywrightHome 'node_modules/playwright/index.js'
-$env:KRABB_PLAYWRIGHT_BROWSERS_PATH = Join-Path $PlaywrightHome 'browsers'
+$env:KRABB_PLAYWRIGHT_BROWSERS_PATH = $env:PLAYWRIGHT_BROWSERS_PATH
 ```
 
 Keep the Node.js, Playwright package, and Chromium binary versions matched. The
@@ -126,6 +127,7 @@ Build and test with:
 
 ```sh
 cargo test --locked -p krabb-plugin-browser
+node --test krabb-plugins/browser/tests/tabs.mjs krabb-plugins/browser/tests/routes.mjs
 cargo build --locked -p krabb-plugin-browser
 ```
 
@@ -148,3 +150,9 @@ If launch reports a missing package or browser, confirm that
 and install its matching Chromium build. A navigation denied by policy needs
 an exact entry in `KRABB_BROWSER_ALLOWED_HOSTS` and a proxy that applies the
 same host and resolved-address checks.
+
+Closing the final tab keeps the browser context and cookies available for a new
+tab. Tabs closed by a website release their observation state and tab capacity.
+
+WebSocket connections (`ws` and `wss`) use the same exact-host allowlist, credential
+rejection, and public-address checks as HTTP requests.

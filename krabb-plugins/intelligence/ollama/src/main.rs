@@ -180,6 +180,7 @@ where
     let mut bytes = 0_usize;
     let mut text = String::new();
     let mut pending = String::new();
+    let mut emitted = 0_usize;
     let mut tools = BTreeMap::<usize, ToolDelta>::new();
     let mut stop = "stop".to_string();
     let mut input_tokens = None;
@@ -221,12 +222,14 @@ where
                     }
 
                     if pending.len() >= 128 {
-                        emit(&mut pending, emitter).await?;
+                        emit(&mut pending, &mut emitted, emitter).await?;
                     }
                 }
             }
 
-            _ = ticker.tick(), if !pending.is_empty() => emit(&mut pending, emitter).await?,
+            _ = ticker.tick(), if !pending.is_empty() => {
+                emit(&mut pending, &mut emitted, emitter).await?;
+            }
         }
     }
 
@@ -242,7 +245,7 @@ where
         )?;
     }
 
-    emit(&mut pending, emitter).await?;
+    emit(&mut pending, &mut emitted, emitter).await?;
 
     let events = tools
         .into_values()
@@ -357,11 +360,17 @@ fn append_text(part: &str, text: &mut String, pending: &mut String) -> krabb_cor
     Ok(())
 }
 
-async fn emit(pending: &mut String, emitter: &mut Emitter) -> krabb_core::Result<()> {
-    if !pending.is_empty() {
+async fn emit(
+    pending: &mut String,
+    emitted: &mut usize,
+    emitter: &mut Emitter,
+) -> krabb_core::Result<()> {
+    if !pending.is_empty() && *emitted < 256 {
         emitter.event(json!({"kind": "text", "text": std::mem::take(pending)})).await?;
+        *emitted += 1;
     }
 
+    pending.clear();
     Ok(())
 }
 
@@ -666,6 +675,30 @@ mod tests {
                 schema: json!({"type": "object"}),
             }],
         }
+    }
+
+    #[tokio::test]
+    async fn completes_streams_beyond_the_notification_budget() {
+        let text = "x".repeat(128);
+        let mut body =
+            format!("{}\n", json!({"message":{"content":text},"done":false})).repeat(300);
+        body.push_str("{\"message\":{},\"done\":true,\"done_reason\":\"stop\"}\n");
+
+        let chunks =
+            futures_util::stream::iter(vec![Ok::<_, std::io::Error>(body.as_bytes().to_vec())]);
+
+        let (output, mut events) = tokio::sync::mpsc::channel(256);
+        let mut emitter = Emitter::new(output);
+        let result = live_stream(1, chunks, &mut emitter).await.unwrap().unwrap();
+
+        assert_eq!(result.result.unwrap()["text"], text.repeat(300));
+        let mut count = 0;
+
+        while events.try_recv().is_ok() {
+            count += 1;
+        }
+
+        assert_eq!(count, 256);
     }
 
     #[test]

@@ -211,6 +211,9 @@ jobs:
       - name: Build Browser Plugin
         run: cargo build --locked -p krabb-plugin-browser
 
+      - name: Test Browser Routes
+        run: node --test krabb-plugins/browser/tests/routes.mjs
+
       - name: Run Browser Integration
         run: node krabb-plugins/browser/tests/integration.mjs
         env:

@@ -8,7 +8,7 @@ use krabb_core::{
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Stdio, time::Duration};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    io::{AsyncWriteExt, BufReader},
     process::{ChildStdin, ChildStdout, Command},
     time::timeout,
 };
@@ -52,7 +52,11 @@ async fn call(request: Request, mut emitter: Emitter) -> krabb_core::Result<Opti
 
     let args = params["args"].as_array().cloned().unwrap_or_default();
     let request = RunRequest::parse(&args)?;
-    let result = run(request, &mut emitter).await?;
+    let mut result = run(request, &mut emitter).await?;
+
+    if params["json"] != true {
+        result["text"] = json!("");
+    }
 
     Ok(Some(Response::ok(id, result)))
 }
@@ -135,6 +139,8 @@ async fn run_command(
     command: PathBuf,
     args: Vec<String>,
 ) -> krabb_core::Result<Value> {
+    let mut updates = Updates { emitter, pending: String::new(), text: String::new(), emitted: 0 };
+
     let workspace = std::fs::canonicalize(&request.workspace).map_err(|error| {
         krabb_core::Error::Denied(format!("The ACP workspace is unavailable: {error}."))
     })?;
@@ -166,7 +172,7 @@ async fn run_command(
         .ok_or_else(|| krabb_core::Error::Protocol("ACP agent stdout was unavailable.".into()))?;
 
     let mut writer = stdin;
-    let mut reader = BufReader::new(stdout).lines();
+    let mut reader = BufReader::new(stdout);
 
     let initialized = rpc(
         &mut writer,
@@ -184,7 +190,7 @@ async fn run_command(
                 "version": env!("CARGO_PKG_VERSION")
             }
         }),
-        emitter,
+        &mut updates,
         &workspace,
     )
     .await?;
@@ -192,12 +198,6 @@ async fn run_command(
     if initialized["protocolVersion"] != 1 {
         return Err(krabb_core::Error::Protocol(
             "ACP agent did not negotiate stable protocol v1.".into(),
-        ));
-    }
-
-    if initialized["authMethods"].as_array().is_some_and(|methods| !methods.is_empty()) {
-        return Err(krabb_core::Error::Denied(
-            "This ACP agent requires an authentication method that Krabb does not provide.".into(),
         ));
     }
 
@@ -214,7 +214,7 @@ async fn run_command(
             1,
             "session/load",
             json!({"sessionId": session_id, "cwd": workspace, "mcpServers": []}),
-            emitter,
+            &mut updates,
             &workspace,
         )
         .await?
@@ -225,15 +225,16 @@ async fn run_command(
             1,
             "session/new",
             json!({"cwd": workspace, "mcpServers": []}),
-            emitter,
+            &mut updates,
             &workspace,
         )
         .await?
     };
 
-    let session_id = setup["sessionId"]
-        .as_str()
-        .ok_or_else(|| krabb_core::Error::Protocol("ACP setup returned no session ID.".into()))?;
+    let session_id =
+        request.session.as_deref().or_else(|| setup["sessionId"].as_str()).ok_or_else(|| {
+            krabb_core::Error::Protocol("ACP setup returned no session ID.".into())
+        })?;
 
     let reply = rpc(
         &mut writer,
@@ -241,10 +242,12 @@ async fn run_command(
         2,
         "session/prompt",
         json!({"sessionId": session_id, "prompt": [{"type": "text", "text": request.prompt}]}),
-        emitter,
+        &mut updates,
         &workspace,
     )
     .await?;
+
+    updates.flush().await?;
 
     drop(reader);
     drop(writer);
@@ -263,7 +266,7 @@ async fn run_command(
     }
 
     Ok(json!({
-        "text": "",
+        "text": updates.text,
         "sessionId": session_id,
         "stopReason": reply["stopReason"]
     }))
@@ -305,33 +308,23 @@ fn command_args_from(raw: &std::ffi::OsStr) -> krabb_core::Result<Vec<String>> {
 
 async fn rpc(
     writer: &mut ChildStdin,
-    reader: &mut Lines<BufReader<ChildStdout>>,
+    reader: &mut BufReader<ChildStdout>,
     id: u64,
     method: &str,
     params: Value,
-    emitter: &mut Emitter,
+    updates: &mut Updates<'_>,
     workspace: &std::path::Path,
 ) -> krabb_core::Result<Value> {
     write_message(writer, json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})).await?;
 
     loop {
-        let line = timeout(RPC_TIMEOUT, reader.next_line())
+        let message: Value = timeout(RPC_TIMEOUT, krabb_core::jsonl::read(reader, LINE_LIMIT))
             .await
             .map_err(|_| krabb_core::Error::Protocol("ACP agent response timed out.".into()))??
             .ok_or_else(|| krabb_core::Error::Protocol("ACP agent closed stdout.".into()))?;
 
-        if line.len() > LINE_LIMIT {
-            return Err(krabb_core::Error::Limit(
-                "ACP agent sent an oversized JSON-RPC line.".into(),
-            ));
-        }
-
-        let message: Value = serde_json::from_str(&line).map_err(|error| {
-            krabb_core::Error::Protocol(format!("ACP agent sent invalid JSON-RPC: {error}."))
-        })?;
-
         if message["method"] == "session/update" {
-            stream_update(&message["params"]["update"], emitter).await?;
+            stream_update(&message["params"]["update"], updates).await?;
             continue;
         }
 
@@ -351,7 +344,8 @@ async fn rpc(
             && matches!(method, "fs/read_text_file" | "fs/write_text_file")
         {
             let request_id = message["id"].clone();
-            let result = filesystem_request(method, &message["params"], workspace, emitter).await;
+            let result =
+                filesystem_request(method, &message["params"], workspace, updates.emitter).await;
             let reply = match result {
                 Ok(result) => json!({"jsonrpc":"2.0","id":request_id,"result":result}),
                 Err(error) => json!({
@@ -476,9 +470,40 @@ fn rejection(options: &Value) -> Value {
         .unwrap_or_else(|| json!({"outcome":"cancelled"}))
 }
 
-async fn stream_update(update: &Value, emitter: &mut Emitter) -> krabb_core::Result<()> {
+struct Updates<'a> {
+    emitter: &'a mut Emitter,
+    pending: String,
+    text: String,
+    emitted: usize,
+}
+
+impl Updates<'_> {
+    async fn flush(&mut self) -> krabb_core::Result<()> {
+        if !self.pending.is_empty() {
+            self.emitter
+                .event(json!({"kind":"text","text":std::mem::take(&mut self.pending)}))
+                .await?;
+
+            self.emitted += 1;
+        }
+
+        Ok(())
+    }
+}
+
+async fn stream_update(update: &Value, updates: &mut Updates<'_>) -> krabb_core::Result<()> {
     let event = match update["sessionUpdate"].as_str() {
         Some("agent_message_chunk") => {
+            if let Some(text) = update["content"]["text"].as_str() {
+                if text.len() > LINE_LIMIT.saturating_sub(updates.text.len()) {
+                    return Err(krabb_core::Error::Limit(
+                        "ACP response exceeded its text limit.".into(),
+                    ));
+                }
+
+                updates.text.push_str(text);
+            }
+
             update["content"]["text"].as_str().map(|text| json!({"kind":"text","text":text}))
         }
 
@@ -492,7 +517,17 @@ async fn stream_update(update: &Value, emitter: &mut Emitter) -> krabb_core::Res
     };
 
     if let Some(event) = event {
-        emitter.event(event).await?;
+        let text = event["text"].as_str().unwrap_or_default();
+
+        if text.len() > LINE_LIMIT.saturating_sub(updates.pending.len()) {
+            return Err(krabb_core::Error::Limit("ACP response exceeded its text limit.".into()));
+        }
+
+        updates.pending.push_str(text);
+
+        if updates.emitted < 255 {
+            updates.flush().await?;
+        }
     }
 
     Ok(())
@@ -641,27 +676,34 @@ mod tests {
     async fn maps_streamed_text_and_tool_status_without_fabricating_tools() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
         let mut emitter = Emitter::new(sender);
+        let mut updates = super::Updates {
+            emitter: &mut emitter,
+            pending: String::new(),
+            text: String::new(),
+            emitted: 0,
+        };
 
         stream_update(
             &json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}),
-            &mut emitter,
+            &mut updates,
         )
         .await
         .unwrap();
 
-        stream_update(&json!({"sessionUpdate":"tool_call","title":"Reading a file"}), &mut emitter)
+        stream_update(&json!({"sessionUpdate":"tool_call","title":"Reading a file"}), &mut updates)
             .await
             .unwrap();
 
         stream_update(
             &json!({"sessionUpdate":"tool_call_update","status":"completed"}),
-            &mut emitter,
+            &mut updates,
         )
         .await
         .unwrap();
 
-        stream_update(&json!({"sessionUpdate":"ignored"}), &mut emitter).await.unwrap();
+        stream_update(&json!({"sessionUpdate":"ignored"}), &mut updates).await.unwrap();
 
+        assert_eq!(updates.text, "hello");
         assert_eq!(receiver.recv().await.unwrap()["params"]["event"]["text"], "hello");
         assert_eq!(
             receiver.recv().await.unwrap()["params"]["event"]["text"],
@@ -672,6 +714,70 @@ mod tests {
             receiver.recv().await.unwrap()["params"]["event"]["text"],
             "[External agent tool completed]"
         );
+    }
+
+    #[tokio::test]
+    async fn coalesces_external_updates_after_the_notification_budget() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
+        let mut emitter = Emitter::new(sender);
+        let mut updates = super::Updates {
+            emitter: &mut emitter,
+            pending: String::new(),
+            text: String::new(),
+            emitted: 0,
+        };
+
+        for _ in 0..300 {
+            stream_update(
+                &json!({"sessionUpdate":"agent_message_chunk","content":{"text":"piece"}}),
+                &mut updates,
+            )
+            .await
+            .unwrap();
+        }
+
+        updates.flush().await.unwrap();
+        let mut text = String::new();
+        let mut count = 0;
+
+        while let Ok(event) = receiver.try_recv() {
+            text.push_str(event["params"]["event"]["text"].as_str().unwrap());
+            count += 1;
+        }
+
+        assert_eq!(count, 256);
+        assert_eq!(text, "piece".repeat(300));
+        assert_eq!(updates.text, text);
+
+        assert!(
+            stream_update(
+                &json!({"sessionUpdate":"agent_message_chunk","content":{"text":"x".repeat(super::LINE_LIMIT)}}),
+                &mut updates,
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_unterminated_oversized_agent_output_without_waiting_for_eof() {
+        let directory = std::env::temp_dir();
+        let request = RunRequest { prompt: "test".into(), session: None, workspace: directory };
+        let (sender, _events) = tokio::sync::mpsc::channel(1);
+        let mut emitter = Emitter::new(sender);
+        // Keep stdout open after exceeding the limit: rejection must precede EOF.
+        let script =
+            format!("head -c {} /dev/zero; read ignored; read ignored", super::LINE_LIMIT + 1);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_command(request, &mut emitter, "/bin/sh".into(), vec!["-c".into(), script]),
+        )
+        .await
+        .expect("oversized frames must be rejected before EOF");
+
+        assert!(result.unwrap_err().to_string().contains("Frame exceeds"));
     }
 
     #[cfg(unix)]
@@ -685,8 +791,9 @@ mod tests {
             "#!/bin/sh\n",
             "while IFS= read -r line; do\n",
             "  case \"$line\" in\n",
-            "    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true},\"authMethods\":[]}}' ;;\n",
-            "    *'\"method\":\"session/new\"'*|*'\"method\":\"session/load\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"session-1\"}}' ;;\n",
+            "    *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true},\"authMethods\":[{\"id\":\"login\",\"name\":\"Sign in\"}]}}' ;;\n",
+            "    *'\"method\":\"session/new\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"session-1\"}}' ;;\n",
+            "    *'\"method\":\"session/load\"'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}' ;;\n",
             "    *'\"method\":\"session/prompt\"'*)\n",
             "      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"hello\"}}}}'\n",
             "      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"session/request_permission\",\"params\":{\"options\":[]}}'\n",
@@ -714,6 +821,7 @@ mod tests {
         let mut emitter = Emitter::new(sender);
         let result = run_command(request, &mut emitter, script.clone(), Vec::new()).await.unwrap();
 
+        assert_eq!(result["text"], "hello");
         assert_eq!(result["sessionId"], "session-1");
         assert_eq!(result["stopReason"], "end_turn");
         assert_eq!(events.recv().await.unwrap()["params"]["event"]["text"], "hello");
@@ -722,17 +830,41 @@ mod tests {
             json!("--workspace"),
             json!(directory.display().to_string()),
             json!("--session"),
-            json!("session-1"),
+            json!("resume-2"),
             json!("continue"),
         ])
         .unwrap();
 
         let (sender, mut events) = tokio::sync::mpsc::channel(4);
         let mut emitter = Emitter::new(sender);
-        let result = run_command(request, &mut emitter, script, Vec::new()).await.unwrap();
+        let result = run_command(request, &mut emitter, script.clone(), Vec::new()).await.unwrap();
 
-        assert_eq!(result["sessionId"], "session-1");
+        assert_eq!(result["text"], "hello");
+        assert_eq!(result["sessionId"], "resume-2");
         assert_eq!(events.recv().await.unwrap()["params"]["event"]["text"], "hello");
+
+        for session in [None, Some("resume-2".into())] {
+            let denied = content
+                .replace(
+                    r#""result":{"sessionId":"session-1"}"#,
+                    r#""error":{"code":-32000,"message":"Authentication required"}"#,
+                )
+                .replace(
+                    r#""id":1,"result":{}"#,
+                    r#""id":1,"error":{"code":-32000,"message":"Authentication required"}"#,
+                );
+
+            fs::write(&script, denied).unwrap();
+            let request =
+                RunRequest { prompt: "hello".into(), workspace: directory.clone(), session };
+
+            let (sender, _) = tokio::sync::mpsc::channel(4);
+            let mut emitter = Emitter::new(sender);
+            let error =
+                run_command(request, &mut emitter, script.clone(), Vec::new()).await.unwrap_err();
+
+            assert!(error.to_string().contains("Authentication required"));
+        }
 
         fs::remove_dir_all(directory).unwrap();
     }
