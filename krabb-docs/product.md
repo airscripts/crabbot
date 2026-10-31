@@ -117,6 +117,11 @@ conditional on that plugin being installed.
 - TUI supports chat, sessions, model/workspace switching, approvals, schedules,
   memory, plugin health, and streamed activity. Session transcripts retain
   displayed TUI command exchanges alongside model turns.
+  Typed shell commands support Linux and Windows with descendant containment. Commands and
+  manual compaction retain exclusive session ownership until execution and cleanup finish.
+  Automatic compaction shares the model turn's deadline and retires failed requests before
+  generation resumes. Stream failures finalize turns after cleanup; approval history writes
+  remain available while uninstall waits for active turns.
 - Sessions support new, resume, fork, cancel, and model switching. One turn
   runs per session; later messages queue; stop cancels. Bounds cover steps,
   time, and tokens. Crashes interrupt turns and mutating tools are never
@@ -157,7 +162,8 @@ conditional on that plugin being installed.
   Missed tasks default to skip-and-notify, with configurable once recovery.
 - Tools provide root-confined files, search, patches, Git status/diff/
   worktrees, and optional shell. Shell is disabled by default and each
-  command requires approval. Docker/Podman isolation is optional, local-only,
+  command requires approval. Docker/Podman isolation is optional on Linux and Windows
+  and required on other Unix hosts for shell containment. Containers are local-only,
   networkless, read-only-root, and limited to a writable active workspace.
   Remote
   rooms default to isolated worktrees; owner DM/TUI defaults to in-place.

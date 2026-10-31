@@ -21,12 +21,9 @@ use std::os::unix::fs::PermissionsExt;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, shells};
-use krabb_core::{
-    plugin::Process,
-    types::{
-        Capability, CommandSpec, Content, Event, Hello, Message, ModelReply, ModelRequest,
-        Protocol, Request, Response, Role, ToolContent, ToolResult, ToolSpec,
-    },
+use krabb_core::types::{
+    Capability, CommandSpec, Content, Event, Hello, Message, ModelReply, ModelRequest, Protocol,
+    Request, Response, Role, ToolContent, ToolResult, ToolSpec,
 };
 
 use krabb_file::{append_jsonl as append_jsonl_file, save as save_file};
@@ -43,8 +40,10 @@ use tracing::{debug, error, info, warn};
 pub(crate) mod approval;
 pub(crate) mod ipc;
 pub(crate) mod logging;
+mod process;
 pub(crate) mod state;
 pub(crate) mod terminal;
+use process::Process;
 
 const NAME: &str = "krabb";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -161,12 +160,14 @@ pub(crate) struct Plugins {
     items: Arc<RwLock<BTreeMap<String, Arc<Live>>>>,
     loading: Arc<AsyncMutex<()>>,
     changed: Arc<Notify>,
+    lifecycle: Arc<RwLock<()>>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct ToolRegistry {
     specs: Vec<ToolSpec>,
     owners: BTreeMap<String, String>,
+    cleanup: process::Cleanup,
 }
 
 impl Default for Plugins {
@@ -175,6 +176,7 @@ impl Default for Plugins {
             items: Arc::new(RwLock::new(BTreeMap::new())),
             loading: Arc::new(AsyncMutex::new(())),
             changed: Arc::new(Notify::new()),
+            lifecycle: Arc::new(RwLock::new(())),
         }
     }
 }
@@ -227,7 +229,9 @@ impl Drop for CancelPluginCall {
 }
 
 impl Live {
-    fn new(process: Process) -> Self {
+    fn new(process: impl Into<Process>) -> Self {
+        let process = process.into();
+
         Self {
             hello: process.hello.clone(),
             process: Arc::new(AsyncMutex::new(Some(process))),
@@ -259,27 +263,6 @@ impl Live {
         }
 
         result
-    }
-
-    async fn call_full_async<F, Fut, C, Cfut>(
-        &self,
-        request: Request,
-        note: F,
-        call: C,
-    ) -> krabb_core::Result<Response>
-    where
-        F: FnMut(Request) -> Fut,
-        Fut: Future<Output = krabb_core::Result<()>>,
-        C: FnMut(Request) -> Cfut,
-        Cfut: Future<Output = krabb_core::Result<Response>>,
-    {
-        self.process
-            .lock()
-            .await
-            .as_mut()
-            .ok_or_else(|| krabb_core::Error::Protocol("Plugin is stopped.".into()))?
-            .call_full_async(request, note, call)
-            .await
     }
 
     async fn restart(&self) -> krabb_core::Result<()> {
@@ -360,11 +343,15 @@ async fn tool_registry(
             continue;
         }
 
+        let process = Arc::clone(&plugin.process).lock_owned().await;
         let response = tokio::time::timeout(
             Duration::from_secs(2),
-            plugin.call(Request::call(1, "tools/list", serde_json::json!({}))),
+            registry
+                .cleanup
+                .call_locked(process, Request::call(1, "tools/list", serde_json::json!({}))),
         )
         .await;
+        registry.cleanup.finish().await?;
         let definitions = match response {
             Ok(Ok(response)) if response.error.is_none() => {
                 let result = response.result.ok_or("Tool listing returned no result.")?;
@@ -1625,8 +1612,14 @@ pub async fn cli() -> ExitCode {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
 
     if root_help_requested(&args) {
-        print_help_with_plugins(&home());
-        return ExitCode::SUCCESS;
+        return match print_help_with_plugins(&home()) {
+            Ok(()) => ExitCode::SUCCESS,
+
+            Err(error) => {
+                eprintln!("{}", diagnostic(sentence(error.to_string())));
+                ExitCode::FAILURE
+            }
+        };
     }
 
     if args.first().is_some_and(|name| name == "tui")
@@ -1724,6 +1717,54 @@ fn root_help_requested(args: &[String]) -> bool {
 pub async fn daemon() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     logging::initialize(logging::Mode::Daemon);
     serve().await
+}
+
+#[cfg(windows)]
+pub fn service_dispatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    logging::initialize(logging::Mode::Daemon);
+    krabb_process::service::dispatch("Krabb", service_main)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn service_main() {
+    let stop = Arc::new(Stop::new());
+    let signal = Arc::clone(&stop);
+    let service = match krabb_process::service::Service::register("Krabb", move || signal.signal())
+    {
+        Ok(service) => service,
+
+        Err(error) => {
+            error!(error = %diagnostic(error.to_string()), "Service registration failed.");
+            return;
+        }
+    };
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
+            let root = home();
+            let daemon = serve_controlled(&root, stop, || service.running());
+            tokio::pin!(daemon);
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+
+            loop {
+                tokio::select! {
+                    result = &mut daemon => break result,
+                    _ = heartbeat.tick() => service.heartbeat()?,
+                }
+            }
+        })
+    }));
+
+    let failed = !matches!(&outcome, Ok(Ok(())));
+
+    if let Ok(Err(error)) = outcome {
+        error!(error = %diagnostic(error.to_string()), "Service failed.");
+    }
+
+    if let Err(error) = service.stopped(failed) {
+        error!(error = %diagnostic(error.to_string()), "Service status failed.");
+    }
 }
 
 pub fn init_logging(verbose: bool, debug_mode: bool, json: bool) {
@@ -2025,14 +2066,15 @@ fn completion_name_from(argv0: Option<&std::ffi::OsStr>) -> &'static str {
     if name.eq_ignore_ascii_case("krabb") { "krabb" } else { NAME }
 }
 
-fn print_help_with_plugins(root: &Path) {
-    print!("{}", style_cli_help(&help_text_with_plugins(root)));
+fn print_help_with_plugins(root: &Path) -> Result<(), PluginError> {
+    print!("{}", style_cli_help(&help_text_with_plugins(root)?));
+    Ok(())
 }
 
-fn help_text_with_plugins(root: &Path) -> String {
+fn help_text_with_plugins(root: &Path) -> Result<String, PluginError> {
     let mut command = Cli::command();
     let mut help = command.render_help().to_string();
-    let commands = available_commands(root);
+    let commands = available_commands(root)?;
 
     let conditional = commands
         .iter()
@@ -2060,7 +2102,7 @@ fn help_text_with_plugins(root: &Path) -> String {
         help.push_str(&plugin_help);
     }
 
-    help
+    Ok(help)
 }
 
 fn command_help_section(
@@ -2177,11 +2219,7 @@ fn export_krabfile_at_mode(
         .into());
     }
 
-    let config = if root.join("config.toml").is_file() {
-        toml::from_str(&std::fs::read_to_string(root.join("config.toml"))?)?
-    } else {
-        Config::default()
-    };
+    let config = load_config_at(root)?;
 
     let lock = load_lock_at(root)?;
     let mut plugins = lock
@@ -2274,7 +2312,9 @@ fn import_krabfile_at_mode(
 
     let destination = root.join("config.toml");
 
-    if destination.exists() && !args.force {
+    let previous_config = load_config_text(root)?;
+
+    if previous_config.is_some() && !args.force {
         return Err("Configuration already exists; use --force to replace it.".into());
     }
 
@@ -2283,7 +2323,6 @@ fn import_krabfile_at_mode(
         return Ok(());
     }
 
-    let previous_config = std::fs::read(&destination).ok();
     init_at(root)?;
     secure(&destination, toml::to_string_pretty(&file.config)?.as_bytes())?;
     let spinner = if !json && !file.plugins.is_empty() {
@@ -2327,9 +2366,10 @@ fn import_krabfile_at_mode(
 
     if let Err(error) = result {
         match previous_config {
-            Some(bytes) => secure(&destination, &bytes)?,
+            Some(text) => secure(&destination, text.as_bytes())?,
 
             None => {
+                let _lock = metadata_lock(root)?;
                 let _ = std::fs::remove_file(&destination);
             }
         }
@@ -2517,11 +2557,7 @@ async fn append_installed_memory_context(
         return Ok(());
     };
 
-    let config = if root.join("config.toml").is_file() {
-        toml::from_str(&std::fs::read_to_string(root.join("config.toml"))?)?
-    } else {
-        Config::default()
-    };
+    let config = load_config_at(root)?;
 
     config
         .validate()
@@ -2549,11 +2585,7 @@ async fn model_at(
     let path = binary_at(&plugin, root)
         .ok_or_else(|| format!("Plugin binary was not found: {plugin}."))?;
 
-    let config = if root.join("config.toml").is_file() {
-        toml::from_str(&std::fs::read_to_string(root.join("config.toml"))?)?
-    } else {
-        Config::default()
-    };
+    let config = load_config_at(root)?;
 
     config
         .validate()
@@ -2562,15 +2594,9 @@ async fn model_at(
     let mut process = launch(root, path, &plugin, Some(Capability::Model), false, &config).await?;
     let result = async {
         let workspace = workspace_root_at(root);
+        let protocol = process.hello.protocol;
         let response = process
-            .call(model_request(
-                2,
-                &model,
-                &messages,
-                &[],
-                Some(&workspace),
-                process.hello.protocol,
-            )?)
+            .call(model_request(2, &model, &messages, &[], Some(&workspace), protocol)?)
             .await?;
         let value = response.result.ok_or_else(|| {
             response
@@ -3275,11 +3301,7 @@ fn parse_schedule_add(
         delay = repeat;
     }
 
-    let config: Config = if root.join("config.toml").is_file() {
-        toml::from_str(&std::fs::read_to_string(root.join("config.toml"))?)?
-    } else {
-        Config::default()
-    };
+    let config: Config = load_config_at(root)?;
 
     let timezone = timezone.or_else(|| config.scheduler.timezone.clone());
 
@@ -4451,10 +4473,10 @@ async fn config_command(
     json: bool,
 ) -> Result<(), PluginError> {
     let path = root.join("config.toml");
+    let text = load_config_text(root)?.ok_or("Configuration was not found.")?;
 
     match command {
         ConfigCommand::Get(args) => {
-            let text = std::fs::read_to_string(&path)?;
             let config: toml::Value = toml::from_str(&text)?;
             let value = args.key.as_deref().map_or(Some(&config), |key| {
                 key.split('.').try_fold(&config, |value, part| value.get(part))
@@ -4507,7 +4529,7 @@ async fn config_command(
             }
 
             let value = raw_value.parse::<toml_edit::Value>()?;
-            let mut document = std::fs::read_to_string(&path)?.parse::<toml_edit::DocumentMut>()?;
+            let mut document = text.parse::<toml_edit::DocumentMut>()?;
 
             let mut table = document.as_table_mut();
 
@@ -4616,16 +4638,11 @@ async fn restart_daemon(root: &Path) -> Result<bool, PluginError> {
         };
 
         #[cfg(target_os = "windows")]
-        let result = {
-            let stopped = std::process::Command::new("sc.exe").args(["stop", "Krabb"]).status()?;
+        {
+            service_action(&service_path(), ServiceAction::Restart)?;
+        }
 
-            if !stopped.success() {
-                return Err("Could not stop the Krabb service.".into());
-            }
-
-            std::process::Command::new("sc.exe").args(["start", "Krabb"]).status()?
-        };
-
+        #[cfg(not(target_os = "windows"))]
         if !result.success() {
             return Err("Could not restart the Krabb service.".into());
         }
@@ -4675,6 +4692,7 @@ fn sessions_at(root: &Path) -> Result<state::Store, Box<dyn std::error::Error + 
     Ok(state::Store::load(root.join("data/sessions/index.json"))?)
 }
 
+#[cfg(test)]
 async fn purge_state_at(
     root: &Path,
     sessions: bool,
@@ -4691,6 +4709,14 @@ async fn purge_state_at(
     }
 
     let _lock = offline_lock(root)?;
+    purge_offline_state(root, sessions, deliveries)
+}
+
+fn purge_offline_state(
+    root: &Path,
+    sessions: bool,
+    deliveries: bool,
+) -> Result<Value, PluginError> {
     let (session_ids, delivery_count) = sessions_at(root)?.purge(sessions, deliveries)?;
     let mut pending_worktrees = Vec::new();
 
@@ -4871,25 +4897,16 @@ fn initialize_home(root: &Path, force_config: bool) -> std::io::Result<()> {
         }
     }
 
-    let config_path = root.join("config.toml");
+    {
+        let _lock = metadata_lock(root)?;
+        let config_path = root.join("config.toml");
+        let existing = load_metadata(&config_path, LOCK_LIMIT)?;
 
-    match std::fs::symlink_metadata(&config_path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Krabb config must be a regular file.",
-            ));
+        if force_config || existing.is_none() {
+            let config =
+                toml::to_string_pretty(&Config::default()).map_err(std::io::Error::other)?;
+            save_file(&config_path, config.as_bytes())?;
         }
-
-        Ok(_) => {}
-
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-
-    if force_config || !regular_file_present(&config_path) {
-        let config = toml::to_string_pretty(&Config::default()).map_err(std::io::Error::other)?;
-        secure(&config_path, config.as_bytes())?;
     }
 
     create_instruction_file(&workspace.join("KRAB.md"), templates::KRAB)?;
@@ -4968,11 +4985,13 @@ fn reset_home(root: &Path) -> std::io::Result<()> {
         }
     })?;
 
+    let metadata = metadata_lock(root)?;
+
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let name = entry.file_name();
 
-        if name == "daemon.lock" || name == ".plugins.lock" {
+        if name == "daemon.lock" || name == ".plugins.lock" || name == ".metadata.lock" {
             continue;
         }
 
@@ -4985,6 +5004,7 @@ fn reset_home(root: &Path) -> std::io::Result<()> {
         }
     }
 
+    drop(metadata);
     initialize_home(root, true)
 }
 
@@ -5003,6 +5023,14 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 async fn serve_at(root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_controlled(root, Arc::new(Stop::new()), || Ok(())).await
+}
+
+async fn serve_controlled(
+    root: &Path,
+    stop: Arc<Stop>,
+    on_ready: impl FnOnce() -> std::io::Result<()>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel_id = std::env::var("KRABB_CHANNEL").unwrap_or_else(|_| "telegram".into());
 
     let (model_id, model) = model_selection(
@@ -5010,7 +5038,7 @@ async fn serve_at(root: &Path) -> Result<(), Box<dyn std::error::Error + Send + 
         std::env::var("KRABB_MODEL").ok(),
     );
 
-    serve_inner(root, &channel_id, &model_id, &model, false).await
+    serve_inner(root, &channel_id, &model_id, &model, false, stop, on_ready).await
 }
 
 async fn serve_inner(
@@ -5019,6 +5047,8 @@ async fn serve_inner(
     model_id: &str,
     model: &str,
     force: bool,
+    stop: Arc<Stop>,
+    on_ready: impl FnOnce() -> std::io::Result<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_at(root)?;
     let _daemon_lock = daemon_lock(root)?;
@@ -5034,7 +5064,7 @@ async fn serve_inner(
         }
     }
 
-    let config: Config = toml::from_str(&std::fs::read_to_string(root.join("config.toml"))?)?;
+    let config: Config = load_config_at(root)?;
     config
         .validate()
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
@@ -5049,7 +5079,6 @@ async fn serve_inner(
     let token = ipc::token()?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
-    let stop = Arc::new(Stop::new());
     let cancels = Arc::new(Mutex::new(BTreeMap::new()));
     let plugins = Plugins::default();
     let ipc_state = Arc::new(ipc::State {
@@ -5122,22 +5151,28 @@ async fn serve_inner(
     ));
 
     let approval_mode = config.approval_mode();
-    let outcome = bridge_with_media(
-        &plugins,
-        channel_id,
-        model_id,
-        model,
-        Arc::clone(&sessions),
-        Arc::clone(&stop),
-        Arc::clone(&cancels),
-        config.channels,
-        approval_mode,
-        false,
-        root.to_owned(),
-        media_root_at(root),
-        pending,
-    )
-    .await;
+    let outcome = match on_ready() {
+        Ok(()) => {
+            bridge_with_media(
+                &plugins,
+                channel_id,
+                model_id,
+                model,
+                Arc::clone(&sessions),
+                Arc::clone(&stop),
+                Arc::clone(&cancels),
+                config.channels,
+                approval_mode,
+                false,
+                root.to_owned(),
+                media_root_at(root),
+                pending,
+            )
+            .await
+        }
+
+        Err(error) => Err(error.into()),
+    };
 
     stop.signal();
     let _ = scheduler_task.await;
@@ -5185,7 +5220,9 @@ async fn run_scheduler(
     let workspace_locks = Arc::new(AsyncMutex::new(HashMap::new()));
 
     loop {
+        let lifecycle = Arc::new(Arc::clone(&plugins.lifecycle).read_owned().await);
         let Some((scheduler_id, scheduler)) = plugins.find(Capability::Scheduler).await else {
+            drop(lifecycle);
             tokio::select! {
                 _ = stop.notified() => return,
                 _ = plugins.changed.notified() => continue,
@@ -5382,8 +5419,10 @@ async fn run_scheduler(
             let worker_workspace_locks = Arc::clone(&workspace_locks);
             active_tasks.insert(task_id);
 
+            let worker_lifecycle = Arc::clone(&lifecycle);
             let worker_id = workers
                 .spawn(async move {
+                    let _lifecycle = worker_lifecycle;
                     run_scheduled_task(
                         task_id,
                         &task,
@@ -5407,6 +5446,8 @@ async fn run_scheduler(
                 .id();
             worker_tasks.insert(worker_id, task_id);
         }
+
+        drop(lifecycle);
 
         tokio::select! {
             _ = stop.notified() => return,
@@ -6633,7 +6674,19 @@ fn offline_lock(root: &Path) -> std::io::Result<DaemonLock> {
     })
 }
 
+fn metadata_lock(root: &Path) -> std::io::Result<DaemonLock> {
+    lock_at_timeout(root, ".metadata.lock", std::time::Duration::from_secs(5))
+}
+
 fn lock_at(root: &Path, name: &str) -> std::io::Result<DaemonLock> {
+    lock_at_timeout(root, name, std::time::Duration::ZERO)
+}
+
+fn lock_at_timeout(
+    root: &Path,
+    name: &str,
+    timeout: std::time::Duration,
+) -> std::io::Result<DaemonLock> {
     std::fs::create_dir_all(root)?;
 
     let path = root.join(name);
@@ -6659,14 +6712,31 @@ fn lock_at(root: &Path, name: &str) -> std::io::Result<DaemonLock> {
         .truncate(false)
         .open(&path)?;
 
-    if let Err(error) = file.try_lock() {
-        return match error {
-            std::fs::TryLockError::WouldBlock => {
-                Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "Lock is already held."))
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+
+                if remaining.is_zero() {
+                    return Err(std::io::Error::new(
+                        if timeout.is_zero() {
+                            std::io::ErrorKind::AlreadyExists
+                        } else {
+                            std::io::ErrorKind::TimedOut
+                        },
+                        format!("Lock {name} is already held."),
+                    ));
+                }
+
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
             }
 
-            std::fs::TryLockError::Error(error) => Err(error),
-        };
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
     }
 
     file.set_len(0)?;
@@ -6704,12 +6774,48 @@ fn recover_plugins(root: &Path) -> std::io::Result<()> {
             let backup = entry.path();
             let destination = plugins.join(id);
 
-            if !lock.plugins.contains_key(id) {
+            let Some(committed) = lock.plugins.get(id) else {
                 std::fs::remove_dir_all(backup)?;
-            } else if !destination.exists() {
+                continue;
+            };
+
+            let matches = |directory: &Path| {
+                let Ok(manifest) = read_manifest_checked(directory) else {
+                    return false;
+                };
+
+                if manifest.id != id
+                    || manifest.version != committed.version
+                    || manifest.protocol != committed.protocol
+                    || manifest.capabilities != committed.capabilities
+                    || manifest.permissions != committed.permissions
+                    || manifest.secrets != committed.secrets
+                    || manifest.commands != committed.commands
+                {
+                    return false;
+                }
+
+                verify_plugin_binary(
+                    id,
+                    committed,
+                    &directory.join("krabb-plugin.toml"),
+                    &directory.join("bin").join(plugin_name(id)),
+                )
+                .is_ok()
+            };
+
+            if matches(&destination) {
+                std::fs::remove_dir_all(backup)?;
+            } else if matches(&backup) {
+                if destination.exists() {
+                    std::fs::remove_dir_all(&destination)?;
+                }
+
                 std::fs::rename(backup, destination)?;
             } else {
-                std::fs::remove_dir_all(backup)?;
+                return Err(std::io::Error::other(format!(
+                    "Neither plugin {id} nor its backup matches the committed lock."
+                )));
             }
         } else if name.starts_with('.') && name.contains(".stage-") {
             std::fs::remove_dir_all(entry.path())?;
@@ -6970,10 +7076,10 @@ fn validate_commands(
     Ok(())
 }
 
-fn available_commands(root: &Path) -> BTreeMap<String, Vec<(String, CommandSpec)>> {
-    let Ok(lock) = load_lock_at(root) else {
-        return BTreeMap::new();
-    };
+fn available_commands(
+    root: &Path,
+) -> Result<BTreeMap<String, Vec<(String, CommandSpec)>>, PluginError> {
+    let lock = load_lock_at(root)?;
 
     let mut commands = BTreeMap::new();
 
@@ -7029,7 +7135,7 @@ fn available_commands(root: &Path) -> BTreeMap<String, Vec<(String, CommandSpec)
         }
     }
 
-    commands
+    Ok(commands)
 }
 
 fn env_for(manifest: &Manifest, config: &Config, root: &Path) -> Vec<(String, String)> {
@@ -7081,6 +7187,7 @@ fn env_for(manifest: &Manifest, config: &Config, root: &Path) -> Vec<(String, St
         "KRABB_BROWSER_ALLOWED_HOSTS",
         "KRABB_BROWSER_EGRESS_PROXY",
         "KRABB_COMPUTER_MODE",
+        "KRABB_COMPUTER_ALLOW_HOST_CONTROL",
         "KRABB_COMPUTER_DISPLAY",
         "KRABB_XVFB",
         "KRABB_COMPUTER_STARTUP",
@@ -7483,7 +7590,9 @@ async fn bridge_with_media(
     let mut provider_failures = 0_u32;
 
     loop {
+        let lifecycle = plugins.lifecycle.read().await;
         let Some(channel) = plugins.get(channel_id).await else {
+            drop(lifecycle);
             tokio::select! {
                 biased;
                 _ = tokio::signal::ctrl_c() => return Ok(()),
@@ -7493,6 +7602,7 @@ async fn bridge_with_media(
         };
 
         let Some(provider) = plugins.get(model_id).await else {
+            drop(lifecycle);
             tokio::select! {
                 biased;
                 _ = tokio::signal::ctrl_c() => return Ok(()),
@@ -8312,14 +8422,6 @@ async fn bridge_with_media(
                             .lock()
                             .map_err(|_| "Session lock is poisoned.")?
                             .clear(&session_name, "cancelled");
-                        let _ = provider.restart().await;
-
-                        for (id, process) in plugins.all().await {
-                            if id != channel_id {
-                                let _ = process.restart().await;
-                            }
-                        }
-
                         acknowledge(&cancels, &session_name)?;
                         continue;
                     }
@@ -9310,6 +9412,41 @@ fn isolate(session: &str) -> Result<Option<PathBuf>, Box<dyn std::error::Error +
     isolate_at(session, &workspace_root())
 }
 
+fn worktree_command(root: &Path) -> std::process::Command {
+    let mut command = git_command();
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
+    command
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .args(["-c", &format!("core.hooksPath={null}")])
+        .args(["-c", "core.fsmonitor=false", "-c", "submodule.recurse=false"])
+        .args(["-c", "protocol.allow=never", "-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+        .arg("-C")
+        .arg(root);
+    command
+}
+
+fn check_checkout(root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config = command_output(worktree_command(root).args([
+        "config",
+        "--get-regexp",
+        r"^(filter\..*\.(clean|smudge|process)|remote\..*\.promisor|extensions\.partialclone)$",
+    ]))?;
+
+    match config.status.code() {
+        Some(1) => Ok(()),
+
+        Some(0) => {
+            Err("Automatic worktrees cannot use checkout filters or partial clones. Prepare the worktree through an explicitly approved shell operation.".into())
+        }
+
+        _ => Err("The workspace Git configuration could not be checked.".into()),
+    }
+}
+
 fn isolate_at(
     session: &str,
     root: &Path,
@@ -9323,12 +9460,8 @@ fn isolate_at(
         Err(_) => return Ok(None),
     };
 
-    let check = command_output(git_command().args([
-        "-C",
-        &root.display().to_string(),
-        "rev-parse",
-        "--is-inside-work-tree",
-    ]));
+    let check =
+        command_output(worktree_command(&root).args(["rev-parse", "--is-inside-work-tree"]));
 
     if !check.is_ok_and(|output| output.status.success()) {
         return Err("The configured workspace is not a Git worktree.".into());
@@ -9347,12 +9480,8 @@ fn isolate_at(
             return Err("The isolated room worktree leaves the configured root.".into());
         }
 
-        let check = command_output(git_command().args([
-            "-C",
-            &path.display().to_string(),
-            "rev-parse",
-            "--is-inside-work-tree",
-        ]))?;
+        let check =
+            command_output(worktree_command(&path).args(["rev-parse", "--is-inside-work-tree"]))?;
 
         if !check.status.success() {
             return Err("The isolated room worktree is not a Git worktree.".into());
@@ -9360,6 +9489,8 @@ fn isolate_at(
 
         return Ok(Some(path));
     }
+
+    check_checkout(&root)?;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -9371,14 +9502,36 @@ fn isolate_at(
     }
 
     let output = command_output(
-        git_command()
-            .args(["-C", &root.display().to_string(), "worktree", "add", "--detach"])
+        worktree_command(&root)
+            .args(["worktree", "add", "--detach", "--no-checkout"])
             .arg(&path)
             .arg("HEAD"),
     )?;
 
     if !output.status.success() {
         return Err("The isolated room worktree could not be created.".into());
+    }
+
+    let checkout = check_checkout(&path).and_then(|()| {
+        let output = command_output(worktree_command(&path).args(["reset", "--hard", "HEAD"]))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err("The isolated room worktree could not be checked out.".into())
+        }
+    });
+
+    if let Err(error) = checkout {
+        let removed = command_output(
+            worktree_command(&root).args(["worktree", "remove", "--force"]).arg(&path),
+        )?;
+
+        if !removed.status.success() {
+            return Err("The incomplete room worktree could not be removed.".into());
+        }
+
+        return Err(error);
     }
 
     let path = std::fs::canonicalize(path)?;
@@ -10312,6 +10465,7 @@ mod tool_availability_tests {
         let registry = ToolRegistry {
             owners: specs.iter().map(|spec| (spec.name.clone(), "tools".into())).collect(),
             specs,
+            ..ToolRegistry::default()
         };
 
         assert!(
@@ -10981,7 +11135,7 @@ async fn answer(
     provider: &Live,
     plugins: &Plugins,
     model: &str,
-    mut messages: Vec<Message>,
+    messages: Vec<Message>,
     session: &str,
     channel: &str,
     chat: &str,
@@ -11004,6 +11158,70 @@ async fn answer(
     scheduled_destination: Option<AuthorizedDestination>,
     schedule_run_id: Option<u64>,
 ) -> Result<ModelReply, Box<dyn std::error::Error + Send + Sync>> {
+    let registry = tool_registry(plugins, tools_enabled, shell_enabled).await?;
+    let cleanup = registry.cleanup.clone();
+    let result = answer_with_registry(
+        provider,
+        plugins,
+        model,
+        messages,
+        session,
+        channel,
+        chat,
+        thread,
+        sessions,
+        workspace,
+        media_root,
+        tools_enabled,
+        schedule_enabled,
+        shell_enabled,
+        approval_mode,
+        approvals,
+        cancel,
+        stop,
+        deadline,
+        call,
+        failed_tool,
+        tool_failures,
+        notices,
+        scheduled_destination,
+        schedule_run_id,
+        registry,
+    )
+    .await;
+    cleanup.finish().await?;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn answer_with_registry(
+    provider: &Live,
+    plugins: &Plugins,
+    model: &str,
+    mut messages: Vec<Message>,
+    session: &str,
+    channel: &str,
+    chat: &str,
+    thread: Option<&str>,
+    sessions: &Arc<Mutex<state::Store>>,
+    workspace: Option<&Path>,
+    media_root: &Path,
+    tools_enabled: bool,
+    schedule_enabled: bool,
+    shell_enabled: bool,
+    approval_mode: ApprovalMode,
+    approvals: Arc<AsyncMutex<approval::Gate>>,
+    cancel: &Cancellation,
+    stop: &Stop,
+    deadline: tokio::time::Instant,
+    call: &mut u64,
+    failed_tool: &mut Option<String>,
+    tool_failures: Option<Arc<Mutex<Vec<String>>>>,
+    notices: tokio::sync::mpsc::Sender<StreamNotice>,
+    scheduled_destination: Option<AuthorizedDestination>,
+    schedule_run_id: Option<u64>,
+    mut registry: ToolRegistry,
+) -> Result<ModelReply, Box<dyn std::error::Error + Send + Sync>> {
     if messages.iter().any(|message| {
         message.content.iter().any(|content| matches!(content, Content::Image { .. }))
     }) && !provider.supports(Capability::Vision)
@@ -11015,7 +11233,6 @@ async fn answer(
     let mut tokens = 0_u64;
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let memory_plugin = plugins.find(Capability::Memory).await;
-    let mut registry = tool_registry(plugins, tools_enabled, shell_enabled).await?;
 
     if plugins.get("sqlite").await.is_some_and(|plugin| plugin.supports(Capability::Store))
         && tools_enabled
@@ -11030,6 +11247,7 @@ async fn answer(
 
     let mut specs = registry.specs.clone();
     let turn_id = format!("{session}:{}", *call);
+    let mut streaming = false;
 
     if memory_plugin.is_some() && tools_enabled {
         specs.extend(memory_tools());
@@ -11062,6 +11280,7 @@ async fn answer(
         let request =
             model_request(*call, model, &messages, &specs, workspace, provider.hello.protocol)?;
         let mut notes = Vec::new();
+        let mut delivered = String::new();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
         let host_plugins = plugins.clone();
         let host_sessions = Arc::clone(sessions);
@@ -11083,7 +11302,8 @@ async fn answer(
         let host_registry = registry.clone();
         let host_turn_id = turn_id.clone();
         let host_scheduled_destination = scheduled_destination.clone();
-        let request_stream = provider.call_full_async(
+        let request_stream = registry.cleanup.call_full_async(
+            Arc::clone(&provider.process),
             request,
             move |note| {
                 let sender = sender.clone();
@@ -11158,24 +11378,7 @@ async fn answer(
                 note = receiver.recv(), if !receiver_closed => {
                     match note {
                         Some(note) => {
-                            if let Some(event) = stream_event(note.clone()) {
-                                match event {
-                                    Event::Text { text } | Event::Done { text } => {
-                                        notices.send(StreamNotice::Text(text)).await.map_err(|_| {
-                                            "The channel stream receiver is unavailable."
-                                        })?;
-                                    }
-
-                                    Event::Tool { name, .. } => {
-                                        notices.send(StreamNotice::Tool(name)).await.map_err(|_| {
-                                            "The channel stream receiver is unavailable."
-                                        })?;
-                                    }
-
-                                    Event::Error { .. } => {}
-                                }
-                            }
-
+                            forward_stream(&note, &mut delivered, &notices).await?;
                             notes.push(note);
                         }
 
@@ -11186,6 +11389,7 @@ async fn answer(
         };
 
         while let Some(note) = receiver.recv().await {
+            forward_stream(&note, &mut delivered, &notices).await?;
             notes.push(note);
         }
 
@@ -11213,6 +11417,18 @@ async fn answer(
         merge_stream(&mut parsed, notes);
         keep_one_mutation(&mut parsed.events);
         parsed.text = clip(parsed.text, TEXT_LIMIT);
+
+        streaming |= !delivered.is_empty();
+
+        if streaming
+            && let Some(suffix) = parsed.text.strip_prefix(&delivered)
+            && !suffix.is_empty()
+        {
+            notices
+                .send(StreamNotice::Text(suffix.to_owned()))
+                .await
+                .map_err(|_| "The channel stream receiver is unavailable.")?;
+        }
 
         if let Some(usage) = parsed.context_usage {
             sessions
@@ -11271,7 +11487,9 @@ async fn answer(
                 return Err(format!("Tool arguments are invalid: {error}").into());
             }
 
-            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= TOOL_CALLS {
+            let tool_call = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            if tool_call >= TOOL_CALLS {
                 return Err("The turn exceeded its tool-call limit.".into());
             }
 
@@ -11318,7 +11536,7 @@ async fn answer(
                     failed_tool,
                     scheduled_destination.as_ref(),
                     schedule_run_id,
-                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    tool_call,
                 ),
             );
 
@@ -11559,6 +11777,24 @@ fn stream_event(note: Request) -> Option<Event> {
         .and_then(|value| serde_json::from_value(value).ok())
 }
 
+async fn forward_stream(
+    note: &Request,
+    delivered: &mut String,
+    notices: &tokio::sync::mpsc::Sender<StreamNotice>,
+) -> Result<(), &'static str> {
+    let notice = match stream_event(note.clone()) {
+        Some(Event::Text { text } | Event::Done { text }) => {
+            delivered.push_str(&text);
+            StreamNotice::Text(text)
+        }
+
+        Some(Event::Tool { name, .. }) => StreamNotice::Tool(name),
+        Some(Event::Error { .. }) | None => return Ok(()),
+    };
+
+    notices.send(notice).await.map_err(|_| "The channel stream receiver is unavailable.")
+}
+
 fn merge_stream(reply: &mut ModelReply, notes: Vec<Request>) {
     let mut text = String::new();
 
@@ -11659,7 +11895,11 @@ async fn tool_with_registry(
         };
 
         values.insert("scope".into(), serde_json::Value::String(memory_scope.into()));
-        let response = match plugin.call(Request::call(id, "data", args)).await {
+        let response = match registry
+            .cleanup
+            .call(Arc::clone(&plugin.process), Request::call(id, "data", args))
+            .await
+        {
             Ok(response) => response,
 
             Err(error) => {
@@ -11690,7 +11930,11 @@ async fn tool_with_registry(
             _ => return Err("Unknown schedule action.".into()),
         };
 
-        let response = match plugin.call(Request::call(id, method, params)).await {
+        let response = match registry
+            .cleanup
+            .call(Arc::clone(&plugin.process), Request::call(id, method, params))
+            .await
+        {
             Ok(response) => response,
 
             Err(error) => {
@@ -11845,7 +12089,11 @@ async fn tool_with_registry(
         let workspace_tools_enabled = params["context"]["tools"] == true;
         let shell_enabled = workspace_tools_enabled && params["context"]["shell"] == true;
 
-        let response = match plugin.call(Request::call(schedule_id, "add", params)).await {
+        let response = match registry
+            .cleanup
+            .call(Arc::clone(&plugin.process), Request::call(schedule_id, "add", params))
+            .await
+        {
             Ok(response) => response,
 
             Err(error) => {
@@ -11915,7 +12163,11 @@ async fn tool_with_registry(
             values.insert("approved".into(), serde_json::Value::Bool(approve));
         }
 
-        let response = match plugin.call(Request::call(id, method, params)).await {
+        let response = match registry
+            .cleanup
+            .call(Arc::clone(&plugin.process), Request::call(id, method, params))
+            .await
+        {
             Ok(response) => response,
 
             Err(error) => {
@@ -11968,7 +12220,10 @@ async fn tool_with_registry(
         })
     };
 
-    let response = match plugin.call(Request::call(id, name, params)).await {
+    let request = Request::call(id, name, params);
+    let response = registry.cleanup.call(Arc::clone(&plugin.process), request).await;
+
+    let response = match response {
         Ok(response) => response,
 
         Err(error) => {
@@ -12021,6 +12276,7 @@ fn legacy_tool_registry(name: Option<&str>) -> ToolRegistry {
     let mut registry = ToolRegistry {
         specs: tools(true),
         owners: tools(true).into_iter().map(|spec| (spec.name, "tools".into())).collect(),
+        ..ToolRegistry::default()
     };
 
     if let Some(name) = name {
@@ -12830,7 +13086,7 @@ fn doctor_at(
     let workspace_path = root.join("workspace");
     let krab_path = workspace_path.join("KRAB.md");
     let klaw_path = workspace_path.join("KLAW.md");
-    let config_was_present = regular_file_present(&config_path);
+    let config_was_present = load_config_text(root)?.is_some();
     let plugins_directory_was_present = directory_present(&plugins_path);
     let workspace_directory_was_present = directory_present(&workspace_path);
     let krab_instructions_were_present = regular_file_present(&krab_path);
@@ -12869,7 +13125,7 @@ fn doctor_at(
     let mut config_valid = None;
 
     if config_present {
-        let config: Config = toml::from_str(&std::fs::read_to_string(root.join("config.toml"))?)?;
+        let config: Config = load_config_at(root)?;
         config.validate().map_err(|error| format!("Config is invalid: {error}"))?;
         config_valid = Some(true);
     }
@@ -13051,6 +13307,17 @@ const SERVICE_VARIABLES: &[&str] = &[
     "KRABB_CODEX_BINARY",
     "KRABB_SANDBOX_RUNTIME",
     "KRABB_SANDBOX_IMAGE",
+    "KRABB_PLAYWRIGHT_MODULE",
+    "KRABB_PLAYWRIGHT_BROWSERS_PATH",
+    "KRABB_NODE",
+    "KRABB_BROWSER_ALLOWED_HOSTS",
+    "KRABB_BROWSER_EGRESS_PROXY",
+    "KRABB_COMPUTER_MODE",
+    "KRABB_COMPUTER_ALLOW_HOST_CONTROL",
+    "KRABB_COMPUTER_DISPLAY",
+    "KRABB_XVFB",
+    "KRABB_COMPUTER_STARTUP",
+    "KRABB_COMPUTER_STARTUP_ARGS",
 ];
 
 const SERVICE_SECRETS: &[&str] = &[
@@ -13090,7 +13357,12 @@ fn service_environment_from(
             let value = PathBuf::from(value);
             let value = if matches!(
                 *name,
-                "KRABB_ROOT" | "KRABB_MEMORY" | "KRABB_TIMER" | "KRABB_DB" | "KRABB_CODEX_HOME"
+                "KRABB_ROOT"
+                    | "KRABB_MEDIA"
+                    | "KRABB_MEMORY"
+                    | "KRABB_TIMER"
+                    | "KRABB_DB"
+                    | "KRABB_CODEX_HOME"
             ) {
                 service_path_value(value)?
             } else {
@@ -13099,6 +13371,15 @@ fn service_environment_from(
 
             values.push(((*name).into(), value));
         }
+    }
+
+    if !environment.contains_key("KRABB_CODEX_HOME")
+        && let Some(home) = environment.get("HOME").or_else(|| environment.get("USERPROFILE"))
+    {
+        values.push((
+            "KRABB_CODEX_HOME".into(),
+            service_path_value(PathBuf::from(home).join(".codex"))?,
+        ));
     }
 
     if !environment.contains_key("KRABB_CODEX_BINARY")
@@ -13485,9 +13766,34 @@ fn windows_service_install(
     path: &Path,
     definition: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let executable = executable.display().to_string();
-
     let snapshot = if force { windows_service_snapshot()? } else { None };
+
+    if snapshot.is_some() {
+        let output = command_output(std::process::Command::new("powershell.exe").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Stop-Service -Name 'Krabb' -Force -ErrorAction Stop",
+        ]))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "Could not stop the service before replacing its account. {}",
+                windows_command_detail(&output)
+            )
+            .into());
+        }
+    }
+
+    krabb_file::service(executable)?;
+
+    for (name, value) in environment {
+        for path in windows_service_private(name, Path::new(value)) {
+            krabb_file::service(path)?;
+        }
+    }
+
+    let executable = format!("\"{}\" --service", executable.display());
 
     let previous_definition = match std::fs::read(path) {
         Ok(bytes) => Some(bytes),
@@ -13503,6 +13809,47 @@ fn windows_service_install(
         } else {
             windows_service_create(&executable)?;
             created = true;
+        }
+
+        let output = command_output(std::process::Command::new("sc.exe").args([
+            "privs",
+            "Krabb",
+            "SeChangeNotifyPrivilege",
+        ]))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "Could not restrict service privileges. {}",
+                windows_command_detail(&output)
+            )
+            .into());
+        }
+
+        for (name, value) in environment {
+            if let Some(directory) = windows_service_directory(name, Path::new(value)) {
+                std::fs::create_dir_all(&directory)?;
+                let output = command_output(&mut windows_service_access(&directory, true))?;
+
+                if !output.status.success() {
+                    return Err(format!(
+                        "Could not grant service access to {name}. {}",
+                        windows_command_detail(&output)
+                    )
+                    .into());
+                }
+            }
+
+            if let Some(dependency) = windows_service_dependency(name, Path::new(value)) {
+                let output = command_output(&mut windows_service_access(&dependency, false))?;
+
+                if !output.status.success() {
+                    return Err(format!(
+                        "Could not grant service read/execute access to {name}. {}",
+                        windows_command_detail(&output)
+                    )
+                    .into());
+                }
+            }
         }
 
         windows_service_recovery()?;
@@ -13558,14 +13905,101 @@ fn windows_service_install(
     Ok(())
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn windows_service_private(name: &str, path: &Path) -> Vec<PathBuf> {
+    match name {
+        "KRABB_HOME" | "KRABB_CREDENTIALS" | "KRABB_TIMER" | "KRABB_CODEX_HOME" => {
+            vec![path.to_path_buf()]
+        }
+
+        "KRABB_MEMORY" => vec![path.to_path_buf(), path.with_extension("lock")],
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_service_directory(name: &str, path: &Path) -> Option<PathBuf> {
+    match name {
+        "KRABB_ROOT" | "KRABB_MEDIA" => Some(path.to_path_buf()),
+        "KRABB_MEMORY" | "KRABB_DB" => Some(
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .to_path_buf(),
+        ),
+
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_service_dependency(name: &str, path: &Path) -> Option<PathBuf> {
+    match name {
+        "KRABB_PLAYWRIGHT_MODULE" => path
+            .ancestors()
+            .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "node_modules"))
+            .or_else(|| path.parent())
+            .map(|parent| if parent.as_os_str().is_empty() { Path::new(".") } else { parent })
+            .map(Path::to_path_buf),
+
+        "KRABB_PLAYWRIGHT_BROWSERS_PATH" => Some(path.to_path_buf()),
+
+        "KRABB_NODE" | "KRABB_CODEX_BINARY" if path.components().count() > 1 || path.is_file() => {
+            Some(path.to_path_buf())
+        }
+
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_service_access(path: &Path, writable: bool) -> std::process::Command {
+    let mut command = std::process::Command::new("icacls.exe");
+
+    let directory = writable || path.is_dir();
+    let permissions = if writable {
+        r"NT SERVICE\Krabb:(OI)(CI)M"
+    } else if directory {
+        r"NT SERVICE\Krabb:(OI)(CI)RX"
+    } else {
+        r"NT SERVICE\Krabb:RX"
+    };
+
+    command.arg(path).args(["/grant", permissions]);
+
+    if directory {
+        command.arg("/T");
+    }
+
+    command.arg("/L");
+
+    command
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_service_command(action: &str, executable: &str, start: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("sc.exe");
+    command.args([
+        action,
+        "Krabb",
+        "binPath=",
+        executable,
+        "start=",
+        start,
+        "obj=",
+        r"NT SERVICE\Krabb",
+        "password=",
+        "",
+    ]);
+
+    command
+}
+
 #[cfg(target_os = "windows")]
 fn windows_service_create(
     executable: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let output = command_output(
-        std::process::Command::new("sc.exe")
-            .args(["create", "Krabb", "binPath=", executable, "start=", "auto"]),
-    )?;
+    let output = command_output(&mut windows_service_command("create", executable, "auto"))?;
 
     if !output.status.success() {
         return Err(
@@ -13581,10 +14015,7 @@ fn windows_service_configure(
     executable: &str,
     start: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let output = command_output(
-        std::process::Command::new("sc.exe")
-            .args(["config", "Krabb", "binPath=", executable, "start=", start]),
-    )?;
+    let output = command_output(&mut windows_service_command("config", executable, start))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -14234,7 +14665,7 @@ fn service_text(executable: &Path, environment: &[(String, String)]) -> String {
             .collect::<String>();
 
         format!(
-            "<service><name>Krabb</name><command>{}</command><environment>{}</environment><start>auto</start></service>\n",
+            "<service><name>Krabb</name><command>{}</command><arguments>--service</arguments><account>NT SERVICE\\Krabb</account><environment>{}</environment><start>auto</start></service>\n",
             xml(executable),
             environment
         )
@@ -14248,7 +14679,12 @@ fn service_text(executable: &Path, environment: &[(String, String)]) -> String {
 
 #[cfg(target_os = "linux")]
 fn systemd(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$").replace('\n', "\\n")
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('%', "%%")
+        .replace('\n', "\\n")
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -14275,9 +14711,9 @@ fn version(json: bool) {
 
 async fn status_command(json: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let root = home();
-    let config_ok = root.join("config.toml").is_file()
-        && toml::from_str::<Config>(&std::fs::read_to_string(root.join("config.toml"))?)
-            .is_ok_and(|config| config.validate().is_ok());
+    let config_ok = load_config_text(&root)?.is_some_and(|text| {
+        toml::from_str::<Config>(&text).is_ok_and(|config| config.validate().is_ok())
+    });
 
     let lock = load_lock_at(&root)?;
     let installed = lock.plugins.len();
@@ -14296,7 +14732,7 @@ async fn status_command(json: bool) -> Result<(), Box<dyn std::error::Error + Se
         entry.capabilities.iter().any(|capability| capability == "channel") && ready(&channel)
     });
 
-    let conflicts = available_commands(&root).values().any(|owners| owners.len() > 1);
+    let conflicts = available_commands(&root)?.values().any(|owners| owners.len() > 1);
     let daemon = ipc::call(&root, "status", serde_json::json!({})).await.is_ok();
     let (health, health_details) = status_health(
         config_ok,
@@ -14430,9 +14866,9 @@ async fn external_command(
     };
 
     let root = home();
-    let commands = available_commands(&root);
+    let commands = available_commands(&root)?;
     let Some(owners) = commands.get(name) else {
-        print_help_with_plugins(&root);
+        print_help_with_plugins(&root)?;
         return Ok(());
     };
 
@@ -14463,38 +14899,54 @@ async fn external_command(
         return Ok(());
     }
 
-    let command_args = external_command_args(name, &args[1..]);
+    let mut command_args = external_command_args(name, &args[1..]);
     let path = binary_at(&plugin, &root)
         .ok_or_else(|| format!("Plugin binary was not found: {plugin}."))?;
 
-    let config = if root.join("config.toml").is_file() {
-        toml::from_str(&std::fs::read_to_string(root.join("config.toml"))?)?
-    } else {
-        Config::default()
-    };
+    let config = load_config_at(&root)?;
 
     if plugin == "tui" {
         return tui_command(path, &command_args, &root, &config).await;
     }
 
+    let acp_workspace = if name == "acp" {
+        let workspace = workspace_root().canonicalize()?;
+        let selected = command_args
+            .iter()
+            .rposition(|argument| argument == "--workspace")
+            .map(|index| command_args.get(index + 1).ok_or("An ACP workspace is required."))
+            .transpose()?;
+        let workspace =
+            selected_workspace(&serde_json::json!({"workspace": selected}), &workspace)?;
+        command_args.extend(["--workspace".into(), workspace.display().to_string()]);
+        Some(workspace)
+    } else {
+        None
+    };
+
     let mut process = launch(&root, path, &plugin, None, false, &config).await?;
     let timeout = if name == "codex" && args.get(1).is_some_and(|argument| argument == "login") {
         std::time::Duration::from_secs(960)
-    } else if name == "ag-ui" {
-        std::time::Duration::from_secs(60 * 60 * 24)
     } else {
         std::time::Duration::from_secs(120)
     };
 
-    let result = if name == "code" {
-        let model_id = std::env::var("KRABB_MODEL_PLUGIN").unwrap_or_else(|_| "codex".into());
-        let model_path = binary_at(&model_id, &root).ok_or_else(|| {
-            format!("The configured intelligence plugin {model_id} is not installed.")
-        })?;
+    let result = if matches!(name.as_str(), "code" | "acp") {
+        let model = if name == "code" {
+            let model_id = std::env::var("KRABB_MODEL_PLUGIN").unwrap_or_else(|_| "codex".into());
+            let model_path = binary_at(&model_id, &root).ok_or_else(|| {
+                format!("The configured intelligence plugin {model_id} is not installed.")
+            })?;
 
-        let model = Arc::new(AsyncMutex::new(Some(
-            launch(&root, model_path, &model_id, Some(Capability::Model), false, &config).await?,
-        )));
+            Some(
+                launch(&root, model_path, &model_id, Some(Capability::Model), false, &config)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        let model = Arc::new(AsyncMutex::new(model));
         let tools = binary_at("tools", &root).map(|path| async {
             launch(&root, path, "tools", Some(Capability::Tool), false, &config).await
         });
@@ -14504,7 +14956,10 @@ async fn external_command(
             None => None,
         }));
 
-        let workspace = workspace_root().canonicalize().unwrap_or_else(|_| workspace_root());
+        let workspace = acp_workspace.unwrap_or_else(|| {
+            workspace_root().canonicalize().unwrap_or_else(|_| workspace_root())
+        });
+
         let model_process = Arc::clone(&model);
         let tool_process = Arc::clone(&tools);
         let approval_mode = config.approval_mode();
@@ -14518,15 +14973,12 @@ async fn external_command(
                 ),
                 timeout,
                 |request| {
-                    if let Request::Note { method, params, .. } = request
-                        && method == "event"
-                        && let Some(text) = params["event"]["text"].as_str()
-                    {
-                        use std::io::Write;
-
-                        print!("{text}");
-                        let _ = std::io::stdout().flush();
-                    }
+                    write_command_event(
+                        &request,
+                        json,
+                        &mut std::io::stdout(),
+                        &mut std::io::stderr(),
+                    );
 
                     std::future::ready(Ok(()))
                 },
@@ -14537,6 +14989,7 @@ async fn external_command(
                         Arc::clone(&tool_process),
                         workspace.clone(),
                         approval_mode,
+                        json,
                         model_events.clone(),
                     )
                 },
@@ -14563,39 +15016,49 @@ async fn external_command(
         let workspace = workspace_root().canonicalize().unwrap_or_else(|_| workspace_root());
         let approval_mode = config.approval_mode();
 
-        process
-            .call_full_timeout_stream_async(
-                Request::call(
-                    1,
-                    "command",
-                    serde_json::json!({"name": name, "args": &command_args, "json": json}),
-                ),
-                timeout,
-                |request| {
-                    if let Request::Note { method, params, .. } = request
-                        && method == "event"
-                        && let Some(text) = params["event"]["text"].as_str()
-                    {
-                        use std::io::Write;
+        let listener = process.listen_stream_async(
+            Request::call(
+                1,
+                "command",
+                serde_json::json!({"name": name, "args": &command_args, "json": json}),
+            ),
+            |request| {
+                if let Some(text) = command_event_text(&request) {
+                    use std::io::Write;
 
+                    if json {
+                        eprintln!("{text}");
+                        let _ = std::io::stderr().flush();
+                    } else {
                         println!("{text}");
                         let _ = std::io::stdout().flush();
                     }
+                }
 
-                    std::future::ready(Ok(()))
-                },
-                |request, events| {
-                    agent_request(
-                        request,
-                        Arc::clone(&model_process),
-                        Arc::clone(&tool_process),
-                        workspace.clone(),
-                        approval_mode,
-                        events,
-                    )
-                },
-            )
-            .await
+                std::future::ready(Ok(()))
+            },
+            |request, events| {
+                agent_request(
+                    request,
+                    Arc::clone(&model_process),
+                    Arc::clone(&tool_process),
+                    workspace.clone(),
+                    approval_mode,
+                    json,
+                    events,
+                )
+            },
+        );
+        tokio::pin!(listener);
+
+        tokio::select! {
+            response = &mut listener => response,
+
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                Ok(Response::ok(1, serde_json::json!({"stopped": true})))
+            }
+        }
     } else {
         process
             .call_stream_timeout_async(
@@ -14606,15 +15069,12 @@ async fn external_command(
                 ),
                 timeout,
                 |request| {
-                    if let Request::Note { method, params, .. } = request
-                        && method == "event"
-                        && let Some(text) = params["event"]["text"].as_str()
-                    {
-                        use std::io::Write;
-
-                        print!("{text}");
-                        let _ = std::io::stdout().flush();
-                    }
+                    write_command_event(
+                        &request,
+                        json,
+                        &mut std::io::stdout(),
+                        &mut std::io::stderr(),
+                    );
 
                     std::future::ready(Ok(()))
                 },
@@ -15122,6 +15582,30 @@ fn format_data_value(value: &Value) -> String {
     value.to_string()
 }
 
+fn command_event_text(request: &Request) -> Option<&str> {
+    if let Request::Note { method, params, .. } = request
+        && method == "event"
+    {
+        return params["event"]["text"].as_str();
+    }
+
+    None
+}
+
+fn write_command_event(
+    request: &Request,
+    json: bool,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+) {
+    if let Some(text) = command_event_text(request) {
+        let output: &mut dyn std::io::Write = if json { stderr } else { stdout };
+
+        let _ = output.write_all(text.as_bytes());
+        let _ = output.flush();
+    }
+}
+
 fn external_command_output(
     value: &Value,
     json: bool,
@@ -15143,6 +15627,7 @@ async fn agent_request(
     tools: Arc<AsyncMutex<Option<Process>>>,
     workspace: PathBuf,
     approval_mode: ApprovalMode,
+    json: bool,
     events: tokio::sync::mpsc::UnboundedSender<Request>,
 ) -> std::result::Result<Response, krabb_core::Error> {
     let Request::Call { id, method, params, .. } = request else {
@@ -15175,25 +15660,76 @@ async fn agent_request(
                 };
 
                 let mut notes = Vec::new();
+                let (handoff, mut pending) = tokio::sync::oneshot::channel();
+                let mut handoff = Some(handoff);
+                let mut frontend = None;
+                let allowed = params["tools"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                    .collect::<BTreeSet<_>>();
                 let result = {
-                    let generation =
-                        provider.call_stream(Request::call(id, "generate", params), |note| {
-                            if let Some(event) = stream_event(note.clone()) {
-                                let _ = events.send(Request::Note {
-                                    jsonrpc: "2.0".into(),
-                                    method: "event".into(),
-                                    params: serde_json::json!({"callId":id,"event":event}),
-                                });
+                    let note = |note: Request| {
+                        if let Some(event) = stream_event(note.clone()) {
+                            let _ = events.send(Request::Note {
+                                jsonrpc: "2.0".into(),
+                                method: "event".into(),
+                                params: serde_json::json!({"callId":id,"event":event}),
+                            });
+                        }
+
+                        notes.push(note);
+                        std::future::ready(Ok(()))
+                    };
+
+                    let call = |request| {
+                        let event = match request {
+                            Request::Call { method, params, .. }
+                                if method == "host/tool"
+                                    && params["name"]
+                                        .as_str()
+                                        .is_some_and(|name| allowed.contains(name)) =>
+                            {
+                                Ok(Event::Tool {
+                                    name: params["name"].as_str().unwrap().to_owned(),
+                                    args: params["args"].clone(),
+                                    id: None,
+                                    thought_signature: None,
+                                })
                             }
 
-                            notes.push(note);
-                        });
+                            _ => Err(krabb_core::Error::Protocol(
+                                concat!(
+                                    "Provider requested an undeclared frontend tool ",
+                                    "or unsupported host method."
+                                )
+                                .into(),
+                            )),
+                        };
+
+                        if let Some(handoff) = handoff.take() {
+                            let _ = handoff.send(event);
+                        }
+
+                        std::future::pending::<krabb_core::Result<Response>>()
+                    };
+
+                    let generation =
+                        provider.call_full_async(Request::call(id, "generate", params), note, call);
 
                     tokio::pin!(generation);
 
                     tokio::select! {
                         result = &mut generation => Some(result),
                         _ = cancelled => None,
+
+                        event = &mut pending => {
+                            frontend = Some(event.map_err(|_| krabb_core::Error::Protocol(
+                                "Provider tool handoff closed.".into(),
+                            ))?);
+                            None
+                        }
                     }
                 };
 
@@ -15202,6 +15738,31 @@ async fn agent_request(
 
                     None => {
                         provider.restart().await?;
+
+                        if let Some(event) = frontend {
+                            let mut normalized =
+                                notes.into_iter().filter_map(stream_event).collect::<Vec<_>>();
+                            normalized.push(event?);
+                            let text = normalized
+                                .iter()
+                                .filter_map(|event| match event {
+                                    Event::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<String>();
+
+                            let reply = ModelReply {
+                                text,
+                                stop: "tool_calls".into(),
+                                input: None,
+                                output: None,
+                                context_usage: None,
+                                events: normalized,
+                            };
+
+                            return Ok(Response::ok(id, serde_json::to_value(reply)?));
+                        }
+
                         return Err(krabb_core::Error::Protocol(
                             "The model request was cancelled.".into(),
                         ));
@@ -15242,7 +15803,7 @@ async fn agent_request(
                 match approval_mode {
                     ApprovalMode::Off => false,
                     ApprovalMode::Auto => true,
-                    ApprovalMode::Prompt => prompt_code_approval(name, &args),
+                    ApprovalMode::Prompt => prompt_code_approval(name, &args, json),
                 }
             } else {
                 false
@@ -15303,21 +15864,16 @@ fn selected_workspace(
     Ok(workspace)
 }
 
-fn prompt_code_approval(name: &str, args: &serde_json::Value) -> bool {
-    use std::io::{self, Write};
-
-    print!(
-        "Krabb requests approval to run {name} with {}. Approve? [y/N] ",
-        clip(args.to_string(), 400)
-    );
-    let _ = io::stdout().flush();
-    let mut answer = String::new();
-
-    if io::stdin().read_line(&mut answer).is_err() {
-        return false;
-    }
-
-    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+fn prompt_code_approval(name: &str, args: &serde_json::Value, json: bool) -> bool {
+    confirm_action(
+        false,
+        json,
+        &format!(
+            "Krabb requests approval to run {name} with {}. Approve?",
+            clip(args.to_string(), 400)
+        ),
+    )
+    .unwrap_or(false)
 }
 
 fn confirm_action(yes: bool, json: bool, question: &str) -> Result<bool, PluginError> {
@@ -15752,40 +16308,59 @@ async fn uninstall_plugin_at(
     id: &str,
     force: bool,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(result) =
+        control_at("plugin.uninstall", serde_json::json!({"id": id, "force": force}), home_root)
+            .await?
+    {
+        return Ok(result);
+    }
+
+    let _offline = offline_lock(home_root)?;
     let lock = load_lock_at(home_root)?;
     let version = lock.plugins.get(id).map(|entry| entry.version.clone());
     let (purge_sessions, purge_deliveries) = last_plugin_state(&lock, id, home_root);
     let purged = if force && (purge_sessions || purge_deliveries) {
-        Some(purge_state_at(home_root, purge_sessions, purge_deliveries).await?)
+        Some(purge_offline_state(home_root, purge_sessions, purge_deliveries)?)
     } else {
-        ensure_no_orphaned_plugin_state(&lock, id, home_root)?;
         None
     };
 
-    let unloaded = unload_at(home_root, id).await?.is_some_and(|value| value["unloaded"] == true);
-
-    if let Err(error) = remove_at(PluginRemove { id: id.into(), yes: true }, home_root) {
-        if let Err(reload) = activate_at(home_root, id).await {
-            return Err(format!(
-                "Plugin uninstallation failed: {}. Runtime restoration also failed: {}.",
-                sentence(error.to_string()),
-                sentence(reload.to_string())
-            )
-            .into());
-        }
-
-        return Err(error);
-    }
-
-    info!(plugin = %id, unloaded, "Plugin uninstalled.");
+    remove_guarded(PluginRemove { id: id.into(), yes: true }, home_root, |lock| {
+        ensure_no_orphaned_plugin_state(lock, id, home_root)
+    })?;
 
     Ok(serde_json::json!({
-        "id": id,
-        "version": version,
-        "status": "uninstalled",
-        "unloaded": unloaded,
-        "purged": purged,
+        "id": id, "version": version, "status": "uninstalled", "unloaded": false, "purged": purged,
     }))
+}
+
+fn check_plugin_state(
+    lock: &Lock,
+    id: &str,
+    root: &Path,
+    state: &Value,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (model, channel) = last_plugin_state(lock, id, root);
+    let sessions = state["sessions"].as_bool().ok_or("Invalid plugin state guard response.")?;
+    let deliveries = state["deliveries"].as_bool().ok_or("Invalid plugin state guard response.")?;
+
+    if model && sessions {
+        return Err(concat!(
+            "Cannot uninstall the last intelligence plugin while sessions exist. ",
+            "Delete the sessions with `krabb session delete` first."
+        )
+        .into());
+    }
+
+    if channel && deliveries {
+        return Err(concat!(
+            "Cannot uninstall the last messaging plugin while deliveries are pending or ",
+            "uncertain. Manage them with `krabb delivery` first."
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 fn plugin_uninstall_output(outcome: &Value) -> String {
@@ -16873,11 +17448,7 @@ fn update_one(
             return Err("The saved plugin update candidate changed while staging.".into());
         }
 
-        let config = if home_root.join("config.toml").is_file() {
-            toml::from_str(&std::fs::read_to_string(home_root.join("config.toml"))?)?
-        } else {
-            Config::default()
-        };
+        let config = load_config_at(home_root)?;
 
         config
             .validate()
@@ -17099,11 +17670,7 @@ fn link_at(
             copy_binary(&binary, &staged)?;
         }
 
-        let config = if home_root.join("config.toml").is_file() {
-            toml::from_str(&std::fs::read_to_string(home_root.join("config.toml"))?)?
-        } else {
-            Config::default()
-        };
+        let config = load_config_at(home_root)?;
 
         config
             .validate()
@@ -17875,9 +18442,20 @@ fn remove(name: PluginRemove) -> Result<(), Box<dyn std::error::Error + Send + S
     remove_at(name, &home())
 }
 
+#[cfg(test)]
 fn remove_at(
     name: PluginRemove,
     home_root: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _offline = offline_lock(home_root)?;
+    let id = name.id.clone();
+    remove_guarded(name, home_root, |lock| ensure_no_orphaned_plugin_state(lock, &id, home_root))
+}
+
+fn remove_guarded(
+    name: PluginRemove,
+    home_root: &Path,
+    guard: impl FnOnce(&Lock) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _lock = lock_at(home_root, ".plugins.lock")?;
 
@@ -17900,7 +18478,7 @@ fn remove_at(
         return Err(format!("Plugin {} is not installed.", name.id).into());
     }
 
-    ensure_no_orphaned_plugin_state(&lock, &name.id, home_root)?;
+    guard(&lock)?;
 
     if had_destination {
         std::fs::rename(&dest, &backup)?;
@@ -17946,29 +18524,22 @@ fn ensure_no_orphaned_plugin_state(
     id: &str,
     home_root: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (removes_last_model, removes_last_channel) = last_plugin_state(lock, id, home_root);
+    let (model, channel) = last_plugin_state(lock, id, home_root);
 
-    if removes_last_model && !sessions_at(home_root)?.sessions.is_empty() {
-        return Err(concat!(
-            "Cannot uninstall the last intelligence plugin while sessions exist. ",
-            "Delete the sessions with `krabb session delete` first."
-        )
-        .into());
+    if !model && !channel {
+        return Ok(());
     }
 
-    if removes_last_channel {
-        let store = sessions_at(home_root)?;
-
-        if !store.outbox.is_empty() || !store.dead.is_empty() {
-            return Err(concat!(
-                "Cannot uninstall the last messaging plugin while deliveries are pending or ",
-                "uncertain. Manage them with `krabb delivery` first."
-            )
-            .into());
-        }
-    }
-
-    Ok(())
+    let store = sessions_at(home_root)?;
+    check_plugin_state(
+        lock,
+        id,
+        home_root,
+        &serde_json::json!({
+            "sessions": !store.sessions.is_empty(),
+            "deliveries": !store.outbox.is_empty() || !store.dead.is_empty(),
+        }),
+    )
 }
 
 fn last_plugin_state(lock: &Lock, id: &str, home_root: &Path) -> (bool, bool) {
@@ -17991,58 +18562,45 @@ fn last_plugin_state(lock: &Lock, id: &str, home_root: &Path) -> (bool, bool) {
     (removes_last_model, removes_last_channel)
 }
 
+fn load_metadata(path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    // Callers hold .metadata.lock across recovery and access.
+    if std::fs::symlink_metadata(path).is_ok() {
+        krabb_file::private(path)?;
+    }
+
+    krabb_file::load(path, limit)
+}
+
+fn load_config_text(root: &Path) -> Result<Option<String>, PluginError> {
+    if !root.try_exists()? {
+        return Ok(None);
+    }
+
+    let _lock = metadata_lock(root)?;
+    load_metadata(&root.join("config.toml"), LOCK_LIMIT)?
+        .map(String::from_utf8)
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn load_config_at(root: &Path) -> Result<Config, PluginError> {
+    match load_config_text(root)? {
+        Some(text) => Ok(toml::from_str(&text)?),
+        None => Ok(Config::default()),
+    }
+}
+
 fn load_lock_at(root: &Path) -> Result<Lock, Box<dyn std::error::Error + Send + Sync>> {
-    let path = root.join("plugins.lock");
+    if !root.try_exists()? {
+        return Ok(Lock::default());
+    }
 
-    #[cfg(windows)]
-    recover_secure_backup(&path)?;
-
-    let bytes = match read_bounded(&path, LOCK_LIMIT) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Lock::default()),
-        Err(error) => return Err(error.into()),
+    let _lock = metadata_lock(root)?;
+    let Some(bytes) = load_metadata(&root.join("plugins.lock"), LOCK_LIMIT)? else {
+        return Ok(Lock::default());
     };
 
     Ok(serde_json::from_slice(&bytes)?)
-}
-
-#[cfg(windows)]
-fn recover_secure_backup(path: &Path) -> std::io::Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-
-    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-        return Ok(());
-    };
-
-    let prefix = format!(".{name}.backup-");
-    let entries = match std::fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-
-    let mut backups = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
-        .filter(|entry| {
-            std::fs::symlink_metadata(entry.path())
-                .is_ok_and(|metadata| metadata.file_type().is_file())
-        })
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    backups.sort();
-
-    if let Some(backup) = backups.into_iter().next() {
-        std::fs::rename(backup, path)?;
-    }
-
-    Ok(())
 }
 
 fn save_lock_at(root: &Path, lock: &Lock) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -18059,6 +18617,18 @@ fn save_lock_at(root: &Path, lock: &Lock) -> Result<(), Box<dyn std::error::Erro
 }
 
 fn secure(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let _lock = if matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("config.toml" | "plugins.lock")
+    ) {
+        let lock = metadata_lock(path.parent().unwrap_or(Path::new(".")))?;
+        krabb_file::recover(path)?;
+        Some(lock)
+    } else {
+        None
+    };
+
     save_file(path, content)
 }
 
@@ -18543,6 +19113,162 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn maximum_data_page_survives_tool_and_model_serialization() {
+        let root = test_root("data-page");
+        fs::create_dir_all(&root).unwrap();
+        let record_limit = 255 * 1024;
+        let overhead = serde_json::to_vec(&serde_json::json!({"a": ""})).unwrap().len();
+        let record = serde_json::json!({"a": "\"".repeat((record_limit - overhead) / 2)});
+        let page = serde_json::json!({
+            "items": [{"id": i64::MAX, "record": record}],
+            "limit": 20, "truncated": true, "next_after": i64::MAX
+        });
+
+        let response = root.join("page.json");
+        fs::write(
+            &response,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 2, "result": page
+                })
+            ),
+        )
+        .unwrap();
+        let script = r#"while IFS= read -r line; do
+            case "$line" in
+                *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"sqlite","version":"0.1.0","capabilities":["store"]}}' ;;
+                *shutdown*) exit 0 ;;
+                *) cat "$KRABB_TEST_PAGE" ;;
+            esac
+        done"#;
+        let process = Process::start_with_env(
+            "sh",
+            ["-c", script],
+            [("KRABB_TEST_PAGE", response.as_os_str())],
+        )
+        .await
+        .unwrap();
+        let plugins = registry([process]).await;
+        let result = super::tool_with_registry(
+            &plugins,
+            &super::ToolRegistry::default(),
+            2,
+            "data",
+            serde_json::json!({"operation": "query", "table": "notes"}),
+            false,
+            None,
+            "cli",
+            "s",
+            "turn",
+            &mut None,
+        )
+        .await
+        .unwrap();
+        let text = super::tool_result_text(&result);
+
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(), page);
+
+        let messages = vec![Message {
+            id: "tool-1".into(),
+            session: "s".into(),
+            role: Role::Tool,
+            sender: Some("data".into()),
+            content: super::bound(vec![Content::Text { text }]),
+        }];
+        let request =
+            super::model_request(3, "test", &messages, &[], None, Protocol::CURRENT).unwrap();
+        let Request::Call { params, .. } = request else { panic!("expected model request") };
+
+        let text = params["messages"][0]["content"][0]["text"].as_str().unwrap();
+
+        assert_eq!(serde_json::from_str::<serde_json::Value>(text).unwrap(), page);
+        stop_registry(&plugins).await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_filesystem_requests_preserve_workspace_and_approval_policy() {
+        let script = r#"while IFS= read -r line; do
+            id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\),"method".*/\1/p')
+            case "$line" in
+                *hello*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":0,"minor":1},"id":"tools","version":"0.1.0","capabilities":["tool"]}}' ;;
+                *shutdown*) exit 0 ;;
+                *) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":'"$line"'}' ;;
+            esac
+        done"#;
+        let tools = Arc::new(tokio::sync::Mutex::new(Some(
+            Process::start_with("sh", ["-c", script]).await.unwrap(),
+        )));
+        let model = Arc::new(tokio::sync::Mutex::new(None));
+        let root = test_root("agent-filesystem");
+        fs::create_dir_all(root.join("project")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let workspace = root.join("project");
+
+        for (name, mode, allowed) in [
+            ("read", super::ApprovalMode::Off, true),
+            ("write", super::ApprovalMode::Off, false),
+            ("write", super::ApprovalMode::Prompt, false),
+            ("write", super::ApprovalMode::Auto, true),
+        ] {
+            let response = super::agent_request(
+                Request::call(
+                    7,
+                    "host/tool",
+                    serde_json::json!({
+                        "name": name, "workspace": workspace,
+                        "args": {"path": "note.txt", "text": "value"}
+                    }),
+                ),
+                model.clone(),
+                tools.clone(),
+                root.clone(),
+                mode,
+                true,
+                tokio::sync::mpsc::unbounded_channel().0,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.error.is_none(), allowed);
+
+            if allowed {
+                let args = response.result.unwrap()["params"].clone();
+
+                assert_eq!(args["workspace"], workspace.display().to_string());
+                assert_eq!(args["approve"], name == "write");
+            }
+        }
+
+        assert!(
+            super::agent_request(
+                Request::call(
+                    8,
+                    "host/tool",
+                    serde_json::json!({
+                        "name": "read", "workspace": root.parent().unwrap(),
+                        "args": {"path": "note.txt"}
+                    })
+                ),
+                model,
+                tools.clone(),
+                root.clone(),
+                super::ApprovalMode::Auto,
+                true,
+                tokio::sync::mpsc::unbounded_channel().0,
+            )
+            .await
+            .is_err()
+        );
+
+        tools.lock().await.take().unwrap().stop().await.unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn agent_model_stream_returns_normalized_provider_events() {
         let script = r#"
 while IFS= read -r line; do
@@ -18568,6 +19294,7 @@ done
             tools,
             workspace,
             super::ApprovalMode::Off,
+            true,
             tokio::sync::mpsc::unbounded_channel().0,
         )
         .await
@@ -18579,6 +19306,81 @@ done
         assert_eq!(reply.events, vec![Event::Text { text: "piece".into() }]);
 
         model.lock().await.take().unwrap().stop().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_model_stream_hands_provider_callbacks_to_the_frontend() {
+        let script = r#"
+while IFS= read -r line; do
+    id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\),"method".*/\1/p')
+    case "$line" in
+        *'"method":"hello"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocol":{"major":0,"minor":1},"id":"test-model","version":"0.1.0","capabilities":["model"]}}' ;;
+        *'"method":"generate"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","method":"event","params":{"event":{"kind":"text","text":"Choose a color."}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":7,"method":"host/tool","params":{"name":"pick","args":{"color":"blue"}}}'
+            IFS= read -r reply
+            touch "$KRABB_TEST_EXECUTED"
+            exit 1 ;;
+        *'"method":"shutdown"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"ok":true}}'; exit 0 ;;
+    esac
+done
+"#;
+        let root = test_root("model-stream-handoff");
+        fs::create_dir_all(&root).unwrap();
+        let executed = root.join("executed");
+
+        for declared in [true, false] {
+            let provider = Process::start_with_env(
+                "sh",
+                ["-c", script],
+                [("KRABB_TEST_EXECUTED", executed.as_os_str())],
+            )
+            .await
+            .unwrap();
+            let model = Arc::new(tokio::sync::Mutex::new(Some(provider)));
+            let tools = if declared {
+                serde_json::json!([{"name":"pick","schema":{"type":"object"}}])
+            } else {
+                serde_json::json!([])
+            };
+
+            let response = super::agent_request(
+                Request::call(42, "host/model_stream", serde_json::json!({"tools":tools})),
+                model.clone(),
+                Arc::new(tokio::sync::Mutex::new(None)),
+                root.clone(),
+                super::ApprovalMode::Off,
+                true,
+                tokio::sync::mpsc::unbounded_channel().0,
+            )
+            .await;
+
+            if declared {
+                let reply: ModelReply =
+                    serde_json::from_value(response.unwrap().result.unwrap()).unwrap();
+
+                assert_eq!(reply.text, "Choose a color.");
+                assert_eq!(reply.stop, "tool_calls");
+                assert_eq!(
+                    reply.events.last().unwrap(),
+                    &Event::Tool {
+                        name: "pick".into(),
+                        args: serde_json::json!({"color":"blue"}),
+                        id: None,
+                        thought_signature: None,
+                    }
+                );
+            } else {
+                assert!(response.unwrap_err().to_string().contains("undeclared frontend tool"));
+            }
+
+            assert!(!executed.exists());
+
+            model.lock().await.take().unwrap().stop().await.unwrap();
+        }
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -18613,6 +19415,7 @@ done
             Arc::new(tokio::sync::Mutex::new(None)),
             root.clone(),
             super::ApprovalMode::Off,
+            true,
             events,
         ));
 
@@ -18952,14 +19755,15 @@ while IFS= read -r line; do
 
                 case "$line" in
                     *'"name":"message_send"'*)
-                        printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"text":"","stop":"tool","events":[{"kind":"tool","name":"message_send","args":{"channel":"tui","chat":"tui-default","private":false,"thread":null,"text":"Ping!"}}]}}'
+                        printf '%s\n' '{"jsonrpc":"2.0","method":"event","params":{"event":{"kind":"text","text":"Checking…"}}}'
+                        printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"text":"Checking…","stop":"tool","events":[{"kind":"tool","name":"message_send","args":{"channel":"tui","chat":"tui-default","private":false,"thread":null,"text":"Ping!"}}]}}'
                         ;;
                     *)
                         printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"text":"I do not have a tool for sending a TUI message.","stop":"stop"}}'
                         ;;
                 esac
             else
-                printf '%s\n' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"text":"DONE: Ping sent to the TUI.","stop":"stop"}}'
+                printf '%s\n' '{"jsonrpc":"2.0","method":"event","params":{"event":{"kind":"text","text":"DONE: "}}}' '{"jsonrpc":"2.0","id":'"$request_id"',"result":{"text":"DONE: Ping sent to the TUI.","stop":"stop"}}'
             fi
             ;;
         *'"method":"shutdown"'*)
@@ -19004,7 +19808,17 @@ done
 
         let stop = Stop::new();
         let (notices, mut received) = tokio::sync::mpsc::channel(8);
-        let drain = tokio::spawn(async move { while received.recv().await.is_some() {} });
+        let drain = tokio::spawn(async move {
+            let mut text = String::new();
+
+            while let Some(notice) = received.recv().await {
+                if let super::StreamNotice::Text(part) = notice {
+                    text.push_str(&part);
+                }
+            }
+
+            text
+        });
 
         let mut call = 1;
         let mut failed_tool = None;
@@ -19043,7 +19857,9 @@ done
         )
         .await
         .unwrap();
-        drain.abort();
+        let delivered = drain.await.unwrap();
+
+        assert_eq!(delivered, "Checking…DONE: Ping sent to the TUI.");
 
         assert_eq!(reply.text, "DONE: Ping sent to the TUI.");
         let message = {
@@ -21311,6 +22127,118 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn scheduled_cancellation_reaps_event_and_host_tool_commands() {
+        let script = r#"
+import json, os, subprocess, sys
+role, root, mode = sys.argv[1:]
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'hello':
+        result = {'protocol': {'major': 0, 'minor': 1}, 'id': role,
+                  'version': '0.1.0', 'capabilities': ['model' if role == 'fixture' else 'tool']}
+    elif method == 'generate':
+        args = {'command': 'touch started; sleep 2; touch leaked'}
+        if mode == 'host':
+            print(json.dumps({'jsonrpc': '2.0', 'id': 77, 'method': 'host/tool',
+                              'params': {'name': 'shell', 'args': args}}), flush=True)
+            continue
+        result = {'text': '', 'stop': 'tool', 'events': [
+            {'kind': 'tool', 'name': 'shell', 'args': args, 'approve': True}]}
+    elif method == 'tools/list':
+        result = {'tools': [{'name': 'shell', 'description': 'Run a fixture command.',
+                  'schema': {'type': 'object', 'properties': {'command': {'type': 'string'}},
+                             'required': ['command'], 'additionalProperties': False}}]}
+    elif method == 'shell':
+        assert request['params']['approve'] is True
+        subprocess.run(request['params']['command'], shell=True, cwd=root, preexec_fn=os.setpgrp)
+        result = {'text': 'finished'}
+    elif method == 'shutdown':
+        break
+    else:
+        result = {}
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#;
+
+        for mode in ["event", "host"] {
+            let root = test_root(&format!("schedule-cancel-{mode}"));
+            fs::create_dir_all(&root).unwrap();
+            let plugins = Plugins::default();
+
+            for role in ["fixture", "tools"] {
+                let process = Process::start_with(
+                    "python3",
+                    ["-u", "-c", script, role, root.to_str().unwrap(), mode],
+                )
+                .await
+                .unwrap();
+                plugins.insert(Live::new(process)).await;
+            }
+
+            let sessions = Arc::new(Mutex::new(
+                super::state::Store::load(root.join("sessions.json")).unwrap(),
+            ));
+            let cancellation = Arc::new(Cancellation::new());
+            let task = serde_json::json!({
+                "text": "Run the command.",
+                "context": {"tools": true, "shell": true}
+            });
+
+            let stop = Stop::new();
+            let config = super::Config::default();
+            let mut call = 10;
+            let result = super::execute_scheduled_task(
+                71,
+                &task,
+                &plugins,
+                &sessions,
+                &stop,
+                &root,
+                &root,
+                &root,
+                "fixture",
+                "test",
+                Arc::clone(&cancellation),
+                Arc::new(super::AsyncMutex::new(super::approval::Gate::new().unwrap())),
+                &config,
+                Some(1),
+                &mut call,
+            );
+            tokio::pin!(result);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    tokio::select! {
+                        result = &mut result => panic!("schedule finished early: {result:?}"),
+
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                            if root.join("started").exists() { break; }
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            cancellation.request();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), result)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert!(result.starts_with("CANCELLED:"), "{result}");
+            assert!(sessions.lock().unwrap().sessions["schedule-71"].inflight.is_none());
+            tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+            assert!(!root.join("leaked").exists(), "{mode} command survived cancellation");
+            stop_registry(&plugins).await;
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn running_schedule_observes_a_persisted_cancellation_request() {
         let script = r#"
 while IFS= read -r line; do
@@ -21791,6 +22719,14 @@ done
             test_home,
         );
 
+        assert_eq!(
+            values
+                .iter()
+                .find(|(key, _)| key == "KRABB_COMPUTER_ALLOW_HOST_CONTROL")
+                .map(|(_, value)| value.clone()),
+            std::env::var("KRABB_COMPUTER_ALLOW_HOST_CONTROL").ok()
+        );
+
         assert!(values.iter().any(|(key, value)| key == "KRABB_SHELL" && value == "off"));
         let expected_root = std::env::var_os("KRABB_ROOT")
             .map(PathBuf::from)
@@ -21869,6 +22805,163 @@ done
         assert_eq!(configured, [("KRABB_ROOT".into(), "/work/project".into())]);
     }
 
+    fn interrupted_metadata(root: &Path, name: &str, previous: &[u8], next: &[u8], phase: &str) {
+        fs::create_dir_all(root).unwrap();
+        let _ = fs::remove_file(root.join(name));
+        fs::write(root.join(format!(".{name}.backup-test")), previous).unwrap();
+        fs::write(root.join(format!(".{name}.tmp-test")), next).unwrap();
+        fs::write(
+            root.join(format!(".{name}.txn-test")),
+            serde_json::to_vec(&serde_json::json!({
+                "path": name,
+                "temporary": format!(".{name}.tmp-test"),
+                "backup": format!(".{name}.backup-test"),
+                "phase": phase,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn command_discovery_waits_for_metadata_recovery() {
+        let root = test_root("command-metadata-contention");
+        let registry = serde_json::to_vec(&serde_json::json!({
+            "plugins": {
+                "echo": {
+                    "source": "local",
+                    "version": "0.1.0",
+                    "protocol": Protocol::CURRENT,
+                    "capabilities": [],
+                    "commands": [{
+                        "name": "echo",
+                        "description": "Echo input.",
+                        "interactive": false
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+        interrupted_metadata(&root, "plugins.lock", &registry, b"invalid", "prepared");
+        let guard = super::metadata_lock(&root).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader_root = root.clone();
+        let reader = std::thread::spawn(move || {
+            sender.send(super::available_commands(&reader_root)).unwrap();
+        });
+
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        assert!(!root.join("plugins.lock").exists());
+        drop(guard);
+
+        let commands = receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+        reader.join().unwrap();
+
+        assert_eq!(commands["echo"][0].0, "echo");
+        assert!(!root.join(".plugins.lock.txn-test").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metadata_lock_wait_is_bounded() {
+        let root = test_root("metadata-timeout");
+        let guard = super::metadata_lock(&root).unwrap();
+        let timeout = std::time::Duration::from_millis(20);
+        let start = std::time::Instant::now();
+        let error = super::lock_at_timeout(&root, ".metadata.lock", timeout).err().unwrap();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= timeout);
+        drop(guard);
+
+        assert!(super::metadata_lock(&root).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_discovery_propagates_metadata_errors() {
+        let root = test_root("command-metadata-error");
+
+        assert!(super::available_commands(&root).unwrap().is_empty());
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("plugins.lock"), b"invalid").unwrap();
+
+        assert!(super::available_commands(&root).is_err());
+        assert!(super::help_text_with_plugins(&root).is_err());
+        fs::remove_file(root.join("plugins.lock")).unwrap();
+        fs::remove_file(root.join(".metadata.lock")).unwrap();
+        fs::create_dir(root.join(".metadata.lock")).unwrap();
+
+        assert!(super::available_commands(&root).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metadata_recovers_before_reading_or_initializing() {
+        let root = test_root("metadata-recovery");
+        let previous = b"update = 'auto'\n";
+        let next = b"update = 'off'\n";
+
+        for phase in ["prepared", "backed_up", "installed"] {
+            interrupted_metadata(&root, "config.toml", previous, next, phase);
+            super::init_at(&root).unwrap();
+
+            let expected = if phase == "backed_up" { next.as_slice() } else { previous.as_slice() };
+
+            assert_eq!(super::load_config_text(&root).unwrap().unwrap().as_bytes(), expected);
+            assert_eq!(fs::read(root.join("config.toml")).unwrap(), expected);
+        }
+
+        interrupted_metadata(&root, "config.toml", previous, next, "prepared");
+
+        assert_eq!(super::load_config_text(&root).unwrap().unwrap().as_bytes(), previous);
+        interrupted_metadata(&root, "plugins.lock", b"{\"plugins\":{}}", b"invalid", "prepared");
+
+        assert!(super::load_lock_at(&root).unwrap().plugins.is_empty());
+        assert!(!root.join(".plugins.lock.txn-test").exists());
+        interrupted_metadata(&root, "plugins.lock", b"invalid", b"{\"plugins\":{}}", "backed_up");
+
+        assert!(super::load_lock_at(&root).unwrap().plugins.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn json_commands_route_streamed_instructions_to_stderr() {
+        let event = Request::Note {
+            jsonrpc: "2.0".into(),
+            method: "event".into(),
+            params: serde_json::json!({"event": {"text": "streamed"}}),
+        };
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        super::write_command_event(&event, true, &mut stdout, &mut stderr);
+
+        assert!(stdout.is_empty());
+        assert_eq!(stderr, b"streamed");
+        super::write_command_event(&event, false, &mut stdout, &mut stderr);
+
+        assert_eq!(stdout, b"streamed");
+        assert_eq!(stderr, b"streamed");
+        assert_eq!(
+            super::command_event_text(&Request::Note {
+                jsonrpc: "2.0".into(),
+                method: "other".into(),
+                params: serde_json::json!({}),
+            },),
+            None
+        );
+
+        assert_eq!(
+            super::command_event_text(&Request::call(1, "event", serde_json::json!({}))),
+            None
+        );
+    }
+
     #[test]
     fn recovers_locks_and_plugin_staging() {
         let root = std::env::temp_dir().join(format!("krabb-lock-{}", std::process::id()));
@@ -21890,6 +22983,19 @@ done
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert!(root.join("plugins/.echo.stage-test").exists());
         drop(active);
+        let backup = root.join("plugins/.echo.backup-test");
+        fs::create_dir_all(backup.join("bin")).unwrap();
+        fs::write(backup.join("bin").join(super::plugin_name("echo")), "old binary").unwrap();
+        fs::write(
+            backup.join("krabb-plugin.toml"),
+            "id = 'echo'\nversion = '0.1.0'\ncapabilities = []\n[protocol]\nmajor = 0\nminor = 1\n",
+        )
+        .unwrap();
+        let hash = super::digest(
+            &backup.join("krabb-plugin.toml"),
+            &backup.join("bin").join(super::plugin_name("echo")),
+        )
+        .unwrap();
         let mut plugins = BTreeMap::new();
         plugins.insert(
             "echo".into(),
@@ -21898,7 +23004,7 @@ done
                 revision: "local".into(),
                 pinned: false,
                 default: false,
-                hash: String::new(),
+                hash,
                 version: "0.1.0".into(),
                 protocol: Protocol::CURRENT,
                 capabilities: Vec::new(),
@@ -21908,8 +23014,13 @@ done
                 linked: false,
             },
         );
-        fs::write(root.join("plugins.lock"), serde_json::to_vec(&super::Lock { plugins }).unwrap())
-            .unwrap();
+        interrupted_metadata(
+            &root,
+            "plugins.lock",
+            &serde_json::to_vec(&super::Lock { plugins }).unwrap(),
+            b"uncommitted lock",
+            "prepared",
+        );
         recover_plugins(&root).unwrap();
 
         assert!(root.join("plugins/echo").is_dir());
@@ -21918,6 +23029,30 @@ done
         recover_plugins(&root).unwrap();
 
         assert!(!root.join("plugins/.gone.backup-remove-test").exists());
+        let destination = root.join("plugins/echo");
+        fs::rename(&destination, &backup).unwrap();
+        fs::create_dir_all(destination.join("bin")).unwrap();
+        fs::copy(backup.join("krabb-plugin.toml"), destination.join("krabb-plugin.toml")).unwrap();
+        fs::write(destination.join("bin").join(super::plugin_name("echo")), "uncommitted binary")
+            .unwrap();
+        recover_plugins(&root).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("bin").join(super::plugin_name("echo"))).unwrap(),
+            "old binary"
+        );
+
+        assert!(!backup.exists());
+
+        fs::create_dir_all(&backup).unwrap();
+        recover_plugins(&root).unwrap();
+
+        assert!(!backup.exists());
+        fs::rename(&destination, &backup).unwrap();
+        fs::write(backup.join("bin").join(super::plugin_name("echo")), "corrupt binary").unwrap();
+
+        assert!(recover_plugins(&root).is_err());
+        assert!(backup.exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -21961,6 +23096,146 @@ done
         let store = super::state::Store::default();
         let missing = std::env::temp_dir().join(format!("krabb-worktrees-{}", std::process::id()));
         reclaim_worktrees(&missing, &store);
+    }
+
+    #[test]
+    fn windows_service_creation_and_reconfiguration_use_an_unprivileged_account() {
+        for action in ["create", "config"] {
+            let command = super::windows_service_command(
+                action,
+                r#""C:\Krabb\daemon.exe" --service"#,
+                "auto",
+            );
+            let args = command.get_args().map(|arg| arg.to_str().unwrap()).collect::<Vec<_>>();
+
+            assert_eq!(command.get_program(), "sc.exe");
+            assert_eq!(
+                args,
+                [
+                    action,
+                    "Krabb",
+                    "binPath=",
+                    r#""C:\Krabb\daemon.exe" --service"#,
+                    "start=",
+                    "auto",
+                    "obj=",
+                    r"NT SERVICE\Krabb",
+                    "password=",
+                    "",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn windows_service_private_state_includes_external_memory_and_its_lock() {
+        let parent = Path::new("external");
+        let memory = parent.join("memory.json");
+        let paths = super::windows_service_private("KRABB_MEMORY", &memory);
+
+        assert_eq!(paths, [memory.clone(), parent.join("memory.lock")]);
+        assert!(!paths.contains(&parent.to_path_buf()));
+        assert_eq!(
+            super::windows_service_private("KRABB_MEMORY", Path::new("memory")),
+            [PathBuf::from("memory"), PathBuf::from("memory.lock")]
+        );
+
+        for name in ["KRABB_HOME", "KRABB_CREDENTIALS", "KRABB_TIMER", "KRABB_CODEX_HOME"] {
+            assert_eq!(
+                super::windows_service_private(name, &memory),
+                std::slice::from_ref(&memory)
+            );
+        }
+
+        for name in ["KRABB_ROOT", "KRABB_MEDIA", "KRABB_DB", "KRABB_MODEL"] {
+            assert!(super::windows_service_private(name, &memory).is_empty());
+        }
+    }
+
+    #[test]
+    fn windows_service_persistence_access_includes_missing_stores_and_sidecars() {
+        let root = test_root("service-persistence-access");
+        let parent = root.join("external");
+        let _ = std::fs::remove_dir_all(&root);
+
+        for name in ["KRABB_MEMORY", "KRABB_DB"] {
+            let store = parent.join("store");
+
+            assert_eq!(super::windows_service_directory(name, &store), Some(parent.clone()));
+
+            std::fs::create_dir_all(&parent).unwrap();
+            std::fs::write(&store, "existing").unwrap();
+            std::fs::write(parent.join("store-wal"), "sidecar").unwrap();
+
+            assert_eq!(super::windows_service_directory(name, &store), Some(parent.clone()));
+            assert_eq!(
+                super::windows_service_directory(name, Path::new("store")),
+                Some(".".into())
+            );
+
+            std::fs::remove_dir_all(&parent).unwrap();
+        }
+
+        for name in ["KRABB_ROOT", "KRABB_MEDIA"] {
+            assert_eq!(super::windows_service_directory(name, &parent), Some(parent.clone()));
+        }
+
+        assert!(super::windows_service_directory("KRABB_MODEL", &parent).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_service_grants_external_directory_access_without_replacing_permissions() {
+        let path = Path::new(r"C:\Users\Alice\private workspace");
+        let command = super::windows_service_access(path, true);
+        let args = command.get_args().map(|arg| arg.to_str().unwrap()).collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), "icacls.exe");
+        assert_eq!(
+            args,
+            [path.to_str().unwrap(), "/grant", r"NT SERVICE\Krabb:(OI)(CI)M", "/T", "/L"]
+        );
+    }
+
+    #[test]
+    fn windows_service_grants_browser_dependencies_read_execute_access() {
+        let root = test_root("service-browser-access");
+        let modules = root.join("node_modules");
+        let browsers = root.join("browsers");
+        fs::create_dir_all(modules.join("playwright")).unwrap();
+        fs::create_dir_all(modules.join("playwright-core")).unwrap();
+        fs::create_dir_all(&browsers).unwrap();
+        let node = root.join("node.exe");
+        fs::write(&node, "fixture executable").unwrap();
+
+        for (name, path, expected) in [
+            ("KRABB_PLAYWRIGHT_MODULE", modules.join("playwright/index.js"), modules),
+            ("KRABB_PLAYWRIGHT_BROWSERS_PATH", browsers.clone(), browsers),
+            ("KRABB_NODE", node.clone(), node),
+            ("KRABB_PLAYWRIGHT_MODULE", root.join("index.js"), root.clone()),
+        ] {
+            let dependency = super::windows_service_dependency(name, &path).unwrap();
+
+            assert_eq!(dependency, expected);
+
+            let command = super::windows_service_access(&dependency, false);
+            let args = command.get_args().map(|arg| arg.to_str().unwrap()).collect::<Vec<_>>();
+            let grant = if dependency.is_dir() {
+                r"NT SERVICE\Krabb:(OI)(CI)RX"
+            } else {
+                r"NT SERVICE\Krabb:RX"
+            };
+
+            assert_eq!(command.get_program(), "icacls.exe");
+            assert_eq!(&args[..3], [dependency.to_str().unwrap(), "/grant", grant]);
+            assert_eq!(args.contains(&"/T"), dependency.is_dir());
+            assert_eq!(args.last(), Some(&"/L"));
+            assert!(!args.contains(&"/reset"));
+        }
+
+        assert!(super::windows_service_dependency("KRABB_BROWSER_EGRESS_PROXY", &root).is_none());
+        assert!(super::windows_service_dependency("KRABB_NODE", Path::new("node")).is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -22018,6 +23293,21 @@ done
         assert!(text.contains("KRABB_CREDENTIALS"));
         assert!(text.contains("/tmp/krabb-credentials.json"));
         assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn service_definition_preserves_percent_encoded_proxy() {
+        let environment = vec![(
+            "KRABB_BROWSER_EGRESS_PROXY".into(),
+            "http://user%40example.test:encoded%25value@proxy.example:8080".into(),
+        )];
+        let text = service_text(std::path::Path::new("/tmp/krabb"), &environment);
+
+        assert!(text.contains(concat!(
+            "Environment=\"KRABB_BROWSER_EGRESS_PROXY=http://user%%40example.test:",
+            "encoded%%25value@proxy.example:8080\""
+        )));
     }
 
     #[test]
@@ -22081,6 +23371,57 @@ done
     }
 
     #[test]
+    fn services_preserve_explicit_browser_and_computer_settings() {
+        let root = test_root("service-desktop");
+        fs::create_dir_all(&root).unwrap();
+        let environment = BTreeMap::from([
+            ("KRABB_PLAYWRIGHT_MODULE".into(), "/opt/playwright/index.js".into()),
+            ("KRABB_PLAYWRIGHT_BROWSERS_PATH".into(), "/opt/browsers".into()),
+            ("KRABB_NODE".into(), "/opt/node".into()),
+            ("KRABB_BROWSER_ALLOWED_HOSTS".into(), "example.com".into()),
+            ("KRABB_BROWSER_EGRESS_PROXY".into(), "http://127.0.0.1:8080".into()),
+            ("KRABB_COMPUTER_MODE".into(), "interactive".into()),
+            ("KRABB_COMPUTER_ALLOW_HOST_CONTROL".into(), "1".into()),
+            ("KRABB_COMPUTER_DISPLAY".into(), ":99".into()),
+            ("KRABB_XVFB".into(), "/opt/Xvfb".into()),
+            ("KRABB_COMPUTER_STARTUP".into(), "/opt/desktop".into()),
+            ("KRABB_COMPUTER_STARTUP_ARGS".into(), "[\"--session\"]".into()),
+        ]);
+        let service = root.join("krabb.service");
+        let values = service_environment_from(&service, root.clone(), &environment).unwrap();
+
+        for setting in &environment {
+            assert!(values.iter().any(|(name, value)| (name, value) == setting));
+        }
+
+        let defaults = service_environment_from(&service, root.clone(), &BTreeMap::new()).unwrap();
+
+        assert!(!defaults.iter().any(|(name, _)| name == "KRABB_COMPUTER_ALLOW_HOST_CONTROL"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn service_environment_pins_installing_codex_profile() {
+        let root = test_root("service-codex-profile");
+        let service = root.join("krabb.service");
+        let mut environment = BTreeMap::new();
+
+        for (name, path, expected) in [
+            ("USERPROFILE", "windows-user", root.join("windows-user").join(".codex")),
+            ("HOME", "home-user", root.join("home-user").join(".codex")),
+            ("KRABB_CODEX_HOME", "custom-profile", root.join("custom-profile")),
+        ] {
+            environment.insert(name.into(), root.join(path).display().to_string());
+            let values = service_environment_from(&service, root.clone(), &environment).unwrap();
+            let profiles =
+                values.iter().filter(|(name, _)| name == "KRABB_CODEX_HOME").collect::<Vec<_>>();
+
+            assert_eq!(profiles.len(), 1);
+            assert_eq!(profiles[0].1, expected.display().to_string());
+        }
+    }
+
+    #[test]
     fn service_environment_pins_codex_found_on_installing_path() {
         let root = test_root("service-codex-path");
         let bin = root.join("user-bin");
@@ -22093,13 +23434,15 @@ done
         {
             use std::os::unix::fs::PermissionsExt;
 
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
         let mut environment = BTreeMap::new();
         environment.insert("PATH".into(), bin.display().to_string());
-        let service = root.join("krabb.service");
-        let values = service_environment_from(&service, root.clone(), &environment).unwrap();
+        let home = root.join("state");
+        let service = home.join("krabb.service");
+        let values = service_environment_from(&service, home, &environment).unwrap();
         let expected = executable.canonicalize().unwrap().display().to_string();
 
         assert!(
@@ -22107,6 +23450,14 @@ done
                 .iter()
                 .any(|(name, value)| { name == "KRABB_CODEX_BINARY" && value == &expected })
         );
+
+        let dependency =
+            super::windows_service_dependency("KRABB_CODEX_BINARY", Path::new(&expected)).unwrap();
+        let command = super::windows_service_access(&dependency, false);
+        let args = command.get_args().map(|arg| arg.to_str().unwrap()).collect::<Vec<_>>();
+
+        assert_eq!(dependency, executable.canonicalize().unwrap());
+        assert_eq!(args, [expected.as_str(), "/grant", r"NT SERVICE\Krabb:RX", "/L"]);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -22493,7 +23844,7 @@ done
             },
         );
         super::save_lock_at(&root, &lock).unwrap();
-        let help = super::help_text_with_plugins(&root);
+        let help = super::help_text_with_plugins(&root).unwrap();
 
         assert!(help.contains("Plugin Commands:"));
         assert!(help.contains("login"));
@@ -22607,12 +23958,12 @@ done
         );
         super::save_lock_at(&root, &lock).unwrap();
 
-        assert!(!super::available_commands(&root).contains_key("ask"));
-        assert!(!super::available_commands(&root).contains_key("session"));
-        assert!(!super::available_commands(&root).contains_key("delivery"));
-        assert!(!super::available_commands(&root).contains_key("data"));
+        assert!(!super::available_commands(&root).unwrap().contains_key("ask"));
+        assert!(!super::available_commands(&root).unwrap().contains_key("session"));
+        assert!(!super::available_commands(&root).unwrap().contains_key("delivery"));
+        assert!(!super::available_commands(&root).unwrap().contains_key("data"));
 
-        let help = super::help_text_with_plugins(&root);
+        let help = super::help_text_with_plugins(&root).unwrap();
         let native = help
             .split("Commands:")
             .nth(1)
@@ -22632,7 +23983,7 @@ done
 
         let binary = root.join("plugins/fake/bin").join(super::plugin_name("fake"));
         fs::write(binary, b"plugin").unwrap();
-        let mut commands = super::available_commands(&root);
+        let mut commands = super::available_commands(&root).unwrap();
 
         assert!(!commands.contains_key("ask"));
         assert_eq!(commands["session"][0].0, "__runtime.session");
@@ -22664,14 +24015,14 @@ done
         let binary = root.join("plugins/channel/bin").join(super::plugin_name("channel"));
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
         fs::write(binary, b"plugin").unwrap();
-        commands = super::available_commands(&root);
+        commands = super::available_commands(&root).unwrap();
 
         assert_eq!(commands["delivery"][0].0, "__runtime.delivery");
 
         let delivery_args = ["list", "--json"].map(str::to_owned);
         super::delivery_command(&delivery_args, &root, false).await.unwrap();
 
-        let help = super::help_text_with_plugins(&root);
+        let help = super::help_text_with_plugins(&root).unwrap();
         let conditional = help
             .split("Conditional Commands:")
             .nth(1)
@@ -22706,13 +24057,13 @@ done
         );
         super::save_lock_at(&root, &lock).unwrap();
 
-        assert!(!super::available_commands(&root).contains_key("schedule"));
+        assert!(!super::available_commands(&root).unwrap().contains_key("schedule"));
 
         let binary = root.join("plugins/scheduler/bin").join(super::plugin_name("scheduler"));
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
         fs::write(binary, b"plugin").unwrap();
 
-        let help = super::help_text_with_plugins(&root);
+        let help = super::help_text_with_plugins(&root).unwrap();
         let native = help
             .split("Commands:")
             .nth(1)
@@ -22768,7 +24119,7 @@ done
         lock.plugins.insert("codex".into(), entry("codex", "model", "codex", false));
         super::save_lock_at(&root, &lock).unwrap();
 
-        let unavailable = super::available_commands(&root);
+        let unavailable = super::available_commands(&root).unwrap();
 
         for name in ["memory", "tui", "data"] {
             assert!(!unavailable.contains_key(name));
@@ -22780,14 +24131,14 @@ done
             fs::write(binary, b"plugin").unwrap();
         }
 
-        let commands = super::available_commands(&root);
+        let commands = super::available_commands(&root).unwrap();
 
         assert_eq!(commands["memory"][0].0, "__runtime.memory");
         assert_eq!(commands["tui"][0].0, "__runtime.tui");
         assert_eq!(commands["data"][0].0, "__runtime.data");
         assert_eq!(commands["codex"][0].0, "codex");
 
-        let help = super::help_text_with_plugins(&root);
+        let help = super::help_text_with_plugins(&root).unwrap();
         let native = help
             .split("Commands:")
             .nth(1)
@@ -26341,6 +27692,8 @@ fn main() {
     #[cfg(unix)]
     #[test]
     fn isolates_group_workspaces() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = std::env::temp_dir().join(format!("krabb-isolate-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -26353,6 +27706,7 @@ fn main() {
                 .success()
         );
         fs::write(root.join("README"), "test").unwrap();
+        fs::write(root.join(".gitattributes"), "README filter=test\n").unwrap();
 
         for args in [
             vec!["-C", root.to_str().unwrap(), "config", "user.email", "test@example.com"],
@@ -26364,9 +27718,114 @@ fn main() {
             assert!(std::process::Command::new("git").args(args).status().unwrap().success());
         }
 
+        let hook = root.join(".git/hooks/post-checkout");
+        let monitor = root.join("monitor");
+
+        for (script, marker) in [(&hook, "hook-ran"), (&monitor, "monitor-ran")] {
+            fs::write(script, format!("#!/bin/sh\ntouch '{}'\n", root.join(marker).display()))
+                .unwrap();
+            fs::set_permissions(script, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["config", "core.fsmonitor"])
+                .arg(&monitor)
+                .status()
+                .unwrap()
+                .success()
+        );
+
         assert!(isolate_at("telegram-7", &root).unwrap().is_some());
         assert!(isolate_at("telegram-7", &root).unwrap().is_some());
         assert!(isolate_at("../escape", &root).unwrap().is_none());
+        assert!(!root.join("hook-ran").exists());
+        assert!(!root.join("monitor-ran").exists());
+        assert_eq!(
+            fs::read_to_string(root.join(".krabb/worktrees/telegram-7/README")).unwrap(),
+            "test"
+        );
+
+        for key in [
+            "filter.test.smudge",
+            "filter.test.process",
+            "filter.test.clean",
+            "remote.origin.promisor",
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["config", key, "true"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+
+            let error = isolate_at("blocked", &root).unwrap_err().to_string();
+
+            assert!(error.contains("explicitly approved shell"), "{error}");
+            assert!(!root.join(".krabb/worktrees/blocked").exists());
+
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["config", "--unset", key])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["config", "--unset", "core.fsmonitor"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let filter = root.join(".git/filter-config");
+        fs::write(&filter, "[filter \"test\"]\nsmudge = touch filter-ran; cat\n").unwrap();
+        let conditional = "includeIf.gitdir:**/worktrees/conditional.path";
+
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["config", conditional])
+                .arg(&filter)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert!(super::check_checkout(&root).is_ok());
+        assert!(
+            isolate_at("conditional", &root)
+                .unwrap_err()
+                .to_string()
+                .contains("explicitly approved shell")
+        );
+
+        assert!(!root.join(".krabb/worktrees/conditional").exists());
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["config", "--unset", conditional])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert!(isolate_at("conditional", &root).unwrap().is_some());
+
         fs::write(root.join(".krabb/worktrees/telegram-7/dirty"), "keep me").unwrap();
 
         assert!(super::state::remove_worktree(&root, "telegram-7").is_err());
@@ -26850,7 +28309,17 @@ fn main() {
         }
 
         let task_root = root.clone();
-        let task = tokio::spawn(async move { super::serve_at(&task_root).await });
+        let stop = Arc::new(Stop::new());
+        let signal = Arc::clone(&stop);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            super::serve_controlled(&task_root, signal, || {
+                assert!(task_root.join("ipc.port").is_file());
+                let _ = ready_tx.send(());
+                Ok(())
+            })
+            .await
+        });
 
         let mut ready = false;
 
@@ -26864,18 +28333,16 @@ fn main() {
         }
 
         assert!(ready);
-        let shutdown = super::ipc::call(&root, "shutdown", serde_json::json!({})).await;
-
-        if let Err(error) = shutdown {
-            let result = task.await.unwrap();
-            panic!("IPC shutdown failed: {error}; daemon: {result:?}");
-        }
+        ready_rx.await.unwrap();
+        stop.signal();
 
         tokio::time::timeout(std::time::Duration::from_secs(2), task)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
+        assert!(!root.join("ipc.port").exists());
+        assert!(!root.join("ipc.token").exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -26911,7 +28378,16 @@ fn main() {
 
         let task_root = root.clone();
         let task = tokio::spawn(async move {
-            super::serve_inner(&task_root, "channel", "model", "test", true).await
+            super::serve_inner(
+                &task_root,
+                "channel",
+                "model",
+                "test",
+                true,
+                Arc::new(Stop::new()),
+                || Ok(()),
+            )
+            .await
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -26959,6 +28435,121 @@ fn main() {
             .unwrap()
             .unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn channel_cancellation_preserves_unrelated_plugin_processes() {
+        let root = test_root("channel-cancel");
+        fs::create_dir_all(&root).unwrap();
+        let script = r#"
+import json, os, pathlib, sys, time
+role, root = sys.argv[1:]
+polled = False
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    if method == 'hello':
+        capability = 'channel' if role == 'telegram' else 'model' if role == 'fixture' else 'tool'
+        result = {'protocol': {'major': 0, 'minor': 1}, 'id': role,
+                  'version': '0.1.0', 'capabilities': [capability]}
+    elif method == 'poll':
+        result = {'events': [] if polled else [
+            {'id': 1, 'chat': 7, 'private': True, 'sender': 8, 'text': 'hello'}]}
+        polled = True
+    elif method == 'generate':
+        pathlib.Path(root, 'started').touch()
+        time.sleep(30)
+        result = {'text': 'cancelled answer', 'stop': 'stop'}
+    elif method == 'tools/list':
+        result = {'tools': []}
+    elif method == 'shutdown':
+        break
+    else:
+        result = {'pid': os.getpid()}
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#;
+        let plugins = Plugins::default();
+
+        for role in ["telegram", "fixture", "browser", "computer"] {
+            let process =
+                Process::start_with("python3", ["-u", "-c", script, role, root.to_str().unwrap()])
+                    .await
+                    .unwrap();
+            plugins.insert(Live::new(process)).await;
+        }
+
+        let mut identities = Vec::new();
+
+        for role in ["browser", "computer"] {
+            let plugin = plugins.get(role).await.unwrap();
+            let identity = plugin
+                .call(Request::call(90, "identity", serde_json::json!({})))
+                .await
+                .unwrap()
+                .result;
+            identities.push((plugin, identity));
+        }
+
+        let sessions =
+            Arc::new(Mutex::new(super::state::Store::load(root.join("sessions.json")).unwrap()));
+        let stop = Arc::new(Stop::new());
+        let cancels = Arc::new(Mutex::new(BTreeMap::new()));
+        let cancellation = super::cancellation(&cancels, "telegram-7");
+        let bridge = super::bridge(
+            &plugins,
+            "telegram",
+            "fixture",
+            "test",
+            Arc::clone(&sessions),
+            Arc::clone(&stop),
+            cancels,
+            BTreeMap::new(),
+            super::ApprovalMode::Off,
+        );
+        tokio::pin!(bridge);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut bridge => panic!("bridge finished early: {result:?}"),
+
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                        if root.join("started").exists() { break; }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        sessions.lock().unwrap().cancel("telegram-7").unwrap();
+        cancellation.request();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut bridge => panic!("bridge finished early: {result:?}"),
+
+                _ = cancellation.wait() => {}
+            }
+        })
+        .await
+        .unwrap();
+
+        for (plugin, identity) in identities {
+            assert_eq!(
+                plugin
+                    .call(Request::call(91, "identity", serde_json::json!({})))
+                    .await
+                    .unwrap()
+                    .result,
+                identity,
+            );
+        }
+
+        stop.signal();
+        tokio::time::timeout(std::time::Duration::from_secs(5), bridge).await.unwrap().unwrap();
+        stop_registry(&plugins).await;
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -27194,6 +28785,132 @@ fn main() {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn counts_each_model_tool_invocation_once() {
+        for requested in [super::TOOL_CALLS, super::TOOL_CALLS + 1] {
+            let event = serde_json::json!({
+                "kind": "tool", "name": "read", "args": {"path": "note.txt"}
+            });
+
+            let first =
+                serde_json::json!({"text":"", "stop":"tool", "events":vec![event.clone(); 8]});
+            let second =
+                serde_json::json!({"text":"", "stop":"tool", "events":vec![event; requested - 8]});
+            let provider_script = r#"
+count=0
+while IFS= read -r line; do
+    id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\),"method".*/\1/p')
+    case "$line" in
+        *'"method":"hello"'*)
+            result='{"protocol":{"major":0,"minor":1},"id":"fixture",'
+            result=$result'"version":"0.1.0","capabilities":["model"]}'
+            ;;
+        *'"method":"generate"'*)
+            case "$count" in
+                0) result='__FIRST__' ;;
+                1) result='__SECOND__' ;;
+                *) result='{"text":"done","stop":"stop","events":[]}' ;;
+            esac
+            count=$((count + 1))
+            ;;
+        *'"method":"shutdown"'*) exit 0 ;;
+    esac
+    printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
+done
+"#
+            .replace("__FIRST__", &first.to_string())
+            .replace("__SECOND__", &second.to_string());
+
+            let tools_script = r#"
+count=0
+while IFS= read -r line; do
+    id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\),"method".*/\1/p')
+    case "$line" in
+        *'"method":"hello"'*)
+            result='{"protocol":{"major":0,"minor":1},"id":"tools",'
+            result=$result'"version":"0.1.0","capabilities":["tool"]}'
+            ;;
+        *'"method":"tools/list"'*)
+            result='{"tools":[{"name":"read","schema":{"type":"object",'
+            result=$result'"properties":{"path":{"type":"string"}}}}]}'
+            ;;
+        *'"method":"read"'*)
+            count=$((count + 1))
+            result='{"text":"read-'"$count"'"}'
+            ;;
+        *'"method":"shutdown"'*) exit 0 ;;
+    esac
+    printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
+done
+"#;
+            let provider = Process::start_with("sh", ["-c", &provider_script]).await.unwrap();
+            let tools = Process::start_with("sh", ["-c", tools_script]).await.unwrap();
+            let plugins = registry([provider, tools]).await;
+            let provider = plugins.get("fixture").await.unwrap();
+            let root = test_root("tool-call-limit");
+            let sessions = Arc::new(Mutex::new(
+                super::state::Store::load(root.join("sessions.json")).unwrap(),
+            ));
+
+            sessions.lock().unwrap().create("local", "test").unwrap();
+            let (notices, _receiver) = tokio::sync::mpsc::channel(32);
+            let mut call = 1;
+            let reply = answer(
+                &provider,
+                &plugins,
+                "test",
+                Vec::new(),
+                "local",
+                "tui",
+                "tui-default",
+                None,
+                &sessions,
+                Some(&root),
+                &root,
+                true,
+                false,
+                false,
+                super::ApprovalMode::Off,
+                Arc::new(super::AsyncMutex::new(super::approval::Gate::new().unwrap())),
+                &Cancellation::new(),
+                &Stop::new(),
+                tokio::time::Instant::now() + Duration::from_secs(10),
+                &mut call,
+                &mut None,
+                None,
+                notices,
+                None,
+                None,
+            )
+            .await;
+
+            if requested == super::TOOL_CALLS {
+                assert_eq!(reply.unwrap().text, "done");
+            } else {
+                assert_eq!(
+                    reply.unwrap_err().to_string(),
+                    "The turn exceeded its tool-call limit."
+                );
+            }
+
+            let transcript = sessions.lock().unwrap().sessions["local"].messages.clone();
+            let results = transcript.iter().filter(|message| message.role == Role::Tool);
+
+            assert_eq!(results.clone().count(), super::TOOL_CALLS);
+
+            for (index, message) in results.enumerate() {
+                assert_eq!(
+                    message.content[0],
+                    Content::Text { text: format!("read-{}", index + 1) }
+                );
+            }
+
+            stop_registry(&plugins).await;
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn sends_inline_tool_screenshots_to_the_next_vision_request() {
         let root = std::env::temp_dir().join(format!("krabb-tool-image-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -27342,6 +29059,158 @@ fn main() {
 
         stop_registry(&plugins).await;
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_discovery_waits_for_a_busy_plugin_before_starting_its_timeout() {
+        let script = r#"
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['method'] == 'hello':
+        result = {'protocol': {'major': 0, 'minor': 1}, 'id': 'browser',
+                  'version': '0.1.0', 'capabilities': ['tool']}
+    elif request['method'] == 'tools/list':
+        result = {'tools': [{'name': 'browser_open', 'schema': {'type': 'object', 'properties': {}}}]}
+    elif request['method'] == 'shutdown':
+        break
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#;
+        let plugin = Process::start_with("python3", ["-u", "-c", script]).await.unwrap();
+        let plugins = registry([plugin]).await;
+        let plugin = plugins.get("browser").await.unwrap();
+        let busy = plugin.process.lock().await;
+        let discovery = super::tool_registry(&plugins, true, false);
+        tokio::pin!(discovery);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(2100), &mut discovery)
+                .await
+                .is_err()
+        );
+
+        drop(busy);
+        let discovered = tokio::time::timeout(std::time::Duration::from_secs(2), discovery)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(discovered.owners["browser_open"], "browser");
+        stop_registry(&plugins).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_browser_calls_retire_before_queued_id_reuse() {
+        let root = test_root("browser-call-cleanup");
+        fs::create_dir_all(&root).unwrap();
+        let script = r#"
+import json, pathlib, sys, time
+root = pathlib.Path(sys.argv[1])
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    if method == 'hello':
+        if (root / 'started').exists():
+            while not (root / 'release').exists():
+                time.sleep(0.01)
+        result = {'protocol': {'major': 0, 'minor': 1}, 'id': 'browser',
+                  'version': '0.1.0', 'capabilities': ['tool']}
+    elif method == 'browser_open':
+        label = request['params']['arguments']['label']
+        if label == 'first':
+            (root / 'started').touch()
+            time.sleep(10)
+        result = {'text': label}
+    elif method == 'shutdown':
+        break
+    else:
+        continue
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#;
+        let plugin = Process::start_with("python3", ["-u", "-c", script, root.to_str().unwrap()])
+            .await
+            .unwrap();
+        let plugins = registry([plugin]).await;
+        let registry = super::ToolRegistry {
+            owners: BTreeMap::from([("browser_open".into(), "browser".into())]),
+            ..Default::default()
+        };
+
+        let mut failed = None;
+        let mut first = Box::pin(super::tool_with_registry(
+            &plugins,
+            &registry,
+            7,
+            "browser_open",
+            serde_json::json!({"label": "first"}),
+            false,
+            None,
+            "global",
+            "session-a",
+            "turn-a",
+            &mut failed,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    result = &mut first => panic!("first call finished early: {result:?}"),
+
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                        if root.join("started").exists() { break; }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut queued_failure = None;
+        let queued_registry = registry.clone();
+        let queued = super::tool_with_registry(
+            &plugins,
+            &queued_registry,
+            7,
+            "browser_open",
+            serde_json::json!({"label": "second"}),
+            false,
+            None,
+            "global",
+            "session-b",
+            "turn-b",
+            &mut queued_failure,
+        );
+        tokio::pin!(queued);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut queued).await.is_err()
+        );
+
+        drop(first);
+        let finished = registry.cleanup.finish();
+        tokio::pin!(finished);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut finished)
+                .await
+                .is_err()
+        );
+
+        assert!(plugins.get("browser").await.unwrap().process.try_lock().is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut queued).await.is_err()
+        );
+
+        fs::write(root.join("release"), "").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), finished).await.unwrap().unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(3), queued).await.unwrap().unwrap();
+
+        assert_eq!(super::tool_result_text(&result), "second");
+        stop_registry(&plugins).await;
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

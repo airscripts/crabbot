@@ -22,7 +22,7 @@ use krabb_core::{
 #[cfg(unix)]
 use rustix::{
     fd::OwnedFd,
-    fs::{AtFlags, Dir, Mode, OFlags, openat, renameat, unlinkat},
+    fs::{AtFlags, Dir, FileType, Mode, OFlags, openat, renameat, statat, unlinkat},
     process::{Pid, Signal, getpgid, getpgrp, kill_process, kill_process_group},
 };
 
@@ -433,7 +433,7 @@ impl Sandbox {
             process.as_std_mut().process_group(0);
         }
 
-        process.arg("run");
+        process.arg("create");
 
         #[cfg(unix)]
         process.arg("--user").arg(format!(
@@ -444,7 +444,6 @@ impl Sandbox {
 
         process
             .args([
-                "--rm",
                 "--pull=never",
                 "--read-only",
                 "--network=none",
@@ -518,13 +517,20 @@ async fn shell_with(
         capture(process, None, true).await
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
         let mut process = Command::new("sh");
         process.process_group(0).args(["-c", command]);
         process.current_dir(root);
+        krabb_process::restrict_process_group(process.as_std_mut());
         capture(process, None, true).await
     }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "Shell containment requires KRABB_SANDBOX_RUNTIME and KRABB_SANDBOX_IMAGE on this platform.",
+    ))
 }
 
 async fn sandbox_shell(
@@ -544,10 +550,30 @@ async fn sandbox_shell(
         }
     };
 
-    let result = capture(process, None, true).await;
-    let cleanup = if result.is_err() { sandbox.remove(&cidfile).await } else { Ok(()) };
+    // Creation cannot execute workspace code. The ID is recorded before start, so
+    // the host can remove a running container after terminating this plugin.
+    let result = async {
+        let created = capture(process, None, true).await?;
 
-    let remove_dir = std::fs::remove_dir_all(&cid_dir);
+        if !created.status.success() {
+            return Ok(created);
+        }
+
+        let id = std::fs::read_to_string(&cidfile)?;
+        let id = id.trim();
+
+        if !(12..=128).contains(&id.len()) || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(invalid("Container runtime returned an invalid container ID."));
+        }
+
+        let mut start = Command::new(&sandbox.runtime);
+        start.args(["start", "--attach", id]).current_dir(root);
+        capture(start, None, true).await
+    }
+    .await;
+
+    let cleanup = sandbox.remove(&cidfile).await;
+    let remove_dir = if cleanup.is_ok() { std::fs::remove_dir_all(&cid_dir) } else { Ok(()) };
 
     match (result, cleanup, remove_dir) {
         (Ok(output), Ok(()), Ok(())) => Ok(output),
@@ -570,7 +596,9 @@ async fn sandbox_shell(
 }
 
 fn cid_dir() -> std::io::Result<std::path::PathBuf> {
-    let parent = std::env::temp_dir();
+    let parent = std::env::var_os("KRABB_SANDBOX_TRACKING")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
 
     for _ in 0..16 {
         let nonce = TEMP_FILES.fetch_add(1, Ordering::Relaxed);
@@ -677,8 +705,19 @@ async fn capture(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
+    #[cfg(windows)]
+    let job = krabb_process::TerminalJob::new()?;
+
+    #[cfg(windows)]
+    command.creation_flags(krabb_process::CREATE_SUSPENDED);
+
+    command.kill_on_drop(true);
+
     let mut child = spawn(&mut command).await?;
     let process_id = child.id();
+
+    #[cfg(windows)]
+    job.assign_and_resume(process_id.ok_or_else(|| invalid("Process has no ID."))?)?;
 
     #[cfg(unix)]
     let process_group = process_id.and_then(child_group);
@@ -711,6 +750,9 @@ async fn capture(
         Ok::<_, std::io::Error>(std::process::Output { status, stdout, stderr })
     })
     .await;
+
+    #[cfg(windows)]
+    job.terminate();
 
     match result {
         Ok(Ok(output)) => {
@@ -788,9 +830,7 @@ async fn stop(child: &mut Child, process_id: Option<u32>, group: bool) {
     }
 
     #[cfg(windows)]
-    if group && let Some(id) = process_id {
-        let _ = Command::new("taskkill").args(["/PID", &id.to_string(), "/T", "/F"]).status().await;
-    }
+    let _ = (process_id, group);
 
     let _ = child.kill().await;
     let _ = child.wait().await;
@@ -1300,6 +1340,24 @@ fn write_confined(path: &Confined, value: &str) -> std::io::Result<()> {
             ));
         };
 
+        use std::os::unix::fs::PermissionsExt;
+
+        let permissions = match statat(&path.directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(metadata) => {
+                if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Write destination must be a regular file.",
+                    ));
+                }
+
+                Some(std::fs::Permissions::from_mode(metadata.st_mode & 0o777))
+            }
+
+            Err(error) if io_error(error).kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(io_error(error)),
+        };
+
         for _ in 0..100 {
             let number = TEMP_FILES.fetch_add(1, Ordering::Relaxed);
             let temporary = format!(".krabb-write-{}-{number}", std::process::id());
@@ -1319,7 +1377,15 @@ fn write_confined(path: &Confined, value: &str) -> std::io::Result<()> {
             };
 
             let mut file = std::fs::File::from(fd);
-            let result = file.write_all(value.as_bytes()).and_then(|()| file.sync_all());
+            let result = (|| {
+                file.write_all(value.as_bytes())?;
+
+                if let Some(permissions) = &permissions {
+                    file.set_permissions(permissions.clone())?;
+                }
+
+                file.sync_all()
+            })();
 
             if let Err(error) = result {
                 let _ = unlinkat(&path.directory, &temporary, AtFlags::empty());
@@ -1949,7 +2015,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(
             &runtime,
-            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --cidfile) printf '%s\\n' 0123456789abcdef > \"$2\"; shift 2 ;;\n    -lc) shift; /bin/sh -c \"$1\"; exit $? ;;\n    *) shift ;;\n  esac\ndone\n",
+            "#!/bin/sh\ncase \"$1\" in\ncreate) while [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --cidfile) printf '%s\\n' 0123456789abcdef > \"$2\"; shift 2 ;;\n    -lc) shift; printf '%s' \"$1\" > script; exit 0 ;;\n    *) shift ;;\n  esac\ndone ;;\nstart) /bin/sh script ;;\nrm) exit 0 ;;\nesac\n",
         )
         .unwrap();
 
@@ -1987,6 +2053,47 @@ mod tests {
         release.join().unwrap();
 
         assert_eq!(String::from_utf8_lossy(&output.stdout), "launched");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writes_preserve_ordinary_permissions_and_keep_new_files_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("write-permissions");
+        fs::create_dir_all(&root).unwrap();
+        let policy = policy(&root);
+        let path = root.join("script");
+
+        for mode in [None, Some(0o755), Some(0o640), Some(0o200), Some(0o6755)] {
+            if let Some(mode) = mode {
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            }
+
+            call(
+                &policy,
+                Request::call(
+                    1,
+                    "write",
+                    json!({
+                        "path": "script", "text": "#!/bin/sh\nexit 0\n", "approve": true
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                mode.unwrap_or(0o600) & 0o777
+            );
+
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+            assert_eq!(fs::read_to_string(&path).unwrap(), "#!/bin/sh\nexit 0\n");
+        }
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2194,11 +2301,15 @@ mod tests {
 
         let output =
             call(&approved, Request::call(1, "shell", json!({"command": "pwd", "approve": true})))
-                .await
-                .unwrap()
-                .unwrap();
+                .await;
 
-        assert_eq!(output.result.unwrap()["status"], 0);
+        #[cfg(any(target_os = "linux", windows))]
+
+        assert_eq!(output.unwrap().unwrap().result.unwrap()["status"], 0);
+
+        #[cfg(not(any(target_os = "linux", windows)))]
+
+        assert!(output.unwrap_err().to_string().contains("Shell containment requires"));
 
         assert!(call(&approved, Request::call(2, "read", json!({}))).await.is_err());
         assert!(call(&approved, Request::call(3, "write", json!({"path": "x"}))).await.is_err());
@@ -2401,8 +2512,20 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
 
+        #[cfg(any(target_os = "linux", windows))]
+
         assert!(shell("printf hello", &root).await.unwrap().status.success());
+
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            let error = shell("touch marker", &root).await.unwrap_err();
+
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            assert!(!root.join("marker").exists());
+        }
+
         assert!(git(&["status".into()], &root).await.is_ok());
+
         assert!(denied("Already denied.").to_string().ends_with("Already denied."));
         assert!(
             file(&Policy { root: Some(root.join("missing")), shell: Shell::Off }, ".").is_err()
@@ -2458,7 +2581,7 @@ mod tests {
         let _ = fs::remove_file(outside_file);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", windows))]
     #[tokio::test]
     async fn shell_stops_background_processes_after_completion() {
         let root = test_root("krabb-tools-group");
@@ -2466,8 +2589,27 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
 
-        shell("(sleep 1; touch marker) >/dev/null 2>&1 &", &root).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        #[cfg(unix)]
+        let command = "(sleep 1; touch marker) >/dev/null 2>&1 &";
+
+        #[cfg(windows)]
+        let command = {
+            fs::write(
+                root.join("background.cmd"),
+                "@echo off\r\necho ready > ready\r\nping -n 3 127.0.0.1 > nul\r\necho leaked > marker\r\n",
+            )
+            .unwrap();
+            fs::write(
+                root.join("parent.cmd"),
+                "@echo off\r\nstart \"\" /b cmd /c background.cmd >nul 2>&1\r\n:wait\r\nif not exist ready goto wait\r\n",
+            )
+            .unwrap();
+
+            "parent.cmd"
+        };
+
+        assert!(shell(command, &root).await.unwrap().status.success());
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
 
         assert!(!marker.exists());
         let _ = fs::remove_dir_all(root);

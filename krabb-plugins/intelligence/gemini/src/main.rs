@@ -110,7 +110,9 @@ async fn generate_at(
         .json(&request_body(&input)?)
         .send()
         .await
-        .map_err(|error| krabb_core::Error::Denied(format!("Gemini request failed: {error}.")))?;
+        .map_err(|error| {
+            krabb_core::Error::Denied(format!("Gemini request failed: {}.", error.without_url()))
+        })?;
 
     let status = response.status();
     let body = collect_response(response).await?;
@@ -144,11 +146,9 @@ async fn generate_at(
 async fn collect_response(mut response: reqwest::Response) -> krabb_core::Result<Vec<u8>> {
     let mut body = Vec::new();
 
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| krabb_core::Error::Denied(format!("Gemini response failed: {error}.")))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        krabb_core::Error::Denied(format!("Gemini response failed: {}.", error.without_url()))
+    })? {
         if chunk.len() > BODY_LIMIT.saturating_sub(body.len()) {
             return Err(krabb_core::Error::Denied(
                 "Gemini response exceeded the protocol limit.".into(),
@@ -230,11 +230,17 @@ fn request_body(input: &ModelRequest) -> krabb_core::Result<Value> {
                 .or_else(|| matched.as_ref().map(|call| call.name.clone()))
                 .unwrap_or_else(|| "tool".into());
 
+            let images = message.content.iter().filter_map(|content| match content {
+                Content::Image { uri, .. } => image_part(uri),
+                _ => None,
+            });
+
             if matched.as_ref().is_some_and(|call| call.legacy) {
                 tool_parts.get_or_insert_with(Vec::new).push(json!({
                     "text": format!("[Tool result {name}]: {}", rendered_content(&message.content)),
                 }));
 
+                tool_parts.get_or_insert_with(Vec::new).extend(images);
                 continue;
             }
 
@@ -248,6 +254,7 @@ fn request_body(input: &ModelRequest) -> krabb_core::Result<Value> {
             }
 
             tool_parts.get_or_insert_with(Vec::new).push(json!({"functionResponse": response}));
+            tool_parts.get_or_insert_with(Vec::new).extend(images);
             continue;
         }
 
@@ -287,6 +294,7 @@ fn requires_thought_signature(model: &str) -> bool {
 fn effective_model(input: &ModelRequest) -> String {
     if input.model.trim().is_empty()
         || input.model == "default"
+        || input.model == "unset"
         || input.model == HOST_DEFAULT_MODEL
     {
         if has_legacy_tool_history(input) {

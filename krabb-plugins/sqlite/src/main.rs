@@ -19,7 +19,9 @@ use std::os::unix::fs::PermissionsExt;
 const LIMIT: i64 = 1_000;
 const KEY_LIMIT: usize = 4 * 1024;
 const VALUE_LIMIT: usize = 256 * 1024;
-const QUERY_LIMIT: usize = 128 * 1024;
+// Query JSON must fit the host's 256 KiB tool and model-message text budgets.
+const QUERY_LIMIT: usize = 256 * 1024;
+const RECORD_LIMIT: usize = QUERY_LIMIT - 1024;
 const FRAME_HEADROOM: usize = 64 * 1024;
 const DB_LIMIT: i64 = 32 * 1024 * 1024;
 
@@ -516,7 +518,7 @@ fn data(db: &mut Connection, params: &serde_json::Value) -> krabb_core::Result<s
             let record = validate_record(&params["record"], &columns)?;
             let value = serde_json::to_string(&record)?;
 
-            if value.len() > VALUE_LIMIT {
+            if value.len() > RECORD_LIMIT {
                 return Err(denied("data.record exceeds the size limit."));
             }
 
@@ -567,7 +569,7 @@ fn data(db: &mut Connection, params: &serde_json::Value) -> krabb_core::Result<s
                 })
                 .map_err(|error| denied(format!("SQLite query failed: {error}.")))?;
             let mut items = Vec::new();
-            let mut result_size = 0;
+            let mut result_size = 256;
             let mut truncated = false;
             let mut next_after = None;
 
@@ -580,9 +582,15 @@ fn data(db: &mut Connection, params: &serde_json::Value) -> krabb_core::Result<s
                     filter.iter().all(|(key, expected)| value[key] == *expected)
                 }) {
                     let item = serde_json::json!({"id": id, "record": value});
-                    let item_size = serde_json::to_vec(&item)?.len();
+                    let item_size = serde_json::to_vec(&item)?.len() + 1;
 
                     if items.len() == limit as usize || result_size + item_size > QUERY_LIMIT {
+                        if items.is_empty() {
+                            return Err(denied(
+                                "Stored record exceeds the query size limit; reduce it with data update.",
+                            ));
+                        }
+
                         truncated = true;
                         break;
                     }
@@ -627,7 +635,7 @@ fn data(db: &mut Connection, params: &serde_json::Value) -> krabb_core::Result<s
             let record = validate_record(&record, &columns)?;
             let value = serde_json::to_string(&record)?;
 
-            if value.len() > VALUE_LIMIT {
+            if value.len() > RECORD_LIMIT {
                 return Err(denied("data.record exceeds the size limit."));
             }
 
@@ -1654,6 +1662,102 @@ mod tests {
         assert!(
             second["items"].as_array().unwrap().last().unwrap()["id"].as_i64().unwrap() <= last_id
         );
+    }
+
+    #[test]
+    fn largest_records_remain_retrievable_across_query_pages() {
+        let db = db();
+        let invoke = |operation: &str, extra: serde_json::Value| {
+            let mut params = json!({"scope": "cli", "operation": operation, "table": "notes"});
+            params.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            store(&db, Request::call(1, "data", params))
+        };
+
+        invoke(
+            "create_table",
+            json!({
+                "columns": [
+                    {"name": "a", "type": "text"},
+                    {"name": "b", "type": "text"},
+                    {"name": "c", "type": "text"}
+                ]
+            }),
+        )
+        .unwrap();
+
+        let first = invoke("insert", json!({"record": {"a": "x".repeat(50 * 1024)}}))
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap()["id"]
+            .clone();
+
+        invoke("update", json!({"id": first, "record": {"b": "x".repeat(50 * 1024)}})).unwrap();
+        invoke("update", json!({"id": first, "record": {"c": "x".repeat(50 * 1024)}})).unwrap();
+
+        // Fill a second record to the existing accepted limit, including escaped text.
+        let overhead = serde_json::to_vec(&json!({"a": ""})).unwrap().len();
+        let text = "\"".repeat((super::RECORD_LIMIT - overhead) / 2);
+        let second = invoke("insert", json!({"record": {"a": text}}))
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap()["id"]
+            .clone();
+
+        let last = invoke("insert", json!({"record": {"a": "last"}}))
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap()["id"]
+            .clone();
+
+        assert!(
+            invoke("insert", json!({"record": {"a": "x".repeat(super::VALUE_LIMIT)}})).is_err()
+        );
+
+        assert!(invoke("update", json!({"id": second, "record": {"b": "overflow"}})).is_err());
+
+        let page = invoke("query", json!({})).unwrap().unwrap();
+
+        assert!(serde_json::to_vec(&page).unwrap().len() < super::QUERY_LIMIT);
+        let page = page.result.unwrap();
+
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["items"][0]["record"]["c"], "x".repeat(50 * 1024));
+        assert_eq!(page["next_after"], first);
+        assert_eq!(page["truncated"], true);
+
+        let page = invoke("query", json!({"after_id": page["next_after"]})).unwrap().unwrap();
+
+        assert!(serde_json::to_vec(&page).unwrap().len() < super::QUERY_LIMIT);
+        let page = page.result.unwrap();
+
+        assert_eq!(page["items"][0]["id"], second);
+        assert_eq!(page["items"][0]["record"]["a"], text);
+        assert_eq!(page["items"][1]["id"], last);
+        assert_eq!(page["truncated"], false);
+
+        // A record written by an older version must not produce a page without a cursor.
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE data_record SET value = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    json!({"a": "x".repeat(super::VALUE_LIMIT)}).to_string(),
+                    second.as_i64().unwrap()
+                ],
+            )
+            .unwrap();
+
+        let error = invoke("query", json!({"after_id": first})).unwrap_err();
+
+        assert!(error.to_string().contains("reduce it with data update"));
+        invoke("update", json!({"id": second, "record": {"a": "repaired"}})).unwrap();
+
+        let page = invoke("query", json!({"after_id": first})).unwrap().unwrap().result.unwrap();
+
+        assert_eq!(page["items"][0]["record"]["a"], "repaired");
     }
 
     #[test]

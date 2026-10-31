@@ -158,9 +158,7 @@ impl Drop for TerminalJob {
 #[cfg(windows)]
 fn close_job_handle(handle: usize) -> i32 {
     // SAFETY: This value owns the handle returned by CreateJobObjectW.
-    let result = unsafe { windows_sys::Win32::Foundation::CloseHandle(handle as _) };
-
-    result
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(handle as _) }
 }
 
 #[cfg(all(test, windows))]

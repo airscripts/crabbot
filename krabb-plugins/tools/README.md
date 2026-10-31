@@ -31,8 +31,11 @@ addresses, rechecks redirects, caps redirects at three and response bodies at
 deadline and a four-request concurrency limit. The plugin declares its network
 permission in the manifest.
 
-Approved shell commands run on the host only when no container sandbox is
-configured. To isolate them, set `KRABB_SANDBOX_RUNTIME` to `docker` or
+On Linux and Windows, approved shell commands run on the host when no container sandbox is
+configured. Linux shells reject process-group and session changes so descendants cannot
+escape cancellation. On macOS and other Unix hosts, shell execution requires the container
+sandbox; host execution fails before running the command.
+To configure the sandbox, set `KRABB_SANDBOX_RUNTIME` to `docker` or
 `podman` and `KRABB_SANDBOX_IMAGE` to an image already available locally.
 The tools plugin never pulls images. The container has no network, a read-only
 root filesystem, dropped Linux capabilities, bounded CPU, memory, process and

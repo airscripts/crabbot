@@ -74,6 +74,10 @@ command: runtime exposes it when SQLite is installed and routes its data
 operations to the plugin. The agent-facing data tool uses the same conditional
 capability.
 
+Command discovery waits up to five seconds for concurrent metadata access. If the
+metadata remains locked or cannot be read, the command exits with an error;
+it does not report success without executing the requested plugin command.
+
 For the boundary between the core library, runtime, and plugins, see
 [Product Architecture](product.md#architecture-and-interfaces).
 
@@ -103,7 +107,10 @@ krabb completion powershell >> $PROFILE
 ## Output And Logging
 
 - `--json` writes structured command results to stdout. Diagnostics go to
-  stderr; failures return a JSON error on stderr.
+  stderr; failures return a JSON error on stderr. Plugin commands send stream
+  notifications, including device login instructions, to stderr and emit only
+  the final structured result on stdout. ACP includes its answer in the result's
+  `text` field.
 - Multiline CLI error details are kept flush left for easier reading and copying.
 - `--verbose` shows progress and nested error causes. `--debug` also prints
   internal diagnostics.
@@ -159,6 +166,11 @@ manage structured records. `/store` remains as a compatibility alias. See the
 [TUI guide](../krabb-plugins/tui/README.md) for controls, sessions, and client
 commands.
 
+Typed `!command` shell execution requires `clients.tui.shell` and is supported on Linux
+and Windows. Other platforms reject typed shell commands because descendant containment
+is unavailable for this execution path. Esc waits for process cleanup before completing
+cancellation, and the next command receives a fresh cancellation token.
+
 ## Plugin Management
 
 ```sh
@@ -178,7 +190,8 @@ the current application log file.
 
 `plugin update` previews changes, then replaces changed plugins after
 confirmation. Uninstall accepts multiple plugin IDs and confirms the batch once;
-it unloads each process before removing its files. Removing
+it waits for active daemon work to settle and reserves the lifecycle through state
+checks, process unloading, and file removal. Removing
 the last model or messaging plugin can require deleting dependent session or
 delivery state; `--force` with confirmation performs that purge. See
 [Plugins](plugins.md) for manifests, permissions, and update behavior.
@@ -279,7 +292,25 @@ requires confirmation.
 Manage the background service with
 `krabb service install|uninstall|status|start|stop|restart`. Installing does
 not start it. `--force` replaces an existing service configuration; uninstall
-confirms before removing it. See [Workflows](workflows.md) for platform setup.
+confirms before removing it. Generated services preserve explicitly configured
+browser and computer settings, including Playwright paths and native desktop
+opt-in. Windows installations register `krabb-daemon --service` with SCM, which
+receives lifecycle status and sends stop/shutdown controls through normal daemon
+cleanup. Running `krabb-daemon` without this flag stays in the foreground.
+Service installation persists `KRABB_CODEX_HOME`, defaulting to the installing user's
+`HOME/.codex` or `USERPROFILE/.codex`, so the daemon can use the existing Codex sign-in.
+Windows services run as the dedicated `NT SERVICE\Krabb` account. Installation grants
+that account access to the executable and existing private state, including the Codex
+profile. Configured `KRABB_ROOT` and `KRABB_MEDIA` directories receive inheritable
+modify access without replacing their existing permissions. Configured Playwright package
+trees, Chromium directories, and explicit `KRABB_NODE` executable paths receive read/execute
+access. The resolved `KRABB_CODEX_BINARY` executable also receives read/execute access,
+without granting access to its parent directory or the entire user profile.
+Reinstall with `krabb service install --force` to migrate an older LocalSystem
+service; this stops the service, so run `krabb service start` afterward. Failed reinstalls
+retain the unprivileged identity when restoring the previous configuration.
+Private files remain accessible to the data-owning account after service writes.
+See [Workflows](workflows.md) for platform setup.
 
 ## Providers And Agent Interoperability
 
@@ -289,6 +320,16 @@ For one-shot model requests, run:
 ```sh
 krabb ask --provider <id> --model <name> <prompt...>
 ```
+
+`krabb acp --workspace <path> <prompt>` routes filesystem requests through the
+tools plugin. The selected directory must stay under the configured workspace;
+writes require the configured approval policy. Approval prompts go to stderr;
+JSON mode and noninteractive execution deny operations requiring a prompt.
+`--session <id>` resumes the requested ACP session, including agents returning an
+empty load result. Advertised authentication methods do not block an already signed-in
+agent; an authentication-required session error is reported by the adapter.
+`krabb ag-ui` serves until
+interrupted, with bounded model work for each HTTP run.
 
 Provider-specific setup and supported agent protocols are in
 [Providers](providers.md). Each integration's README describes its limits.

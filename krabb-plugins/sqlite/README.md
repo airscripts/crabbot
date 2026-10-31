@@ -19,8 +19,10 @@ add optional columns or remove columns, update a record by ID, and delete record
 or tables. Database and table names use letters, numbers, and underscores.
 Column types are `text`, `integer`, `real`, `boolean`, and `json`. A database
 can contain up to 100 tables; each table can contain 10,000 records and 64
-columns. Queries return at most 20
-records and 128 KiB of data.
+columns. Queries return at most 20 records and 256 KiB of JSON. Records are limited
+to 255 KiB, reserving room for page metadata within the host's tool-result and
+model-message limits. Older records that exceed a query page produce an explicit
+error; reduce them with `data update` before querying again.
 
 Databases are logical namespaces inside the configured SQLite file, not
 separate SQLite files. Data is scoped to the active conversation identity so

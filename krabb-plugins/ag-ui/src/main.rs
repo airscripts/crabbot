@@ -81,7 +81,7 @@ fn hello() -> Hello {
         capabilities: vec![Capability::Agent],
         commands: vec![CommandSpec {
             name: "ag-ui".into(),
-            description: "Serve the local AG-UI run endpoint.".into(),
+            description: "Serve the AG-UI run endpoint for local agent clients.".into(),
             interactive: false,
         }],
     }
@@ -313,6 +313,12 @@ where
             result = &mut generation => {
                 match result {
                     Ok(reply) => {
+                        while let Ok(event) = event_receiver.try_recv() {
+                            for event in stream_state.push(&run, event)? {
+                                write_sse_event(&mut stream, &event).await?;
+                            }
+                        }
+
                         for event in stream_state.fallback(&run, &reply)? {
                             write_sse_event(&mut stream, &event).await?;
                         }
@@ -352,8 +358,8 @@ where
 struct RunStream {
     message_id: String,
     message_open: bool,
-    text_seen: bool,
-    event_seen: bool,
+    text: String,
+    tools: Vec<Value>,
     pending_tools: Vec<String>,
     error: Option<String>,
     index: usize,
@@ -364,8 +370,8 @@ impl RunStream {
         Self {
             message_id: format!("{}-message", run.run_id),
             message_open: false,
-            text_seen: false,
-            event_seen: false,
+            text: String::new(),
+            tools: Vec::new(),
             pending_tools: Vec::new(),
             error: None,
             index: 0,
@@ -376,11 +382,14 @@ impl RunStream {
         let event: Event = serde_json::from_value(value).map_err(|error| {
             krabb_core::Error::Protocol(format!("Invalid model stream event: {error}."))
         })?;
-        self.event_seen = true;
+
+        if matches!(event, Event::Tool { .. }) {
+            self.tools.push(serde_json::to_value(&event)?);
+        }
 
         let mapped = match event {
             Event::Text { text } | Event::Done { text } if !text.is_empty() => {
-                self.text_seen = true;
+                self.text.push_str(&text);
                 let mut events = Vec::new();
 
                 if !self.message_open {
@@ -420,22 +429,42 @@ impl RunStream {
     fn fallback(&mut self, run: &RunInput, reply: &ModelReply) -> krabb_core::Result<Vec<Value>> {
         let mut events = Vec::new();
 
-        if !self.event_seen {
-            for event in &reply.events {
-                events.extend(self.push(run, serde_json::to_value(event)?)?);
+        let mut delivered = self.tools.clone();
+
+        for event in &reply.events {
+            if matches!(event, Event::Text { .. } | Event::Done { .. }) {
+                continue;
+            }
+
+            let value = serde_json::to_value(event)?;
+
+            if let Some(index) = delivered.iter().position(|seen| seen == &value) {
+                delivered.remove(index);
+            } else {
+                events.extend(self.push(run, value)?);
             }
         }
 
-        if self.text_seen || reply.text.is_empty() {
-            return Ok(events);
-        }
+        let final_text = if reply.text.is_empty() {
+            reply
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Text { text } | Event::Done { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        } else {
+            reply.text.clone()
+        };
 
-        self.message_open = true;
-        self.text_seen = true;
-        events.extend([
-            json!({"type":"TEXT_MESSAGE_START","messageId":self.message_id,"role":"assistant"}),
-            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":self.message_id,"delta":reply.text}),
-        ]);
+        if let Some(missing) = final_text.strip_prefix(&self.text)
+            && !missing.is_empty()
+        {
+            events.extend(
+                self.push(run, serde_json::to_value(Event::Text { text: missing.to_owned() })?)?,
+            );
+        }
 
         Ok(events)
     }
@@ -1062,6 +1091,72 @@ mod tests {
     }
 
     #[test]
+    fn reconciles_partial_text_and_final_tools_without_duplicates() {
+        let run = RunInput::parse(&json!({
+            "threadId":"thread", "runId":"run", "messages":[{"role":"user","content":"hello"}],
+        }))
+        .unwrap();
+        let tool = Event::Tool {
+            name: "confirm".into(),
+            args: json!({"ok": true}),
+            id: Some("call".into()),
+            thought_signature: None,
+        };
+
+        for streamed_tool in [false, true] {
+            let mut stream = RunStream::new(&run);
+            stream.push(&run, json!({"kind":"text", "text":"part"})).unwrap();
+
+            if streamed_tool {
+                stream.push(&run, serde_json::to_value(&tool).unwrap()).unwrap();
+            }
+
+            let mut reply = reply("partial response");
+            reply.events = vec![Event::Text { text: "partial response".into() }, tool.clone()];
+            let events = stream.fallback(&run, &reply).unwrap();
+
+            assert_eq!(stream.text, "partial response");
+            assert_eq!(
+                events.iter().filter(|event| event["type"] == "TEXT_MESSAGE_START").count(),
+                0
+            );
+
+            assert_eq!(
+                events.iter().filter(|event| event["type"] == "TOOL_CALL_START").count(),
+                usize::from(!streamed_tool)
+            );
+
+            assert_eq!(stream.pending_tools, vec!["call"]);
+            assert!(stream.fallback(&run, &reply).unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn drains_notifications_queued_with_the_final_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let handler =
+            tokio::spawn(handle_connection(server, test_security(), |_, events| async move {
+                events.send(json!({"kind":"text", "text":"part"})).unwrap();
+                Ok(reply("partial response"))
+            }));
+        let body =
+            r#"{"threadId":"thread","runId":"run","messages":[{"role":"user","content":"hello"}]}"#;
+        client.write_all(format!(
+            "POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\nContent-Length: {}\r\n\r\n{body}", body.len(),
+        ).as_bytes()).await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        handler.await.unwrap().unwrap();
+
+        assert_eq!(response.matches("TEXT_MESSAGE_START").count(), 1);
+        assert_eq!(response.matches("TEXT_MESSAGE_CONTENT").count(), 2);
+        assert!(response.contains("ial response"));
+        assert!(response.contains("RUN_FINISHED"));
+    }
+
+    #[test]
     fn parses_standard_run_input_and_maps_text_messages() {
         let run = RunInput::parse(&json!({
             "threadId":"thread-1",
@@ -1178,6 +1273,13 @@ mod tests {
         assert_eq!(hello.capabilities, vec![Capability::Agent]);
         assert_eq!(hello.commands[0].name, "ag-ui");
         assert!(!hello.commands[0].interactive);
+
+        let manifest: serde_json::Value =
+            toml::from_str(include_str!("../krabb-plugin.toml")).unwrap();
+        let commands: Vec<CommandSpec> =
+            serde_json::from_value(manifest["commands"].clone()).unwrap();
+
+        assert_eq!(hello.commands, commands);
     }
 
     #[test]

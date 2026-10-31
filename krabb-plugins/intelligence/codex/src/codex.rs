@@ -807,28 +807,11 @@ impl Server {
 
         let response = emitter.call("host/tool", json!({"name": name, "args": args})).await?;
 
-        let (success, output) = if let Some(error) = response.error {
+        if response.error.is_some() {
             self.failed_tool_calls.insert(key);
-            (false, error.message)
-        } else {
-            let value = response.result.unwrap_or(Value::Null);
-            (true, value["text"].as_str().unwrap_or_default().to_owned())
-        };
-
-        let mut reply = json!({
-            "id": id,
-            "result": {
-                "success": success,
-                "contentItems": [{"type": "inputText", "text": output}]
-            }
-        });
-
-        if serde_json::to_vec(&reply)?.len().saturating_add(1) > jsonl::MAX {
-            reply["result"]["contentItems"][0]["text"] =
-                "Tool output exceeded the Codex protocol limit.".into();
-
-            reply["result"]["success"] = false.into();
         }
+
+        let reply = tool_reply(id, response)?;
 
         jsonl::write(&mut self.output, &reply).await
     }
@@ -846,6 +829,44 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
+}
+
+fn tool_reply(id: Value, response: Response) -> krabb_core::Result<Value> {
+    let success = response.error.is_none();
+    let mut items = Vec::new();
+
+    if let Some(error) = response.error {
+        items.push(json!({"type": "inputText", "text": error.message}));
+    } else {
+        let value = response.result.unwrap_or(Value::Null);
+        items
+            .push(json!({"type": "inputText", "text": value["text"].as_str().unwrap_or_default()}));
+
+        for content in value["content"].as_array().into_iter().flatten() {
+            if content["kind"] == "image" {
+                let image: krabb_core::types::ToolContent =
+                    serde_json::from_value(content.clone())?;
+
+                if let krabb_core::types::ToolContent::Image { uri, .. } = image {
+                    items.push(json!({"type": "inputImage", "imageUrl": uri}));
+                }
+            }
+        }
+    }
+
+    let mut reply = json!({"id": id, "result": {"success": success, "contentItems": items}});
+
+    if serde_json::to_vec(&reply)?.len().saturating_add(1) > jsonl::MAX {
+        reply["result"] = json!({
+            "success": false,
+            "contentItems": [{
+                "type": "inputText",
+                "text": "Tool output exceeded the Codex protocol limit."
+            }]
+        });
+    }
+
+    Ok(reply)
 }
 
 fn final_text(turn: &Value) -> Option<String> {
@@ -1061,6 +1082,64 @@ mod tests {
     use krabb_core::types::{Content, Message, ModelRequest, Role, ToolSpec};
     use serde_json::json;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn dynamic_tool_replies_preserve_images_and_bound_the_entire_frame() {
+        use krabb_core::types::Response;
+
+        let uri = "data:image/png;base64,aW1hZ2U=";
+        let reply = super::tool_reply(
+            json!(7),
+            Response::ok(
+                1,
+                json!({
+                    "text": "Screenshot\nTool metadata: {}",
+                    "content": [
+                        {"kind": "text", "text": "Screenshot"},
+                        {"kind": "image", "uri": uri, "alt": "Screen"}
+                    ]
+                }),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["result"]["success"], true);
+        assert_eq!(
+            reply["result"]["contentItems"],
+            json!([
+                {"type": "inputText", "text": "Screenshot\nTool metadata: {}"},
+                {"type": "inputImage", "imageUrl": uri}
+            ])
+        );
+
+        let legacy = super::tool_reply(json!(8), Response::ok(1, json!({"text": "done"}))).unwrap();
+
+        assert_eq!(
+            legacy["result"]["contentItems"],
+            json!([{"type": "inputText", "text": "done"}])
+        );
+
+        let failed = super::tool_reply(json!(9), Response::fail(1, -32000, "denied")).unwrap();
+
+        assert_eq!(failed["result"]["success"], false);
+        assert_eq!(failed["result"]["contentItems"][0]["text"], "denied");
+
+        let oversized = super::tool_reply(
+            json!(10),
+            Response::ok(
+                1,
+                json!({
+                    "content": [{"kind": "image", "uri": "x".repeat(krabb_core::jsonl::MAX)}]
+                }),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(oversized["result"]["success"], false);
+        assert_eq!(oversized["result"]["contentItems"].as_array().unwrap().len(), 1);
+        assert!(serde_json::to_vec(&oversized).unwrap().len() < krabb_core::jsonl::MAX);
+    }
 
     #[test]
     fn reads_context_window_and_latest_token_usage() {

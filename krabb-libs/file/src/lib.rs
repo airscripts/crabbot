@@ -8,6 +8,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+// Stable SID for NT SERVICE\Krabb, as reported by `sc.exe showsid Krabb`.
+#[cfg(any(windows, test))]
+const SERVICE_SID: &str = "S-1-5-80-3700705418-1466718386-3227256717-750624257-2359456539";
+
 const CREDENTIAL_LIMIT: u64 = 1024 * 1024;
 
 #[cfg(unix)]
@@ -381,14 +385,32 @@ fn regular(path: &Path) -> bool {
 
 fn write_journal(path: &Path, transaction: &Transaction) -> io::Result<()> {
     let bytes = serde_json::to_vec(transaction).map_err(io::Error::other)?;
+    let temporary = path.with_file_name(format!(".journal-{}-{}", name(path), nonce()));
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options.open(path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    private(path)
+    let mut file = options.open(&temporary)?;
+
+    let result = (|| {
+        private(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+
+    result
 }
 
 fn reject_link(path: &Path) -> io::Result<()> {
@@ -411,6 +433,187 @@ fn nonce() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |value| value.as_nanos())
 }
 
+/// Prepare existing private state for the Windows Krabb virtual service account.
+#[cfg(windows)]
+pub fn service(path: impl AsRef<Path>) -> io::Result<()> {
+    let mut pending = vec![path.as_ref().to_path_buf()];
+
+    while let Some(path) = pending.pop() {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Service state cannot contain symbolic links.",
+            ));
+        }
+
+        protect(&path)?;
+
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn owner(path: &Path) -> io::Result<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::{ERROR_SUCCESS, LocalFree},
+        Security::{
+            Authorization::{ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT},
+            OWNER_SECURITY_INFORMATION,
+        },
+    };
+
+    let wide = path.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let mut descriptor = std::ptr::null_mut();
+    let mut sid = std::ptr::null_mut();
+    let result = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+
+    if result != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(result as i32));
+    }
+
+    let mut text = std::ptr::null_mut();
+    let converted = unsafe { ConvertSidToStringSidW(sid, &mut text) };
+
+    let error = io::Error::last_os_error();
+    unsafe { LocalFree(descriptor) };
+
+    if converted == 0 {
+        return Err(error);
+    }
+
+    let mut length = 0;
+
+    while unsafe { *text.add(length) } != 0 {
+        length += 1;
+    }
+
+    let value = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+
+    unsafe { LocalFree(text.cast()) };
+
+    Ok(value)
+}
+
+#[cfg(any(windows, test))]
+fn principal(
+    path: &Path,
+    mut owner: impl FnMut(&Path) -> io::Result<String>,
+) -> io::Result<String> {
+    // Service-created files belong to the service account; retain the user's access
+    // by finding the owning account of their enclosing data directory.
+    for ancestor in path.ancestors() {
+        let sid = owner(ancestor)?;
+
+        if sid != "S-1-5-18" && sid != SERVICE_SID {
+            return Ok(sid);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "Service state needs a user-owned directory.",
+    ))
+}
+
+#[cfg(windows)]
+fn protect(path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::{
+        Foundation::{ERROR_SUCCESS, LocalFree},
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+                SE_FILE_OBJECT, SetNamedSecurityInfoW,
+            },
+            DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        },
+    };
+
+    let mut descriptor = std::ptr::null_mut();
+    let mut length = 0;
+    let principal = principal(path, owner)?;
+    let inheritance = if fs::symlink_metadata(path)?.is_dir() { "OICI" } else { "" };
+
+    let security = format!(
+        "D:P(A;{inheritance};FA;;;{principal})(A;{inheritance};FA;;;{SERVICE_SID})(A;{inheritance};FA;;;SY)\0"
+    )
+        .encode_utf16()
+        .collect::<Vec<_>>();
+
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            security.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            &mut length,
+        )
+    };
+
+    if converted == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut dacl = std::ptr::null_mut();
+    let result =
+        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) };
+
+    if result == 0 {
+        unsafe { LocalFree(descriptor.cast()) };
+
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    wide.push(0);
+    let result = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+
+    unsafe { LocalFree(descriptor.cast()) };
+
+    if result != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(result as i32));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -424,6 +627,62 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn parallel_saves_keep_independent_transaction_journals() {
+        let root = root("parallel-journals");
+        let barrier = std::sync::Barrier::new(8);
+
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let path = root.join(format!("state-{index}.json"));
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+
+                    for revision in 0..20 {
+                        save(&path, revision.to_string()).unwrap();
+                    }
+                });
+            }
+        });
+
+        for index in 0..8 {
+            assert_eq!(load(root.join(format!("state-{index}.json")), 16).unwrap().unwrap(), b"19");
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incomplete_journal_replacement_keeps_the_previous_recovery_record() {
+        let root = root("journal-replacement");
+        let path = root.join("state.json");
+        let backup = root.join(".state.json.backup-test");
+        let journal = root.join(".state.json.txn-test");
+        fs::write(&path, b"saved").unwrap();
+        let mut transaction = Transaction {
+            path: "state.json".into(),
+            temporary: ".state.json.tmp-test".into(),
+            backup: ".state.json.backup-test".into(),
+            phase: "prepared".into(),
+        };
+
+        super::write_journal(&journal, &transaction).unwrap();
+        fs::rename(&path, &backup).unwrap();
+        fs::write(root.join(".journal-interrupted"), b"{\"path\":").unwrap();
+
+        assert_eq!(load(&path, 32).unwrap().unwrap(), b"saved");
+
+        super::write_journal(&journal, &transaction).unwrap();
+        transaction.phase = "backed_up".into();
+        super::write_journal(&journal, &transaction).unwrap();
+        let published: Transaction = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+
+        assert_eq!(published.phase, "backed_up");
+        check(&journal).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -642,71 +901,124 @@ mod tests {
         assert!(credential(&path).is_err());
         let _ = fs::remove_dir_all(root);
     }
-}
 
-#[cfg(windows)]
-fn protect(path: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
+    #[cfg(windows)]
+    #[test]
+    fn service_sid_matches_windows_account_identity() {
+        let output =
+            std::process::Command::new("sc.exe").args(["showsid", "Krabb"]).output().unwrap();
 
-    use windows_sys::Win32::{
-        Foundation::{ERROR_SUCCESS, LocalFree},
-        Security::{
-            Authorization::{
-                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-                SE_FILE_OBJECT, SetNamedSecurityInfoW,
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains(super::SERVICE_SID));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_state_allows_only_the_owner_service_and_system_after_replacement() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::{
+            Foundation::{ERROR_SUCCESS, LocalFree},
+            Security::{
+                ACCESS_ALLOWED_ACE,
+                Authorization::{
+                    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+                    SDDL_REVISION_1, SE_FILE_OBJECT,
+                },
+                DACL_SECURITY_INFORMATION, EqualSid, GetAce, OWNER_SECURITY_INFORMATION,
             },
-            DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
-            PROTECTED_DACL_SECURITY_INFORMATION,
-        },
-    };
+        };
 
-    let mut descriptor = std::ptr::null_mut();
-    let mut length = 0;
-    let security = "D:P(A;;FA;;;OW)\0".encode_utf16().collect::<Vec<_>>();
-    let converted = unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            security.as_ptr(),
-            SDDL_REVISION_1,
-            &mut descriptor,
-            &mut length,
-        )
-    };
+        let root = root("service-access");
+        let path = root.join("state.json");
+        fs::write(&path, "old").unwrap();
+        super::service(&root).unwrap();
 
-    if converted == 0 {
-        return Err(io::Error::last_os_error());
+        for content in ["first", "second"] {
+            save(&path, content).unwrap();
+            check(&path).unwrap();
+            let wide = path.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+            let mut descriptor = std::ptr::null_mut();
+            let mut owner = std::ptr::null_mut();
+            let mut acl = std::ptr::null_mut();
+
+            let result = unsafe {
+                GetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                    &mut owner,
+                    std::ptr::null_mut(),
+                    &mut acl,
+                    std::ptr::null_mut(),
+                    &mut descriptor,
+                )
+            };
+
+            assert_eq!(result, ERROR_SUCCESS);
+
+            let mut ace = std::ptr::null_mut();
+
+            assert_ne!(unsafe { GetAce(acl, 0, &mut ace) }, 0);
+
+            let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+            let sid = unsafe { &raw mut (*ace).SidStart }.cast();
+
+            assert_ne!(unsafe { EqualSid(owner, sid) }, 0);
+
+            let mut text = std::ptr::null_mut();
+            let mut length = 0;
+            let result = unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    descriptor,
+                    SDDL_REVISION_1,
+                    DACL_SECURITY_INFORMATION,
+                    &mut text,
+                    &mut length,
+                )
+            };
+
+            unsafe { LocalFree(descriptor) };
+
+            assert_ne!(result, 0);
+
+            let dacl = String::from_utf16_lossy(unsafe {
+                std::slice::from_raw_parts(text, length as usize - 1)
+            });
+
+            unsafe { LocalFree(text.cast()) };
+
+            assert!(dacl.starts_with("D:P(A;;FA;;;"));
+            assert!(dacl.ends_with(")(A;;FA;;;SY)"));
+            assert!(dacl.contains(&format!("(A;;FA;;;{})", super::SERVICE_SID)));
+            assert_eq!(dacl.matches('(').count(), 3);
+            assert_eq!(load(&path, 1024).unwrap().unwrap(), content.as_bytes());
+        }
+
+        fs::remove_dir_all(root).unwrap();
     }
 
-    let mut present = 0;
-    let mut defaulted = 0;
-    let mut dacl = std::ptr::null_mut();
-    let result =
-        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) };
+    #[test]
+    fn service_owned_state_retains_the_enclosing_users_access() {
+        let path = std::path::Path::new("user/data/state.json");
+        let user = "S-1-5-21-1-2-3-1001";
 
-    if result == 0 {
-        unsafe { LocalFree(descriptor.cast()) };
+        for service in ["S-1-5-18", super::SERVICE_SID] {
+            let sid = super::principal(path, |path| {
+                Ok(if path == std::path::Path::new("user") { user } else { service }.into())
+            })
+            .unwrap();
 
-        return Err(io::Error::last_os_error());
+            assert_eq!(sid, user);
+            assert!(super::principal(path, |_| Ok(service.into())).is_err());
+        }
+
+        assert_eq!(super::principal(path, |_| Ok(user.into())).unwrap(), user);
+        assert!(super::principal(path, |_| Ok("S-1-5-18".into())).is_err());
+        assert!(
+            super::principal(path, |_| Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            )))
+            .is_err()
+        );
     }
-
-    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
-    wide.push(0);
-    let result = unsafe {
-        SetNamedSecurityInfoW(
-            wide.as_mut_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            dacl,
-            std::ptr::null_mut(),
-        )
-    };
-
-    unsafe { LocalFree(descriptor.cast()) };
-
-    if result != ERROR_SUCCESS {
-        return Err(io::Error::from_raw_os_error(result as i32));
-    }
-
-    Ok(())
 }

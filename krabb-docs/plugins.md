@@ -261,12 +261,16 @@ requests require an explicit `approved: true` flag because they start an
 operator-selected process. HTTP accepts only HTTPS or loopback endpoints,
 with strict host-boundary checks, never invokes a shell, and forwards
 normalized JSON-RPC requests without allowing one plugin to call another
-directly.
+directly. Stdio initializes the child and sends `notifications/initialized` before
+performing an operation. HTTP negotiates JSON/SSE responses and accepts empty 202
+acknowledgements. HTTP callers perform initialization and pass the returned
+`session_id` and negotiated `protocol_version` on subsequent calls to the same
+authenticated endpoint; see the [MCP transport contract](../krabb-plugins/mcp/README.md).
 
 Channel plugins split outgoing text at Telegram, Discord, and WhatsApp message
 limits and retain normalized attachment metadata for providers. Telegram,
 Discord, and WhatsApp media operations resolve opaque provider references into
-bounded private files; generated daemon replies currently remain text-only.
+bounded private files, preserving binary image and audio bytes; generated daemon replies currently remain text-only.
 
 The SQLite plugin uses WAL mode and idempotent schema migrations. When it is
 installed and agent tools are enabled, Krabb adds a `data` tool to model
@@ -311,7 +315,9 @@ does not implement cancellation. ACP agents run their own tools and model
 workflow.
 
 A2A is a client for discovering remote agents, sending messages, streaming
-task updates, checking status, and requesting cancellation. It does not expose
+task updates, checking status, and requesting cancellation. Streamed artifact
+replacements and appended parts are accumulated in the final command result,
+so `--json` retains the answer after a completion status update. It does not expose
 Krabb agents as A2A services or implement OAuth. AG-UI accepts runs on a
 loopback HTTP endpoint and emits run, text, frontend tool-call, state snapshot,
 and error events. Frontend tools are returned to the client for execution; the
